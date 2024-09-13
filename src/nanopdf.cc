@@ -1,14 +1,14 @@
 #if defined(NANOPDF_USE_NANOSTL)
-#include "nanostring.h"
 #include "nanocstring.h"
+#include "nanostring.h"
 #else
-#include <string>
 #include <cstring>
 #include <iostream>
+#include <string>
 #endif
 
-#include "nanopdf.hh"
 #include "common-macros.inc"
+#include "nanopdf.hh"
 
 namespace nanopdf {
 
@@ -75,7 +75,7 @@ static inline void swap8(int64_t *val) {
   dst[7] = src[0];
 }
 
-} // namespace
+}  // namespace
 
 ///
 /// Simple stream reader
@@ -122,7 +122,7 @@ class StreamReader {
         return 0;
       }
 
-      size_t nbytes = size_t(len); // may shorten size on 32bit platform
+      size_t nbytes = size_t(len);  // may shorten size on 32bit platform
 
       memcpy(dst, &binary_[idx_], nbytes);
       idx_ += nbytes;
@@ -349,19 +349,78 @@ class StreamReader {
 
 namespace detail {
 
+struct Cursor {
+  int row{0};
+  int col{0};
+};
+
+class Parser {
+ public:
+  Parser(StreamReader &sr) : _sr(sr) {}
+
+  bool Char1(char *c) {
+    return _sr.read1(c);
+  }
+
+  bool SkipUntilNewline();
+  bool Eof() const { return _sr.eof(); }
+
+ private:
+  StreamReader &_sr;
+  Cursor _cursor;
+};
+
+bool Parser::SkipUntilNewline() {
+  while (!Eof()) {
+    char c;
+    if (!Char1(&c)) {
+      // this should not happen.
+      return false;
+    }
+
+    if (c == '\n') {
+      break;
+    } else if (c == '\r') {
+      // CRLF?
+      if (_sr.tell() < (_sr.size() - 1)) {
+        char d;
+        if (!Char1(&d)) {
+          // this should not happen.
+          return false;
+        }
+
+        if (d == '\n') {
+          break;
+        }
+
+        // unwind 1 char
+        if (!_sr.seek_from_current(-1)) {
+          // this should not happen.
+          return false;
+        }
+
+        break;
+      }
+
+    } else {
+      // continue
+    }
+  }
+
+  _cursor.row++;
+  _cursor.col = 0;
+  return true;
+}
+
 bool parse_header(StreamReader &sr, int &minor_version, std::string &err) {
   char buf[8];
   if (!sr.read(8, 8, reinterpret_cast<uint8_t *>(buf))) {
     return false;
   }
 
-  if ((buf[0] == '%') &&
-    (buf[1] == 'P') &&
-    (buf[2] == 'D') &&
-    (buf[3] == 'F') &&
-    (buf[4] == '-') &&
-    (buf[5] == '1') &&
-    (buf[6] == '.')) {
+  if ((buf[0] == '%') && (buf[1] == 'P') && (buf[2] == 'D') &&
+      (buf[3] == 'F') && (buf[4] == '-') && (buf[5] == '1') &&
+      (buf[6] == '.')) {
     // ok
   } else {
     err += "Invalid header.\n";
@@ -374,11 +433,11 @@ bool parse_header(StreamReader &sr, int &minor_version, std::string &err) {
     err += "Invalid or unsupported PDF minor version.\n";
     return false;
   }
-    
+
   return true;
 }
 
-} // namespace detail
+}  // namespace detail
 
 bool parse_from_memory(const uint8_t *addr, const size_t size) {
   if (size < 8) {
@@ -386,7 +445,7 @@ bool parse_from_memory(const uint8_t *addr, const size_t size) {
     return false;
   }
 
-  bool swap_endian = false; // TODO
+  bool swap_endian = false;  // TODO
   StreamReader sr(addr, size, swap_endian);
 
   int minor_version{0};
@@ -402,4 +461,4 @@ bool parse_from_memory(const uint8_t *addr, const size_t size) {
   return true;
 }
 
-} // namespace nanopdf
+}  // namespace nanopdf
