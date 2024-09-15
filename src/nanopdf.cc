@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <limits>
 #endif
 
 #include "common-macros.inc"
@@ -13,6 +14,62 @@
 namespace nanopdf {
 
 namespace {
+
+// parseInt(32bit)
+// 0 = success
+// -1 = bad input
+// -2 = overflow
+// -3 = underflow
+int parseInt(const std::string &s, int *out_result) {
+  size_t n = s.size();
+  const char *c = s.c_str();
+
+  if ((c == nullptr) || (*c) == '\0') {
+    return -1;
+  }
+
+  size_t idx = 0;
+  bool negative = c[0] == '-';
+  if ((c[0] == '+') | (c[0] == '-')) {
+    idx = 1;
+    if (n == 1) {
+      // sign char only
+      return -1;
+    }
+  }
+
+  int64_t result = 0;
+
+  // allow zero-padded digits(e.g. "003")
+  while (idx < n) {
+    if ((c[idx] >= '0') && (c[idx] <= '9')) {
+      int digit = int(c[idx] - '0');
+      result = result * 10 + digit;
+    } else {
+      // bad input
+      return -1;
+    }
+
+    if (negative) {
+      if ((-result) < (std::numeric_limits<int>::min)()) {
+        return -3;
+      }
+    } else {
+      if (result > (std::numeric_limits<int>::max)()) {
+        return -2;
+      }
+    }
+
+    idx++;
+  }
+
+  if (negative) {
+    (*out_result) = -int(result);
+  } else {
+  }
+
+  return 0;  // OK
+}
 
 static inline void swap2(unsigned short *val) {
   unsigned short tmp = *val;
@@ -358,9 +415,7 @@ class Parser {
  public:
   Parser(StreamReader &sr) : _sr(sr) {}
 
-  bool Char1(char *c) {
-    return _sr.read1(c);
-  }
+  bool Char1(char *c) { return _sr.read1(c); }
 
   bool SkipUntilNewline();
   bool Eof() const { return _sr.eof(); }
