@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <limits>
+#include <sstream>
 #endif
 
 #include "common-macros.inc"
@@ -65,6 +66,61 @@ int parseInt(const std::string &s, int *out_result) {
 
   if (negative) {
     (*out_result) = -int(result);
+  } else {
+  }
+
+  return 0;  // OK
+}
+
+int parseInt64(const std::string &s, int64_t *out_result) {
+  size_t n = s.size();
+  const char *c = s.c_str();
+
+  if ((c == nullptr) || (*c) == '\0') {
+    return -1;
+  }
+
+  size_t idx = 0;
+  bool negative = c[0] == '-';
+  if ((c[0] == '+') | (c[0] == '-')) {
+    idx = 1;
+    if (n == 1) {
+      // sign char only
+      return -1;
+    }
+  }
+
+  int64_t result = 0;
+
+  // allow zero-padded digits(e.g. "003")
+  while (idx < n) {
+    if ((c[idx] >= '0') && (c[idx] <= '9')) {
+      if (idx > std::numeric_limits<int64_t>::digits10) {
+        // input too long
+        return -1;
+      }
+      int digit = int(c[idx] - '0');
+      result = result * 10 + digit;
+    } else {
+      // bad input
+      return -1;
+    }
+
+    if (negative) {
+      if ((-result) < (std::numeric_limits<int64_t>::min)()) {
+        return -3;
+      }
+    } else {
+      if (result > (std::numeric_limits<int64_t>::max)()) {
+        return -2;
+      }
+    }
+
+    idx++;
+  }
+
+  if (negative) {
+    (*out_result) = -result;
   } else {
   }
 
@@ -415,15 +471,121 @@ class Parser {
  public:
   Parser(StreamReader &sr) : _sr(sr) {}
 
-  bool Char1(char *c) { return _sr.read1(c); }
+  bool Char1(char *c) {
+    bool ret = _sr.read1(c);
+    _cursor.col++;
+    return ret;
+  }
+
+  // Read PDF comment lines.
+  bool ReadComments();
 
   bool SkipUntilNewline();
+  bool ReadUntilNewline(std::string *s);
   bool Eof() const { return _sr.eof(); }
 
+  bool Look(const std::string &s) const;
+  bool Expect(const std::string &s) const;
+
+  // Advance 'n' characters(ignore read character(s))
+  bool Consume(size_t n) const;
+
+  bool Parse();
+  bool ParseHeader();
+  bool ParseBody();
+  bool ParseXRefTable();
+  bool ParseTrailer();
+
+  bool ParseEnd();
+
+  void PushError(const std::string &msg) {
+    std::stringstream ss;
+    ss << msg << ": near line " << std::to_string(_cursor.row + 1) << ", column " << std::to_string(_cursor.col) << "\n";
+    _err += ss.str();
+  }
+
+  const std::string &GetError() const {
+    return _err;
+  }
+
+  int MinorVersion() const {
+    return _minor_version;
+  }
+
+  const std::vector<std::string> Comments() const {
+    return _comments;
+  }
+
  private:
+
+  bool ParseObject();
+
   StreamReader &_sr;
   Cursor _cursor;
+  std::string _err;
+
+  int _minor_version{0};
+  std::vector<std::string> _comments;
 };
+
+bool Parser::Look(const std::string &s) const {
+    size_t n = s.size();
+    std::vector<uint8_t> buf;
+    buf.resize(n);
+  
+    uint64_t loc = _sr.tell();
+  
+    if (!_sr.read(n, n, buf.data())) {
+      _sr.seek_set(loc);
+      return false;
+    }
+  
+    bool is_same = (memcmp(buf.data(), s.data(), s.size()) == 0);
+  
+    // rewind
+    _sr.seek_set(loc);
+  
+    return is_same;
+  }
+  
+  bool Parser::Expect(const std::string &s) const {
+    size_t n = s.size();
+    std::vector<uint8_t> buf;
+    buf.resize(n);
+  
+    uint64_t loc = _sr.tell();
+  
+    if (!_sr.read(n, n, buf.data())) {
+      _sr.seek_set(loc);
+      return false;
+    }
+  
+    bool is_same = (memcmp(buf.data(), s.data(), s.size()) == 0);
+  
+    return is_same;
+  }
+
+  bool Parser::Consume(size_t n) const {
+    if (n < 1) {
+      return false;
+    }
+  
+    size_t cnt = 0;
+    while (cnt < n) {
+      if (_sr.eof()) {
+        return false;
+      }
+  
+      char c;
+      if (!_sr.read1(&c)) {
+        return false;
+      }
+    }
+  
+    return true;
+  }
+
+
 
 bool Parser::SkipUntilNewline() {
   while (!Eof()) {
@@ -467,9 +629,137 @@ bool Parser::SkipUntilNewline() {
   return true;
 }
 
-bool parse_header(StreamReader &sr, int &minor_version, std::string &err) {
+bool Parser::ReadUntilNewline(std::string *result) {
+  std::string ret;
+  while (!Eof()) {
+    char c;
+    if (!Char1(&c)) {
+      // this should not happen.
+      return false;
+    }
+
+    if (c == '\n') {
+      break;
+    } else if (c == '\r') {
+      // CRLF?
+      if (_sr.tell() < (_sr.size() - 1)) {
+        char d;
+        if (!Char1(&d)) {
+          // this should not happen.
+          return false;
+        }
+
+        if (d == '\n') {
+          break;
+        }
+
+        // unwind 1 char
+        if (!_sr.seek_from_current(-1)) {
+          // this should not happen.
+          return false;
+        }
+
+        break;
+      }
+
+    } else {
+      // continue
+      ret += c;
+    }
+  }
+
+  _cursor.row++;
+  _cursor.col = 0;
+  (*result) = ret;
+
+  return true;
+}
+
+bool Parser::ReadComments() {
+  while (!Eof()) {
+    if (Look("%%EOF")) {
+      return false;
+    }
+
+    if (Look("%")) {
+      Consume(1);
+
+      std::string comment;
+      if (!ReadUntilNewline(&comment)) {
+        return false;
+      }
+
+      _comments.push_back(comment);
+    }
+  }
+
+  return true;
+}
+
+bool Parser::ParseObject() {
+  // <obj_id> <generation> obj
+  // ...
+  // endobj
+
+  
+  return false;
+}
+
+bool Parser::ParseBody() {
+  return false;
+}
+
+bool Parser::ParseXRefTable() {
+  return false;
+}
+
+bool Parser::ParseTrailer() {
+  return false;
+}
+
+
+bool Parser::ParseEnd() {
+  if (!Expect("%%EOF")) {
+    PushError("%%EOF appears before the end of document.");
+    return false;
+  }
+
+  if (!SkipUntilNewline()) {
+    return false;
+  }
+
+  if (!Eof()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool Parser::Parse() {
+  if (!ParseHeader()) {
+    return false;
+  }
+  if (!ParseBody()) {
+    return false;
+  }
+  if (!ParseXRefTable()) {
+    return false;
+  }
+  if (!ParseTrailer()) {
+    return false;
+  }
+
+  if (!ParseEnd()) {
+    PushError("Failed to read %%EOF mark.\n");
+    return false;
+  }
+
+  return true;
+}
+
+bool Parser::ParseHeader() {
   char buf[8];
-  if (!sr.read(8, 8, reinterpret_cast<uint8_t *>(buf))) {
+  if (!_sr.read(8, 8, reinterpret_cast<uint8_t *>(buf))) {
     return false;
   }
 
@@ -478,19 +768,28 @@ bool parse_header(StreamReader &sr, int &minor_version, std::string &err) {
       (buf[6] == '.')) {
     // ok
   } else {
-    err += "Invalid header.\n";
+    PushError("Invalid header.");
     return false;
   }
 
   if ((buf[7] >= '0') && (buf[7] < '8')) {
-    minor_version = buf[7] - '0';
+    _minor_version = buf[7] - '0';
   } else {
-    err += "Invalid or unsupported PDF minor version.\n";
+    PushError("Invalid or unsupported PDF minor version.");
+    return false;
+  }
+
+  if (!SkipUntilNewline()) {
+    return false;
+  }
+
+  if (!ReadComments()) {
     return false;
   }
 
   return true;
 }
+
 
 }  // namespace detail
 
@@ -503,14 +802,14 @@ bool parse_from_memory(const uint8_t *addr, const size_t size) {
   bool swap_endian = false;  // TODO
   StreamReader sr(addr, size, swap_endian);
 
-  int minor_version{0};
-  std::string err;
-  if (!detail::parse_header(sr, minor_version, err)) {
-    std::cerr << err << "\n";
+  detail::Parser parser(sr);
+  if (!parser.Parse()) {
+    std::cerr << parser.GetError() << "\n";
     return false;
   }
 
-  DCOUT("minor " << minor_version);
+
+  DCOUT("minor " << parser.MinorVersion());
   std::cout << "minor\n";
 
   return true;
