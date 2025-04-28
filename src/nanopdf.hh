@@ -21,45 +21,40 @@ using namespace nanostl;
 
 namespace nanopdf {
 
-class StreamReader {
- public:
-  StreamReader(const uint8_t* data, size_t size) 
-      : data_(data), size_(size), pos_(0) {}
-  
-  bool read(uint8_t* buf, size_t count) {
-    if (pos_ + count > size_) return false;
-    memcpy(buf, data_ + pos_, count);
-    pos_ += count;
-    return true;
-  }
-  
-  uint8_t peek() const {
-    if (pos_ >= size_) return 0;
-    return data_[pos_];
-  }
-  
-  uint8_t get() {
-    if (pos_ >= size_) return 0;
-    return data_[pos_++];
-  }
-  
-  void seek(size_t pos) {
-    pos_ = (pos < size_) ? pos : size_;
-  }
-  
-  size_t pos() const { return pos_; }
-  size_t size() const { return size_; }
-  bool eof() const { return pos_ >= size_; }
-  
- private:
-  const uint8_t* data_;
-  size_t size_;
-  size_t pos_;
+struct Value
+{
+  std::vector<Value> _arr;
+  std::map<std::string, Value> _dict;
+
+  bool _b{false};
+  std::vector<uint8_t> _s{false}; // string in bytes
+  double _v{0.0}; // int, real
+  std::string _n; // Name(Identifier)
 };
 
-namespace detail {
-class Parser;
-}
+using Dictionary = std::map<std::string, Value>;
+
+struct Pdf
+{
+  int version_major{1};
+  int version_minor{5};
+};
+
+struct XRef {
+  uint64_t offset{0};
+  uint16_t generation{65535};
+  bool use{false};
+};
+
+
+struct XRefSection
+{
+  std::vector<XRef> xrefs;
+  uint32_t start_object_id{0};
+  uint32_t num_objectsid{0};
+};
+
+bool parse_from_memory(const uint8_t *addr, const size_t size);
 
 // forward decl
 class Value;
