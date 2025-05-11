@@ -5,8 +5,10 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <limits>
 #endif
 
+#include <zlib.h>
 #include "common-macros.inc"
 #include "nanopdf.hh"
 
@@ -230,18 +232,21 @@ class Parser {
 };
 
 bool Parser::SkipUntilNewline() {
-  while (!_sr.eof()) {
-    char c = _sr.get();
+  while (!Eof()) {
+    char c;
+    if (!Char1(&c)) {
+      // this should not happen.
+      return false;
+    }
 
     if (c == '\n') {
       break;
     } else if (c == '\r') {
       // CRLF?
-      if (_sr.pos() < (_sr.size() - 1)) {
-        char d = _sr.get();
-        if (d != '\n') {
-          _sr.seek(_sr.pos() - 1);
-        }
+      char next;
+      if (Char1(&next) && next != '\n') {
+        // Not CRLF, step back
+        _sr.seek(_sr.pos() - 1);
       }
       break;
     }
@@ -952,20 +957,122 @@ bool apply_predictor(std::vector<uint8_t>& data, const DecodeParams& params) {
   return true;
 }
 
-// Base-85 digits
-constexpr uint8_t ascii85_digits[86] = {
-  '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*',
-  '+', ',', '-', '.', '/', '0', '1', '2', '3', '4',
-  '5', '6', '7', '8', '9', ':', ';', '<', '=', '>',
-  '?', '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-  'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
-  'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\',
-  ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f',
-  'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
-  'q', 'r', 's', 't', 'u'
+} // namespace
+
+// Forward declare LZWDecoder class
+class LZWDecoder {
+public:
+  LZWDecoder() = default;
+  bool init(const uint8_t* data, size_t size, bool early_change);
+  bool decode(std::vector<uint8_t>& output);
+
+private:
+  const uint8_t* data_;
+  size_t size_;
+  size_t pos_;
+  bool early_change_;
+  int bit_pos_;
+  uint32_t bit_buffer_;
+
+  bool fill_buffer();
+  int get_code(int code_size);
 };
 
-} // namespace
+bool LZWDecoder::init(const uint8_t* data, size_t size, bool early_change) {
+  data_ = data;
+  size_ = size;
+  pos_ = 0;
+  early_change_ = early_change;
+  bit_pos_ = 0;
+  bit_buffer_ = 0;
+  return true;
+}
+
+bool LZWDecoder::fill_buffer() {
+  if (pos_ >= size_) return false;
+  bit_buffer_ = (bit_buffer_ << 8) | data_[pos_++];
+  bit_pos_ += 8;
+  return true;
+}
+
+int LZWDecoder::get_code(int code_size) {
+  while (bit_pos_ < code_size) {
+    if (!fill_buffer()) return -1;
+  }
+  
+  int code = bit_buffer_ >> (bit_pos_ - code_size);
+  bit_pos_ -= code_size;
+  bit_buffer_ &= (1 << bit_pos_) - 1;
+  
+  return code;
+}
+
+bool LZWDecoder::decode(std::vector<uint8_t>& output) {
+  // Implement basic LZW decoding
+  const int CLEAR_CODE = 256;
+  const int EOD_CODE = 257;
+  const int FIRST_CODE = 258;
+  const int MAX_CODES = 4096;
+  
+  // Initialize the dictionary
+  std::vector<std::vector<uint8_t>> dict(FIRST_CODE);
+  for (int i = 0; i < 256; i++) {
+    dict[i] = {static_cast<uint8_t>(i)};
+  }
+  
+  int code_size = 9;
+  int next_code = FIRST_CODE;
+  
+  // Process codes
+  int old_code = -1;
+  std::vector<uint8_t> string;
+  
+  while (true) {
+    int code = get_code(code_size);
+    if (code < 0) return false;
+    
+    if (code == EOD_CODE) {
+      break;
+    } else if (code == CLEAR_CODE) {
+      // Reset the dictionary
+      dict.resize(FIRST_CODE);
+      next_code = FIRST_CODE;
+      code_size = 9;
+      old_code = -1;
+    } else {
+      if (code < next_code) {
+        // Code exists in the dictionary
+        string = dict[code];
+      } else if (code == next_code && old_code != -1) {
+        // Special case for code = next_code
+        string = dict[old_code];
+        string.push_back(string[0]);
+      } else {
+        return false;  // Invalid code
+      }
+      
+      // Output the string
+      output.insert(output.end(), string.begin(), string.end());
+      
+      // Add to the dictionary if we have a previous code
+      if (old_code != -1) {
+        std::vector<uint8_t> new_string = dict[old_code];
+        new_string.push_back(string[0]);
+        dict.push_back(new_string);
+        next_code++;
+        
+        // Increase code size if needed
+        if (next_code == (1 << code_size) && next_code < MAX_CODES) {
+          code_size++;
+        }
+      }
+      
+      old_code = code;
+    }
+  }
+  
+  return true;
+}
 
 DecodeParams parse_decode_params(const Dictionary& params) {
   DecodeParams result;
@@ -1022,57 +1129,130 @@ DecodedStream decode_ascii85(const uint8_t* data, size_t size, const DecodeParam
       continue;
     }
 
-    // TODO: report true when eof()?
-    return false;
-  }
-
-  const uint8_t *data() const { return binary_; }
-
-  bool swap_endian() const { return swap_endian_; }
-
-  uint64_t size() const { return length_; }
-
- private:
-  const uint8_t *binary_;
-  const uint64_t length_;
-  bool swap_endian_;
-  char pad_[7];
-  mutable uint64_t idx_;
-};
-
-namespace detail {
-
-struct Cursor {
-  int row{0};
-  int col{0};
-};
-
-class Parser {
- public:
-  Parser(StreamReader &sr) : _sr(sr) {}
-
-  bool Char1(char *c) {
-    return _sr.read1(c);
-  }
-
-  bool SkipUntilNewline();
-  bool Eof() const { return _sr.eof(); }
-
- private:
-  StreamReader &_sr;
-  Cursor _cursor;
-};
-
-bool Parser::SkipUntilNewline() {
-  while (!Eof()) {
-    char c;
-    if (!Char1(&c)) {
-      // this should not happen.
-      return false;
+    // Check for end marker
+    if (c == '~' && i < size && data[i] == '>') {
+      break;
     }
 
-    if (c == '\n') {
-      break;
+    // Process regular ASCII85 character
+    if (c < '!' || c > 'u') {
+      result.error = "Invalid ASCII85 character";
+      return result;
+    }
+
+    value = value * 85 + (c - '!');
+    count++;
+
+    if (count == 5) {
+      // Output 4 bytes for every 5 ASCII85 characters
+      output.push_back((value >> 24) & 0xFF);
+      output.push_back((value >> 16) & 0xFF);
+      output.push_back((value >> 8) & 0xFF);
+      output.push_back(value & 0xFF);
+      value = 0;
+      count = 0;
+    }
+  }
+
+  // Handle remaining bytes
+  if (count > 0) {
+    // Adjust the value for partial group
+    for (int j = count; j < 5; j++) {
+      value = value * 85 + 84; // '!' + 84 = 'u'
+    }
+    
+    // Output the appropriate number of bytes
+    if (count > 1) output.push_back((value >> 24) & 0xFF);
+    if (count > 2) output.push_back((value >> 16) & 0xFF);
+    if (count > 3) output.push_back((value >> 8) & 0xFF);
+  }
+
+  result.data = std::move(output);
+  result.success = true;
+  return result;
+}
+
+DecodedStream decode_flate(const uint8_t* data, size_t size, const DecodeParams& params) {
+  DecodedStream result;
+  std::vector<uint8_t> output;
+
+  // Decompress using zlib
+  z_stream strm;
+  memset(&strm, 0, sizeof(strm));
+  strm.next_in = const_cast<Bytef*>(data);
+  strm.avail_in = static_cast<uInt>(size);
+
+  if (inflateInit(&strm) != Z_OK) {
+    result.error = "Failed to initialize zlib";
+    return result;
+  }
+
+  int ret;
+  do {
+    output.resize(output.size() + 4096);
+    strm.next_out = output.data() + strm.total_out;
+    strm.avail_out = static_cast<uInt>(output.size() - strm.total_out);
+
+    ret = inflate(&strm, Z_NO_FLUSH);
+    if (ret != Z_OK && ret != Z_STREAM_END) {
+      inflateEnd(&strm);
+      result.error = "Failed to decompress data";
+      return result;
+    }
+  } while (ret != Z_STREAM_END);
+
+  inflateEnd(&strm);
+  output.resize(strm.total_out);
+
+  // Apply predictor if needed
+  if (!apply_predictor(output, params)) {
+    result.error = "Failed to apply PNG predictor";
+    return result;
+  }
+
+  result.data = std::move(output);
+  result.success = true;
+  return result;
+}
+
+DecodedStream decode_lzw(const uint8_t* data, size_t size, const DecodeParams& params) {
+  DecodedStream result;
+  std::vector<uint8_t> output;
+
+  // Initialize LZW decoder
+  LZWDecoder decoder;
+  if (!decoder.init(data, size, params.early_change)) {
+    result.error = "Failed to initialize LZW decoder";
+    return result;
+  }
+
+  // Decode data
+  if (!decoder.decode(output)) {
+    result.error = "Failed to decode LZW data";
+    return result;
+  }
+
+  // Apply predictor if needed
+  if (!apply_predictor(output, params)) {
+    result.error = "Failed to apply PNG predictor";
+    return result;
+  }
+
+  result.data = std::move(output);
+  result.success = true;
+  return result;
+}
+
+DecodedStream decode_runlength(const uint8_t* data, size_t size, const DecodeParams& params) {
+  DecodedStream result;
+  std::vector<uint8_t> output;
+
+  size_t i = 0;
+  while (i < size) {
+    int8_t length = static_cast<int8_t>(data[i++]);
+
+    if (length == -128) {
+      break;  // End of data
     }
     
     if (length < 0x80) {  // Copy next (length + 1) bytes
@@ -1096,6 +1276,13 @@ bool Parser::SkipUntilNewline() {
 
   result.data = std::move(output);
   result.success = true;
+  return result;
+}
+
+DecodedStream decode_jbig2(const uint8_t* /*data*/, size_t /*size*/, const DecodeParams& /*params*/) {
+  DecodedStream result;
+  result.success = false;
+  result.error = "JBIG2Decode filter is not implemented.";
   return result;
 }
 
@@ -1138,6 +1325,10 @@ DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj) {
         return filters::decode_lzw(stream_obj.stream.data.data(),
                                  stream_obj.stream.data.size(),
                                  params);
+    } else if (filter_name == "JBIG2Decode") {
+        return filters::decode_jbig2(stream_obj.stream.data.data(),
+                                    stream_obj.stream.data.size(),
+                                    params);
     }
 
     result.error = "Unsupported filter type: " + filter_name;
@@ -1234,19 +1425,17 @@ bool parse_from_memory(const uint8_t *addr, const size_t size) {
     return false;
   }
 
-  bool swap_endian = false;  // TODO
+  bool swap_endian = false;  // TODO: detect endianness if needed
   StreamReader sr(addr, size, swap_endian);
 
   int minor_version{0};
   std::string err;
   if (!detail::parse_header(sr, minor_version, err)) {
-    std::cerr << err << "\n";
+    std::cerr << err;
     return false;
   }
 
-  DCOUT("minor " << minor_version);
-  std::cout << "minor\n";
-
+  // Successfully parsed header
   return true;
 }
 
