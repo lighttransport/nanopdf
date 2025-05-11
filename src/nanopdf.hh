@@ -21,6 +21,7 @@ using namespace nanostl;
 
 namespace nanopdf {
 
+#if 0
 struct Value
 {
   std::vector<Value> _arr;
@@ -31,6 +32,8 @@ struct Value
   double _v{0.0}; // int, real
   std::string _n; // Name(Identifier)
 };
+#endif
+struct Value;
 
 using Dictionary = std::map<std::string, Value>;
 
@@ -55,9 +58,6 @@ struct XRefSection
 };
 
 bool parse_from_memory(const uint8_t *addr, const size_t size);
-
-// forward decl
-class Value;
 
 // Forward declare Dictionary for use in StreamValue
 using Dictionary = std::map<std::string, Value>;
@@ -245,12 +245,6 @@ struct DocumentCatalog {
   Dictionary acro_form;
 };
 
-struct XRef {
-  uint64_t offset{0};
-  uint16_t generation{65535};
-  bool use{false};
-};
-
 struct XRefSection {
   std::vector<XRef> xrefs;
   uint32_t start_object_id{0};
@@ -320,6 +314,7 @@ struct DecodeParams {
 DecodedStream decode_flate(const uint8_t* data, size_t size, const DecodeParams& params);
 DecodedStream decode_ascii85(const uint8_t* data, size_t size, const DecodeParams& params);
 DecodedStream decode_lzw(const uint8_t* data, size_t size, const DecodeParams& params);
+DecodedStream decode_jbig2(const uint8_t* data, size_t size, const DecodeParams& params); // JBIG2 stub
 DecodeParams parse_decode_params(const Dictionary& params);
 
 } // namespace filters

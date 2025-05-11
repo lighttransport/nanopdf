@@ -54,7 +54,7 @@ set(NANOPDF_EXT_INCLUDE_DIRS_PRIVATE "")
 set(NANOPDF_EXT_LIBRARIES_PRIVATE "")
 set(NANOPDF_EXT_LIBRARIES_PUBLIC "")
 
-add_library(${BUILD_TARGET} src/nanopdf.cc)
+add_library(${BUILD_TARGET} src/nanopdf.cc src/jbig2-decoder.cc)
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_DEBUG_PRINT=1")
 
 if (NANOPDF_USE_NANOSTL)
