@@ -7,6 +7,7 @@ project(${BUILD_TARGET} LANGUAGES C CXX)
 # options
 option(NANOPDF_USE_CCACHE "Use ccache for faster recompile." ON)
 option(NANOPDF_USE_NANOSTL "Use nanostl." OFF)
+option(NANOPDF_USE_STB_TRUETYPE "Use stb_truetype to load fonts." ON)
 
 # cmake modules
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -61,6 +62,10 @@ if (NANOPDF_USE_NANOSTL)
   # nanostl
   target_include_directories(${BUILD_TARGET} PRIVATE src/nanostl/include)
   target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_NANOSTL")
+endif ()
+
+if (NANOPDF_USE_STB_TRUETYPE)
+  target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_STB_TRUETYPE")
 endif ()
 
 add_sanitizers(${BUILD_TARGET})

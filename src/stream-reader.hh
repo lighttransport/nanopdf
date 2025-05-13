@@ -159,6 +159,25 @@ class StreamReader {
     }
   }
 
+  uint64_t read(const uint64_t n, uint8_t *dst) const {
+    uint64_t len = n;
+    if ((idx_ + len) > length_) {
+      len = length_ - uint64_t(idx_);
+    }
+
+    if (len > 0) {
+
+      size_t nbytes = size_t(len); // may shorten size on 32bit platform
+
+      memcpy(dst, &binary_[idx_], nbytes);
+      idx_ += nbytes;
+      return nbytes;
+
+    } else {
+      return 0;
+    }
+  }
+
   bool read1(uint8_t *ret) const {
     if ((idx_ + 1) > length_) {
       return false;

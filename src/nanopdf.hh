@@ -12,11 +12,17 @@ using namespace nanostl;
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
-#include <map>
-#include <string>
 #include <functional>
+#include <map>
 #include <memory>
+#include <string>
+#include <vector>
+#endif
+
+#include "stream-reader.hh"
+
+#if defined(NANOPDF_USE_STB_TRUETYPE)
+#include "stb_truetype.h"
 #endif
 
 namespace nanopdf {
@@ -37,11 +43,7 @@ struct Value;
 
 using Dictionary = std::map<std::string, Value>;
 
-struct Pdf
-{
-  int version_major{1};
-  int version_minor{5};
-};
+struct Pdf;
 
 struct XRef {
   uint64_t offset{0};
@@ -49,29 +51,27 @@ struct XRef {
   bool use{false};
 };
 
-
-struct XRefSection
-{
+struct XRefSection {
   std::vector<XRef> xrefs;
   uint32_t start_object_id{0};
   uint32_t num_objectsid{0};
 };
 
-bool parse_from_memory(const uint8_t *addr, const size_t size);
+bool parse_from_memory(const uint8_t* addr, const size_t size);
 
 // Forward declare Dictionary for use in StreamValue
 using Dictionary = std::map<std::string, Value>;
 
 // Define StreamValue before Value
 struct StreamValue {
-    std::vector<uint8_t> data;
-    Dictionary dict;
+  std::vector<uint8_t> data;
+  Dictionary dict;
 
-    StreamValue() = default;
-    StreamValue(const StreamValue& other) = default;
-    StreamValue& operator=(const StreamValue& other) = default;
-    StreamValue(StreamValue&& other) = default;
-    StreamValue& operator=(StreamValue&& other) = default;
+  StreamValue() = default;
+  StreamValue(const StreamValue& other) = default;
+  StreamValue& operator=(const StreamValue& other) = default;
+  StreamValue(StreamValue&& other) = default;
+  StreamValue& operator=(StreamValue&& other) = default;
 };
 
 // Value type definitions first
@@ -91,7 +91,7 @@ class Value {
   };
 
   Type type{UNDEFINED};
-  
+
   union {
     bool boolean;
     double number;
@@ -108,13 +108,13 @@ class Value {
 
   Value() : type(UNDEFINED) {}
   ~Value() { clear(); }
-  
+
   Value(const Value& other) : type(UNDEFINED) { *this = other; }
   Value(Value&& other) noexcept : type(UNDEFINED) { *this = std::move(other); }
-  
+
   Value& operator=(const Value& other);
   Value& operator=(Value&& other) noexcept;
-  
+
   void clear();
 
  private:
@@ -137,7 +137,7 @@ struct FontDescriptor {
   std::string font_name;
   std::string font_family;
   FontType font_type{FontType::Type1};
-  
+
   // Font metrics
   double ascent{0.0};
   double descent{0.0};
@@ -148,7 +148,7 @@ struct FontDescriptor {
   std::vector<double> font_bbox;
   int flags{0};
   double italic_angle{0.0};
-  
+
   // Embedded font file data
   Value font_file;  // Can be FontFile, FontFile2, or FontFile3
   uint32_t font_file_length{0};
@@ -158,16 +158,16 @@ struct FontDescriptor {
 
 // Base font class for all font types
 struct BaseFont {
-  std::string subtype;  // Font type (Type1, TrueType, etc.)
-  std::string base_font;  // PostScript name of the font
-  std::string encoding;  // Font encoding
+  std::string subtype;                  // Font type (Type1, TrueType, etc.)
+  std::string base_font;                // PostScript name of the font
+  std::string encoding;                 // Font encoding
   FontDescriptor* descriptor{nullptr};  // Optional font descriptor
-  
+
   // Font widths
   std::vector<int> widths;
   int first_char{0};
   int last_char{0};
-  
+
   virtual ~BaseFont() {
     if (descriptor) {
       delete descriptor;
@@ -187,17 +187,17 @@ struct ResolvedObject {
   bool success{false};
   std::string error;
   Value value;
-  
+
   ResolvedObject() = default;
-  
+
   // Implement move operations
   ResolvedObject(ResolvedObject&& other) noexcept
-    : success(other.success)
-    , error(std::move(other.error))
-    , value(std::move(other.value)) {
+      : success(other.success),
+        error(std::move(other.error)),
+        value(std::move(other.value)) {
     other.success = false;
   }
-  
+
   ResolvedObject& operator=(ResolvedObject&& other) noexcept {
     if (this != &other) {
       success = other.success;
@@ -207,13 +207,13 @@ struct ResolvedObject {
     }
     return *this;
   }
-  
+
   // Delete copy operations
   ResolvedObject(const ResolvedObject&) = delete;
   ResolvedObject& operator=(const ResolvedObject&) = delete;
 };
 
-struct Pdf;  // Forward declare
+struct Pdf;   // Forward declare
 struct Page;  // Forward declare
 
 struct PageContent {
@@ -231,7 +231,7 @@ struct Page {
   std::vector<double> crop_box;
   double rotate{0.0};
   std::map<std::string, std::unique_ptr<BaseFont>> fonts;  // Font resources
-  
+
   PageContent load_contents(const Pdf& pdf) const;
 };
 
@@ -243,12 +243,6 @@ struct DocumentCatalog {
   Dictionary names;
   Dictionary outlines;
   Dictionary acro_form;
-};
-
-struct XRefSection {
-  std::vector<XRef> xrefs;
-  uint32_t start_object_id{0};
-  uint32_t num_objectsid{0};
 };
 
 // Now we can define Pdf after its dependencies
@@ -270,29 +264,35 @@ struct Pdf {
   size_t data_size{0};
 
   DocumentCatalog catalog;
-  
+
   bool load_document_structure();
   const Page* get_page(uint32_t page_number) const;
   ResolvedObject load_object(uint32_t obj_num, uint16_t gen_num) const;
 
-  static std::unique_ptr<BaseFont> parse_font(const Pdf& pdf, const Value& font_val);
-  static std::unique_ptr<FontDescriptor> parse_font_descriptor(const Pdf& pdf, const Value& font_dict);
-  static bool parse_font_resources(const Pdf& pdf, Page& page, const Dictionary& resources);
+  static std::unique_ptr<BaseFont> parse_font(const Pdf& pdf,
+                                              const Value& font_val);
+  static std::unique_ptr<FontDescriptor> parse_font_descriptor(
+      const Pdf& pdf, const Value& font_dict);
+  static bool parse_font_resources(const Pdf& pdf, Page& page,
+                                   const Dictionary& resources);
 
-  private:
-    bool parse_font_resources(Page& page, const Dictionary& resources);
-    std::unique_ptr<BaseFont> parse_font(const Value& font_val);
-    std::unique_ptr<FontDescriptor> parse_font_descriptor(const Value& font_dict);
+ private:
+  bool parse_font_resources(Page& page, const Dictionary& resources);
+  std::unique_ptr<BaseFont> parse_font(const Value& font_val);
+  std::unique_ptr<FontDescriptor> parse_font_descriptor(const Value& font_dict);
 };
 
+class Parser;
+
 // Function declarations
-bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf);
-ResolvedObject resolve_reference(const Pdf& pdf, uint32_t obj_num, uint16_t gen_num);
-bool parse_indirect_object(StreamReader& sr, detail::Parser& parser, Value* out_value);
+bool parse_from_memory(const uint8_t* addr, const size_t size, Pdf* out_pdf);
+ResolvedObject resolve_reference(const Pdf& pdf, uint32_t obj_num,
+                                 uint16_t gen_num);
+bool parse_indirect_object(StreamReader& sr, Parser& parser, Value* out_value);
 DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj);
 
 // Add parse_string function declaration
-bool parse_string(StreamReader& sr, detail::Parser& parser, std::string* out_str);
+bool parse_string(StreamReader& sr, Parser& parser, std::string* out_str);
 
 // Stream filter processing namespace declaration remains the same
 namespace filters {
@@ -303,7 +303,7 @@ struct DecodeParams {
   int colors{1};
   int bits_per_component{8};
   int columns{1};
-  
+
   // LZWDecode parameters
   bool early_change{true};
 
@@ -311,12 +311,16 @@ struct DecodeParams {
   bool ascii85_strip_terminator{true};
 };
 
-DecodedStream decode_flate(const uint8_t* data, size_t size, const DecodeParams& params);
-DecodedStream decode_ascii85(const uint8_t* data, size_t size, const DecodeParams& params);
-DecodedStream decode_lzw(const uint8_t* data, size_t size, const DecodeParams& params);
-DecodedStream decode_jbig2(const uint8_t* data, size_t size, const DecodeParams& params); // JBIG2 stub
+DecodedStream decode_flate(const uint8_t* data, size_t size,
+                           const DecodeParams& params);
+DecodedStream decode_ascii85(const uint8_t* data, size_t size,
+                             const DecodeParams& params);
+DecodedStream decode_lzw(const uint8_t* data, size_t size,
+                         const DecodeParams& params);
+DecodedStream decode_jbig2(const uint8_t* data, size_t size,
+                           const DecodeParams& params);  // JBIG2 stub
 DecodeParams parse_decode_params(const Dictionary& params);
 
-} // namespace filters
+}  // namespace filters
 
-} // namespace nanopdf
+}  // namespace nanopdf
