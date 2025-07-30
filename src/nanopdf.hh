@@ -132,6 +132,36 @@ enum class FontType {
   CIDFontType2
 };
 
+// PDF Form field types
+enum class FieldType {
+  Button,    // Btn
+  Text,      // Tx
+  Choice,    // Ch
+  Signature  // Sig
+};
+
+// Signature field data structure
+struct SignatureField {
+  std::string name;                    // Field name (T)
+  FieldType field_type{FieldType::Signature}; // Field type (FT)
+  std::vector<double> rect;            // Field rectangle [x1 y1 x2 y2] (Rect)
+  uint32_t page_ref{0};                // Page reference (P)
+  uint32_t flags{0};                   // Field flags (F)
+  
+  // Signature-specific data
+  Dictionary signature_dict;           // Signature dictionary (V)
+  Dictionary lock_dict;                // Signature lock dictionary (Lock)
+  
+  // Signature validation info
+  bool is_signed{false};
+  std::string signing_reason;
+  std::string signing_location;
+  std::string signing_contact_info;
+  std::string signing_date;
+  
+  SignatureField() = default;
+};
+
 // Font descriptor containing metrics and font file data
 struct FontDescriptor {
   std::string font_name;
@@ -243,6 +273,7 @@ struct DocumentCatalog {
   Dictionary names;
   Dictionary outlines;
   Dictionary acro_form;
+  std::vector<SignatureField> signature_fields;  // Parsed signature fields
 };
 
 // Now we can define Pdf after its dependencies
@@ -275,6 +306,12 @@ struct Pdf {
       const Pdf& pdf, const Value& font_dict);
   static bool parse_font_resources(const Pdf& pdf, Page& page,
                                    const Dictionary& resources);
+  
+  // Signature field parsing functions
+  bool parse_signature_fields();
+  static bool parse_acro_form_fields(const Pdf& pdf, const Dictionary& acro_form, 
+                                     std::vector<SignatureField>& signature_fields);
+  static SignatureField parse_signature_field(const Pdf& pdf, const Dictionary& field_dict);
 
  private:
   bool parse_font_resources(Page& page, const Dictionary& resources);

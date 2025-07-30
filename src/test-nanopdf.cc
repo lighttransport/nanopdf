@@ -125,6 +125,40 @@ int main(int argc, char **argv) {
 
   std::cout << "PDF parsed successfully. Pages: " << pdf.catalog.pages_count << "\n";
 
+  // Parse signature fields
+  if (pdf.parse_signature_fields()) {
+    std::cout << "Signature fields parsed. Found " << pdf.catalog.signature_fields.size() << " signature field(s)\n";
+    
+    for (size_t i = 0; i < pdf.catalog.signature_fields.size(); ++i) {
+      const auto& sig_field = pdf.catalog.signature_fields[i];
+      std::cout << "Signature Field " << (i + 1) << ":\n";
+      std::cout << "  Name: " << sig_field.name << "\n";
+      std::cout << "  Signed: " << (sig_field.is_signed ? "Yes" : "No") << "\n";
+      
+      if (sig_field.is_signed) {
+        if (!sig_field.signing_reason.empty()) {
+          std::cout << "  Reason: " << sig_field.signing_reason << "\n";
+        }
+        if (!sig_field.signing_location.empty()) {
+          std::cout << "  Location: " << sig_field.signing_location << "\n";
+        }
+        if (!sig_field.signing_contact_info.empty()) {
+          std::cout << "  Contact: " << sig_field.signing_contact_info << "\n";
+        }
+        if (!sig_field.signing_date.empty()) {
+          std::cout << "  Date: " << sig_field.signing_date << "\n";
+        }
+      }
+      
+      if (sig_field.rect.size() == 4) {
+        std::cout << "  Rectangle: [" << sig_field.rect[0] << ", " << sig_field.rect[1] 
+                  << ", " << sig_field.rect[2] << ", " << sig_field.rect[3] << "]\n";
+      }
+    }
+  } else {
+    std::cerr << "Failed to parse signature fields\n";
+  }
+
   if (pdf.catalog.pages_count > 0) {
     const nanopdf::Page* first_page = pdf.get_page(0);
     if (first_page) {
