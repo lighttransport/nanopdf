@@ -1,4 +1,5 @@
 #include "nanopdf.hh"
+#include "canvas-exporter.hh"
 
 #include <cstdio>
 #include <vector>
@@ -111,8 +112,84 @@ int main(int argc, char **argv) {
     return -2;
   }
 
-  if (nanopdf::parse_from_memory(buf.data(), buf.size())) {
+  nanopdf::Pdf pdf;
+  if (!nanopdf::parse_from_memory(buf.data(), buf.size(), &pdf)) {
+    std::cerr << "Failed to parse PDF\n";
     return -3;
+  }
+
+  if (!pdf.load_document_structure()) {
+    std::cerr << "Failed to load document structure\n";
+    return -4;
+  }
+
+  std::cout << "PDF parsed successfully. Pages: " << pdf.catalog.pages_count << "\n";
+
+  if (pdf.catalog.pages_count > 0) {
+    const nanopdf::Page* first_page = pdf.get_page(0);
+    if (first_page) {
+      std::cout << "Exporting first page to HTML5 Canvas commands...\n";
+      
+      nanopdf::CanvasExporter exporter;
+      nanopdf::CanvasExportResult result = exporter.export_page(pdf, *first_page);
+      
+      if (result.success) {
+        std::cout << "Canvas export successful!\n";
+        std::cout << "Page dimensions: " << result.width << "x" << result.height << "\n";
+        std::cout << "Generated " << result.commands.size() << " canvas commands\n\n";
+        
+        std::string js_code = exporter.commands_to_javascript(result.commands, "pdfCanvas");
+        std::cout << "JavaScript code:\n";
+        std::cout << js_code << std::endl;
+        
+        std::string json_code = exporter.commands_to_json(result.commands);
+        std::cout << "\nCanvas JSON export:\n";
+        std::cout << json_code << std::endl;
+        
+        std::cout << "\nExporting to SVG...\n";
+        nanopdf::SvgExportResult svg_result = exporter.export_page_to_svg(pdf, *first_page);
+        
+        if (svg_result.success) {
+          std::cout << "SVG export successful!\n";
+          std::cout << "Generated " << svg_result.elements.size() << " SVG elements\n";
+          
+          std::string svg_json_code = exporter.svg_to_json(svg_result.elements);
+          std::cout << "\nSVG JSON export:\n";
+          std::cout << svg_json_code << std::endl;
+        } else {
+          std::cerr << "SVG export failed: " << svg_result.error << "\n";
+        }
+        
+        std::ofstream js_outfile("canvas_output.js");
+        if (js_outfile.is_open()) {
+          js_outfile << js_code;
+          js_outfile.close();
+          std::cout << "\nJavaScript code written to canvas_output.js\n";
+        }
+        
+        std::ofstream json_outfile("canvas_output.json");
+        if (json_outfile.is_open()) {
+          json_outfile << json_code;
+          json_outfile.close();
+          std::cout << "Canvas JSON export written to canvas_output.json\n";
+        }
+        
+        if (svg_result.success) {
+          std::ofstream svg_json_outfile("svg_output.json");
+          if (svg_json_outfile.is_open()) {
+            svg_json_outfile << exporter.svg_to_json(svg_result.elements);
+            svg_json_outfile.close();
+            std::cout << "SVG JSON export written to svg_output.json\n";
+          }
+        }
+      } else {
+        std::cerr << "Canvas export failed: " << result.error << "\n";
+        return -5;
+      }
+    } else {
+      std::cerr << "Failed to get first page\n";
+      return -6;
+    }
   }
 
   return 0;
