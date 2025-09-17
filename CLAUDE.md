@@ -41,6 +41,16 @@ make test_nanopdf     # Build test executable
 Run the test executable with a PDF file:
 ```bash
 ./test_nanopdf path/to/file.pdf
+
+# Test with provided sample
+./test_nanopdf ../data/blank.pdf
+```
+
+### Code Formatting
+
+Uses Google C++ style with 2-space indentation. Format code with:
+```bash
+clang-format -i src/*.cc src/*.hh
 ```
 
 ## Code Architecture
@@ -60,12 +70,26 @@ Run the test executable with a PDF file:
 
 **ttf-loader.cc**: TrueType font file loader and parser.
 
+**canvas-exporter.hh/cc**: Canvas and SVG export functionality for rendering PDF content to HTML5 Canvas commands or SVG elements.
+
 ### Key Data Structures
 
 - `XRef`/`XRefSection`: Cross-reference table entries for object location tracking
 - `BaseFont`/`FontDescriptor`: Font resource management with metrics and embedded font data
+- `Type0Font`: CID font support with CMap and ToUnicode mappings
+- `Type3Font`: User-defined font support with glyph procedures
 - `DecodedStream`: Result container for stream filter decoding operations
 - `ResolvedObject`: Container for dereferenced PDF objects with error handling
+- `ColorSpace`: Color space representation (DeviceGray, DeviceRGB, DeviceCMYK, CalRGB, CalGray, ICCBased, Indexed)
+- `ImageXObject`: Image resource with dimensions, color space, and decoded data
+- `TextState`: Complete text state tracking for content stream processing
+- `CMap`: Character to Unicode mapping for font encoding
+- `FontSubstitution`: Font fallback system for missing fonts
+- `Annotation`: Base class for all annotation types with appearance streams
+- `TextAnnotation`, `LinkAnnotation`, `MarkupAnnotation`, `FreeTextAnnotation`: Specific annotation types
+- `FormField`: Base class for interactive form fields
+- `TextField`, `ButtonField`, `ChoiceField`: Specific form field types
+- `WidgetAnnotation`: Form field widget annotations
 
 ### Stream Filters
 
@@ -73,7 +97,9 @@ The `filters` namespace provides decoders for:
 - FlateDecode (zlib/deflate compression)
 - ASCII85Decode (Base85 encoding)
 - LZWDecode (Lempel-Ziv-Welch compression)
-- JBIG2Decode (monochrome bitmap compression)
+- RunLengthDecode (Run-length encoding compression)
+- DCTDecode (JPEG compression via stb_image)
+- JBIG2Decode (monochrome bitmap compression - partial)
 
 ### Dependencies
 
@@ -94,3 +120,18 @@ Objects are resolved through the `resolve_reference()` function using object num
 
 ### Stream Processing
 Stream data is decoded through a pipeline: raw bytes → filter decoding → final decoded content using the `decode_stream()` function.
+
+## Compilation Defines
+
+- `NANOPDF_DEBUG_PRINT`: Enable debug output (set to 1 in CMakeLists.txt by default)
+- `NANOPDF_USE_NANOSTL`: Use nanostl library instead of standard library
+- `NANOPDF_USE_STB_TRUETYPE`: Enable TrueType font support via stb_truetype
+
+## Testing Files
+
+The repository includes `data/blank.pdf` as a sample PDF file for testing. The main test executable is `test_nanopdf` which accepts a PDF file path as command-line argument and demonstrates library usage for parsing and extracting content.
+
+Test executables:
+- `test_nanopdf`: Main PDF parsing test
+- `test_phase1_simple`: Phase 1 features (filters, images, color spaces)
+- `test_phase2`: Phase 2 features (text extraction, fonts, rendering modes)

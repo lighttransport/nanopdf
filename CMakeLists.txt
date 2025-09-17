@@ -55,8 +55,9 @@ set(NANOPDF_EXT_INCLUDE_DIRS_PRIVATE "")
 set(NANOPDF_EXT_LIBRARIES_PRIVATE "")
 set(NANOPDF_EXT_LIBRARIES_PUBLIC "")
 
-add_library(${BUILD_TARGET} src/nanopdf.cc src/jbig2-decoder.cc src/canvas-exporter.cc)
+add_library(${BUILD_TARGET} src/nanopdf.cc src/jbig2-decoder.cc src/canvas-exporter.cc src/crypto.cc src/pdf-security.cc)
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_DEBUG_PRINT=1")
+target_link_libraries(${BUILD_TARGET} PUBLIC z)
 
 if (NANOPDF_USE_NANOSTL)
   # nanostl
@@ -72,6 +73,30 @@ add_sanitizers(${BUILD_TARGET})
 
 add_executable(${TEST_TARGET} src/test-nanopdf.cc)
 target_link_libraries(${TEST_TARGET} ${BUILD_TARGET})
+
+# Phase 1 features test
+add_executable(test_phase1 src/test-phase1-features.cc)
+target_link_libraries(test_phase1 ${BUILD_TARGET})
+
+# Phase 1 simple test (without Value objects)
+add_executable(test_phase1_simple src/test-phase1-simple.cc)
+target_link_libraries(test_phase1_simple ${BUILD_TARGET})
+
+# Phase 2 features test
+add_executable(test_phase2 src/test-phase2-features.cc)
+target_link_libraries(test_phase2 ${BUILD_TARGET})
+
+# Phase 3 features test
+add_executable(test_phase3 src/test-phase3-features.cc)
+target_link_libraries(test_phase3 ${BUILD_TARGET})
+
+# Phase 4 features test
+add_executable(test_phase4 src/test-phase4-features.cc)
+target_link_libraries(test_phase4 ${BUILD_TARGET})
+
+# Phase 5 features test
+add_executable(test_phase5 src/test-phase5-features.cc)
+target_link_libraries(test_phase5 ${BUILD_TARGET})
 
 ## [VisualStudio]
 #if(MSVC)
