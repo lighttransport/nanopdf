@@ -98,6 +98,10 @@ target_link_libraries(test_phase4 ${BUILD_TARGET})
 add_executable(test_phase5 src/test-phase5-features.cc)
 target_link_libraries(test_phase5 ${BUILD_TARGET})
 
+# Phase 6 features test (CCITTFaxDecode, transparency, patterns, tagged PDF)
+add_executable(test_phase6 src/test-phase6-features.cc)
+target_link_libraries(test_phase6 ${BUILD_TARGET})
+
 ## [VisualStudio]
 #if(MSVC)
 #

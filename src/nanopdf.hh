@@ -804,6 +804,9 @@ struct XMPMetadata {
   bool parse_xml(const std::string& xml);
 };
 
+// Forward declarations
+struct StructureTreeRoot;
+
 // Phase 5: Security and Encryption
 
 enum class EncryptionAlgorithm {
@@ -897,6 +900,10 @@ struct DocumentCatalog {
   std::map<std::string, NamedDestination> named_destinations;  // Named destinations
   DocumentInfo document_info;                  // Document information
   XMPMetadata xmp_metadata;                   // XMP metadata
+
+  // Phase 6.3: Tagged PDF
+  Dictionary mark_info;                       // MarkInfo dictionary for tagged PDFs
+  std::unique_ptr<StructureTreeRoot> structure_tree;  // Structure tree for tagged PDFs
 };
 
 // Now we can define Pdf after its dependencies
@@ -982,6 +989,338 @@ void parse_named_destinations(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_document_info(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_xmp_metadata(const Pdf& pdf, DocumentCatalog& catalog);
 
+// Phase 6.2: Advanced Graphics - Transparency and Blending
+
+// Blend modes supported by PDF
+enum class BlendMode {
+  Normal,
+  Multiply,
+  Screen,
+  Overlay,
+  Darken,
+  Lighten,
+  ColorDodge,
+  ColorBurn,
+  HardLight,
+  SoftLight,
+  Difference,
+  Exclusion,
+  Hue,
+  Saturation,
+  Color,
+  Luminosity
+};
+
+// Soft mask types
+enum class SoftMaskType {
+  None,
+  Alpha,      // Use alpha channel
+  Luminosity  // Use luminosity
+};
+
+// Graphics state parameters
+struct ExtendedGraphicsState {
+  // Line parameters
+  double line_width{1.0};
+  int line_cap{0};      // 0=butt, 1=round, 2=square
+  int line_join{0};     // 0=miter, 1=round, 2=bevel
+  double miter_limit{10.0};
+  std::vector<double> dash_pattern;
+  double dash_phase{0.0};
+
+  // Transparency parameters
+  double ca{1.0};       // Stroking alpha constant
+  double CA{1.0};       // Non-stroking alpha constant
+  BlendMode blend_mode{BlendMode::Normal};
+  bool alpha_is_shape{false};
+  bool knockout_group{false};
+
+  // Soft mask
+  SoftMaskType soft_mask_type{SoftMaskType::None};
+  Dictionary soft_mask_dict;
+  Value transfer_function;  // Transfer function for soft mask
+
+  // Rendering intent
+  std::string rendering_intent{"RelativeColorimetric"};
+
+  // Overprint control
+  bool overprint_stroking{false};
+  bool overprint_nonstroking{false};
+  int overprint_mode{0};
+
+  // Black generation and undercolor removal
+  Value black_generation;
+  Value undercolor_removal;
+
+  // Halftone
+  Dictionary halftone_dict;
+
+  // Smoothness tolerance
+  double smoothness{0.0};
+};
+
+// Transparency group attributes
+struct TransparencyGroup {
+  ColorSpace* color_space{nullptr};
+  bool isolated{false};
+  bool knockout{false};
+};
+
+// Pattern types
+enum class PatternType {
+  Tiling = 1,
+  Shading = 2
+};
+
+// Tiling pattern paint types
+enum class TilingPaintType {
+  ColoredTiles = 1,
+  UncoloredTiles = 2
+};
+
+// Tiling pattern structure
+struct TilingPattern {
+  TilingPaintType paint_type{TilingPaintType::ColoredTiles};
+  int tiling_type{1};  // 1=constant, 2=no distortion, 3=constant/faster
+  std::vector<double> bbox;  // Pattern bounding box
+  double x_step{0.0};
+  double y_step{0.0};
+  Dictionary resources;
+  std::vector<double> matrix{1, 0, 0, 1, 0, 0};  // Pattern matrix
+  std::vector<uint8_t> content_stream;  // Pattern drawing instructions
+};
+
+// Shading types
+enum class ShadingType {
+  FunctionBased = 1,
+  Axial = 2,
+  Radial = 3,
+  FreeFormTriangleMesh = 4,
+  LatticeFormTriangleMesh = 5,
+  CoonsPatchMesh = 6,
+  TensorProductPatchMesh = 7
+};
+
+// Base shading structure
+struct Shading {
+  ShadingType type;
+  ColorSpace* color_space{nullptr};
+  std::vector<double> bbox;  // Optional bounding box
+  std::vector<double> background;  // Optional background color
+  bool anti_alias{false};
+
+  // Function-based shading (Type 1)
+  std::vector<double> domain{0, 1, 0, 1};
+  std::vector<double> matrix{1, 0, 0, 1, 0, 0};
+  Value function;  // Color function
+
+  // Axial shading (Type 2)
+  std::vector<double> coords;  // [x0, y0, x1, y1]
+  std::vector<bool> extend{false, false};
+
+  // Radial shading (Type 3)
+  // coords = [x0, y0, r0, x1, y1, r1]
+
+  // Mesh-based shadings (Types 4-7)
+  int bits_per_coordinate{0};
+  int bits_per_component{0};
+  int bits_per_flag{0};
+  std::vector<double> decode;
+  std::vector<uint8_t> data_stream;
+};
+
+// Pattern structure
+struct Pattern {
+  PatternType type;
+  std::unique_ptr<TilingPattern> tiling;
+  std::unique_ptr<Shading> shading;
+  std::vector<double> matrix{1, 0, 0, 1, 0, 0};
+};
+
+// Helper functions for graphics state
+ExtendedGraphicsState parse_ext_gstate(const Pdf& pdf, const Dictionary& gs_dict);
+BlendMode parse_blend_mode(const std::string& mode_name);
+std::unique_ptr<Pattern> parse_pattern(const Pdf& pdf, const Dictionary& pattern_dict);
+std::unique_ptr<Shading> parse_shading(const Pdf& pdf, const Dictionary& shading_dict);
+TransparencyGroup parse_transparency_group(const Pdf& pdf, const Dictionary& group_dict);
+
+// Phase 6.3: Tagged PDF - Logical Structure
+
+// Standard structure types in tagged PDFs
+enum class StructureType {
+  // Grouping elements
+  Document,
+  Part,
+  Art,      // Article
+  Sect,     // Section
+  Div,      // Division
+  BlockQuote,
+  Caption,
+  TOC,      // Table of contents
+  TOCI,     // TOC item
+  Index,
+  NonStruct,
+  Private,
+
+  // Block-level structure elements
+  H, H1, H2, H3, H4, H5, H6,  // Heading levels
+  P,        // Paragraph
+  L,        // List
+  LI,       // List item
+  Lbl,      // List label
+  LBody,    // List body
+
+  // Table elements
+  Table,
+  TR,       // Table row
+  TH,       // Table header
+  TD,       // Table data cell
+  THead,    // Table header group
+  TBody,    // Table body group
+  TFoot,    // Table footer group
+
+  // Inline-level structure elements
+  Span,
+  Quote,
+  Note,
+  Reference,
+  BibEntry,  // Bibliography entry
+  Code,
+  Link,
+  Annot,     // Annotation
+
+  // Illustration elements
+  Figure,
+  Formula,
+  Form,
+
+  // Ruby and Warichu elements (Japanese text)
+  Ruby,
+  RB,        // Ruby base
+  RT,        // Ruby text
+  RP,        // Ruby punctuation
+  Warichu,
+  WT,        // Warichu text
+  WP,        // Warichu punctuation
+
+  Unknown
+};
+
+// Structure element attributes
+struct StructureElementAttributes {
+  std::string owner{"Layout"};  // Attribute owner (Layout, List, Table, etc.)
+
+  // Layout attributes
+  std::string placement;        // Block, Inline, Before, Start, End
+  std::string writing_mode;     // LrTb, RlTb, TbRl
+  std::string text_align;       // Start, Center, End, Justify
+  std::vector<double> bbox;     // Bounding box
+  double width{0};
+  double height{0};
+  double block_align{0};
+  double inline_align{0};
+  double tbs{0};               // Text baseline shift
+  std::string text_decoration_type;  // None, Underline, Overline, LineThrough
+
+  // List attributes
+  std::string list_numbering;  // None, Disc, Circle, Square, Decimal, etc.
+
+  // Table attributes
+  int row_span{1};
+  int col_span{1};
+  std::vector<std::string> headers;  // IDs of header cells
+  std::string scope;           // Row, Column, Both
+  std::string summary;
+};
+
+// Marked content identifier
+struct MarkedContentID {
+  int mcid{-1};                // Marked content identifier
+  uint32_t page_ref{0};        // Reference to page object
+  uint16_t page_gen{0};
+};
+
+// Object reference (for non-content items like images)
+struct ObjectReference {
+  uint32_t obj_ref{0};
+  uint16_t obj_gen{0};
+};
+
+// Structure tree element
+struct StructureElement {
+  StructureType type{StructureType::Unknown};
+  std::string type_string;     // Original type name from PDF
+  std::string id;              // Element ID
+  std::string title;           // T - Title
+  std::string lang;            // Lang - Language
+  std::string alt_text;        // Alt - Alternative text
+  std::string actual_text;     // ActualText - Replacement text
+  std::string expansion;       // E - Expanded form of abbreviation
+
+  StructureElementAttributes attributes;
+
+  // Parent and children
+  StructureElement* parent{nullptr};
+  std::vector<std::unique_ptr<StructureElement>> children;
+
+  // Content items (either marked content or object references)
+  std::vector<MarkedContentID> marked_content;
+  std::vector<ObjectReference> object_refs;
+
+  // Class attributes
+  std::vector<std::string> classes;  // C - Class names
+  Dictionary class_attributes;       // A - Attributes from class
+
+  // Associated page
+  uint32_t page_ref{0};
+  uint16_t page_gen{0};
+};
+
+// Role mapping
+struct RoleMap {
+  std::map<std::string, std::string> mappings;
+
+  std::string get_standard_type(const std::string& custom_type) const {
+    auto it = mappings.find(custom_type);
+    return (it != mappings.end()) ? it->second : custom_type;
+  }
+};
+
+// Structure tree root
+struct StructureTreeRoot {
+  std::unique_ptr<StructureElement> root_element;
+  RoleMap role_map;
+  std::vector<std::string> class_map;  // Class names
+  Dictionary parent_tree;               // Parent tree (number tree)
+  std::string id_tree;                  // ID tree name
+  Dictionary parent_tree_next_key;     // Next key for parent tree
+};
+
+// Marked content properties
+struct MarkedContentProperties {
+  int mcid{-1};
+  std::string tag;
+  std::string lang;
+  std::string alt_text;
+  std::string actual_text;
+  std::string expansion;
+  Dictionary properties;
+};
+
+// Helper functions for tagged PDF
+StructureTreeRoot parse_structure_tree(const Pdf& pdf, const Dictionary& struct_tree_dict);
+std::unique_ptr<StructureElement> parse_structure_element(const Pdf& pdf, const Value& elem_val);
+StructureType parse_structure_type(const std::string& type_name);
+StructureElementAttributes parse_structure_attributes(const Pdf& pdf, const Dictionary& attr_dict);
+RoleMap parse_role_map(const Dictionary& role_map_dict);
+MarkedContentProperties parse_marked_content_props(const Dictionary& props_dict);
+
+// Check if a PDF is tagged
+bool is_tagged_pdf(const Pdf& pdf);
+
+// Get structure element for a marked content ID
+StructureElement* find_structure_element_by_mcid(StructureElement* root, int mcid, uint32_t page_ref);
+
 // Stream filter processing namespace declaration remains the same
 namespace filters {
 
@@ -997,6 +1336,15 @@ struct DecodeParams {
 
   // ASCII85Decode parameters
   bool ascii85_strip_terminator{true};
+
+  // CCITTFaxDecode parameters
+  int k{0};                    // Encoding type: <0 = Group 4, 0 = Group 3 1D, >0 = Group 3 2D
+  bool end_of_line{false};     // EOL marker present
+  bool encoded_byte_align{false}; // Align EOL to byte boundary
+  bool end_of_block{true};     // EOFB present at end
+  bool black_is_1{false};     // Black pixels are 1 (default: white is 1)
+  int rows{0};                 // Number of rows (0 = determine from data)
+  int damaged_rows_before_error{0}; // Continue decoding past errors
 };
 
 DecodedStream decode_flate(const uint8_t* data, size_t size,
@@ -1011,6 +1359,8 @@ DecodedStream decode_runlength(const uint8_t* data, size_t size,
                                const DecodeParams& params);
 DecodedStream decode_dct(const uint8_t* data, size_t size,
                         const DecodeParams& params);
+DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
+                              const DecodeParams& params);
 DecodeParams parse_decode_params(const Dictionary& params);
 
 }  // namespace filters
