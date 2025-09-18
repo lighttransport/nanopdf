@@ -24,6 +24,11 @@ make
 cd build
 make
 
+# Build for WebAssembly/Emscripten
+./scripts/bootstrap-emscripten.sh
+cd build
+make
+
 # Build specific targets
 make nanopdf          # Build library
 make test_nanopdf     # Build test executable
@@ -32,8 +37,11 @@ make test_nanopdf     # Build test executable
 ### CMake Options
 
 - `NANOPDF_USE_CCACHE`: Use ccache for faster recompilation (default: ON)
-- `NANOPDF_USE_NANOSTL`: Use nanostl instead of standard library (default: OFF)  
+- `NANOPDF_USE_NANOSTL`: Use nanostl instead of standard library (default: OFF)
 - `NANOPDF_USE_STB_TRUETYPE`: Use stb_truetype for font loading (default: ON)
+- `NANOPDF_BUILD_TESTS`: Build test executables (default: ON)
+- `NANOPDF_BUILD_WASM`: Build for WebAssembly with Emscripten (default: OFF)
+- `NANOPDF_USE_THORVG`: Use ThorVG for rendering backend (default: OFF)
 - `SANITIZE_ADDRESS`: Enable address sanitizer for debugging
 
 ### Testing
@@ -71,6 +79,8 @@ clang-format -i src/*.cc src/*.hh
 **ttf-loader.cc**: TrueType font file loader and parser.
 
 **canvas-exporter.hh/cc**: Canvas and SVG export functionality for rendering PDF content to HTML5 Canvas commands or SVG elements.
+
+**thorvg-backend.hh/cc**: ThorVG rendering backend for vector graphics rendering (optional, enabled with NANOPDF_USE_THORVG).
 
 ### Key Data Structures
 
@@ -133,5 +143,11 @@ The repository includes `data/blank.pdf` as a sample PDF file for testing. The m
 
 Test executables:
 - `test_nanopdf`: Main PDF parsing test
+- `test_phase1`: Phase 1 comprehensive features test
 - `test_phase1_simple`: Phase 1 features (filters, images, color spaces)
 - `test_phase2`: Phase 2 features (text extraction, fonts, rendering modes)
+- `test_phase3`: Phase 3 features (annotations, forms, interactivity)
+- `test_phase4`: Phase 4 features (advanced typography, OpenType)
+- `test_phase5`: Phase 5 features (security, encryption, digital signatures)
+- `test_phase6`: Phase 6 features (advanced PDF features)
+- `test_thorvg`: ThorVG backend test (when NANOPDF_USE_THORVG is enabled)
