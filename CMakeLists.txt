@@ -8,6 +8,8 @@ project(${BUILD_TARGET} LANGUAGES C CXX)
 option(NANOPDF_USE_CCACHE "Use ccache for faster recompile." ON)
 option(NANOPDF_USE_NANOSTL "Use nanostl." OFF)
 option(NANOPDF_USE_STB_TRUETYPE "Use stb_truetype to load fonts." ON)
+option(NANOPDF_BUILD_TESTS "Build test executables" ON)
+option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
 
 # cmake modules
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -22,8 +24,31 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Emscripten-specific settings
+if(NANOPDF_BUILD_WASM)
+  if(NOT EMSCRIPTEN)
+    message(FATAL_ERROR "NANOPDF_BUILD_WASM is ON but Emscripten toolchain is not detected. Use emcmake to configure.")
+  endif()
+
+  # Disable ccache for Emscripten builds
+  set(NANOPDF_USE_CCACHE OFF)
+
+  # Disable sanitizers for WASM builds
+  set(SANITIZE_ADDRESS OFF)
+
+  # Set Emscripten-specific compilation flags (no -s flags during compilation)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
+
+  # Set Emscripten-specific linker flags (all -s flags go here)
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s WASM=1 -s ALLOW_MEMORY_GROWTH=1")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s MODULARIZE=1 -s EXPORT_ES6=1")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS'] -s EXPORTED_FUNCTIONS=['_malloc','_free']")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s USE_ZLIB=1")
+endif()
+
 # [ccache]
-if(NANOPDF_USE_CCACHE)
+if(NANOPDF_USE_CCACHE AND NOT NANOPDF_BUILD_WASM)
   if(MSVC)
     # No ccache support
   else()
@@ -57,7 +82,15 @@ set(NANOPDF_EXT_LIBRARIES_PUBLIC "")
 
 add_library(${BUILD_TARGET} src/nanopdf.cc src/jbig2-decoder.cc src/canvas-exporter.cc src/crypto.cc src/pdf-security.cc)
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_DEBUG_PRINT=1")
-target_link_libraries(${BUILD_TARGET} PUBLIC z)
+
+# Link with zlib - Emscripten provides it via USE_ZLIB flag
+if(NANOPDF_BUILD_WASM)
+  # For Emscripten, USE_ZLIB must be specified for both compilation and linking
+  target_compile_options(${BUILD_TARGET} PRIVATE "SHELL:-s USE_ZLIB=1")
+  target_link_options(${BUILD_TARGET} PRIVATE "SHELL:-s USE_ZLIB=1")
+else()
+  target_link_libraries(${BUILD_TARGET} PUBLIC z)
+endif()
 
 if (NANOPDF_USE_NANOSTL)
   # nanostl
@@ -69,38 +102,57 @@ if (NANOPDF_USE_STB_TRUETYPE)
   target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_STB_TRUETYPE")
 endif ()
 
-add_sanitizers(${BUILD_TARGET})
+# Only add sanitizers for non-WASM builds
+if(NOT NANOPDF_BUILD_WASM)
+  add_sanitizers(${BUILD_TARGET})
+endif()
 
-add_executable(${TEST_TARGET} src/test-nanopdf.cc)
-target_link_libraries(${TEST_TARGET} ${BUILD_TARGET})
+# Build test executables only if requested and not building for WASM
+if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
+  add_executable(${TEST_TARGET} src/test-nanopdf.cc)
+  target_link_libraries(${TEST_TARGET} ${BUILD_TARGET})
 
-# Phase 1 features test
-add_executable(test_phase1 src/test-phase1-features.cc)
-target_link_libraries(test_phase1 ${BUILD_TARGET})
+  # Phase 1 features test
+  add_executable(test_phase1 src/test-phase1-features.cc)
+  target_link_libraries(test_phase1 ${BUILD_TARGET})
 
-# Phase 1 simple test (without Value objects)
-add_executable(test_phase1_simple src/test-phase1-simple.cc)
-target_link_libraries(test_phase1_simple ${BUILD_TARGET})
+  # Phase 1 simple test (without Value objects)
+  add_executable(test_phase1_simple src/test-phase1-simple.cc)
+  target_link_libraries(test_phase1_simple ${BUILD_TARGET})
 
-# Phase 2 features test
-add_executable(test_phase2 src/test-phase2-features.cc)
-target_link_libraries(test_phase2 ${BUILD_TARGET})
+  # Phase 2 features test
+  add_executable(test_phase2 src/test-phase2-features.cc)
+  target_link_libraries(test_phase2 ${BUILD_TARGET})
 
-# Phase 3 features test
-add_executable(test_phase3 src/test-phase3-features.cc)
-target_link_libraries(test_phase3 ${BUILD_TARGET})
+  # Phase 3 features test
+  add_executable(test_phase3 src/test-phase3-features.cc)
+  target_link_libraries(test_phase3 ${BUILD_TARGET})
 
-# Phase 4 features test
-add_executable(test_phase4 src/test-phase4-features.cc)
-target_link_libraries(test_phase4 ${BUILD_TARGET})
+  # Phase 4 features test
+  add_executable(test_phase4 src/test-phase4-features.cc)
+  target_link_libraries(test_phase4 ${BUILD_TARGET})
 
-# Phase 5 features test
-add_executable(test_phase5 src/test-phase5-features.cc)
-target_link_libraries(test_phase5 ${BUILD_TARGET})
+  # Phase 5 features test
+  add_executable(test_phase5 src/test-phase5-features.cc)
+  target_link_libraries(test_phase5 ${BUILD_TARGET})
 
-# Phase 6 features test (CCITTFaxDecode, transparency, patterns, tagged PDF)
-add_executable(test_phase6 src/test-phase6-features.cc)
-target_link_libraries(test_phase6 ${BUILD_TARGET})
+  # Phase 6 features test (CCITTFaxDecode, transparency, patterns, tagged PDF)
+  add_executable(test_phase6 src/test-phase6-features.cc)
+  target_link_libraries(test_phase6 ${BUILD_TARGET})
+endif()
+
+# For WASM builds, create a JavaScript module
+if(NANOPDF_BUILD_WASM)
+  # Set output as JavaScript module
+  set_target_properties(${BUILD_TARGET} PROPERTIES
+    SUFFIX ".js"
+    LINK_FLAGS "-s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS'] -s EXPORTED_FUNCTIONS=['_malloc','_free'] -s USE_ZLIB=1 -s ALLOW_MEMORY_GROWTH=1"
+  )
+
+  # Install headers for potential Node.js usage
+  install(FILES src/nanopdf.hh DESTINATION include)
+  install(TARGETS ${BUILD_TARGET} DESTINATION lib)
+endif()
 
 ## [VisualStudio]
 #if(MSVC)
