@@ -10,6 +10,7 @@ option(NANOPDF_USE_NANOSTL "Use nanostl." OFF)
 option(NANOPDF_USE_STB_TRUETYPE "Use stb_truetype to load fonts." ON)
 option(NANOPDF_BUILD_TESTS "Build test executables" ON)
 option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
+option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 
 # cmake modules
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -80,7 +81,19 @@ set(NANOPDF_EXT_INCLUDE_DIRS_PRIVATE "")
 set(NANOPDF_EXT_LIBRARIES_PRIVATE "")
 set(NANOPDF_EXT_LIBRARIES_PUBLIC "")
 
-add_library(${BUILD_TARGET} src/nanopdf.cc src/jbig2-decoder.cc src/canvas-exporter.cc src/crypto.cc src/pdf-security.cc)
+set(NANOPDF_SOURCES
+  src/nanopdf.cc
+  src/jbig2-decoder.cc
+  src/canvas-exporter.cc
+  src/crypto.cc
+  src/pdf-security.cc
+)
+
+if(NANOPDF_USE_THORVG)
+  list(APPEND NANOPDF_SOURCES src/thorvg-backend.cc)
+endif()
+
+add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_DEBUG_PRINT=1")
 
 # Link with zlib - Emscripten provides it via USE_ZLIB flag
@@ -100,6 +113,41 @@ endif ()
 
 if (NANOPDF_USE_STB_TRUETYPE)
   target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_STB_TRUETYPE")
+endif ()
+
+if (NANOPDF_USE_THORVG)
+  # Find ThorVG package or use FetchContent
+  find_package(PkgConfig)
+  if (PkgConfig_FOUND)
+    pkg_check_modules(THORVG thorvg)
+  endif()
+
+  if (NOT THORVG_FOUND)
+    # Fallback to manual inclusion if ThorVG is installed locally
+    # Assumes ThorVG headers are in /usr/local/include/thorvg or similar
+    find_path(THORVG_INCLUDE_DIR thorvg.h
+      PATHS /usr/local/include/thorvg /usr/include/thorvg
+      PATH_SUFFIXES thorvg)
+
+    find_library(THORVG_LIBRARY NAMES thorvg
+      PATHS /usr/local/lib /usr/lib
+      PATH_SUFFIXES thorvg)
+
+    if (THORVG_INCLUDE_DIR AND THORVG_LIBRARY)
+      set(THORVG_FOUND TRUE)
+      set(THORVG_INCLUDE_DIRS ${THORVG_INCLUDE_DIR})
+      set(THORVG_LIBRARIES ${THORVG_LIBRARY})
+      message(STATUS "Found ThorVG: ${THORVG_LIBRARY}")
+    else()
+      message(WARNING "ThorVG not found. Please install ThorVG or disable NANOPDF_USE_THORVG")
+    endif()
+  endif()
+
+  if (THORVG_FOUND)
+    target_include_directories(${BUILD_TARGET} PUBLIC ${THORVG_INCLUDE_DIRS})
+    target_link_libraries(${BUILD_TARGET} PUBLIC ${THORVG_LIBRARIES})
+    target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_THORVG")
+  endif()
 endif ()
 
 # Only add sanitizers for non-WASM builds
@@ -139,6 +187,16 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   # Phase 6 features test (CCITTFaxDecode, transparency, patterns, tagged PDF)
   add_executable(test_phase6 src/test-phase6-features.cc)
   target_link_libraries(test_phase6 ${BUILD_TARGET})
+
+  # ThorVG backend test
+  if(NANOPDF_USE_THORVG)
+    add_executable(test_thorvg src/test-thorvg-backend.cc)
+    target_link_libraries(test_thorvg ${BUILD_TARGET})
+    if (THORVG_FOUND)
+      target_include_directories(test_thorvg PRIVATE ${THORVG_INCLUDE_DIRS})
+      target_link_libraries(test_thorvg ${THORVG_LIBRARIES})
+    endif()
+  endif()
 endif()
 
 # For WASM builds, create a JavaScript module
