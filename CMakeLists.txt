@@ -4,11 +4,13 @@ set(BUILD_TARGET "nanopdf")
 set(TEST_TARGET "test_nanopdf")
 project(${BUILD_TARGET} LANGUAGES C CXX)
 
+include(CTest)
+
 # options
 option(NANOPDF_USE_CCACHE "Use ccache for faster recompile." ON)
 option(NANOPDF_USE_NANOSTL "Use nanostl." OFF)
 option(NANOPDF_USE_STB_TRUETYPE "Use stb_truetype to load fonts." ON)
-option(NANOPDF_BUILD_TESTS "Build test executables" ON)
+option(NANOPDF_BUILD_TESTS "Build test executables" ${BUILD_TESTING})
 option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 
@@ -157,44 +159,43 @@ endif()
 
 # Build test executables only if requested and not building for WASM
 if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
-  add_executable(${TEST_TARGET} src/test-nanopdf.cc)
-  target_link_libraries(${TEST_TARGET} ${BUILD_TARGET})
+  enable_testing()
 
-  # Phase 1 features test
-  add_executable(test_phase1 src/test-phase1-features.cc)
-  target_link_libraries(test_phase1 ${BUILD_TARGET})
+  function(add_nanopdf_test target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
+    if(ARGC GREATER 2)
+      add_test(NAME ${target} COMMAND ${target} ${ARGN})
+    else()
+      add_test(NAME ${target} COMMAND ${target})
+    endif()
+  endfunction()
 
-  # Phase 1 simple test (without Value objects)
-  add_executable(test_phase1_simple src/test-phase1-simple.cc)
-  target_link_libraries(test_phase1_simple ${BUILD_TARGET})
+  add_nanopdf_test(${TEST_TARGET} src/test-nanopdf.cc ${PROJECT_SOURCE_DIR}/data/HelloWorld_xr.pdf)
 
-  # Phase 2 features test
-  add_executable(test_phase2 src/test-phase2-features.cc)
-  target_link_libraries(test_phase2 ${BUILD_TARGET})
+  set(_NANOPDF_PHASE_TEST_SPECS
+    "test_phase1|src/test-phase1-features.cc"
+    "test_phase1_simple|src/test-phase1-simple.cc"
+    "test_phase2|src/test-phase2-features.cc"
+    "test_phase3|src/test-phase3-features.cc"
+    "test_phase4|src/test-phase4-features.cc"
+    "test_phase5|src/test-phase5-features.cc"
+    "test_phase6|src/test-phase6-features.cc"
+  )
 
-  # Phase 3 features test
-  add_executable(test_phase3 src/test-phase3-features.cc)
-  target_link_libraries(test_phase3 ${BUILD_TARGET})
-
-  # Phase 4 features test
-  add_executable(test_phase4 src/test-phase4-features.cc)
-  target_link_libraries(test_phase4 ${BUILD_TARGET})
-
-  # Phase 5 features test
-  add_executable(test_phase5 src/test-phase5-features.cc)
-  target_link_libraries(test_phase5 ${BUILD_TARGET})
-
-  # Phase 6 features test (CCITTFaxDecode, transparency, patterns, tagged PDF)
-  add_executable(test_phase6 src/test-phase6-features.cc)
-  target_link_libraries(test_phase6 ${BUILD_TARGET})
+  foreach(_spec ${_NANOPDF_PHASE_TEST_SPECS})
+    string(REPLACE "|" ";" _spec_items "${_spec}")
+    list(GET _spec_items 0 _test_name)
+    list(GET _spec_items 1 _test_source)
+    add_nanopdf_test(${_test_name} ${_test_source})
+  endforeach()
 
   # ThorVG backend test
   if(NANOPDF_USE_THORVG)
-    add_executable(test_thorvg src/test-thorvg-backend.cc)
-    target_link_libraries(test_thorvg ${BUILD_TARGET})
+    add_nanopdf_test(test_thorvg src/test-thorvg-backend.cc ${PROJECT_SOURCE_DIR}/data/HelloWorld_xr.pdf)
     if (THORVG_FOUND)
       target_include_directories(test_thorvg PRIVATE ${THORVG_INCLUDE_DIRS})
-      target_link_libraries(test_thorvg ${THORVG_LIBRARIES})
+      target_link_libraries(test_thorvg PRIVATE ${THORVG_LIBRARIES})
     endif()
   endif()
 endif()
@@ -232,4 +233,3 @@ endif()
 #
 #  set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT pbrlab-cli)
 #endif()
-

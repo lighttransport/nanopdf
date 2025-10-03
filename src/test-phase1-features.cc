@@ -68,7 +68,7 @@ void test_color_space_parsing() {
   // Test case 1: Simple device color spaces
   {
     Value cs_value;
-    cs_value.type = Value::NAME;
+    cs_value.SetType(Value::NAME);
     cs_value.name = "DeviceRGB";
 
     ColorSpace cs = parse_color_space(pdf, cs_value);
@@ -80,7 +80,7 @@ void test_color_space_parsing() {
   // Test case 2: DeviceGray
   {
     Value cs_value;
-    cs_value.type = Value::NAME;
+    cs_value.SetType(Value::NAME);
     cs_value.name = "DeviceGray";
 
     ColorSpace cs = parse_color_space(pdf, cs_value);
@@ -91,7 +91,7 @@ void test_color_space_parsing() {
   // Test case 3: DeviceCMYK
   {
     Value cs_value;
-    cs_value.type = Value::NAME;
+    cs_value.SetType(Value::NAME);
     cs_value.name = "DeviceCMYK";
 
     ColorSpace cs = parse_color_space(pdf, cs_value);
@@ -102,21 +102,23 @@ void test_color_space_parsing() {
   // Test case 4: CalGray with parameters
   {
     Value cs_value;
-    cs_value.type = Value::ARRAY;
+    cs_value.SetType(Value::ARRAY);
 
     Value type_val;
-    type_val.type = Value::NAME;
+    type_val.SetType(Value::NAME);
     type_val.name = "CalGray";
     cs_value.array.push_back(type_val);
 
     Value params_val;
-    params_val.type = Value::DICTIONARY;
+    params_val.SetType(Value::DICTIONARY);
 
     // Add WhitePoint
     Value wp_val;
-    wp_val.type = Value::ARRAY;
+    wp_val.SetType(Value::ARRAY);
     Value wp_x, wp_y, wp_z;
-    wp_x.type = wp_y.type = wp_z.type = Value::NUMBER;
+    wp_x.SetType(Value::NUMBER);
+    wp_y.SetType(Value::NUMBER);
+    wp_z.SetType(Value::NUMBER);
     wp_x.number = 0.9505;
     wp_y.number = 1.0;
     wp_z.number = 1.0890;
@@ -127,7 +129,7 @@ void test_color_space_parsing() {
 
     // Add Gamma
     Value gamma_val;
-    gamma_val.type = Value::NUMBER;
+    gamma_val.SetType(Value::NUMBER);
     gamma_val.number = 2.2;
     params_val.dict["Gamma"] = gamma_val;
 
@@ -155,27 +157,27 @@ void test_image_xobject_parsing() {
   // Test case 1: Basic image with width, height, and bits per component
   {
     Value stream_val;
-    stream_val.type = Value::STREAM;
+    stream_val.SetType(Value::STREAM);
 
     // Set up dictionary
     Value width_val;
-    width_val.type = Value::NUMBER;
+    width_val.SetType(Value::NUMBER);
     width_val.number = 100;
     stream_val.stream.dict["Width"] = width_val;
 
     Value height_val;
-    height_val.type = Value::NUMBER;
+    height_val.SetType(Value::NUMBER);
     height_val.number = 50;
     stream_val.stream.dict["Height"] = height_val;
 
     Value bpc_val;
-    bpc_val.type = Value::NUMBER;
+    bpc_val.SetType(Value::NUMBER);
     bpc_val.number = 8;
     stream_val.stream.dict["BitsPerComponent"] = bpc_val;
 
     // Add color space
     Value cs_val;
-    cs_val.type = Value::NAME;
+    cs_val.SetType(Value::NAME);
     cs_val.name = "DeviceRGB";
     stream_val.stream.dict["ColorSpace"] = cs_val;
 
@@ -194,25 +196,25 @@ void test_image_xobject_parsing() {
   // Test case 2: Image mask
   {
     Value stream_val;
-    stream_val.type = Value::STREAM;
+    stream_val.SetType(Value::STREAM);
 
     Value width_val;
-    width_val.type = Value::NUMBER;
+    width_val.SetType(Value::NUMBER);
     width_val.number = 32;
     stream_val.stream.dict["Width"] = width_val;
 
     Value height_val;
-    height_val.type = Value::NUMBER;
+    height_val.SetType(Value::NUMBER);
     height_val.number = 32;
     stream_val.stream.dict["Height"] = height_val;
 
     Value mask_val;
-    mask_val.type = Value::BOOLEAN;
+    mask_val.SetType(Value::BOOLEAN);
     mask_val.boolean = true;
     stream_val.stream.dict["ImageMask"] = mask_val;
 
     Value bpc_val;
-    bpc_val.type = Value::NUMBER;
+    bpc_val.SetType(Value::NUMBER);
     bpc_val.number = 1;
     stream_val.stream.dict["BitsPerComponent"] = bpc_val;
 
@@ -227,20 +229,20 @@ void test_image_xobject_parsing() {
   // Test case 3: Image with interpolation
   {
     Value stream_val;
-    stream_val.type = Value::STREAM;
+    stream_val.SetType(Value::STREAM);
 
     Value width_val;
-    width_val.type = Value::NUMBER;
+    width_val.SetType(Value::NUMBER);
     width_val.number = 64;
     stream_val.stream.dict["Width"] = width_val;
 
     Value height_val;
-    height_val.type = Value::NUMBER;
+    height_val.SetType(Value::NUMBER);
     height_val.number = 64;
     stream_val.stream.dict["Height"] = height_val;
 
     Value interp_val;
-    interp_val.type = Value::BOOLEAN;
+    interp_val.SetType(Value::BOOLEAN);
     interp_val.boolean = true;
     stream_val.stream.dict["Interpolate"] = interp_val;
 
