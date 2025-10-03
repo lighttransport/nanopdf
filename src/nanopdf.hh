@@ -42,6 +42,7 @@ struct Value
 };
 #endif
 struct Value;
+struct StreamValue;
 
 using Dictionary = std::map<std::string, Value>;
 
@@ -61,10 +62,6 @@ struct XRefSection {
 
 bool parse_from_memory(const uint8_t* addr, const size_t size);
 
-// Forward declare Dictionary for use in StreamValue
-using Dictionary = std::map<std::string, Value>;
-
-// Define StreamValue before Value
 struct StreamValue {
   std::vector<uint8_t> data;
   Dictionary dict;
@@ -76,7 +73,6 @@ struct StreamValue {
   StreamValue& operator=(StreamValue&& other) = default;
 };
 
-// Value type definitions first
 class Value {
  public:
   enum Type {
@@ -92,35 +88,30 @@ class Value {
     NULL_OBJ
   };
 
-  Type type{UNDEFINED};
+  Value() = default;
+  explicit Value(Type new_type) { SetType(new_type); }
 
-  union {
-    bool boolean;
-    double number;
-    std::string str;
-    std::string name;
-    std::vector<Value> array;
-    Dictionary dict;
-    StreamValue stream;
-  };
+  Value(const Value& other) = default;
+  Value(Value&& other) noexcept = default;
+  Value& operator=(const Value& other) = default;
+  Value& operator=(Value&& other) noexcept = default;
 
-  // For reference objects
-  uint32_t ref_object_number{0};
-  uint16_t ref_generation_number{0};
+  ~Value() = default;
 
-  Value() : type(UNDEFINED) {}
-  ~Value() { clear(); }
-
-  Value(const Value& other) : type(UNDEFINED) { *this = other; }
-  Value(Value&& other) noexcept : type(UNDEFINED) { *this = std::move(other); }
-
-  Value& operator=(const Value& other);
-  Value& operator=(Value&& other) noexcept;
-
+  void SetType(Type new_type);
   void clear();
 
- private:
-  void destroy();
+  Type type{UNDEFINED};
+  bool boolean{false};
+  double number{0.0};
+  std::string str;
+  std::string name;
+  std::vector<Value> array;
+  Dictionary dict;
+  StreamValue stream;
+
+  uint32_t ref_object_number{0};
+  uint16_t ref_generation_number{0};
 };
 
 // Font types supported in PDF

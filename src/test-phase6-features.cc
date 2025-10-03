@@ -56,17 +56,17 @@ void test_transparency_blending() {
 
   // Add transparency parameters
   Value ca_val;
-  ca_val.type = Value::NUMBER;
+  ca_val.SetType(Value::NUMBER);
   ca_val.number = 0.5;
   gs_dict["ca"] = ca_val;
 
   Value CA_val;
-  CA_val.type = Value::NUMBER;
+  CA_val.SetType(Value::NUMBER);
   CA_val.number = 0.75;
   gs_dict["CA"] = CA_val;
 
   Value bm_val;
-  bm_val.type = Value::NAME;
+  bm_val.SetType(Value::NAME);
   bm_val.name = std::string("Multiply");
   gs_dict["BM"] = bm_val;
 
@@ -83,17 +83,17 @@ void test_transparency_blending() {
   Dictionary group_dict;
 
   Value s_val;
-  s_val.type = Value::NAME;
+  s_val.SetType(Value::NAME);
   s_val.name = std::string("Transparency");
   group_dict["S"] = s_val;
 
   Value isolated_val;
-  isolated_val.type = Value::BOOLEAN;
+  isolated_val.SetType(Value::BOOLEAN);
   isolated_val.boolean = true;
   group_dict["I"] = isolated_val;
 
   Value knockout_val;
-  knockout_val.type = Value::BOOLEAN;
+  knockout_val.SetType(Value::BOOLEAN);
   knockout_val.boolean = false;
   group_dict["K"] = knockout_val;
 
@@ -113,27 +113,27 @@ void test_patterns_shadings() {
   Dictionary pattern_dict;
 
   Value pattern_type;
-  pattern_type.type = Value::NUMBER;
+  pattern_type.SetType(Value::NUMBER);
   pattern_type.number = 1;  // Tiling pattern
   pattern_dict["PatternType"] = pattern_type;
 
   Value paint_type;
-  paint_type.type = Value::NUMBER;
+  paint_type.SetType(Value::NUMBER);
   paint_type.number = 1;  // Colored tiles
   pattern_dict["PaintType"] = paint_type;
 
   Value tiling_type;
-  tiling_type.type = Value::NUMBER;
+  tiling_type.SetType(Value::NUMBER);
   tiling_type.number = 1;  // Constant spacing
   pattern_dict["TilingType"] = tiling_type;
 
   Value xstep;
-  xstep.type = Value::NUMBER;
+  xstep.SetType(Value::NUMBER);
   xstep.number = 100;
   pattern_dict["XStep"] = xstep;
 
   Value ystep;
-  ystep.type = Value::NUMBER;
+  ystep.SetType(Value::NUMBER);
   ystep.number = 100;
   pattern_dict["YStep"] = ystep;
 
@@ -150,14 +150,17 @@ void test_patterns_shadings() {
   Dictionary shading_dict;
 
   Value shading_type;
-  shading_type.type = Value::NUMBER;
+  shading_type.SetType(Value::NUMBER);
   shading_type.number = 2;  // Axial shading
   shading_dict["ShadingType"] = shading_type;
 
   Value coords;
-  coords.type = Value::ARRAY;
+  coords.SetType(Value::ARRAY);
   Value x0, y0, x1, y1;
-  x0.type = y0.type = x1.type = y1.type = Value::NUMBER;
+  x0.SetType(Value::NUMBER);
+  y0.SetType(Value::NUMBER);
+  x1.SetType(Value::NUMBER);
+  y1.SetType(Value::NUMBER);
   x0.number = 0;
   y0.number = 0;
   x1.number = 100;
@@ -194,12 +197,12 @@ void test_tagged_pdf() {
   Dictionary role_map_dict;
 
   Value heading_val;
-  heading_val.type = Value::NAME;
+  heading_val.SetType(Value::NAME);
   heading_val.name = std::string("H1");
   role_map_dict["Heading"] = heading_val;
 
   Value para_val;
-  para_val.type = Value::NAME;
+  para_val.SetType(Value::NAME);
   para_val.name = std::string("P");
   role_map_dict["Paragraph"] = para_val;
 
@@ -214,32 +217,32 @@ void test_tagged_pdf() {
   Dictionary elem_dict;
 
   Value s_val;
-  s_val.type = Value::NAME;
+  s_val.SetType(Value::NAME);
   s_val.name = std::string("P");
   elem_dict["S"] = s_val;
 
   Value id_val;
-  id_val.type = Value::STRING;
+  id_val.SetType(Value::STRING);
   id_val.str = "para1";
   elem_dict["ID"] = id_val;
 
   Value title_val;
-  title_val.type = Value::STRING;
+  title_val.SetType(Value::STRING);
   title_val.str = "First Paragraph";
   elem_dict["T"] = title_val;
 
   Value lang_val;
-  lang_val.type = Value::STRING;
+  lang_val.SetType(Value::STRING);
   lang_val.str = "en-US";
   elem_dict["Lang"] = lang_val;
 
   Value alt_val;
-  alt_val.type = Value::STRING;
+  alt_val.SetType(Value::STRING);
   alt_val.str = "Alternative text for paragraph";
   elem_dict["Alt"] = alt_val;
 
   Value elem_val;
-  elem_val.type = Value::DICTIONARY;
+  elem_val.SetType(Value::DICTIONARY);
   elem_val.dict = elem_dict;
 
   auto element = parse_structure_element(dummy_pdf, elem_val);
@@ -256,22 +259,22 @@ void test_tagged_pdf() {
   Dictionary attr_dict;
 
   Value placement_val;
-  placement_val.type = Value::NAME;
+  placement_val.SetType(Value::NAME);
   placement_val.name = std::string("Block");
   attr_dict["Placement"] = placement_val;
 
   Value text_align_val;
-  text_align_val.type = Value::NAME;
+  text_align_val.SetType(Value::NAME);
   text_align_val.name = std::string("Center");
   attr_dict["TextAlign"] = text_align_val;
 
   Value width_val;
-  width_val.type = Value::NUMBER;
+  width_val.SetType(Value::NUMBER);
   width_val.number = 200;
   attr_dict["Width"] = width_val;
 
   Value height_val;
-  height_val.type = Value::NUMBER;
+  height_val.SetType(Value::NUMBER);
   height_val.number = 50;
   attr_dict["Height"] = height_val;
 
@@ -286,17 +289,17 @@ void test_tagged_pdf() {
   Dictionary props_dict;
 
   Value mcid_val;
-  mcid_val.type = Value::NUMBER;
+  mcid_val.SetType(Value::NUMBER);
   mcid_val.number = 42;
   props_dict["MCID"] = mcid_val;
 
   Value tag_val;
-  tag_val.type = Value::NAME;
+  tag_val.SetType(Value::NAME);
   tag_val.name = std::string("P");
   props_dict["Tag"] = tag_val;
 
   Value actual_text_val;
-  actual_text_val.type = Value::STRING;
+  actual_text_val.SetType(Value::STRING);
   actual_text_val.str = "Actual text content";
   props_dict["ActualText"] = actual_text_val;
 
@@ -309,7 +312,7 @@ void test_tagged_pdf() {
   // Test is_tagged_pdf function
   Pdf pdf;
   Value marked_val;
-  marked_val.type = Value::BOOLEAN;
+  marked_val.SetType(Value::BOOLEAN);
   marked_val.boolean = true;
   pdf.catalog.mark_info["Marked"] = marked_val;
 

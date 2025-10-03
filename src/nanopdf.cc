@@ -239,7 +239,7 @@ bool parse_stream(StreamReader &sr, Parser &parser, Value *out_value) {
   length = static_cast<size_t>(it->second.number);
 
   // Read stream data
-  out_value->type = Value::STREAM;
+  out_value->SetType(Value::STREAM);
   out_value->stream.data.resize(length);
   if (!sr.read(length, out_value->stream.data.data())) {
     return false;
@@ -292,7 +292,7 @@ bool parse_object(StreamReader &sr, Parser &parser, Value *value) {
     if (!sr.read1(&c)) return false;
     if (c == '<') {
       // Dictionary
-      value->type = Value::DICTIONARY;
+      value->SetType(Value::DICTIONARY);
       if (!parse_dictionary(sr, parser, &value->dict)) return false;
 
       // Check if this is a stream object
@@ -300,16 +300,16 @@ bool parse_object(StreamReader &sr, Parser &parser, Value *value) {
     } else {
       // Hex string
       sr.seek_from_current(-1);
-      value->type = Value::STRING;
+      value->SetType(Value::STRING);
       return parse_string(sr, parser, &value->str);
     }
   } else if (c == '[') {
     // Array
-    value->type = Value::ARRAY;
+    value->SetType(Value::ARRAY);
     return parse_array(sr, parser, &value->array);
   } else if (c == '/') {
     // Name
-    value->type = Value::NAME;
+    value->SetType(Value::NAME);
     return parse_name(sr, parser, &value->name);
   } else if ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
     // Could be a number or a reference
@@ -323,16 +323,16 @@ bool parse_object(StreamReader &sr, Parser &parser, Value *value) {
 
     // Not a reference, try as number
     sr.seek_set(saved_pos);
-    value->type = Value::NUMBER;
+    value->SetType(Value::NUMBER);
     return parse_number(sr, parser, &value->number);
   } else if (c == 't') {
     // Could be "true"
-    value->type = Value::BOOLEAN;
+    value->SetType(Value::BOOLEAN);
     value->boolean = true;
     return true;
   } else if (c == 'f') {
     // Could be "false"
-    value->type = Value::BOOLEAN;
+    value->SetType(Value::BOOLEAN);
     value->boolean = false;
     return true;
   }
@@ -455,7 +455,7 @@ bool parse_reference(StreamReader &sr, Parser &parser, Value *value) {
     return false;
   }
 
-  value->type = Value::REFERENCE;
+  value->SetType(Value::REFERENCE);
   return true;
 }
 
@@ -1524,31 +1524,89 @@ PageContent Page::load_contents(const Pdf& pdf) const {
   return content;
 }
 
-// Stub implementations for Value class functions
 void Value::clear() {
-  // Stub implementation - needs proper value cleanup
+  switch (type) {
+    case STRING:
+      str.clear();
+      break;
+    case NAME:
+      name.clear();
+      break;
+    case ARRAY:
+      array.clear();
+      break;
+    case DICTIONARY:
+      dict.clear();
+      break;
+    case STREAM:
+      stream = StreamValue{};
+      break;
+    case BOOLEAN:
+      boolean = false;
+      break;
+    case NUMBER:
+      number = 0.0;
+      break;
+    case REFERENCE:
+    case NULL_OBJ:
+    case UNDEFINED:
+      break;
+  }
+
+  boolean = false;
+  number = 0.0;
+  ref_object_number = 0;
+  ref_generation_number = 0;
   type = UNDEFINED;
 }
 
-Value& Value::operator=(const Value& other) {
-  // Stub implementation - needs proper value assignment
-  if (this != &other) {
+void Value::SetType(Type new_type) {
+  if (type != new_type) {
     clear();
-    type = other.type;
-    // Copy other fields as needed
+    type = new_type;
   }
-  return *this;
-}
 
-Value& Value::operator=(Value&& other) noexcept {
-  // Stub implementation - needs proper value move assignment
-  if (this != &other) {
-    clear();
-    type = other.type;
-    other.type = UNDEFINED;
-    // Move other fields as needed
+  switch (new_type) {
+    case BOOLEAN:
+      boolean = false;
+      break;
+    case NUMBER:
+      number = 0.0;
+      break;
+    case STRING:
+      str.clear();
+      break;
+    case NAME:
+      name.clear();
+      break;
+    case ARRAY:
+      array.clear();
+      break;
+    case DICTIONARY:
+      dict.clear();
+      break;
+    case STREAM:
+      stream = StreamValue{};
+      break;
+    case REFERENCE:
+    case NULL_OBJ:
+    case UNDEFINED:
+      break;
   }
-  return *this;
+
+  if (new_type != BOOLEAN) {
+    boolean = false;
+  }
+  if (new_type != NUMBER) {
+    number = 0.0;
+  }
+  if (new_type == REFERENCE) {
+    ref_object_number = 0;
+    ref_generation_number = 0;
+  } else {
+    ref_object_number = 0;
+    ref_generation_number = 0;
+  }
 }
 
 // Color space parsing
