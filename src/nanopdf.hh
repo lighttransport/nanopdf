@@ -13,10 +13,12 @@ using namespace nanostl;
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #endif
@@ -917,10 +919,25 @@ struct Pdf {
 
   DocumentCatalog catalog;
   SecurityHandler security;
+  mutable std::map<uint64_t, Value> object_cache;
+  mutable std::unordered_map<uint64_t, uint64_t> object_offsets;
+  mutable bool object_offsets_built{false};
+  mutable bool object_offsets_failed{false};
+  mutable std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> object_stream_entries;
+  mutable std::unordered_map<uint32_t, std::vector<uint8_t>> object_stream_cache;
+  mutable std::deque<uint32_t> object_stream_cache_order;
+  static const size_t kDefaultObjectStreamCacheCapacity = 32;
+  mutable size_t object_stream_cache_capacity{kDefaultObjectStreamCacheCapacity};
 
   bool load_document_structure();
   const Page* get_page(uint32_t page_number) const;
   ResolvedObject load_object(uint32_t obj_num, uint16_t gen_num) const;
+  bool build_object_offset_cache() const;
+  bool load_object_from_stream(uint32_t object_number, uint16_t generation,
+                               uint32_t stream_object_number, uint32_t index,
+                               Value* out_value) const;
+
+  void set_object_stream_cache_capacity(size_t capacity) const;
 
   static std::unique_ptr<BaseFont> parse_font(const Pdf& pdf,
                                               const Value& font_val);

@@ -5,12 +5,16 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #endif
 
 #include <zlib.h>
@@ -156,12 +160,28 @@ class Parser {
   }
 
   bool skip_whitespace(StreamReader &sr) {
-    char c;
-    while (Look(&c)) {
-      if (c != ' ' && c != '\r' && c != '\n' && c != '\t') {
-        break;
+    while (true) {
+      char c;
+      if (!Look(&c)) {
+        return true;
       }
-      _sr.seek_from_current(1);
+
+      if (c == '%') {
+        // Comment. Consume '%' and skip until newline.
+        _sr.seek_from_current(1);
+        if (!SkipUntilNewline()) {
+          return false;
+        }
+        continue;
+      }
+
+      if (c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == '\f' ||
+          c == '\0') {
+        _sr.seek_from_current(1);
+        continue;
+      }
+
+      break;
     }
     return true;
   }
@@ -238,6 +258,8 @@ bool parse_stream(StreamReader &sr, Parser &parser, Value *out_value) {
   }
   length = static_cast<size_t>(it->second.number);
 
+  Dictionary dict_copy = std::move(out_value->dict);
+
   // Read stream data
   out_value->SetType(Value::STREAM);
   out_value->stream.data.resize(length);
@@ -246,7 +268,7 @@ bool parse_stream(StreamReader &sr, Parser &parser, Value *out_value) {
   }
 
   // Move dictionary to stream
-  out_value->stream.dict = std::move(out_value->dict);
+  out_value->stream.dict = std::move(dict_copy);
 
   // Expect "endstream"
   if (!parser.skip_whitespace(sr)) return false;
@@ -260,80 +282,120 @@ bool parse_object(StreamReader &sr, Parser &parser, Value *value);
 bool parse_dictionary(StreamReader &sr, Parser &parser, Dictionary *dict);
 bool parse_array(StreamReader &sr, Parser &parser, std::vector<Value> *arr);
 bool parse_name(StreamReader &sr, Parser &parser, std::string *name);
-bool parse_string(StreamReader &sr, Parser &parser, std::vector<uint8_t> *str);
+bool parse_string(StreamReader &sr, Parser &parser, std::string *str);
 bool parse_number(StreamReader &sr, Parser &parser, double *num);
 bool parse_reference(StreamReader &sr, Parser &parser, Value *value);
 bool parse_stream(StreamReader &sr, Parser &parser, Value *value);
 
-// Helper function to skip whitespace
-inline bool skip_whitespace(StreamReader &sr) {
-  char c;
-  while (!sr.eof()) {
-    if (!sr.read1(&c)) return false;
-    if (c != ' ' && c != '\r' && c != '\n' && c != '\t') {
-      sr.seek_from_current(-1);
-      break;
+inline bool is_whitespace_char(char c) {
+  return c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == '\f' ||
+         c == '\0';
+}
+
+inline bool is_delimiter_char(char c) {
+  return c == '(' || c == ')' || c == '<' || c == '>' || c == '[' || c == ']' ||
+         c == '{' || c == '}' || c == '/' || c == '%' || c == '\r' ||
+         c == '\n' || c == '\t' || c == '\f' || c == ' ';
+}
+
+inline bool consume_keyword_rest(StreamReader &sr, const char *rest) {
+  for (const char *p = rest; *p != '\0'; ++p) {
+    uint8_t ch;
+    if (!sr.read1(&ch) || static_cast<char>(ch) != *p) {
+      return false;
     }
   }
   return true;
 }
 
+inline bool ensure_token_delimiter(StreamReader &sr) {
+  uint8_t ch;
+  if (!sr.read1(&ch)) {
+    return true;  // EOF counts as delimiter
+  }
+
+  if (!is_delimiter_char(static_cast<char>(ch))) {
+    sr.seek_from_current(-1);
+    return false;
+  }
+
+  sr.seek_from_current(-1);
+  return true;
+}
+
+inline int hex_value(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  return -1;
+}
+
 bool parse_object(StreamReader &sr, Parser &parser, Value *value) {
   if (!value) return false;
 
-  // Skip whitespace
-  if (!skip_whitespace(sr)) return false;
+  if (!parser.skip_whitespace(sr)) return false;
 
-  char c;
-  if (!sr.read1(&c)) return false;
+  uint8_t uchar;
+  if (!sr.read1(&uchar)) return false;
+  char c = static_cast<char>(uchar);
 
   if (c == '<') {
-    // Dictionary or hex string
-    if (!sr.read1(&c)) return false;
-    if (c == '<') {
-      // Dictionary
+    uint8_t peek;
+    if (!sr.read1(&peek)) return false;
+    if (static_cast<char>(peek) == '<') {
       value->SetType(Value::DICTIONARY);
       if (!parse_dictionary(sr, parser, &value->dict)) return false;
-
-      // Check if this is a stream object
-      return parse_stream(sr, parser, value);
+      uint64_t pos_after_dict = sr.tell();
+      if (!parser.skip_whitespace(sr)) return false;
+      uint64_t stream_pos = sr.tell();
+      uint8_t keyword_buf[6] = {0};
+      uint64_t read = sr.read(6, keyword_buf);
+      sr.seek_set(stream_pos);
+      if (read == 6 && std::memcmp(keyword_buf, "stream", 6) == 0) {
+        return parse_stream(sr, parser, value);
+      }
+      sr.seek_set(pos_after_dict);
+      return true;
     } else {
-      // Hex string
-      sr.seek_from_current(-1);
+      sr.seek_from_current(-2);
       value->SetType(Value::STRING);
       return parse_string(sr, parser, &value->str);
     }
+  } else if (c == '(') {
+    sr.seek_from_current(-1);
+    value->SetType(Value::STRING);
+    return parse_string(sr, parser, &value->str);
   } else if (c == '[') {
-    // Array
     value->SetType(Value::ARRAY);
     return parse_array(sr, parser, &value->array);
   } else if (c == '/') {
-    // Name
     value->SetType(Value::NAME);
     return parse_name(sr, parser, &value->name);
   } else if ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
-    // Could be a number or a reference
     sr.seek_from_current(-1);
-
-    // Try parsing as reference first
     uint64_t saved_pos = sr.tell();
     if (parse_reference(sr, parser, value)) {
       return true;
     }
-
-    // Not a reference, try as number
     sr.seek_set(saved_pos);
     value->SetType(Value::NUMBER);
     return parse_number(sr, parser, &value->number);
   } else if (c == 't') {
-    // Could be "true"
+    if (!consume_keyword_rest(sr, "rue")) return false;
+    if (!ensure_token_delimiter(sr)) return false;
     value->SetType(Value::BOOLEAN);
     value->boolean = true;
     return true;
   } else if (c == 'f') {
-    // Could be "false"
+    if (!consume_keyword_rest(sr, "alse")) return false;
+    if (!ensure_token_delimiter(sr)) return false;
     value->SetType(Value::BOOLEAN);
     value->boolean = false;
+    return true;
+  } else if (c == 'n') {
+    if (!consume_keyword_rest(sr, "ull")) return false;
+    if (!ensure_token_delimiter(sr)) return false;
+    value->SetType(Value::NULL_OBJ);
     return true;
   }
 
@@ -343,62 +405,72 @@ bool parse_object(StreamReader &sr, Parser &parser, Value *value) {
 bool parse_dictionary(StreamReader &sr, Parser &parser, Dictionary *dict) {
   if (!dict) return false;
 
-  if (!skip_whitespace(sr)) return false;
+  while (true) {
+    if (!parser.skip_whitespace(sr)) return false;
 
-  char c;
-  // Check for dictionary end
-  if (!sr.read1(&c)) return false;
-  if (c == '>') {
-    char next;
-    if (!sr.read1(&next)) return false;
-    if (next == '>') {
+    uint8_t ch;
+    if (!sr.read1(&ch)) return false;
+    char c = static_cast<char>(ch);
+
+    if (c == '>') {
+      uint8_t next;
+      if (!sr.read1(&next)) return false;
+      if (static_cast<char>(next) != '>') {
+        return false;
+      }
       return true;
     }
-    return false;
+
+    if (c == '%') {
+      if (!parser.SkipUntilNewline()) return false;
+      continue;
+    }
+
+    if (c != '/') {
+      return false;
+    }
+
+    std::string key;
+    if (!parse_name(sr, parser, &key)) return false;
+
+    Value val;
+    if (!parse_object(sr, parser, &val)) return false;
+
+    (*dict)[key] = std::move(val);
   }
-  sr.seek_from_current(-1);
-
-  // Must be a name
-  if (!sr.read1(&c)) return false;
-  if (c != '/') return false;
-
-  // Parse key (name)
-  std::string key;
-  if (!parse_name(sr, parser, &key)) return false;
-
-  // Parse value
-  Value value;
-  if (!parse_object(sr, parser, &value)) return false;
-
-  (*dict)[key] = value;
-
-  return true;
 }
 
 bool parse_array(StreamReader &sr, nanopdf::Parser &parser,
                  std::vector<Value> *arr) {
   if (!arr) return false;
 
-  if (!skip_whitespace(sr)) return false;
+  while (true) {
+    if (!parser.skip_whitespace(sr)) return false;
 
-  char c;
-  // Check for array end
-  if (!sr.read1(&c)) return false;
-  if (c == ']') {
-    return true;
+    uint8_t ch;
+    if (!sr.read1(&ch)) return false;
+    char c = static_cast<char>(ch);
+
+    if (c == ']') {
+      return true;
+    }
+
+    if (c == '%') {
+      if (!parser.SkipUntilNewline()) return false;
+      continue;
+    }
+
+    sr.seek_from_current(-1);
+    Value value;
+    if (!parse_object(sr, parser, &value)) return false;
+    arr->push_back(std::move(value));
   }
-  sr.seek_from_current(-1);
-
-  // Parse value
-  Value value;
-  if (!parse_object(sr, parser, &value)) return false;
-  arr->push_back(value);
-
-  return true;
 }
 
 bool parse_reference(StreamReader &sr, Parser &parser, Value *value) {
   if (!value) return false;
+
+  value->SetType(Value::REFERENCE);
 
   // Format: "12 0 R" - object number, generation number, R
   char buf[32];
@@ -447,37 +519,77 @@ bool parse_reference(StreamReader &sr, Parser &parser, Value *value) {
     if (c != ' ' && c != '\r' && c != '\n' && c != '\t') {
       break;
     }
-  }
+ }
 
   // Must be 'R'
   if (c != 'R') {
     sr.seek_from_current(-1);
     return false;
   }
-
-  value->SetType(Value::REFERENCE);
   return true;
 }
 
 bool parse_indirect_object(StreamReader &sr, Parser &parser, Value *out_value) {
   if (!out_value) return false;
 
-  if (!skip_whitespace(sr)) return false;
+  if (!parser.skip_whitespace(sr)) return false;
 
-  // Read object number
-  uint32_t obj_num = 0;
-  while (!sr.eof()) {
-    char c;
-    if (!sr.read1(&c)) return false;
-    if (c == ' ' || c == '\r' || c == '\n' || c == '\t') {
-      if (obj_num > 0) break;
-      continue;
+  auto read_uint = [&](uint32_t *out) -> bool {
+    *out = 0;
+    bool read_digit = false;
+    while (true) {
+      uint8_t raw;
+      if (!sr.read1(&raw)) {
+        break;
+      }
+      char c = static_cast<char>(raw);
+      if (is_whitespace_char(c)) {
+        if (read_digit) {
+          break;
+        }
+        continue;
+      }
+      if (!(c >= '0' && c <= '9')) {
+        sr.seek_from_current(-1);
+        break;
+      }
+      read_digit = true;
+      *out = (*out * 10) + static_cast<uint32_t>(c - '0');
     }
-    if (c < '0' || c > '9') return false;
-    obj_num = obj_num * 10 + (c - '0');
+    return read_digit;
+  };
+
+  uint32_t obj_num = 0;
+  if (!read_uint(&obj_num)) {
+    return false;
   }
 
-  // TODO: Continue parsing generation number and object content
+  if (!parser.skip_whitespace(sr)) return false;
+
+  uint32_t gen_num = 0;
+  if (!read_uint(&gen_num)) {
+    return false;
+  }
+
+  if (!parser.skip_whitespace(sr)) return false;
+
+  if (!parser.consume_keyword(sr, "obj")) {
+    return false;
+  }
+
+  Value value;
+  if (!parse_object(sr, parser, &value)) {
+    return false;
+  }
+
+  if (!parser.skip_whitespace(sr)) return false;
+  if (!parser.consume_keyword(sr, "endobj")) {
+    return false;
+  }
+
+  *out_value = std::move(value);
+  out_value->ref_object_number = obj_num;
+  out_value->ref_generation_number = static_cast<uint16_t>(gen_num);
 
   return true;
 }
@@ -1471,56 +1583,1419 @@ SignatureField Pdf::parse_signature_field(const Pdf& pdf, const Dictionary& fiel
 
 // Stub implementations for missing functions
 bool parse_string(StreamReader& sr, Parser& parser, std::string* out_str) {
-  // Stub implementation - needs proper PDF string parsing
-  *out_str = "";
+  (void)parser;
+  if (!out_str) return false;
+
+  out_str->clear();
+
+  uint8_t first_ch;
+  if (!sr.read1(&first_ch)) return false;
+  char first = static_cast<char>(first_ch);
+
+  if (first == '(') {
+    std::string result;
+    int depth = 1;
+
+    while (true) {
+      uint8_t raw;
+      if (!sr.read1(&raw)) {
+        return false;
+      }
+      char c = static_cast<char>(raw);
+
+      if (c == '\\') {
+        uint8_t escape_raw;
+        if (!sr.read1(&escape_raw)) {
+          return false;
+        }
+        char esc = static_cast<char>(escape_raw);
+
+        if (esc == '\r' || esc == '\n') {
+          // Line continuation. If CR followed by LF consume both.
+          if (esc == '\r') {
+            uint8_t next_raw;
+            if (sr.read1(&next_raw)) {
+              if (static_cast<char>(next_raw) != '\n') {
+                sr.seek_from_current(-1);
+              }
+            }
+          }
+          continue;
+        }
+
+        switch (esc) {
+          case 'n':
+            result.push_back('\n');
+            break;
+          case 'r':
+            result.push_back('\r');
+            break;
+          case 't':
+            result.push_back('\t');
+            break;
+          case 'b':
+            result.push_back('\b');
+            break;
+          case 'f':
+            result.push_back('\f');
+            break;
+          case '(':
+          case ')':
+          case '\\':
+            result.push_back(esc);
+            break;
+          default: {
+            if (esc >= '0' && esc <= '7') {
+              int octal = esc - '0';
+              for (int i = 0; i < 2; ++i) {
+                uint8_t next_raw;
+                if (!sr.read1(&next_raw)) {
+                  break;
+                }
+                char next = static_cast<char>(next_raw);
+                if (next >= '0' && next <= '7') {
+                  octal = (octal << 3) + (next - '0');
+                } else {
+                  sr.seek_from_current(-1);
+                  break;
+                }
+              }
+              result.push_back(static_cast<char>(octal & 0xFF));
+            } else {
+              // Unknown escape sequence; keep literal character.
+              result.push_back(esc);
+            }
+            break;
+          }
+        }
+        continue;
+      }
+
+      if (c == '(') {
+        depth++;
+        result.push_back(c);
+      } else if (c == ')') {
+        depth--;
+        if (depth == 0) {
+          break;
+        }
+        result.push_back(c);
+      } else {
+        result.push_back(c);
+      }
+    }
+
+    *out_str = std::move(result);
+    return true;
+  }
+
+  if (first == '<') {
+    std::string bytes;
+    std::string hex_buffer;
+
+    while (true) {
+      uint8_t raw;
+      if (!sr.read1(&raw)) {
+        return false;
+      }
+      char c = static_cast<char>(raw);
+
+      if (c == '>') {
+        break;
+      }
+
+      if (is_whitespace_char(c)) {
+        continue;
+      }
+
+      int hv = hex_value(c);
+      if (hv < 0) {
+        return false;
+      }
+      hex_buffer.push_back(static_cast<char>(hv));
+    }
+
+    if (hex_buffer.size() % 2 == 1) {
+      hex_buffer.push_back(0);  // Pad with zero nibble as per PDF spec
+    }
+
+    bytes.reserve(hex_buffer.size() / 2);
+    for (size_t i = 0; i < hex_buffer.size(); i += 2) {
+      int high = static_cast<unsigned char>(hex_buffer[i]);
+      int low = static_cast<unsigned char>(hex_buffer[i + 1]);
+      bytes.push_back(static_cast<char>((high << 4) | low));
+    }
+
+    *out_str = std::move(bytes);
+    return true;
+  }
+
   return false;
 }
 
 bool parse_name(StreamReader& sr, Parser& parser, std::string* out_str) {
-  // Stub implementation - needs proper PDF name parsing  
-  *out_str = "";
-  return false;
+  (void)parser;
+  if (!out_str) return false;
+  out_str->clear();
+
+  while (true) {
+    uint8_t raw;
+    if (!sr.read1(&raw)) {
+      break;
+    }
+    char c = static_cast<char>(raw);
+
+    if (is_delimiter_char(c) || is_whitespace_char(c)) {
+      sr.seek_from_current(-1);
+      break;
+    }
+
+    if (c == '#') {
+      uint8_t h1_raw, h2_raw;
+      if (!sr.read1(&h1_raw) || !sr.read1(&h2_raw)) {
+        return false;
+      }
+      int hi = hex_value(static_cast<char>(h1_raw));
+      int lo = hex_value(static_cast<char>(h2_raw));
+      if (hi < 0 || lo < 0) {
+        return false;
+      }
+      out_str->push_back(static_cast<char>((hi << 4) | lo));
+      continue;
+    }
+
+    out_str->push_back(c);
+  }
+
+  return true;
 }
 
 bool parse_number(StreamReader& sr, Parser& parser, double* out_number) {
-  // Stub implementation - needs proper PDF number parsing
-  *out_number = 0.0;
+  (void)parser;
+  if (!out_number) return false;
+
+  std::string token;
+  bool has_digit = false;
+
+  while (true) {
+    uint8_t raw;
+    if (!sr.read1(&raw)) {
+      break;
+    }
+    char c = static_cast<char>(raw);
+
+    if (is_delimiter_char(c)) {
+      sr.seek_from_current(-1);
+      break;
+    }
+
+    if (!is_whitespace_char(c)) {
+      token.push_back(c);
+      if (std::isdigit(static_cast<unsigned char>(c))) {
+        has_digit = true;
+      }
+    } else {
+      break;
+    }
+  }
+
+  if (token.empty() || !has_digit) {
+    return false;
+  }
+
+  try {
+    *out_number = std::stod(token);
+  } catch (const std::exception&) {
+    return false;
+  }
+
+  return true;
+}
+
+namespace {
+
+bool compute_object_body_offset(const Pdf& pdf, uint64_t header_offset,
+                                uint32_t obj_num, uint16_t gen_num,
+                                uint64_t* body_offset) {
+  if (!pdf.data || !body_offset || header_offset >= pdf.data_size) {
+    return false;
+  }
+
+  StreamReader sr(pdf.data, pdf.data_size, /*swap_endian=*/false);
+  Parser parser(sr);
+
+  if (!sr.seek_set(header_offset)) {
+    return false;
+  }
+
+  auto read_uint32 = [&](uint32_t* out) -> bool {
+    if (!out) return false;
+    *out = 0;
+    bool has_digit = false;
+
+    while (true) {
+      uint8_t raw;
+      if (!sr.read1(&raw)) {
+        return has_digit;
+      }
+      char c = static_cast<char>(raw);
+
+      if (is_whitespace_char(c)) {
+        if (has_digit) {
+          return true;
+        }
+        continue;
+      }
+
+      if (!std::isdigit(static_cast<unsigned char>(c))) {
+        if (!has_digit) {
+          return false;
+        }
+        sr.seek_from_current(-1);
+        return true;
+      }
+
+      has_digit = true;
+      *out = (*out * 10) + static_cast<uint32_t>(c - '0');
+    }
+  };
+
+  uint32_t parsed_obj = 0;
+  if (!read_uint32(&parsed_obj) || parsed_obj != obj_num) {
+    return false;
+  }
+
+  if (!parser.skip_whitespace(sr)) {
+    return false;
+  }
+
+  uint32_t parsed_gen = 0;
+  if (!read_uint32(&parsed_gen) || parsed_gen != gen_num) {
+    return false;
+  }
+
+  if (!parser.skip_whitespace(sr)) {
+    return false;
+  }
+
+  if (!parser.consume_keyword(sr, "obj")) {
+    return false;
+  }
+
+  if (!parser.skip_whitespace(sr)) {
+    return false;
+  }
+
+  *body_offset = sr.tell();
+  return true;
+}
+
+bool find_indirect_object_body_offset(const Pdf& pdf, uint32_t obj_num,
+                                      uint16_t gen_num, uint64_t* offset) {
+  if (!pdf.data || pdf.data_size == 0 || !offset) {
+    return false;
+  }
+
+  const uint8_t* data = pdf.data;
+  const size_t size = pdf.data_size;
+  const std::string token = std::to_string(obj_num) + " " +
+                            std::to_string(gen_num) + " obj";
+  const size_t token_len = token.size();
+
+  if (token_len == 0 || token_len > size) {
+    return false;
+  }
+
+  for (size_t pos = 0; pos + token_len <= size; ++pos) {
+    if (data[pos] != static_cast<uint8_t>(token[0])) {
+      continue;
+    }
+
+    bool matched = true;
+    for (size_t i = 1; i < token_len; ++i) {
+      if (data[pos + i] != static_cast<uint8_t>(token[i])) {
+        matched = false;
+        break;
+      }
+    }
+    if (!matched) {
+      continue;
+    }
+
+    if (pos > 0) {
+      char before = static_cast<char>(data[pos - 1]);
+      if (!is_whitespace_char(before) && !is_delimiter_char(before)) {
+        continue;
+      }
+    }
+
+    size_t after = pos + token_len;
+    if (after < size) {
+      char after_c = static_cast<char>(data[after]);
+      if (!is_whitespace_char(after_c) && !is_delimiter_char(after_c)) {
+        continue;
+      }
+    }
+
+    while (after < size && is_whitespace_char(static_cast<char>(data[after]))) {
+      after++;
+    }
+
+    uint64_t body_offset = 0;
+    if (compute_object_body_offset(pdf, static_cast<uint64_t>(pos), obj_num,
+                                   gen_num, &body_offset)) {
+      *offset = body_offset;
+      return true;
+    }
+  }
+
   return false;
 }
 
+}  // namespace
+
 ResolvedObject resolve_reference(const Pdf& pdf, uint32_t obj_num, uint16_t gen_num) {
-  // Stub implementation - needs proper object resolution
-  ResolvedObject result;
-  result.success = false;
-  result.error = "resolve_reference not yet implemented";
-  return std::move(result);
+  return pdf.load_object(obj_num, gen_num);
 }
 
-// Stub implementations for Pdf member functions
-bool Pdf::load_document_structure() {
-  // Parse Phase 3 features
-  parse_acro_form(*this, catalog);
+ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
+  ResolvedObject result;
 
-  // Parse Phase 4 features
+  uint64_t key = (static_cast<uint64_t>(obj_num) << 32) |
+                 static_cast<uint64_t>(gen_num);
+  auto cached = object_cache.find(key);
+  if (cached != object_cache.end()) {
+    result.success = true;
+    result.value = cached->second;
+    return result;
+  }
+
+  if (!object_offsets_built && !object_offsets_failed) {
+    if (build_object_offset_cache()) {
+      object_offsets_built = true;
+    } else {
+      object_offsets_failed = true;
+    }
+  }
+  // DEBUG
+
+  uint64_t body_offset = 0;
+  bool have_offset = false;
+
+  if (object_offsets_built) {
+    auto found = object_offsets.find(key);
+    if (found != object_offsets.end()) {
+      body_offset = found->second;
+      have_offset = true;
+    } else if (gen_num != 0) {
+      uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
+      auto zero_found = object_offsets.find(zero_key);
+      if (zero_found != object_offsets.end()) {
+        body_offset = zero_found->second;
+        have_offset = true;
+      }
+    }
+  }
+
+  if (!have_offset) {
+    auto stream_it = object_stream_entries.find(key);
+    if (stream_it == object_stream_entries.end() && gen_num != 0) {
+      uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
+      stream_it = object_stream_entries.find(zero_key);
+    }
+    if (stream_it != object_stream_entries.end()) {
+      Value from_stream;
+      if (load_object_from_stream(obj_num, gen_num, stream_it->second.first,
+                                  stream_it->second.second, &from_stream)) {
+        object_cache[key] = from_stream;
+        result.success = true;
+        result.value = std::move(from_stream);
+        return result;
+      }
+      result.success = false;
+      result.error = "Failed to load object from object stream";
+      return result;
+    }
+
+    if (!find_indirect_object_body_offset(*this, obj_num, gen_num, &body_offset)) {
+      result.success = false;
+      result.error = "Failed to locate object";
+      return result;
+    }
+  }
+
+  StreamReader sr(data, data_size, /*swap_endian=*/false);
+  Parser parser(sr);
+
+  if (!sr.seek_set(body_offset)) {
+    result.success = false;
+    result.error = "Invalid object offset";
+    return result;
+  }
+
+  if (!parser.skip_whitespace(sr)) {
+    result.success = false;
+    result.error = "Failed to prepare object stream";
+    return result;
+  }
+
+  if (!parse_object(sr, parser, &result.value)) {
+    result.success = false;
+    result.error = "Failed to parse object";
+    return result;
+  }
+
+  if (!parser.skip_whitespace(sr)) {
+    result.success = false;
+    result.error = "Failed to parse object";
+    return result;
+  }
+
+  if (!parser.consume_keyword(sr, "endobj")) {
+    result.success = false;
+    result.error = "Missing endobj for object";
+    return result;
+  }
+
+  result.success = true;
+  object_cache[key] = result.value;
+  return result;
+}
+
+bool Pdf::build_object_offset_cache() const {
+  object_offsets.clear();
+  object_stream_entries.clear();
+  object_stream_cache.clear();
+  object_stream_cache_order.clear();
+
+  if (!data || data_size == 0) {
+    return false;
+  }
+
+  const char* begin = reinterpret_cast<const char*>(data);
+  const char* end = begin + data_size;
+  const char keyword[] = "startxref";
+  const size_t keyword_len = sizeof(keyword) - 1;
+
+  if (data_size < keyword_len) {
+    return false;
+  }
+
+  const char* startxref_pos = nullptr;
+  for (size_t pos = data_size - keyword_len;; --pos) {
+    if (std::memcmp(begin + pos, keyword, keyword_len) == 0) {
+      startxref_pos = begin + pos;
+      break;
+    }
+    if (pos == 0) {
+      break;
+    }
+  }
+
+  if (!startxref_pos) {
+    return false;
+  }
+
+  const char* cursor = startxref_pos + keyword_len;
+  while (cursor < end && is_whitespace_char(*cursor)) {
+    cursor++;
+  }
+  if (cursor >= end) {
+    return false;
+  }
+
+  uint64_t initial_xref = 0;
+  bool has_digit = false;
+  while (cursor < end && std::isdigit(static_cast<unsigned char>(*cursor))) {
+    has_digit = true;
+    initial_xref = initial_xref * 10 + static_cast<uint64_t>(*cursor - '0');
+    cursor++;
+  }
+  if (!has_digit || initial_xref >= data_size) {
+    return false;
+  }
+
+  auto skip_ws_ptr = [&](const char*& p) {
+    while (p < end && is_whitespace_char(*p)) {
+      p++;
+    }
+  };
+
+  auto parse_uint_ptr = [&](const char*& p, uint64_t& out) -> bool {
+    skip_ws_ptr(p);
+    if (p >= end || !std::isdigit(static_cast<unsigned char>(*p))) {
+      return false;
+    }
+    out = 0;
+    while (p < end && std::isdigit(static_cast<unsigned char>(*p))) {
+      out = out * 10 + static_cast<uint64_t>(*p - '0');
+      p++;
+    }
+    return true;
+  };
+
+  auto store_entry = [&](uint32_t object_number, uint16_t generation,
+                         uint64_t header_offset) {
+    if (header_offset >= data_size) {
+      return;
+    }
+    uint64_t body_offset = 0;
+    if (compute_object_body_offset(*this, header_offset, object_number,
+                                   generation, &body_offset)) {
+      uint64_t key = (static_cast<uint64_t>(object_number) << 32) |
+                     static_cast<uint64_t>(generation);
+      object_offsets[key] = body_offset;
+    }
+  };
+
+  auto update_trailer = [&](const Dictionary& dict) {
+    Pdf* self = const_cast<Pdf*>(this);
+    self->trailer = dict;
+
+    auto size_it_local = dict.find("Size");
+    if (size_it_local != dict.end() && size_it_local->second.type == Value::NUMBER) {
+      self->size = static_cast<uint32_t>(size_it_local->second.number);
+    }
+
+    auto root_it = dict.find("Root");
+    if (root_it != dict.end() && root_it->second.type == Value::REFERENCE) {
+      self->root = root_it->second.ref_object_number;
+    }
+
+    auto info_it = dict.find("Info");
+    if (info_it != dict.end() && info_it->second.type == Value::REFERENCE) {
+      self->info = info_it->second.ref_object_number;
+    }
+
+    auto encrypt_it = dict.find("Encrypt");
+    if (encrypt_it != dict.end() && encrypt_it->second.type == Value::REFERENCE) {
+      self->encrypt = encrypt_it->second.ref_object_number;
+    }
+
+    auto prev_it_root = dict.find("Prev");
+    if (prev_it_root != dict.end() && prev_it_root->second.type == Value::NUMBER) {
+      self->prev = static_cast<uint32_t>(prev_it_root->second.number);
+    }
+
+    auto id_it = dict.find("ID");
+    if (id_it != dict.end() && id_it->second.type == Value::ARRAY &&
+        !id_it->second.array.empty() &&
+        id_it->second.array[0].type == Value::STRING) {
+      self->id = id_it->second.array[0].str;
+    }
+  };
+
+  auto handle_trailer_offsets = [&](const Dictionary& dict,
+                                   std::deque<uint64_t>& worklist) {
+    auto push_offset = [&](const Value& v) {
+      if (v.type == Value::NUMBER) {
+        uint64_t off = static_cast<uint64_t>(v.number);
+        if (off < data_size) {
+          worklist.push_back(off);
+        }
+      }
+    };
+
+    update_trailer(dict);
+
+    auto prev_it = dict.find("Prev");
+    if (prev_it != dict.end()) {
+      push_offset(prev_it->second);
+    }
+
+    auto xrefstm_it = dict.find("XRefStm");
+    if (xrefstm_it != dict.end()) {
+      push_offset(xrefstm_it->second);
+    }
+  };
+
+  std::deque<uint64_t> worklist;
+  std::unordered_set<uint64_t> visited_offsets;
+  worklist.push_back(initial_xref);
+
+  bool any_entries = false;
+
+  while (!worklist.empty()) {
+    uint64_t current_offset = worklist.front();
+    worklist.pop_front();
+
+    if (current_offset >= data_size) {
+      continue;
+    }
+    if (!visited_offsets.insert(current_offset).second) {
+      continue;
+    }
+
+    const char* ptr = begin + current_offset;
+
+    auto parse_traditional_xref = [&](uint64_t offset) -> bool {
+      const char* p = begin + offset;
+      if (p + 4 > end || std::memcmp(p, "xref", 4) != 0) {
+        return false;
+      }
+      p += 4;
+      skip_ws_ptr(p);
+
+      while (p < end) {
+        if (p[0] == '%') {
+          while (p < end && *p != '\n' && *p != '\r') {
+            p++;
+          }
+          skip_ws_ptr(p);
+          continue;
+        }
+
+        if (p + 7 <= end && std::memcmp(p, "trailer", 7) == 0) {
+          p += 7;
+          skip_ws_ptr(p);
+
+          uint64_t dict_offset = static_cast<uint64_t>(p - begin);
+          StreamReader sr(data, data_size, /*swap_endian=*/false);
+          Parser parser(sr);
+          if (!sr.seek_set(dict_offset)) {
+            return false;
+          }
+
+          Value trailer_val;
+          trailer_val.SetType(Value::DICTIONARY);
+          if (!parse_dictionary(sr, parser, &trailer_val.dict)) {
+            return false;
+          }
+
+          handle_trailer_offsets(trailer_val.dict, worklist);
+          any_entries = any_entries || !object_offsets.empty();
+          return true;
+        }
+
+        uint64_t first_obj = 0;
+        if (!parse_uint_ptr(p, first_obj)) {
+          break;
+        }
+
+        uint64_t count = 0;
+        if (!parse_uint_ptr(p, count) || count > 10000000ULL) {
+          return false;
+        }
+
+        skip_ws_ptr(p);
+
+        for (uint64_t i = 0; i < count; ++i) {
+          if (p >= end) {
+            return false;
+          }
+
+          char* endptr = nullptr;
+          uint64_t entry_offset = std::strtoull(p, &endptr, 10);
+          if (endptr == p || entry_offset >= data_size) {
+            return false;
+          }
+          p = endptr;
+
+          if (p >= end || *p != ' ') {
+            return false;
+          }
+          p++;
+
+          unsigned long entry_gen_ul = std::strtoul(p, &endptr, 10);
+          if (endptr == p) {
+            return false;
+          }
+          p = endptr;
+
+          if (p >= end || *p != ' ') {
+            return false;
+          }
+          p++;
+
+          if (p >= end) {
+            return false;
+          }
+          char entry_type = *p++;
+
+          while (p < end && (*p == ' ' || *p == '\t')) {
+            p++;
+          }
+          if (p < end && *p == '\r') {
+            p++;
+          }
+          if (p < end && *p == '\n') {
+            p++;
+          }
+
+          if (entry_type == 'n') {
+            store_entry(static_cast<uint32_t>(first_obj + i),
+                        static_cast<uint16_t>(entry_gen_ul), entry_offset);
+            any_entries = true;
+          }
+        }
+
+        skip_ws_ptr(p);
+      }
+
+      return true;
+    };
+
+    auto parse_xref_stream = [&](uint64_t offset) -> bool {
+      StreamReader sr(data, data_size, /*swap_endian=*/false);
+      Parser parser(sr);
+      if (!sr.seek_set(offset)) {
+        return false;
+      }
+
+      Value xref_obj;
+      if (!parse_indirect_object(sr, parser, &xref_obj)) {
+        return false;
+      }
+
+      if (xref_obj.type != Value::STREAM) {
+        return false;
+      }
+
+      auto type_it = xref_obj.stream.dict.find("Type");
+      if (type_it != xref_obj.stream.dict.end()) {
+        if (type_it->second.type != Value::NAME ||
+            type_it->second.name != "XRef") {
+          return false;
+        }
+      }
+
+      auto w_it = xref_obj.stream.dict.find("W");
+      if (w_it == xref_obj.stream.dict.end() ||
+          w_it->second.type != Value::ARRAY ||
+          w_it->second.array.size() != 3) {
+        return false;
+      }
+
+      int w[3] = {0, 0, 0};
+      for (size_t i = 0; i < 3; ++i) {
+        const Value& item = w_it->second.array[i];
+        if (item.type != Value::NUMBER) {
+          return false;
+        }
+        int width = static_cast<int>(item.number);
+        if (width < 0 || width > 8) {
+          return false;
+        }
+        w[i] = width;
+      }
+
+      auto size_it = xref_obj.stream.dict.find("Size");
+      if (size_it == xref_obj.stream.dict.end() ||
+          size_it->second.type != Value::NUMBER) {
+        return false;
+      }
+      uint64_t doc_size = static_cast<uint64_t>(size_it->second.number);
+
+      std::vector<uint64_t> index_pairs;
+      auto index_it = xref_obj.stream.dict.find("Index");
+      if (index_it != xref_obj.stream.dict.end() &&
+          index_it->second.type == Value::ARRAY) {
+        const auto& arr = index_it->second.array;
+        if (arr.size() % 2 != 0) {
+          return false;
+        }
+        index_pairs.reserve(arr.size());
+        for (const auto& v : arr) {
+          if (v.type != Value::NUMBER) {
+            return false;
+          }
+          index_pairs.push_back(static_cast<uint64_t>(v.number));
+        }
+      } else {
+        index_pairs = {0, doc_size};
+      }
+
+      DecodedStream decoded = decode_stream(*this, xref_obj);
+      if (!decoded.success) {
+        return false;
+      }
+
+      size_t pos = 0;
+      const auto& bytes = decoded.data;
+
+      auto read_field = [&](int width) -> uint64_t {
+        uint64_t value = 0;
+        for (int i = 0; i < width; ++i) {
+          value = (value << 8) | static_cast<uint64_t>(bytes[pos++]);
+        }
+        return value;
+      };
+
+      for (size_t i = 0; i + 1 < index_pairs.size(); i += 2) {
+        uint64_t obj = index_pairs[i];
+        uint64_t count = index_pairs[i + 1];
+
+        if (count > doc_size) {
+          return false;
+        }
+
+        for (uint64_t j = 0; j < count; ++j, ++obj) {
+          if (pos > bytes.size()) {
+            return false;
+          }
+
+          if (w[0] && pos + static_cast<size_t>(w[0]) > bytes.size()) {
+            return false;
+          }
+          uint64_t type_field = w[0] ? read_field(w[0]) : 1;
+
+          if (w[1] && pos + static_cast<size_t>(w[1]) > bytes.size()) {
+            return false;
+          }
+          uint64_t field2 = w[1] ? read_field(w[1]) : 0;
+
+          if (w[2] && pos + static_cast<size_t>(w[2]) > bytes.size()) {
+            return false;
+          }
+          uint64_t field3 = w[2] ? read_field(w[2]) : 0;
+
+          if (type_field == 1) {
+            store_entry(static_cast<uint32_t>(obj),
+                        static_cast<uint16_t>(field3), field2);
+            any_entries = true;
+          } else if (type_field == 2) {
+            uint32_t stream_object = static_cast<uint32_t>(field2);
+            uint32_t index = static_cast<uint32_t>(field3);
+            uint64_t key = (static_cast<uint64_t>(obj) << 32);
+            object_stream_entries[key] = {stream_object, index};
+            any_entries = true;
+          }
+        }
+      }
+
+      handle_trailer_offsets(xref_obj.stream.dict, worklist);
+      return true;
+    };
+
+    if (current_offset + 4 <= data_size &&
+        std::memcmp(ptr, "xref", 4) == 0) {
+      parse_traditional_xref(current_offset);
+    } else {
+      parse_xref_stream(current_offset);
+    }
+  }
+
+  return any_entries && (!object_offsets.empty() || !object_stream_entries.empty());
+}
+
+bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
+                                  uint32_t stream_object_number,
+                                  uint32_t index, Value* out_value) const {
+  if (!out_value) {
+    return false;
+  }
+
+  // Compressed objects are always generation 0 per PDF spec.
+  if (generation != 0) {
+    return load_object_from_stream(object_number, 0, stream_object_number, index,
+                                   out_value);
+  }
+
+  ResolvedObject stream_obj = load_object(stream_object_number, 0);
+  if (!stream_obj.success || stream_obj.value.type != Value::STREAM) {
+    return false;
+  }
+
+  const auto& dict = stream_obj.value.stream.dict;
+  auto n_it = dict.find("N");
+  auto first_it = dict.find("First");
+  if (n_it == dict.end() || first_it == dict.end() ||
+      n_it->second.type != Value::NUMBER ||
+      first_it->second.type != Value::NUMBER) {
+    return false;
+  }
+
+  uint32_t object_count = static_cast<uint32_t>(n_it->second.number);
+  uint32_t first_offset = static_cast<uint32_t>(first_it->second.number);
+  if (object_count == 0 || index >= object_count) {
+    return false;
+  }
+
+  const std::vector<uint8_t>* data_ptr = nullptr;
+  auto touch_cache_entry = [&](uint32_t key, bool inserted) {
+    if (!inserted) {
+      for (auto it = object_stream_cache_order.begin();
+           it != object_stream_cache_order.end(); ++it) {
+        if (*it == key) {
+          object_stream_cache_order.erase(it);
+          break;
+        }
+      }
+    }
+    object_stream_cache_order.push_back(key);
+    while (object_stream_cache_order.size() > object_stream_cache_capacity) {
+      uint32_t evict = object_stream_cache_order.front();
+      object_stream_cache_order.pop_front();
+      object_stream_cache.erase(evict);
+    }
+  };
+
+  auto cache_it = object_stream_cache.find(stream_object_number);
+  if (cache_it == object_stream_cache.end()) {
+    DecodedStream decoded = decode_stream(*this, stream_obj.value);
+    if (!decoded.success) {
+      return false;
+    }
+    cache_it = object_stream_cache
+                   .emplace(stream_object_number, std::move(decoded.data))
+                   .first;
+    touch_cache_entry(stream_object_number, true);
+  } else {
+    touch_cache_entry(stream_object_number, false);
+  }
+  data_ptr = &cache_it->second;
+  const std::vector<uint8_t>& data = *data_ptr;
+  if (first_offset > data.size()) {
+    return false;
+  }
+
+  std::vector<std::pair<uint32_t, uint32_t>> entries;
+  entries.reserve(object_count);
+
+  size_t pos = 0;
+  auto skip_ws = [&]() {
+    while (pos < first_offset) {
+      char c = static_cast<char>(data[pos]);
+      if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+        break;
+      }
+      pos++;
+    }
+  };
+
+  auto read_uint = [&](uint32_t* out) -> bool {
+    skip_ws();
+    if (pos >= first_offset) {
+      return false;
+    }
+    uint32_t value = 0;
+    bool has_digit = false;
+    while (pos < first_offset) {
+      char c = static_cast<char>(data[pos]);
+      if (c < '0' || c > '9') {
+        break;
+      }
+      has_digit = true;
+      value = value * 10 + static_cast<uint32_t>(c - '0');
+      pos++;
+    }
+    if (!has_digit) {
+      return false;
+    }
+    *out = value;
+    return true;
+  };
+
+  for (uint32_t i = 0; i < object_count; ++i) {
+    uint32_t object_id = 0;
+    uint32_t offset_val = 0;
+    if (!read_uint(&object_id) || !read_uint(&offset_val)) {
+      return false;
+    }
+    entries.emplace_back(object_id, offset_val);
+  }
+
+  if (index >= entries.size()) {
+    return false;
+  }
+
+  uint32_t object_offset = entries[index].second;
+  uint32_t object_id_from_stream = entries[index].first;
+  if (object_id_from_stream != object_number) {
+    // mismatch, treat as failure
+    return false;
+  }
+
+  size_t content_start = static_cast<size_t>(first_offset) + object_offset;
+  if (content_start >= data.size()) {
+    return false;
+  }
+
+  size_t content_end = data.size();
+  if (index + 1 < entries.size()) {
+    size_t next_offset = static_cast<size_t>(first_offset) + entries[index + 1].second;
+    if (next_offset <= data.size()) {
+      content_end = next_offset;
+    }
+  }
+
+  if (content_end <= content_start) {
+    return false;
+  }
+
+  StreamReader sr(data.data() + content_start, content_end - content_start,
+                  /*swap_endian=*/false);
+  Parser parser(sr);
+
+  Value parsed;
+  if (!parse_object(sr, parser, &parsed)) {
+    return false;
+  }
+
+  *out_value = std::move(parsed);
+  return true;
+}
+
+void Pdf::set_object_stream_cache_capacity(size_t capacity) const {
+  if (capacity == 0) {
+    capacity = 1;
+  }
+  object_stream_cache_capacity = capacity;
+
+  while (object_stream_cache_order.size() > object_stream_cache_capacity) {
+    uint32_t evict = object_stream_cache_order.front();
+    object_stream_cache_order.pop_front();
+    object_stream_cache.erase(evict);
+  }
+}
+
+bool Pdf::load_document_structure() {
+  if (!object_offsets_built && !object_offsets_failed) {
+    if (build_object_offset_cache()) {
+      object_offsets_built = true;
+    } else {
+      object_offsets_failed = true;
+    }
+  }
+
+  auto ensure_field_from_trailer = [&](const char* key, uint32_t* out) {
+    if (*out != 0) {
+      return;
+    }
+    auto it = trailer.find(key);
+    if (it != trailer.end() && it->second.type == Value::REFERENCE) {
+      *out = it->second.ref_object_number;
+    }
+  };
+
+  if (size == 0) {
+    auto it = trailer.find("Size");
+    if (it != trailer.end() && it->second.type == Value::NUMBER) {
+      size = static_cast<uint32_t>(it->second.number);
+    }
+  }
+
+  ensure_field_from_trailer("Root", &root);
+  ensure_field_from_trailer("Info", &info);
+  ensure_field_from_trailer("Encrypt", &encrypt);
+
+  catalog.object_number = root;
+  catalog.pages.clear();
+  catalog.pages_count = 0;
+
+  if (root == 0) {
+    return false;
+  }
+
+  ResolvedObject root_obj = load_object(root, 0);
+  if (!root_obj.success || root_obj.value.type != Value::DICTIONARY) {
+    return false;
+  }
+
+  const Dictionary& root_dict = root_obj.value.dict;
+  auto version_it = root_dict.find("Version");
+  if (version_it != root_dict.end() && version_it->second.type == Value::NAME) {
+    catalog.version = version_it->second.name;
+  }
+
+  struct InheritedProps {
+    Dictionary resources;
+    bool has_resources{false};
+    std::vector<double> media_box;
+    bool has_media_box{false};
+    std::vector<double> crop_box;
+    bool has_crop_box{false};
+  };
+
+  auto extract_box = [&](const Value& value, std::vector<double>* out) -> bool {
+    if (value.type != Value::ARRAY || value.array.size() < 4) {
+      return false;
+    }
+    std::vector<double> box;
+    for (size_t i = 0; i < 4; ++i) {
+      const Value& entry = value.array[i];
+      if (entry.type != Value::NUMBER) {
+        return false;
+      }
+      box.push_back(entry.number);
+    }
+    *out = std::move(box);
+    return true;
+  };
+
+  auto resolve_dictionary_value = [&](const Value& value, Dictionary* out) -> bool {
+    if (value.type == Value::DICTIONARY) {
+      *out = value.dict;
+      return true;
+    }
+    if (value.type == Value::REFERENCE) {
+      ResolvedObject resolved = load_object(value.ref_object_number,
+                                            value.ref_generation_number);
+      if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+        *out = resolved.value.dict;
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto apply_inheritance = [&](const Dictionary& dict,
+                               const InheritedProps& parent) {
+    InheritedProps props = parent;
+
+    auto res_it = dict.find("Resources");
+    if (res_it != dict.end()) {
+      Dictionary resolved;
+      if (resolve_dictionary_value(res_it->second, &resolved)) {
+        props.resources = std::move(resolved);
+        props.has_resources = true;
+      }
+    }
+
+    auto media_it = dict.find("MediaBox");
+    if (media_it != dict.end()) {
+      std::vector<double> box;
+      if (extract_box(media_it->second, &box)) {
+        props.media_box = std::move(box);
+        props.has_media_box = true;
+      }
+    }
+
+    auto crop_it = dict.find("CropBox");
+    if (crop_it != dict.end()) {
+      std::vector<double> box;
+      if (extract_box(crop_it->second, &box)) {
+        props.crop_box = std::move(box);
+        props.has_crop_box = true;
+      }
+    }
+
+    return props;
+  };
+
+  auto append_page = [&](const Dictionary& dict, uint32_t object_number,
+                         const InheritedProps& inherited) {
+    Page page;
+    page.object_number = object_number;
+    page.page_number = static_cast<uint32_t>(catalog.pages.size() + 1);
+
+    Dictionary resources;
+    bool has_resources = false;
+    auto res_it = dict.find("Resources");
+    if (res_it != dict.end()) {
+      if (resolve_dictionary_value(res_it->second, &resources)) {
+        has_resources = true;
+      }
+    }
+    if (!has_resources && inherited.has_resources) {
+      resources = inherited.resources;
+      has_resources = true;
+    }
+    if (has_resources) {
+      page.resources = std::move(resources);
+    }
+
+    auto media_it = dict.find("MediaBox");
+    if (media_it != dict.end()) {
+      std::vector<double> box;
+      if (extract_box(media_it->second, &box)) {
+        page.media_box = std::move(box);
+      }
+    } else if (inherited.has_media_box) {
+      page.media_box = inherited.media_box;
+    }
+
+    auto crop_it = dict.find("CropBox");
+    if (crop_it != dict.end()) {
+      std::vector<double> box;
+      if (extract_box(crop_it->second, &box)) {
+        page.crop_box = std::move(box);
+      }
+    } else if (inherited.has_crop_box) {
+      page.crop_box = inherited.crop_box;
+    }
+
+    auto rotate_it = dict.find("Rotate");
+    if (rotate_it != dict.end() && rotate_it->second.type == Value::NUMBER) {
+      page.rotate = rotate_it->second.number;
+    }
+
+    auto contents_it = dict.find("Contents");
+    if (contents_it != dict.end()) {
+      if (contents_it->second.type == Value::ARRAY) {
+        page.contents = contents_it->second.array;
+      } else {
+        page.contents.clear();
+        page.contents.push_back(contents_it->second);
+      }
+    }
+
+    catalog.pages.push_back(std::move(page));
+  };
+
+  std::unordered_set<uint64_t> visited;
+  std::function<void(uint32_t, const InheritedProps&)> walk_pages;
+  std::function<void(const Dictionary&, uint32_t, const InheritedProps&)> process_dict;
+
+  process_dict = [&](const Dictionary& dict, uint32_t object_number,
+                     const InheritedProps& parent_props) {
+    auto type_it = dict.find("Type");
+    std::string type_name;
+    if (type_it != dict.end() && type_it->second.type == Value::NAME) {
+      type_name = type_it->second.name;
+    }
+
+    InheritedProps props = apply_inheritance(dict, parent_props);
+
+    if (type_name == "Pages") {
+      auto kids_it = dict.find("Kids");
+      if (kids_it != dict.end() && kids_it->second.type == Value::ARRAY) {
+        for (const auto& kid : kids_it->second.array) {
+          if (kid.type == Value::REFERENCE) {
+            walk_pages(kid.ref_object_number, props);
+          } else if (kid.type == Value::DICTIONARY) {
+            process_dict(kid.dict, 0, props);
+          }
+        }
+      }
+    } else if (type_name == "Page" || type_name.empty()) {
+      append_page(dict, object_number, props);
+    }
+  };
+
+  walk_pages = [&](uint32_t object_number, const InheritedProps& parent_props) {
+    uint64_t key = (static_cast<uint64_t>(object_number) << 32);
+    if (!visited.insert(key).second) {
+      return;
+    }
+
+    ResolvedObject obj = load_object(object_number, 0);
+    if (!obj.success || obj.value.type != Value::DICTIONARY) {
+      return;
+    }
+
+    process_dict(obj.value.dict, object_number, parent_props);
+  };
+
+  InheritedProps root_props;
+  root_props = apply_inheritance(root_dict, root_props);
+
+  auto pages_it = root_dict.find("Pages");
+  if (pages_it != root_dict.end()) {
+    if (pages_it->second.type == Value::REFERENCE) {
+      walk_pages(pages_it->second.ref_object_number, root_props);
+    } else if (pages_it->second.type == Value::DICTIONARY) {
+      process_dict(pages_it->second.dict, 0, root_props);
+    }
+  }
+
+  catalog.pages_count = static_cast<uint32_t>(catalog.pages.size());
+
+  parse_acro_form(*this, catalog);
   parse_document_outline(*this, catalog);
   parse_page_labels(*this, catalog);
   parse_named_destinations(*this, catalog);
   parse_document_info(*this, catalog);
   parse_xmp_metadata(*this, catalog);
-
   return true;
 }
 
 const Page* Pdf::get_page(uint32_t page_number) const {
-  // Stub implementation - needs proper page retrieval
+  if (catalog.pages.empty()) {
+    return nullptr;
+  }
+
+  if (page_number == 0) {
+    return &catalog.pages.front();
+  }
+
+  if (page_number <= catalog.pages.size()) {
+    return &catalog.pages[page_number - 1];
+  }
+
   return nullptr;
 }
 
 PageContent Page::load_contents(const Pdf& pdf) const {
-  // Stub implementation - needs proper page content loading
   PageContent content;
-  content.success = false;
-  content.error = "load_contents not yet implemented";
+
+  if (contents.empty()) {
+    content.success = true;
+    return content;
+  }
+
+  std::vector<uint8_t> aggregate;
+  std::vector<std::unique_ptr<Value>> owned_values;
+  std::vector<const Value*> stack;
+
+  stack.reserve(contents.size());
+  for (auto it = contents.rbegin(); it != contents.rend(); ++it) {
+    stack.push_back(&*it);
+  }
+
+  while (!stack.empty()) {
+    const Value* node = stack.back();
+    stack.pop_back();
+
+    switch (node->type) {
+      case Value::REFERENCE: {
+        ResolvedObject resolved =
+            resolve_reference(pdf, node->ref_object_number,
+                              node->ref_generation_number);
+        if (!resolved.success) {
+          content.error = resolved.error;
+          content.success = false;
+          return content;
+        }
+        owned_values.push_back(std::unique_ptr<Value>(new Value(std::move(resolved.value))));
+        stack.push_back(owned_values.back().get());
+        break;
+      }
+
+      case Value::ARRAY: {
+        for (auto it = node->array.rbegin(); it != node->array.rend(); ++it) {
+          stack.push_back(&*it);
+        }
+        break;
+      }
+
+      case Value::STREAM: {
+        DecodedStream decoded = decode_stream(pdf, *node);
+        if (!decoded.success) {
+          content.error = decoded.error;
+          content.success = false;
+          return content;
+        }
+
+        if (!aggregate.empty() && !decoded.data.empty() &&
+            aggregate.back() != '\n') {
+          aggregate.push_back('\n');
+        }
+        aggregate.insert(aggregate.end(), decoded.data.begin(), decoded.data.end());
+        break;
+      }
+
+      case Value::STRING: {
+        if (!aggregate.empty() && !node->str.empty() &&
+            aggregate.back() != '\n') {
+          aggregate.push_back('\n');
+        }
+        aggregate.insert(aggregate.end(), node->str.begin(), node->str.end());
+        break;
+      }
+
+      case Value::NULL_OBJ:
+        break;
+
+      default:
+        content.error = "Unsupported content type";
+        content.success = false;
+        return content;
+    }
+  }
+
+  content.data = std::move(aggregate);
+  content.success = true;
   return content;
 }
 
