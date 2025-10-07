@@ -1093,183 +1093,274 @@ DecodedStream decode_dct(const uint8_t *data, size_t size,
 }
 
 // CCITTFaxDecode implementation
-DecodedStream decode_ccittfax(const uint8_t *data, size_t size,
-                              const DecodeParams &params) {
+DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
+                              const DecodeParams& params) {
   DecodedStream result;
 
-  // CCITTFax decoder implementation
-  // This is a simplified decoder for CCITT Group 3 and Group 4 fax compression
+  if (params.k != 0) {
+    result.error = "CCITTFaxDecode: Only 1D (Group 3) encoding is supported.";
+    return result;
+  }
 
   struct BitReader {
-    const uint8_t* data;
-    size_t size;
-    size_t byte_pos;
-    int bit_pos;
+    const uint8_t* data{nullptr};
+    size_t size{0};
+    size_t byte_pos{0};
+    int bit_pos{7};
 
-    BitReader(const uint8_t* d, size_t s) : data(d), size(s), byte_pos(0), bit_pos(7) {}
+    BitReader(const uint8_t* d, size_t s) : data(d), size(s) {}
 
-    bool get_bit() {
-      if (byte_pos >= size) return false;
-      bool bit = (data[byte_pos] >> bit_pos) & 1;
-      if (--bit_pos < 0) {
+    int get_bit() {
+      if (byte_pos >= size) {
+        return -1;
+      }
+      int bit = (data[byte_pos] >> bit_pos) & 1;
+      if (bit_pos == 0) {
         bit_pos = 7;
         byte_pos++;
+      } else {
+        bit_pos--;
       }
       return bit;
     }
 
-    uint32_t get_bits(int count) {
-      uint32_t result = 0;
-      for (int i = 0; i < count; i++) {
-        result = (result << 1) | (get_bit() ? 1 : 0);
+    bool align_to_byte() {
+      if (byte_pos >= size) {
+        return false;
       }
-      return result;
+      if (bit_pos != 7) {
+        bit_pos = 7;
+        ++byte_pos;
+      }
+      return byte_pos <= size;
     }
 
     bool find_eol() {
-      // EOL is 000000000001 (12 bits)
       int zero_count = 0;
       while (byte_pos < size) {
-        if (get_bit()) {
+        int bit = get_bit();
+        if (bit < 0) {
+          return false;
+        }
+        if (bit == 0) {
+          zero_count++;
+        } else {
           if (zero_count >= 11) {
-            return true; // Found EOL
+            return true;
           }
           zero_count = 0;
-        } else {
-          zero_count++;
         }
       }
       return false;
     }
   };
 
-  // Huffman code tables for CCITT Group 3/4
   struct CodeEntry {
     uint16_t code;
     uint8_t length;
-    int16_t value; // run length, negative for special codes
+    uint16_t run;
+    bool is_makeup;
   };
 
-  // Simplified white run codes
-  static const CodeEntry white_codes[] = {
-    // Terminating codes (0-63)
-    {0x35, 8, 0}, {0x07, 6, 1}, {0x07, 4, 2}, {0x08, 4, 3},
-    {0x0B, 4, 4}, {0x0C, 4, 5}, {0x0E, 4, 6}, {0x0F, 4, 7},
-    {0x13, 5, 8}, {0x14, 5, 9}, {0x07, 5, 10}, {0x08, 5, 11},
-    {0x08, 6, 12}, {0x03, 6, 13}, {0x34, 6, 14}, {0x35, 6, 15},
-    {0x2A, 6, 16}, {0x2B, 6, 17}, {0x27, 7, 18}, {0x0C, 7, 19},
-    {0x08, 7, 20}, {0x17, 7, 21}, {0x03, 7, 22}, {0x04, 7, 23},
-    {0x28, 7, 24}, {0x2B, 7, 25}, {0x13, 7, 26}, {0x24, 7, 27},
-    {0x18, 7, 28}, {0x02, 8, 29}, {0x03, 8, 30}, {0x1A, 8, 31},
-    // ... More codes would be added for a complete implementation
+  static const CodeEntry kWhiteTerminating[] = {
+      {0x35, 8, 0, false},   {0x07, 6, 1, false},   {0x07, 4, 2, false},
+      {0x08, 4, 3, false},   {0x0B, 4, 4, false},   {0x0C, 4, 5, false},
+      {0x0E, 4, 6, false},   {0x0F, 4, 7, false},   {0x13, 5, 8, false},
+      {0x14, 5, 9, false},   {0x07, 5, 10, false},  {0x08, 5, 11, false},
+      {0x08, 6, 12, false},  {0x03, 6, 13, false},  {0x34, 6, 14, false},
+      {0x35, 6, 15, false},  {0x2A, 6, 16, false},  {0x2B, 6, 17, false},
+      {0x27, 7, 18, false},  {0x0C, 7, 19, false},  {0x08, 7, 20, false},
+      {0x17, 7, 21, false},  {0x03, 7, 22, false},  {0x04, 7, 23, false},
+      {0x28, 7, 24, false},  {0x2B, 7, 25, false},  {0x13, 7, 26, false},
+      {0x24, 7, 27, false},  {0x18, 7, 28, false},  {0x02, 8, 29, false},
+      {0x03, 8, 30, false},  {0x1A, 8, 31, false},  {0x1B, 8, 32, false},
+      {0x12, 8, 33, false},  {0x13, 8, 34, false},  {0x14, 8, 35, false},
+      {0x15, 8, 36, false},  {0x16, 8, 37, false},  {0x17, 8, 38, false},
+      {0x28, 8, 39, false},  {0x29, 8, 40, false},  {0x2A, 8, 41, false},
+      {0x2B, 8, 42, false},  {0x2C, 8, 43, false},  {0x2D, 8, 44, false},
+      {0x04, 8, 45, false},  {0x05, 8, 46, false},  {0x0A, 8, 47, false},
+      {0x0B, 8, 48, false},  {0x52, 8, 49, false},  {0x53, 8, 50, false},
+      {0x54, 8, 51, false},  {0x55, 8, 52, false},  {0x24, 8, 53, false},
+      {0x25, 8, 54, false},  {0x58, 8, 55, false},  {0x59, 8, 56, false},
+      {0x5A, 8, 57, false},  {0x5B, 8, 58, false},  {0x4A, 8, 59, false},
+      {0x4B, 8, 60, false},  {0x32, 8, 61, false},  {0x33, 8, 62, false},
+      {0x34, 8, 63, false},
   };
 
-  // Simplified black run codes
-  static const CodeEntry black_codes[] = {
-    // Terminating codes (0-63)
-    {0x37, 10, 0}, {0x02, 3, 1}, {0x03, 2, 2}, {0x02, 2, 3},
-    {0x03, 3, 4}, {0x03, 4, 5}, {0x02, 4, 6}, {0x03, 5, 7},
-    {0x05, 6, 8}, {0x04, 6, 9}, {0x04, 7, 10}, {0x05, 7, 11},
-    {0x07, 7, 12}, {0x04, 8, 13}, {0x07, 8, 14}, {0x18, 9, 15},
-    // ... More codes would be added for a complete implementation
+  static const CodeEntry kWhiteMakeup[] = {
+      {0x1B, 5, 64, true},   {0x12, 5, 128, true},  {0x17, 6, 192, true},
+      {0x37, 7, 256, true},  {0x36, 8, 320, true},  {0x37, 8, 384, true},
+      {0x64, 8, 448, true},  {0x65, 8, 512, true},  {0x68, 8, 576, true},
+      {0x67, 8, 640, true},  {0xCC, 8, 704, true},  {0xCD, 8, 768, true},
+      {0xD2, 8, 832, true},  {0xD3, 8, 896, true},  {0xD4, 8, 960, true},
+      {0xD5, 8, 1024, true}, {0xD6, 8, 1088, true}, {0xD7, 8, 1152, true},
+      {0xD8, 8, 1216, true}, {0xD9, 8, 1280, true}, {0xDA, 8, 1344, true},
+      {0xDB, 8, 1408, true}, {0x98, 9, 1472, true}, {0x99, 9, 1536, true},
+      {0x9A, 9, 1600, true}, {0x18, 9, 1664, true}, {0x9B, 9, 1728, true},
+      {0x08, 11, 1792, true}, {0x0C, 11, 1856, true}, {0x0D, 11, 1920, true},
+      {0x12, 12, 1984, true}, {0x13, 12, 2048, true}, {0x14, 12, 2112, true},
+      {0x15, 12, 2176, true}, {0x16, 12, 2240, true}, {0x17, 12, 2304, true},
+      {0x1C, 12, 2368, true}, {0x1D, 12, 2432, true}, {0x1E, 12, 2496, true},
+      {0x1F, 12, 2560, true},
   };
 
-  BitReader reader(data, size);
-  std::vector<uint8_t> output;
+  static const CodeEntry kBlackTerminating[] = {
+      {0x037, 10, 0, false}, {0x02, 3, 1, false},   {0x03, 2, 2, false},
+      {0x03, 3, 3, false},   {0x03, 4, 4, false},   {0x02, 4, 5, false},
+      {0x03, 5, 6, false},   {0x05, 6, 7, false},   {0x04, 6, 8, false},
+      {0x04, 7, 9, false},   {0x05, 7, 10, false},  {0x07, 7, 11, false},
+      {0x04, 8, 12, false},  {0x07, 8, 13, false},  {0x18, 9, 14, false},
+      {0x17, 10, 15, false}, {0x18, 10, 16, false}, {0x08, 10, 17, false},
+      {0x67, 11, 18, false}, {0x68, 11, 19, false}, {0x6C, 11, 20, false},
+      {0x37, 11, 21, false}, {0x28, 11, 22, false}, {0x17, 11, 23, false},
+      {0x18, 11, 24, false}, {0xCA, 12, 25, false}, {0xCB, 12, 26, false},
+      {0xCC, 12, 27, false}, {0xCD, 12, 28, false}, {0x68, 12, 29, false},
+      {0x69, 12, 30, false}, {0x6A, 12, 31, false}, {0x6B, 12, 32, false},
+      {0xD2, 12, 33, false}, {0xD3, 12, 34, false}, {0xD4, 12, 35, false},
+      {0xD5, 12, 36, false}, {0xD6, 12, 37, false}, {0xD7, 12, 38, false},
+      {0x6C, 12, 39, false}, {0x6D, 12, 40, false}, {0xDA, 12, 41, false},
+      {0xDB, 12, 42, false}, {0x54, 12, 43, false}, {0x55, 12, 44, false},
+      {0x56, 12, 45, false}, {0x57, 12, 46, false}, {0x64, 12, 47, false},
+      {0x65, 12, 48, false}, {0x52, 12, 49, false}, {0x53, 12, 50, false},
+      {0x24, 12, 51, false}, {0x37, 12, 52, false}, {0x38, 12, 53, false},
+      {0x27, 12, 54, false}, {0x28, 12, 55, false}, {0x58, 12, 56, false},
+      {0x59, 12, 57, false}, {0x2B, 12, 58, false}, {0x2C, 12, 59, false},
+      {0x5A, 12, 60, false}, {0x66, 12, 61, false}, {0x67, 12, 62, false},
+      {0x0F, 10, 63, false},
+  };
 
-  int width = params.columns;
+  static const CodeEntry kBlackMakeup[] = {
+      {0x0F, 10, 64, true},  {0xC8, 12, 128, true},  {0xC9, 12, 192, true},
+      {0x5B, 12, 256, true}, {0x33, 12, 320, true}, {0x34, 12, 384, true},
+      {0x35, 12, 448, true}, {0x6C, 13, 512, true}, {0x6D, 13, 576, true},
+      {0x4A, 13, 640, true}, {0x4B, 13, 704, true}, {0x4C, 13, 768, true},
+      {0x4D, 13, 832, true}, {0x72, 13, 896, true}, {0x73, 13, 960, true},
+      {0x74, 13, 1024, true}, {0x75, 13, 1088, true}, {0x76, 13, 1152, true},
+      {0x77, 13, 1216, true}, {0x52, 13, 1280, true}, {0x53, 13, 1344, true},
+      {0x54, 13, 1408, true}, {0x55, 13, 1472, true}, {0x5A, 13, 1536, true},
+      {0x5B, 13, 1600, true}, {0x64, 13, 1664, true}, {0x65, 13, 1728, true},
+      {0x08, 11, 1792, true}, {0x0C, 11, 1856, true}, {0x0D, 11, 1920, true},
+      {0x12, 12, 1984, true}, {0x13, 12, 2048, true}, {0x14, 12, 2112, true},
+      {0x15, 12, 2176, true}, {0x16, 12, 2240, true}, {0x17, 12, 2304, true},
+      {0x1C, 12, 2368, true}, {0x1D, 12, 2432, true}, {0x1E, 12, 2496, true},
+      {0x1F, 12, 2560, true},
+  };
+
+  auto decode_code = [](BitReader& reader, const CodeEntry* term_table,
+                        size_t term_count, const CodeEntry* makeup_table,
+                        size_t makeup_count, int max_length,
+                        CodeEntry* out) -> bool {
+    uint32_t code = 0;
+    for (int length = 1; length <= max_length; ++length) {
+      int bit = reader.get_bit();
+      if (bit < 0) {
+        return false;
+      }
+      code = (code << 1) | static_cast<uint32_t>(bit);
+
+      for (size_t i = 0; i < term_count; ++i) {
+        if (term_table[i].length == length && term_table[i].code == code) {
+          *out = term_table[i];
+          return true;
+        }
+      }
+      for (size_t i = 0; i < makeup_count; ++i) {
+        if (makeup_table[i].length == length && makeup_table[i].code == code) {
+          *out = makeup_table[i];
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  auto decode_run = [&](BitReader& reader, bool white, int* out_run) -> bool {
+    static const size_t kWhiteTermCount =
+        sizeof(kWhiteTerminating) / sizeof(kWhiteTerminating[0]);
+    static const size_t kBlackTermCount =
+        sizeof(kBlackTerminating) / sizeof(kBlackTerminating[0]);
+    static const size_t kWhiteMakeupCount =
+        sizeof(kWhiteMakeup) / sizeof(kWhiteMakeup[0]);
+    static const size_t kBlackMakeupCount =
+        sizeof(kBlackMakeup) / sizeof(kBlackMakeup[0]);
+
+    const CodeEntry* term_table = white ? kWhiteTerminating : kBlackTerminating;
+    const CodeEntry* makeup_table = white ? kWhiteMakeup : kBlackMakeup;
+    size_t term_count = white ? kWhiteTermCount : kBlackTermCount;
+    size_t makeup_count = white ? kWhiteMakeupCount : kBlackMakeupCount;
+    int max_len = white ? 13 : 13;
+
+    int total = 0;
+    while (true) {
+      CodeEntry entry{};
+      if (!decode_code(reader, term_table, term_count, makeup_table,
+                       makeup_count, max_len, &entry)) {
+        return false;
+      }
+      total += entry.run;
+      if (!entry.is_makeup) {
+        *out_run = total;
+        return true;
+      }
+    }
+  };
+
+  int width = params.columns > 0 ? params.columns : 1728;
   int height = params.rows;
 
-  if (width <= 0) {
-    width = 1728; // Default fax width
-  }
+  BitReader reader(data, size);
+  const int bytes_per_row = (width + 7) / 8;
+  std::vector<uint8_t> output;
+  output.reserve((height > 0 ? height : 1) * bytes_per_row);
 
-  // Determine compression type
-  bool is_group4 = (params.k < 0);
-  bool is_2d = (params.k != 0);
+  std::vector<uint8_t> row_bytes(bytes_per_row, 0);
+  std::vector<bool> pixels(width, false);
 
-  // Basic decoding loop
-  std::vector<bool> current_line(width, !params.black_is_1);
-  std::vector<bool> reference_line(width, !params.black_is_1);
-
-  int row = 0;
-  while (reader.byte_pos < size && (height == 0 || row < height)) {
+  int decoded_rows = 0;
+  while (reader.byte_pos < size && (height == 0 || decoded_rows < height)) {
     if (params.end_of_line) {
       if (!reader.find_eol()) {
-        break;
+        result.error = "CCITTFaxDecode: Missing EOL";
+        return result;
+      }
+      if (params.encoded_byte_align) {
+        reader.align_to_byte();
       }
     }
 
-    // Decode line based on encoding type
-    if (is_group4 || (is_2d && row > 0)) {
-      // 2D encoding - use reference line
-      // Simplified: just copy reference line
-      current_line = reference_line;
-    } else {
-      // 1D encoding
-      int pos = 0;
-      bool is_white = !params.black_is_1;
+    std::fill(pixels.begin(), pixels.end(), false);
 
-      while (pos < width && reader.byte_pos < size) {
-        // Decode run length (simplified)
-        int run_length = 0;
-
-        // Read bits until we match a code (simplified)
-        uint32_t code = 0;
-        int code_len = 0;
-        bool found = false;
-
-        while (code_len < 13 && reader.byte_pos < size && !found) {
-          code = (code << 1) | (reader.get_bit() ? 1 : 0);
-          code_len++;
-
-          // Check against code tables (simplified)
-          if (is_white) {
-            for (size_t i = 0; i < sizeof(white_codes)/sizeof(white_codes[0]); i++) {
-              if (white_codes[i].length == code_len && white_codes[i].code == code) {
-                run_length = white_codes[i].value;
-                found = true;
-                break;
-              }
-            }
-          } else {
-            for (size_t i = 0; i < sizeof(black_codes)/sizeof(black_codes[0]); i++) {
-              if (black_codes[i].length == code_len && black_codes[i].code == code) {
-                run_length = black_codes[i].value;
-                found = true;
-                break;
-              }
-            }
-          }
+    int pos = 0;
+    bool is_white = true;
+    while (pos < width) {
+      int run = 0;
+      if (!decode_run(reader, is_white, &run)) {
+        result.error = "CCITTFaxDecode: Invalid code";
+        return result;
+      }
+      if (pos + run > width) {
+        run = width - pos;
+      }
+      if (!is_white) {
+        for (int i = 0; i < run; ++i) {
+          pixels[pos + i] = true;
         }
+      }
+      pos += run;
+      is_white = !is_white;
+    }
 
-        if (!found) {
-          // Use default run length
-          run_length = 1;
-        }
-
-        // Fill run
-        for (int i = 0; i < run_length && pos < width; i++) {
-          current_line[pos++] = is_white;
-        }
-
-        is_white = !is_white;
+    std::fill(row_bytes.begin(), row_bytes.end(), 0);
+    for (int i = 0; i < width; ++i) {
+      bool black_pixel = pixels[i];
+      bool bit = params.black_is_1 ? black_pixel : !black_pixel;
+      if (bit) {
+        row_bytes[i / 8] |= static_cast<uint8_t>(1 << (7 - (i % 8)));
       }
     }
 
-    // Convert line to bytes
-    for (int i = 0; i < width; i += 8) {
-      uint8_t byte = 0;
-      for (int j = 0; j < 8 && i + j < width; j++) {
-        if (current_line[i + j]) {
-          byte |= (1 << (7 - j));
-        }
-      }
-      output.push_back(byte);
-    }
-
-    reference_line = current_line;
-    row++;
+    output.insert(output.end(), row_bytes.begin(), row_bytes.end());
+    ++decoded_rows;
   }
 
   result.data = std::move(output);
