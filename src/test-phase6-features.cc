@@ -2,40 +2,120 @@
 #include <cassert>
 #include <vector>
 #include <cstring>
+#include <stdexcept>
 
 #include "nanopdf.hh"
 
 using namespace nanopdf;
 
+struct BitBuilder {
+  std::vector<int> bits;
+
+  void append(uint16_t code, uint8_t length) {
+    for (int i = length - 1; i >= 0; --i) {
+      bits.push_back((code >> i) & 1);
+    }
+  }
+
+  std::vector<uint8_t> to_bytes() const {
+    std::vector<uint8_t> bytes((bits.size() + 7) / 8, 0);
+    for (size_t i = 0; i < bits.size(); ++i) {
+      if (bits[i]) {
+        bytes[i / 8] |= static_cast<uint8_t>(1 << (7 - (i % 8)));
+      }
+    }
+    return bytes;
+  }
+};
+
+void append_white(BitBuilder& bb, int run) {
+  struct Entry { int run; uint16_t code; uint8_t length; };
+  static const Entry table[] = {
+      {0, 0x35, 8},  {1, 0x07, 6},  {2, 0x07, 4},  {3, 0x08, 4},
+      {4, 0x0B, 4},  {5, 0x0C, 4},  {6, 0x0E, 4},  {7, 0x0F, 4},
+      {8, 0x13, 5},  {9, 0x14, 5},  {10, 0x07, 5}, {11, 0x08, 5},
+      {12, 0x08, 6}, {13, 0x03, 6}, {14, 0x34, 6}, {15, 0x35, 6},
+      {16, 0x2A, 6},
+  };
+  for (const auto& entry : table) {
+    if (entry.run == run) {
+      bb.append(entry.code, entry.length);
+      return;
+    }
+  }
+  throw std::runtime_error("Unsupported white run length");
+}
+
+void append_black(BitBuilder& bb, int run) {
+  struct Entry { int run; uint16_t code; uint8_t length; };
+  static const Entry table[] = {
+      {0, 0x37, 10}, {1, 0x02, 3}, {2, 0x03, 2}, {3, 0x02, 2},
+      {4, 0x03, 3},  {5, 0x03, 4}, {6, 0x02, 4}, {7, 0x03, 5},
+      {8, 0x05, 6},  {9, 0x04, 6}, {10, 0x04, 7}, {11, 0x05, 7},
+      {12, 0x07, 7}, {13, 0x04, 8}, {14, 0x07, 8}, {15, 0x18, 9},
+      {16, 0x17, 10},
+  };
+  for (const auto& entry : table) {
+    if (entry.run == run) {
+      bb.append(entry.code, entry.length);
+      return;
+    }
+  }
+  throw std::runtime_error("Unsupported black run length");
+}
+
+std::vector<uint8_t> build_ccitt_sample() {
+  BitBuilder bb;
+  const uint16_t kEolCode = 0x001;  // 000000000001
+  const uint8_t kEolLength = 12;
+
+  // Line 1: 8 white pixels, 8 black pixels
+  bb.append(kEolCode, kEolLength);
+  append_white(bb, 8);
+  append_black(bb, 8);
+
+  // Line 2: 16 white pixels
+  bb.append(kEolCode, kEolLength);
+  append_white(bb, 16);
+
+  // Final EOL to terminate block
+  bb.append(kEolCode, kEolLength);
+
+  // Pad with zeros to the next byte boundary
+  while (bb.bits.size() % 8 != 0) {
+    bb.bits.push_back(0);
+  }
+
+  return bb.to_bytes();
+}
+
 // Test CCITTFaxDecode filter
 void test_ccittfax_decode() {
   std::cout << "Testing CCITTFaxDecode..." << std::endl;
 
-  // Create a simple CCITT Group 3 1D encoded data
-  // This is a simplified test - real CCITT data would be more complex
-  uint8_t encoded[] = {
-    0x00, 0x01,  // EOL marker (000000000001)
-    0x35,        // White run code
-    0x02,        // Black run code
-    0x00, 0x01,  // EOL marker
-    0x00, 0x80   // EOD marker
-  };
+  auto encoded = build_ccitt_sample();
 
   filters::DecodeParams params;
-  params.k = 0;  // Group 3 1D
-  params.columns = 8;
+  params.k = 0;
+  params.columns = 16;
   params.rows = 2;
   params.end_of_line = true;
   params.black_is_1 = false;
 
-  DecodedStream result = filters::decode_ccittfax(encoded, sizeof(encoded), params);
+  DecodedStream result = filters::decode_ccittfax(encoded.data(), encoded.size(), params);
+  assert(result.success);
+  assert(result.data.size() == 4);
+  assert(result.data[0] == 0xFF && result.data[1] == 0x00);
+  assert(result.data[2] == 0xFF && result.data[3] == 0xFF);
+  std::cout << "  CCITTFaxDecode (BlackIs1=0): PASS" << std::endl;
 
-  if (result.success) {
-    std::cout << "  CCITTFaxDecode succeeded, decoded " << result.data.size()
-              << " bytes" << std::endl;
-  } else {
-    std::cout << "  CCITTFaxDecode failed: " << result.error << std::endl;
-  }
+  params.black_is_1 = true;
+  result = filters::decode_ccittfax(encoded.data(), encoded.size(), params);
+  assert(result.success);
+  assert(result.data.size() == 4);
+  assert(result.data[0] == 0x00 && result.data[1] == 0xFF);
+  assert(result.data[2] == 0x00 && result.data[3] == 0x00);
+  std::cout << "  CCITTFaxDecode (BlackIs1=1): PASS" << std::endl;
 }
 
 // Test transparency and blending modes parsing
