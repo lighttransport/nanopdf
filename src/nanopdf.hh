@@ -589,6 +589,8 @@ struct BaseFont {
   std::string base_font;                // PostScript name of the font
   std::string encoding;                 // Font encoding
   FontDescriptor* descriptor{nullptr};  // Optional font descriptor
+  CMap to_unicode_cmap;
+  std::map<uint32_t, std::string> encoding_differences;  // Custom code->glyph overrides
 
   // Font widths
   std::vector<int> widths;
@@ -612,8 +614,8 @@ struct Type0Font : public BaseFont {
   // CMap for character encoding
   CMap encoding_cmap;
 
-  // ToUnicode CMap for Unicode conversion
-  CMap to_unicode_cmap;
+  int default_width{1000};
+  std::map<uint32_t, int> cid_widths;
 
   // CIDToGIDMap for glyph mapping
   std::vector<uint16_t> cid_to_gid_map;
@@ -953,9 +955,9 @@ struct Pdf {
   static SignatureField parse_signature_field(const Pdf& pdf, const Dictionary& field_dict);
 
  private:
-  bool parse_font_resources(Page& page, const Dictionary& resources);
-  std::unique_ptr<BaseFont> parse_font(const Value& font_val);
-  std::unique_ptr<FontDescriptor> parse_font_descriptor(const Value& font_dict);
+  bool parse_font_resources(Page& page, const Dictionary& resources) const;
+  std::unique_ptr<BaseFont> parse_font(const Value& font_val) const;
+  std::unique_ptr<FontDescriptor> parse_font_descriptor(const Value& font_dict) const;
 };
 
 class Parser;

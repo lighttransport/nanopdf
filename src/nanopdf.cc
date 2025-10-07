@@ -2793,6 +2793,9 @@ bool Pdf::load_document_structure() {
     }
     if (has_resources) {
       page.resources = std::move(resources);
+      parse_font_resources(page, page.resources);
+    } else {
+      page.fonts.clear();
     }
 
     auto media_it = dict.find("MediaBox");
@@ -3305,6 +3308,115 @@ std::map<std::string, ImageXObject> parse_xobject_resources(const Pdf& pdf, cons
   return images;
 }
 
+namespace {
+
+static const uint16_t kWinAnsiEncoding[256] = {
+    0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007,
+    0x0008, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x000E, 0x000F,
+    0x0010, 0x0011, 0x0012, 0x0013, 0x0014, 0x0015, 0x0016, 0x0017,
+    0x0018, 0x0019, 0x001A, 0x001B, 0x001C, 0x001D, 0x001E, 0x001F,
+    0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,
+    0x0028, 0x0029, 0x002A, 0x002B, 0x002C, 0x002D, 0x002E, 0x002F,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F,
+    0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+    0x0048, 0x0049, 0x004A, 0x004B, 0x004C, 0x004D, 0x004E, 0x004F,
+    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
+    0x0058, 0x0059, 0x005A, 0x005B, 0x005C, 0x005D, 0x005E, 0x005F,
+    0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
+    0x0068, 0x0069, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F,
+    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
+    0x0078, 0x0079, 0x007A, 0x007B, 0x007C, 0x007D, 0x007E, 0x007F,
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,
+    0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
+    0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+    0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,
+    0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,
+    0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,
+    0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+    0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,
+    0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,
+    0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+    0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,
+    0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF
+};
+
+static const uint16_t kMacRomanEncoding[256] = {
+    0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007,
+    0x0008, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x000E, 0x000F,
+    0x0010, 0x0011, 0x0012, 0x0013, 0x0014, 0x0015, 0x0016, 0x0017,
+    0x0018, 0x0019, 0x001A, 0x001B, 0x001C, 0x001D, 0x001E, 0x001F,
+    0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,
+    0x0028, 0x0029, 0x002A, 0x002B, 0x002C, 0x002D, 0x002E, 0x002F,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F,
+    0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+    0x0048, 0x0049, 0x004A, 0x004B, 0x004C, 0x004D, 0x004E, 0x004F,
+    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
+    0x0058, 0x0059, 0x005A, 0x005B, 0x005C, 0x005D, 0x005E, 0x005F,
+    0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
+    0x0068, 0x0069, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F,
+    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
+    0x0078, 0x0079, 0x007A, 0x007B, 0x007C, 0x007D, 0x007E, 0x007F,
+    0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1,
+    0x00E0, 0x00E2, 0x00E4, 0x00E3, 0x00E5, 0x00E7, 0x00E9, 0x00E8,
+    0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3,
+    0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC,
+    0x2020, 0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF,
+    0x00AE, 0x00A9, 0x2122, 0x00B4, 0x00A8, 0x2260, 0x00C6, 0x00D8,
+    0x221E, 0x00B1, 0x2264, 0x2265, 0x00A5, 0x00B5, 0x2202, 0x2211,
+    0x220F, 0x03C0, 0x222B, 0x00AA, 0x00BA, 0x03A9, 0x00E6, 0x00F8,
+    0x00BF, 0x00A1, 0x00AC, 0x221A, 0x0192, 0x2248, 0x2206, 0x00AB,
+    0x00BB, 0x2026, 0x00A0, 0x00C0, 0x00C3, 0x00D5, 0x0152, 0x0153,
+    0x2013, 0x2014, 0x201C, 0x201D, 0x2018, 0x2019, 0x00F7, 0x25CA,
+    0x00FF, 0x0178, 0x2044, 0x20AC, 0x2039, 0x203A, 0xFB01, 0xFB02,
+    0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1,
+    0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC, 0x00D3, 0x00D4,
+    0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC,
+    0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7
+};
+
+static const char* kStandardEncodingNames[256] = {
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, "exclamdown", "cent", "sterling", "fraction", "yen", "florin", "section",
+    "currency", "quotesingle", "quotedblleft", "guillemotleft", "guilsinglleft", "guilsinglright", "fi", "fl",
+    nullptr, "endash", "dagger", "daggerdbl", "periodcentered", nullptr, "paragraph", "bullet",
+    "quotesinglbase", "quotedblbase", "quotedblright", "guillemotright", "ellipsis", "perthousand", nullptr, "questiondown",
+    nullptr, "grave", "acute", "circumflex", "tilde", "macron", "breve", "dotaccent",
+    "dieresis", nullptr, "ring", "cedilla", nullptr, "hungarumlaut", "ogonek", "caron",
+    "emdash", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, "AE", nullptr, "ordfeminine", nullptr, nullptr, nullptr, nullptr,
+    "Lslash", "Oslash", "OE", "ordmasculine", nullptr, nullptr, nullptr, nullptr,
+    nullptr, "ae", nullptr, nullptr, nullptr, "dotlessi", nullptr, nullptr,
+    "lslash", "oslash", "oe", "germandbls", nullptr, nullptr, nullptr, nullptr,
+};
+
+}  // namespace
+
 // Text extraction implementation
 class TextExtractor {
 public:
@@ -3442,17 +3554,19 @@ private:
   void execute_operator(const std::string& op, const std::vector<std::string>& operands) {
     if (op == "BT") {
       // Begin text block
+      ensure_line_break();
+      flush_text();
       text_state_.reset();
     } else if (op == "ET") {
       // End text block
-      if (!text_state_.current_text.empty()) {
-        extracted_text_ += text_state_.current_text;
-        text_state_.current_text.clear();
-      }
+      flush_text();
     } else if (op == "Td" && operands.size() >= 2) {
       // Move text position
       double tx = parse_number(operands[0]);
       double ty = parse_number(operands[1]);
+      if (ty < 0.0) {
+        ensure_line_break();
+      }
       text_state_.line_matrix[4] += tx * text_state_.line_matrix[0] + ty * text_state_.line_matrix[2];
       text_state_.line_matrix[5] += tx * text_state_.line_matrix[1] + ty * text_state_.line_matrix[3];
       std::copy(text_state_.line_matrix, text_state_.line_matrix + 6, text_state_.text_matrix);
@@ -3461,6 +3575,9 @@ private:
       double tx = parse_number(operands[0]);
       double ty = parse_number(operands[1]);
       text_state_.leading = -ty;
+      if (ty < 0.0) {
+        ensure_line_break();
+      }
       text_state_.line_matrix[4] += tx * text_state_.line_matrix[0] + ty * text_state_.line_matrix[2];
       text_state_.line_matrix[5] += tx * text_state_.line_matrix[1] + ty * text_state_.line_matrix[3];
       std::copy(text_state_.line_matrix, text_state_.line_matrix + 6, text_state_.text_matrix);
@@ -3472,6 +3589,7 @@ private:
       std::copy(text_state_.text_matrix, text_state_.text_matrix + 6, text_state_.line_matrix);
     } else if (op == "T*") {
       // Move to next line
+      ensure_line_break();
       text_state_.line_matrix[4] += 0;
       text_state_.line_matrix[5] -= text_state_.leading;
       std::copy(text_state_.line_matrix, text_state_.line_matrix + 6, text_state_.text_matrix);
@@ -3538,6 +3656,11 @@ private:
   }
 
   std::string decode_text_string(const std::string& str) {
+    std::string raw = decode_pdf_string_raw(str);
+    return map_text_with_font(raw);
+  }
+
+  std::string decode_pdf_string_raw(const std::string& str) {
     if (str.empty()) return "";
 
     if (str[0] == '(') {
@@ -3588,6 +3711,397 @@ private:
 
     return str;
   }
+
+  std::string map_text_with_font(const std::string& raw) {
+    if (!text_state_.current_font) {
+      return raw;
+    }
+
+    const BaseFont* base_font = text_state_.current_font;
+    if (!base_font->to_unicode_cmap.code_to_unicode.empty()) {
+      return map_with_cmap(base_font->to_unicode_cmap, raw);
+    }
+
+    if (base_font->subtype != "Type0" &&
+        (base_font->encoding.empty() || base_font->encoding == "StandardEncoding")) {
+      return map_with_standard_encoding(base_font, raw);
+    }
+
+    if (base_font->subtype == "Type0") {
+      const Type0Font* type0 = dynamic_cast<const Type0Font*>(base_font);
+      if (type0) {
+        if (!type0->encoding_cmap.code_to_unicode.empty()) {
+          return map_with_cmap(type0->encoding_cmap, raw);
+        }
+        if (uses_identity_cmap(type0->encoding_cmap) ||
+            uses_identity_cmap(base_font->to_unicode_cmap)) {
+          return decode_utf16be(raw);
+        }
+      }
+    }
+
+    if (base_font->encoding == "WinAnsiEncoding") {
+      return map_with_single_byte_encoding(base_font, kWinAnsiEncoding, raw);
+    }
+    if (base_font->encoding == "MacRomanEncoding") {
+      return map_with_single_byte_encoding(base_font, kMacRomanEncoding, raw);
+    }
+
+    return raw;
+  }
+
+  void ensure_line_break() {
+    if (!text_state_.current_text.empty()) {
+      if (text_state_.current_text.back() != '\n') {
+        text_state_.current_text.push_back('\n');
+      }
+    } else if (!extracted_text_.empty() && extracted_text_.back() != '\n') {
+      extracted_text_.push_back('\n');
+    }
+  }
+
+  void flush_text() {
+    if (!text_state_.current_text.empty()) {
+      extracted_text_ += text_state_.current_text;
+      text_state_.current_text.clear();
+    }
+  }
+
+  bool apply_encoding_difference(const BaseFont* font, uint8_t byte,
+                                 std::string* out) {
+    if (!font || !out || font->encoding_differences.empty()) {
+      return false;
+    }
+
+    auto diff_it = font->encoding_differences.find(static_cast<uint32_t>(byte));
+    if (diff_it == font->encoding_differences.end()) {
+      return false;
+    }
+
+    uint32_t diff_code = 0;
+    if (glyph_name_to_unicode(diff_it->second, &diff_code)) {
+      append_utf8(diff_code, out);
+      return true;
+    }
+
+    return false;
+  }
+
+  std::string map_with_single_byte_encoding(const BaseFont* font, const uint16_t* table,
+                                            const std::string& raw) {
+    if (!table) {
+      return raw;
+    }
+
+    std::string result;
+    result.reserve(raw.size());
+
+    for (unsigned char byte : raw) {
+      if (apply_encoding_difference(font, byte, &result)) {
+        continue;
+      }
+
+      uint16_t code = table[byte];
+      if (code == 0) {
+        if (byte == '\n' || byte == '\r' || byte == '\t' || byte == ' ') {
+          result.push_back(static_cast<char>(byte));
+        } else if (byte >= 32) {
+          result.push_back(static_cast<char>(byte));
+        } else {
+          result.push_back('?');
+        }
+        continue;
+      }
+
+      append_utf8(code, &result);
+    }
+
+    return result;
+  }
+
+  std::string map_with_standard_encoding(const BaseFont* font, const std::string& raw) {
+    std::string result;
+    result.reserve(raw.size());
+
+    for (unsigned char byte : raw) {
+      if (apply_encoding_difference(font, byte, &result)) {
+        continue;
+      }
+
+      if (byte >= 32 && byte <= 126) {
+        result.push_back(static_cast<char>(byte));
+        continue;
+      }
+
+      if (byte == '\n' || byte == '\r' || byte == '\t' || byte == ' ') {
+        result.push_back(static_cast<char>(byte));
+        continue;
+      }
+
+      const char* name = kStandardEncodingNames[byte];
+      if (name) {
+        uint32_t codepoint = 0;
+        if (glyph_name_to_unicode(name, &codepoint)) {
+          append_utf8(codepoint, &result);
+          continue;
+        }
+      }
+
+      result.push_back('?');
+    }
+
+    return result;
+  }
+
+  std::string map_with_cmap(const CMap& cmap, const std::string& raw) {
+    if (cmap.code_to_unicode.empty()) {
+      return raw;
+    }
+
+    std::string result;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+      bool matched = false;
+      size_t remaining = raw.size() - pos;
+      size_t max_len = std::min<size_t>(4, remaining);
+      for (size_t length = max_len; length > 0; --length) {
+        uint32_t code = 0;
+        for (size_t i = 0; i < length; ++i) {
+          code = (code << 8) | static_cast<unsigned char>(raw[pos + i]);
+        }
+        auto it = cmap.code_to_unicode.find(code);
+        if (it != cmap.code_to_unicode.end()) {
+          append_utf8(it->second, &result);
+          pos += length;
+          matched = true;
+          break;
+        }
+      }
+
+      if (!matched) {
+        unsigned char byte = static_cast<unsigned char>(raw[pos]);
+        if (byte >= 32 || byte == '\n' || byte == '\r' || byte == '\t') {
+          result += static_cast<char>(byte);
+        } else {
+          result += '?';
+        }
+        pos += 1;
+      }
+    }
+
+    return result;
+  }
+
+  void append_utf8(uint32_t codepoint, std::string* out) {
+    if (!out) {
+      return;
+    }
+
+    if (codepoint <= 0x7F) {
+      out->push_back(static_cast<char>(codepoint));
+    } else if (codepoint <= 0x7FF) {
+      out->push_back(static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F)));
+      out->push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else if (codepoint <= 0xFFFF) {
+      if (codepoint >= 0xD800 && codepoint <= 0xDFFF) {
+        return;
+      }
+      out->push_back(static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F)));
+      out->push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else if (codepoint <= 0x10FFFF) {
+      out->push_back(static_cast<char>(0xF0 | ((codepoint >> 18) & 0x07)));
+      out->push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else {
+      out->push_back('?');
+    }
+  }
+
+  bool glyph_name_to_unicode(const std::string& name, uint32_t* codepoint) {
+    if (!codepoint || name.empty() || name == ".notdef") {
+      return false;
+    }
+
+    // Handle names like "uniXXXX" or "uniXXXXYYYY"
+    if (name.size() >= 7 && name.compare(0, 3, "uni") == 0) {
+      size_t pos = 3;
+      if (name.size() >= pos + 4) {
+        std::string hex = name.substr(pos, 4);
+        char* end = nullptr;
+        long value = std::strtol(hex.c_str(), &end, 16);
+        if (end && *end == '\0') {
+          *codepoint = static_cast<uint32_t>(value);
+          return true;
+        }
+      }
+    }
+
+    if (name.size() >= 5 && name.front() == 'u') {
+      std::string hex = name.substr(1);
+      char* end = nullptr;
+      long value = std::strtol(hex.c_str(), &end, 16);
+      if (end && *end == '\0') {
+        *codepoint = static_cast<uint32_t>(value);
+        return true;
+      }
+    }
+
+    if (name.size() == 1) {
+      unsigned char ch = static_cast<unsigned char>(name[0]);
+      if (ch >= 32) {
+        *codepoint = ch;
+        return true;
+      }
+    }
+
+    const auto& table = glyph_name_map();
+    auto it = table.find(name);
+    if (it != table.end()) {
+      *codepoint = it->second;
+      return true;
+    }
+
+    return false;
+  }
+
+  const std::unordered_map<std::string, uint32_t>& glyph_name_map() {
+    static const std::unordered_map<std::string, uint32_t> kMap = {
+        {"space", 0x20},       {"exclam", 0x21},      {"quotedbl", 0x22},
+        {"numbersign", 0x23},  {"dollar", 0x24},      {"percent", 0x25},
+        {"ampersand", 0x26},   {"quotesingle", 0x27}, {"parenleft", 0x28},
+        {"parenright", 0x29},  {"asterisk", 0x2A},    {"plus", 0x2B},
+        {"comma", 0x2C},       {"hyphen", 0x2D},      {"minus", 0x2212},
+        {"period", 0x2E},      {"slash", 0x2F},       {"zero", 0x30},
+        {"one", 0x31},         {"two", 0x32},         {"three", 0x33},
+        {"four", 0x34},        {"five", 0x35},        {"six", 0x36},
+        {"seven", 0x37},       {"eight", 0x38},       {"nine", 0x39},
+        {"colon", 0x3A},       {"semicolon", 0x3B},   {"less", 0x3C},
+        {"equal", 0x3D},       {"greater", 0x3E},     {"question", 0x3F},
+        {"at", 0x40},          {"A", 0x41},           {"B", 0x42},
+        {"C", 0x43},           {"D", 0x44},           {"E", 0x45},
+        {"F", 0x46},           {"G", 0x47},           {"H", 0x48},
+        {"I", 0x49},           {"J", 0x4A},           {"K", 0x4B},
+        {"L", 0x4C},           {"M", 0x4D},           {"N", 0x4E},
+        {"O", 0x4F},           {"P", 0x50},           {"Q", 0x51},
+        {"R", 0x52},           {"S", 0x53},           {"T", 0x54},
+        {"U", 0x55},           {"V", 0x56},           {"W", 0x57},
+        {"X", 0x58},           {"Y", 0x59},           {"Z", 0x5A},
+        {"bracketleft", 0x5B}, {"backslash", 0x5C},   {"bracketright", 0x5D},
+        {"asciicircum", 0x5E}, {"underscore", 0x5F},  {"grave", 0x60},
+        {"a", 0x61},           {"b", 0x62},           {"c", 0x63},
+        {"d", 0x64},           {"e", 0x65},           {"f", 0x66},
+        {"g", 0x67},           {"h", 0x68},           {"i", 0x69},
+        {"j", 0x6A},           {"k", 0x6B},           {"l", 0x6C},
+        {"m", 0x6D},           {"n", 0x6E},           {"o", 0x6F},
+        {"p", 0x70},           {"q", 0x71},           {"r", 0x72},
+        {"s", 0x73},           {"t", 0x74},           {"u", 0x75},
+        {"v", 0x76},           {"w", 0x77},           {"x", 0x78},
+        {"y", 0x79},           {"z", 0x7A},           {"braceleft", 0x7B},
+        {"bar", 0x7C},         {"braceright", 0x7D},  {"asciitilde", 0x7E},
+        {"nbspace", 0xA0},     {"exclamdown", 0xA1},  {"cent", 0xA2},
+        {"sterling", 0xA3},    {"currency", 0xA4},    {"yen", 0xA5},
+        {"brokenbar", 0xA6},   {"section", 0xA7},     {"dieresis", 0xA8},
+        {"copyright", 0xA9},   {"ordfeminine", 0xAA}, {"guillemotleft", 0xAB},
+        {"logicalnot", 0xAC},  {"registered", 0xAE},  {"macron", 0xAF},
+        {"degree", 0xB0},      {"plusminus", 0xB1},   {"twosuperior", 0xB2},
+        {"threesuperior", 0xB3},{"acute", 0xB4},       {"mu", 0xB5},
+        {"paragraph", 0xB6},   {"periodcentered", 0xB7}, {"cedilla", 0xB8},
+        {"onesuperior", 0xB9}, {"ordmasculine", 0xBA},{"guillemotright", 0xBB},
+        {"onequarter", 0xBC},  {"onehalf", 0xBD},     {"threequarters", 0xBE},
+        {"questiondown", 0xBF}, {"Agrave", 0xC0},     {"Aacute", 0xC1},
+        {"Acircumflex", 0xC2}, {"Atilde", 0xC3},      {"Adieresis", 0xC4},
+        {"Aring", 0xC5},       {"AE", 0xC6},          {"Ccedilla", 0xC7},
+        {"Egrave", 0xC8},      {"Eacute", 0xC9},      {"Ecircumflex", 0xCA},
+        {"Edieresis", 0xCB},   {"Igrave", 0xCC},      {"Iacute", 0xCD},
+        {"Icircumflex", 0xCE}, {"Idieresis", 0xCF},   {"Eth", 0xD0},
+        {"Ntilde", 0xD1},      {"Ograve", 0xD2},      {"Oacute", 0xD3},
+        {"Ocircumflex", 0xD4}, {"Otilde", 0xD5},      {"Odieresis", 0xD6},
+        {"multiply", 0xD7},    {"Oslash", 0xD8},      {"Ugrave", 0xD9},
+        {"Uacute", 0xDA},      {"Ucircumflex", 0xDB}, {"Udieresis", 0xDC},
+        {"Yacute", 0xDD},      {"Thorn", 0xDE},       {"germandbls", 0xDF},
+        {"agrave", 0xE0},      {"aacute", 0xE1},      {"acircumflex", 0xE2},
+        {"atilde", 0xE3},      {"adieresis", 0xE4},   {"aring", 0xE5},
+        {"ae", 0xE6},          {"ccedilla", 0xE7},    {"egrave", 0xE8},
+        {"eacute", 0xE9},      {"ecircumflex", 0xEA}, {"edieresis", 0xEB},
+        {"igrave", 0xEC},      {"iacute", 0xED},      {"icircumflex", 0xEE},
+        {"idieresis", 0xEF},   {"eth", 0xF0},         {"ntilde", 0xF1},
+        {"ograve", 0xF2},      {"oacute", 0xF3},      {"ocircumflex", 0xF4},
+        {"otilde", 0xF5},      {"odieresis", 0xF6},   {"divide", 0xF7},
+        {"oslash", 0xF8},      {"ugrave", 0xF9},      {"uacute", 0xFA},
+        {"ucircumflex", 0xFB}, {"udieresis", 0xFC},   {"yacute", 0xFD},
+        {"thorn", 0xFE},       {"ydieresis", 0xFF},   {"emdash", 0x2014},
+        {"endash", 0x2013},    {"quoteleft", 0x2018}, {"quoteright", 0x2019},
+        {"quotesinglbase", 0x201A}, {"quotedblleft", 0x201C},
+        {"quotedblright", 0x201D}, {"quotedblbase", 0x201E},
+        {"bullet", 0x2022},    {"ellipsis", 0x2026},  {"dagger", 0x2020},
+        {"daggerdbl", 0x2021}, {"trademark", 0x2122}, {"guilsinglleft", 0x2039},
+        {"guilsinglright", 0x203A}, {"perthousand", 0x2030}, {"florin", 0x0192},
+        {"fraction", 0x2044}, {"ring", 0x02DA},      {"tilde", 0x02DC},
+        {"circumflex", 0x02C6}, {"macron", 0x00AF},   {"breve", 0x02D8},
+        {"dotaccent", 0x02D9}, {"hungarumlaut", 0x02DD}, {"ogonek", 0x02DB},
+        {"caron", 0x02C7},     {"fi", 0xFB01},        {"fl", 0xFB02},
+        {"dotlessi", 0x0131},  {"Lslash", 0x0141},    {"lslash", 0x0142},
+        {"Oslash", 0x00D8},    {"oslash", 0x00F8},    {"OE", 0x0152},
+        {"oe", 0x0153}}
+        ;
+    return kMap;
+  }
+
+  bool uses_identity_cmap(const CMap& cmap) const {
+    if (cmap.name.empty()) {
+      return false;
+    }
+    return cmap.name == "Identity-H" || cmap.name == "Identity-V";
+  }
+
+  std::string decode_utf16be(const std::string& raw) {
+    if (raw.size() < 2) {
+      return raw;
+    }
+
+    std::string result;
+    size_t pos = 0;
+
+    if (raw.size() >= 2) {
+      unsigned char b0 = static_cast<unsigned char>(raw[0]);
+      unsigned char b1 = static_cast<unsigned char>(raw[1]);
+      if (b0 == 0xFE && b1 == 0xFF) {
+        pos = 2;
+      }
+    }
+
+    while (pos + 1 < raw.size()) {
+      uint16_t high = static_cast<uint8_t>(raw[pos]);
+      uint16_t low = static_cast<uint8_t>(raw[pos + 1]);
+      uint16_t code = static_cast<uint16_t>((high << 8) | low);
+      pos += 2;
+
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        if (pos + 1 >= raw.size()) {
+          break;
+        }
+        uint16_t low_high = static_cast<uint8_t>(raw[pos]);
+        uint16_t low_low = static_cast<uint8_t>(raw[pos + 1]);
+        uint16_t low_code = static_cast<uint16_t>((low_high << 8) | low_low);
+        pos += 2;
+        if (low_code >= 0xDC00 && low_code <= 0xDFFF) {
+          uint32_t full = 0x10000 +
+                          (((static_cast<uint32_t>(code) - 0xD800) << 10) |
+                           (static_cast<uint32_t>(low_code) - 0xDC00));
+          append_utf8(full, &result);
+        }
+        continue;
+      }
+
+      append_utf8(code, &result);
+    }
+
+    return result;
+  }
+
+
 
   std::vector<std::string> parse_array_elements(const std::string& array_content) {
     std::vector<std::string> elements;
@@ -3648,55 +4162,816 @@ private:
   // Need to include <set> for std::set
 };
 
+bool Pdf::parse_font_resources(const Pdf& pdf, Page& page,
+                               const Dictionary& resources) {
+  return pdf.parse_font_resources(page, resources);
+}
+
+bool Pdf::parse_font_resources(Page& page, const Dictionary& resources) const {
+  // Reset fonts map before populating
+  page.fonts.clear();
+
+  auto font_it = resources.find("Font");
+  if (font_it == resources.end()) {
+    return true;
+  }
+
+  auto resolve_dict = [&](const Value& value, Dictionary* out) -> bool {
+    if (value.type == Value::DICTIONARY) {
+      *out = value.dict;
+      return true;
+    }
+    if (value.type == Value::REFERENCE) {
+      ResolvedObject resolved =
+          load_object(value.ref_object_number, value.ref_generation_number);
+      if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+        *out = resolved.value.dict;
+        return true;
+      }
+    }
+    return false;
+  };
+
+  Dictionary font_resource_dict;
+  if (!resolve_dict(font_it->second, &font_resource_dict)) {
+    return false;
+  }
+
+  for (const auto& entry : font_resource_dict) {
+    const Value& font_val = entry.second;
+    Value resolved_font = font_val;
+    if (resolved_font.type == Value::REFERENCE) {
+      ResolvedObject resolved =
+          load_object(resolved_font.ref_object_number,
+                      resolved_font.ref_generation_number);
+      if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
+        continue;
+      }
+      resolved_font = resolved.value;
+    }
+
+    if (resolved_font.type != Value::DICTIONARY) {
+      continue;
+    }
+
+    std::unique_ptr<BaseFont> font = parse_font(resolved_font);
+    if (font) {
+      page.fonts[entry.first] = std::move(font);
+    }
+  }
+
+  return true;
+}
+
+std::unique_ptr<BaseFont> Pdf::parse_font(const Value& font_val) const {
+  return parse_font(*this, font_val);
+}
+
+std::unique_ptr<FontDescriptor> Pdf::parse_font_descriptor(const Value& font_val) const {
+  return parse_font_descriptor(*this, font_val);
+}
+
+namespace {
+
+std::string trim_cmap_line(const std::string& line) {
+  size_t start = 0;
+  size_t end = line.size();
+  while (start < end && std::isspace(static_cast<unsigned char>(line[start]))) {
+    start++;
+  }
+  while (end > start && std::isspace(static_cast<unsigned char>(line[end - 1]))) {
+    end--;
+  }
+  return line.substr(start, end - start);
+}
+
+std::vector<std::string> tokenize_cmap_line(const std::string& line) {
+  std::vector<std::string> tokens;
+  size_t i = 0;
+  while (i < line.size()) {
+    unsigned char ch = static_cast<unsigned char>(line[i]);
+    if (std::isspace(ch)) {
+      i++;
+      continue;
+    }
+    if (line[i] == '%') {
+      break;
+    }
+    if (line[i] == '<') {
+      size_t j = i + 1;
+      while (j < line.size() && line[j] != '>') {
+        j++;
+      }
+      if (j < line.size()) {
+        j++;
+      }
+      tokens.push_back(line.substr(i, j - i));
+      i = j;
+      continue;
+    }
+    if (line[i] == '[') {
+      size_t j = i + 1;
+      int depth = 1;
+      while (j < line.size() && depth > 0) {
+        if (line[j] == '[') {
+          depth++;
+        } else if (line[j] == ']') {
+          depth--;
+        }
+        j++;
+      }
+      tokens.push_back(line.substr(i, j - i));
+      i = j;
+      continue;
+    }
+    size_t j = i + 1;
+    while (j < line.size() && !std::isspace(static_cast<unsigned char>(line[j]))) {
+      j++;
+    }
+    tokens.push_back(line.substr(i, j - i));
+    i = j;
+  }
+  return tokens;
+}
+
+bool parse_integer_token(const std::string& token, int* out) {
+  if (!out) {
+    return false;
+  }
+  try {
+    size_t consumed = 0;
+    int value = std::stoi(token, &consumed, 10);
+    if (consumed != token.size()) {
+      return false;
+    }
+    *out = value;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool parse_literal_number(const std::string& token, uint32_t* out) {
+  if (!out) {
+    return false;
+  }
+  try {
+    size_t consumed = 0;
+    uint32_t value = static_cast<uint32_t>(std::stoul(token, &consumed, 10));
+    if (consumed != token.size()) {
+      return false;
+    }
+    *out = value;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool parse_hex_string_token(const std::string& token, uint32_t* out) {
+  if (!out || token.size() < 2 || token.front() != '<') {
+    return false;
+  }
+  size_t end_pos = token.find('>');
+  if (end_pos == std::string::npos) {
+    return false;
+  }
+  std::string hex;
+  for (size_t i = 1; i < end_pos; ++i) {
+    char c = token[i];
+    if (!std::isspace(static_cast<unsigned char>(c))) {
+      hex += c;
+    }
+  }
+  if (hex.empty()) {
+    *out = 0;
+    return true;
+  }
+  try {
+    *out = static_cast<uint32_t>(std::stoul(hex, nullptr, 16));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+std::vector<uint32_t> parse_hex_array_token(const std::string& token) {
+  std::vector<uint32_t> values;
+  size_t i = 0;
+  while (i < token.size()) {
+    if (token[i] == '<') {
+      size_t j = token.find('>', i);
+      if (j == std::string::npos) {
+        break;
+      }
+      uint32_t value = 0;
+      if (parse_hex_string_token(token.substr(i, j - i + 1), &value)) {
+        values.push_back(value);
+      }
+      i = j + 1;
+    } else {
+      i++;
+    }
+  }
+  return values;
+}
+
+bool resolve_indirect_value(const Pdf& pdf, const Value& value, Value* out) {
+  if (!out) {
+    return false;
+  }
+  if (value.type == Value::REFERENCE) {
+    ResolvedObject resolved =
+        resolve_reference(pdf, value.ref_object_number, value.ref_generation_number);
+    if (!resolved.success) {
+      return false;
+    }
+    *out = resolved.value;
+    return true;
+  }
+  *out = value;
+  return true;
+}
+
+void parse_encoding_differences(const std::vector<Value>& diffs, BaseFont* font) {
+  if (!font) {
+    return;
+  }
+
+  uint32_t current_code = 0;
+  bool have_code = false;
+
+  for (const auto& entry : diffs) {
+    if (entry.type == Value::NUMBER) {
+      current_code = static_cast<uint32_t>(entry.number);
+      have_code = true;
+      continue;
+    }
+    if (!have_code) {
+      continue;
+    }
+
+    if (entry.type == Value::NAME) {
+      font->encoding_differences[current_code] = entry.name;
+      current_code++;
+      continue;
+    }
+
+    if (entry.type == Value::STRING) {
+      font->encoding_differences[current_code] = entry.str;
+      current_code++;
+      continue;
+    }
+  }
+}
+
+void parse_simple_font_encoding(const Pdf& pdf, const Value& encoding_value, BaseFont* font) {
+  if (!font) {
+    return;
+  }
+
+  Value resolved;
+  if (!resolve_indirect_value(pdf, encoding_value, &resolved)) {
+    return;
+  }
+
+  if (resolved.type == Value::NAME) {
+    font->encoding = resolved.name;
+    font->encoding_differences.clear();
+    return;
+  }
+
+  if (resolved.type != Value::DICTIONARY) {
+    return;
+  }
+
+  const Dictionary& dict = resolved.dict;
+
+  auto base_it = dict.find("BaseEncoding");
+  if (base_it != dict.end() && base_it->second.type == Value::NAME) {
+    font->encoding = base_it->second.name;
+  } else if (font->encoding.empty()) {
+    font->encoding = "StandardEncoding";
+  }
+
+  auto diff_it = dict.find("Differences");
+  if (diff_it != dict.end() && diff_it->second.type == Value::ARRAY) {
+    font->encoding_differences.clear();
+    parse_encoding_differences(diff_it->second.array, font);
+  }
+}
+
+void extract_cid_system_info(const Dictionary& dict, std::string* registry,
+                             std::string* ordering, int* supplement) {
+  auto registry_it = dict.find("Registry");
+  if (registry && registry_it != dict.end()) {
+    if (registry_it->second.type == Value::STRING) {
+      *registry = registry_it->second.str;
+    } else if (registry_it->second.type == Value::NAME) {
+      *registry = registry_it->second.name;
+    }
+  }
+  auto ordering_it = dict.find("Ordering");
+  if (ordering && ordering_it != dict.end()) {
+    if (ordering_it->second.type == Value::STRING) {
+      *ordering = ordering_it->second.str;
+    } else if (ordering_it->second.type == Value::NAME) {
+      *ordering = ordering_it->second.name;
+    }
+  }
+  auto supplement_it = dict.find("Supplement");
+  if (supplement && supplement_it != dict.end() &&
+      supplement_it->second.type == Value::NUMBER) {
+    *supplement = static_cast<int>(supplement_it->second.number);
+  }
+}
+
+void parse_cid_system_info(const Dictionary& dict, Type0Font* font) {
+  if (!font) {
+    return;
+  }
+  std::string registry = font->registry;
+  std::string ordering = font->ordering;
+  int supplement = font->supplement;
+  extract_cid_system_info(dict, &registry, &ordering, &supplement);
+  if (!registry.empty()) {
+    font->registry = registry;
+    font->encoding_cmap.registry = registry;
+  }
+  if (!ordering.empty()) {
+    font->ordering = ordering;
+    font->encoding_cmap.ordering = ordering;
+  }
+  font->supplement = supplement;
+  font->encoding_cmap.supplement = supplement;
+}
+
+void parse_cid_width_array(const std::vector<Value>& array, Type0Font* font) {
+  if (!font) {
+    return;
+  }
+  size_t i = 0;
+  while (i < array.size()) {
+    if (array[i].type != Value::NUMBER) {
+      i++;
+      continue;
+    }
+    uint32_t cid = static_cast<uint32_t>(array[i].number);
+    i++;
+    if (i >= array.size()) {
+      break;
+    }
+    const Value& next = array[i];
+    if (next.type == Value::ARRAY) {
+      const auto& widths_array = next.array;
+      for (size_t j = 0; j < widths_array.size(); ++j) {
+        if (widths_array[j].type == Value::NUMBER) {
+          font->cid_widths[cid + static_cast<uint32_t>(j)] =
+              static_cast<int>(widths_array[j].number);
+        }
+      }
+      i++;
+    } else if (next.type == Value::NUMBER) {
+      uint32_t end_cid = static_cast<uint32_t>(next.number);
+      i++;
+      if (i >= array.size()) {
+        break;
+      }
+      if (array[i].type == Value::NUMBER) {
+        int width = static_cast<int>(array[i].number);
+        for (uint32_t current = cid; current <= end_cid; ++current) {
+          font->cid_widths[current] = width;
+        }
+      }
+      i++;
+    } else {
+      i++;
+    }
+  }
+}
+
+void parse_cid_to_gid_map(const Pdf& pdf, const Value& value, Type0Font* font) {
+  if (!font) {
+    return;
+  }
+  Value resolved;
+  if (!resolve_indirect_value(pdf, value, &resolved)) {
+    return;
+  }
+  if (resolved.type == Value::NAME) {
+    font->cid_to_gid_map.clear();
+    return;
+  }
+  if (resolved.type != Value::STREAM) {
+    return;
+  }
+  DecodedStream decoded = decode_stream(pdf, resolved);
+  if (!decoded.success) {
+    return;
+  }
+  const auto& data = decoded.data;
+  font->cid_to_gid_map.clear();
+  for (size_t i = 0; i + 1 < data.size(); i += 2) {
+    uint16_t gid = static_cast<uint16_t>((static_cast<uint16_t>(data[i]) << 8) |
+                                         static_cast<uint16_t>(data[i + 1]));
+    font->cid_to_gid_map.push_back(gid);
+  }
+}
+
+std::string extract_parenthesized_value(const std::string& line,
+                                        const std::string& key) {
+  auto key_pos = line.find(key);
+  if (key_pos == std::string::npos) {
+    return std::string();
+  }
+  auto start = line.find('(', key_pos);
+  auto end = line.find(')', start + 1);
+  if (start == std::string::npos || end == std::string::npos || end <= start) {
+    return std::string();
+  }
+  return line.substr(start + 1, end - start - 1);
+}
+
+bool parse_cmap_content(const std::string& content, CMap* cmap) {
+  if (!cmap) {
+    return false;
+  }
+  std::istringstream input(content);
+  auto read_data_line = [&](std::string* out_line) -> bool {
+    std::string raw;
+    while (std::getline(input, raw)) {
+      std::string trimmed = trim_cmap_line(raw);
+      if (trimmed.empty()) {
+        continue;
+      }
+      if (trimmed[0] == '%') {
+        continue;
+      }
+      *out_line = trimmed;
+      return true;
+    }
+    return false;
+  };
+
+  std::string line;
+  while (read_data_line(&line)) {
+    auto tokens = tokenize_cmap_line(line);
+    if (tokens.empty()) {
+      continue;
+    }
+
+    if (tokens.back() == "begincodespacerange") {
+      int count = 0;
+      if (!parse_integer_token(tokens.front(), &count)) {
+        continue;
+      }
+      int processed = 0;
+      while (processed < count) {
+        std::string entry_line;
+        if (!read_data_line(&entry_line)) {
+          break;
+        }
+        auto entry_tokens = tokenize_cmap_line(entry_line);
+        if (entry_tokens.size() < 2) {
+          continue;
+        }
+        processed++;
+      }
+      continue;
+    }
+
+    if (tokens.back() == "beginbfchar") {
+      int count = 0;
+      if (!parse_integer_token(tokens.front(), &count)) {
+        continue;
+      }
+      int processed = 0;
+      while (processed < count) {
+        std::string entry_line;
+        if (!read_data_line(&entry_line)) {
+          break;
+        }
+        auto entry_tokens = tokenize_cmap_line(entry_line);
+        if (entry_tokens.size() < 2) {
+          continue;
+        }
+        uint32_t src = 0;
+        if (!parse_hex_string_token(entry_tokens[0], &src)) {
+          continue;
+        }
+        if (entry_tokens[1].front() == '<') {
+          uint32_t dst = 0;
+          if (parse_hex_string_token(entry_tokens[1], &dst)) {
+            cmap->code_to_unicode[src] = dst;
+          }
+        }
+        processed++;
+      }
+      continue;
+    }
+
+    if (tokens.back() == "beginbfrange") {
+      int count = 0;
+      if (!parse_integer_token(tokens.front(), &count)) {
+        continue;
+      }
+      int processed = 0;
+      while (processed < count) {
+        std::string entry_line;
+        if (!read_data_line(&entry_line)) {
+          break;
+        }
+        auto entry_tokens = tokenize_cmap_line(entry_line);
+        if (entry_tokens.size() < 3) {
+          continue;
+        }
+        uint32_t start_code = 0;
+        uint32_t end_code = 0;
+        if (!parse_hex_string_token(entry_tokens[0], &start_code) ||
+            !parse_hex_string_token(entry_tokens[1], &end_code)) {
+          continue;
+        }
+        if (entry_tokens[2].front() == '[') {
+          auto values = parse_hex_array_token(entry_tokens[2]);
+          for (size_t idx = 0; idx < values.size(); ++idx) {
+            cmap->code_to_unicode[start_code + static_cast<uint32_t>(idx)] =
+                values[idx];
+          }
+        } else if (entry_tokens[2].front() == '<') {
+          uint32_t dst = 0;
+          if (parse_hex_string_token(entry_tokens[2], &dst)) {
+            for (uint32_t code = start_code; code <= end_code; ++code) {
+              cmap->code_to_unicode[code] = dst + (code - start_code);
+            }
+          }
+        }
+        processed++;
+      }
+      continue;
+    }
+
+    if (tokens.back() == "begincidchar") {
+      int count = 0;
+      if (!parse_integer_token(tokens.front(), &count)) {
+        continue;
+      }
+      int processed = 0;
+      while (processed < count) {
+        std::string entry_line;
+        if (!read_data_line(&entry_line)) {
+          break;
+        }
+        auto entry_tokens = tokenize_cmap_line(entry_line);
+        if (entry_tokens.size() < 2) {
+          continue;
+        }
+        uint32_t src = 0;
+        if (!parse_hex_string_token(entry_tokens[0], &src)) {
+          continue;
+        }
+        uint32_t dst = 0;
+        if (entry_tokens[1].front() == '<') {
+          if (parse_hex_string_token(entry_tokens[1], &dst)) {
+            cmap->code_to_unicode[src] = dst;
+          }
+        } else if (parse_literal_number(entry_tokens[1], &dst)) {
+          cmap->code_to_unicode[src] = dst;
+        }
+        processed++;
+      }
+      continue;
+    }
+
+    if (tokens.back() == "begincidrange") {
+      int count = 0;
+      if (!parse_integer_token(tokens.front(), &count)) {
+        continue;
+      }
+      int processed = 0;
+      while (processed < count) {
+        std::string entry_line;
+        if (!read_data_line(&entry_line)) {
+          break;
+        }
+        auto entry_tokens = tokenize_cmap_line(entry_line);
+        if (entry_tokens.size() < 3) {
+          continue;
+        }
+        uint32_t start_code = 0;
+        uint32_t end_code = 0;
+        if (!parse_hex_string_token(entry_tokens[0], &start_code) ||
+            !parse_hex_string_token(entry_tokens[1], &end_code)) {
+          continue;
+        }
+        uint32_t dst = 0;
+        if (entry_tokens[2].front() == '<') {
+          if (parse_hex_string_token(entry_tokens[2], &dst)) {
+            for (uint32_t code = start_code; code <= end_code; ++code) {
+              cmap->code_to_unicode[code] = dst + (code - start_code);
+            }
+          }
+        } else if (parse_literal_number(entry_tokens[2], &dst)) {
+          for (uint32_t code = start_code; code <= end_code; ++code) {
+            cmap->code_to_unicode[code] = dst + (code - start_code);
+          }
+        }
+        processed++;
+      }
+      continue;
+    }
+
+    if (tokens.size() >= 2 && tokens[0] == "/CMapName") {
+      const std::string& name_token = tokens[1];
+      if (!name_token.empty() && name_token.front() == '/') {
+        cmap->name = name_token.substr(1);
+      }
+      continue;
+    }
+
+    if (line.find("/Registry") != std::string::npos) {
+      std::string value = extract_parenthesized_value(line, "/Registry");
+      if (!value.empty()) {
+        cmap->registry = value;
+      }
+      continue;
+    }
+
+    if (line.find("/Ordering") != std::string::npos) {
+      std::string value = extract_parenthesized_value(line, "/Ordering");
+      if (!value.empty()) {
+        cmap->ordering = value;
+      }
+      continue;
+    }
+
+    if (line.find("/Supplement") != std::string::npos) {
+      auto supp_tokens = tokenize_cmap_line(line);
+      for (size_t idx = 0; idx + 1 < supp_tokens.size(); ++idx) {
+        if (supp_tokens[idx] == "/Supplement") {
+          int supp = 0;
+          if (parse_integer_token(supp_tokens[idx + 1], &supp)) {
+            cmap->supplement = supp;
+          }
+          break;
+        }
+      }
+      continue;
+    }
+  }
+  return true;
+}
+
+bool parse_cmap_value(const Pdf& pdf, const Value& value, CMap* cmap) {
+  if (!cmap) {
+    return false;
+  }
+  Value resolved;
+  if (!resolve_indirect_value(pdf, value, &resolved)) {
+    return false;
+  }
+  if (resolved.type == Value::NAME) {
+    cmap->name = resolved.name;
+    return true;
+  }
+  if (resolved.type == Value::STREAM) {
+    DecodedStream decoded = decode_stream(pdf, resolved);
+    if (!decoded.success) {
+      return false;
+    }
+    std::string content(decoded.data.begin(), decoded.data.end());
+    return parse_cmap_content(content, cmap);
+  }
+  if (resolved.type == Value::DICTIONARY) {
+    auto name_it = resolved.dict.find("CMapName");
+    if (name_it != resolved.dict.end()) {
+      if (name_it->second.type == Value::NAME) {
+        cmap->name = name_it->second.name;
+      } else if (name_it->second.type == Value::STRING) {
+        cmap->name = name_it->second.str;
+      }
+    }
+    auto sysinfo_it = resolved.dict.find("CIDSystemInfo");
+    if (sysinfo_it != resolved.dict.end() && sysinfo_it->second.type == Value::DICTIONARY) {
+      extract_cid_system_info(sysinfo_it->second.dict, &cmap->registry,
+                              &cmap->ordering, &cmap->supplement);
+    }
+    auto use_it = resolved.dict.find("UseCMap");
+    if (use_it != resolved.dict.end()) {
+      parse_cmap_value(pdf, use_it->second, cmap);
+    }
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 // Parse Type0 (CID) font
 std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& font_dict) {
   auto font = std::unique_ptr<Type0Font>(new Type0Font());
 
-  // Parse BaseFont name
   auto base_it = font_dict.find("BaseFont");
   if (base_it != font_dict.end() && base_it->second.type == Value::NAME) {
     font->base_font = base_it->second.name;
   }
 
-  // Parse Encoding (CMap)
   auto encoding_it = font_dict.find("Encoding");
   if (encoding_it != font_dict.end()) {
-    if (encoding_it->second.type == Value::NAME) {
-      font->encoding_cmap.name = encoding_it->second.name;
-    } else if (encoding_it->second.type == Value::STREAM) {
-      // Parse embedded CMap
-      // This would require parsing the CMap stream format
-    }
+    parse_cmap_value(pdf, encoding_it->second, &font->encoding_cmap);
   }
 
-  // Parse ToUnicode CMap
   auto tounicode_it = font_dict.find("ToUnicode");
-  if (tounicode_it != font_dict.end() && tounicode_it->second.type == Value::STREAM) {
-    // Parse ToUnicode CMap stream
-    // This would decode character codes to Unicode
+  if (tounicode_it != font_dict.end()) {
+    parse_cmap_value(pdf, tounicode_it->second, &font->to_unicode_cmap);
   }
 
-  // Parse DescendantFonts array
   auto desc_it = font_dict.find("DescendantFonts");
-  if (desc_it != font_dict.end() && desc_it->second.type == Value::ARRAY) {
-    if (!desc_it->second.array.empty()) {
-      const Value& desc_font_ref = desc_it->second.array[0];
-      if (desc_font_ref.type == Value::REFERENCE) {
-        ResolvedObject resolved = resolve_reference(pdf,
-          desc_font_ref.ref_object_number,
-          desc_font_ref.ref_generation_number);
-        if (resolved.success && resolved.value.type == Value::DICTIONARY) {
-          // Parse descendant font (CIDFont)
-          auto subtype_it = resolved.value.dict.find("Subtype");
-          if (subtype_it != resolved.value.dict.end() &&
-              subtype_it->second.type == Value::NAME) {
-            // Create appropriate descendant font type
-            font->descendant_font.reset(new BaseFont());
-            font->descendant_font->subtype = subtype_it->second.name;
+  if (desc_it != font_dict.end() && desc_it->second.type == Value::ARRAY &&
+      !desc_it->second.array.empty()) {
+    Value descendant_value;
+    if (resolve_indirect_value(pdf, desc_it->second.array[0], &descendant_value) &&
+        descendant_value.type == Value::DICTIONARY) {
+      const Dictionary& cid_font_dict = descendant_value.dict;
+
+      auto descendant = std::unique_ptr<BaseFont>(new BaseFont());
+      auto subtype_it = cid_font_dict.find("Subtype");
+      if (subtype_it != cid_font_dict.end() && subtype_it->second.type == Value::NAME) {
+        descendant->subtype = subtype_it->second.name;
+      }
+
+      auto descendant_base_it = cid_font_dict.find("BaseFont");
+      if (descendant_base_it != cid_font_dict.end() &&
+          descendant_base_it->second.type == Value::NAME) {
+        descendant->base_font = descendant_base_it->second.name;
+      }
+
+      auto descendant_encoding_it = cid_font_dict.find("Encoding");
+      if (descendant_encoding_it != cid_font_dict.end() &&
+          descendant_encoding_it->second.type == Value::NAME) {
+        descendant->encoding = descendant_encoding_it->second.name;
+      }
+
+      auto descriptor_it = cid_font_dict.find("FontDescriptor");
+      if (descriptor_it != cid_font_dict.end()) {
+        auto descriptor = Pdf::parse_font_descriptor(pdf, descriptor_it->second);
+        if (descriptor) {
+          descendant->descriptor = descriptor.release();
+        }
+      }
+
+      auto first_it = cid_font_dict.find("FirstChar");
+      if (first_it != cid_font_dict.end() && first_it->second.type == Value::NUMBER) {
+        descendant->first_char = static_cast<int>(first_it->second.number);
+      }
+
+      auto last_it = cid_font_dict.find("LastChar");
+      if (last_it != cid_font_dict.end() && last_it->second.type == Value::NUMBER) {
+        descendant->last_char = static_cast<int>(last_it->second.number);
+      }
+
+      auto widths_it = cid_font_dict.find("Widths");
+      if (widths_it != cid_font_dict.end() && widths_it->second.type == Value::ARRAY) {
+        descendant->widths.clear();
+        for (const auto& width_val : widths_it->second.array) {
+          if (width_val.type == Value::NUMBER) {
+            descendant->widths.push_back(static_cast<int>(width_val.number));
           }
         }
       }
+
+      auto cid_info_it = cid_font_dict.find("CIDSystemInfo");
+      if (cid_info_it != cid_font_dict.end() && cid_info_it->second.type == Value::DICTIONARY) {
+        parse_cid_system_info(cid_info_it->second.dict, font.get());
+      }
+
+      auto dw_it = cid_font_dict.find("DW");
+      if (dw_it != cid_font_dict.end() && dw_it->second.type == Value::NUMBER) {
+        font->default_width = static_cast<int>(dw_it->second.number);
+      }
+
+      auto w_it = cid_font_dict.find("W");
+      if (w_it != cid_font_dict.end() && w_it->second.type == Value::ARRAY) {
+        font->cid_widths.clear();
+        parse_cid_width_array(w_it->second.array, font.get());
+      }
+
+      auto cid_to_gid_it = cid_font_dict.find("CIDToGIDMap");
+      if (cid_to_gid_it != cid_font_dict.end()) {
+        parse_cid_to_gid_map(pdf, cid_to_gid_it->second, font.get());
+      }
+
+      font->descendant_font = std::move(descendant);
     }
+  }
+
+  if (font->registry.empty() && !font->encoding_cmap.registry.empty()) {
+    font->registry = font->encoding_cmap.registry;
+  }
+  if (font->ordering.empty() && !font->encoding_cmap.ordering.empty()) {
+    font->ordering = font->encoding_cmap.ordering;
+  }
+  if (font->supplement == 0 && font->encoding_cmap.supplement != 0) {
+    font->supplement = font->encoding_cmap.supplement;
   }
 
   return font;
@@ -3922,14 +5197,19 @@ std::unique_ptr<BaseFont> Pdf::parse_font(const Pdf& pdf, const Value& font_val)
 
     // Parse Encoding
     auto enc_it = font_dict.find("Encoding");
-    if (enc_it != font_dict.end() && enc_it->second.type == Value::NAME) {
-      font->encoding = enc_it->second.name;
+    if (enc_it != font_dict.end()) {
+      parse_simple_font_encoding(pdf, enc_it->second, font.get());
     }
 
     // Parse FontDescriptor
     auto desc_it = font_dict.find("FontDescriptor");
     if (desc_it != font_dict.end()) {
       font->descriptor = parse_font_descriptor(pdf, desc_it->second).release();
+    }
+
+    auto tounicode_it = font_dict.find("ToUnicode");
+    if (tounicode_it != font_dict.end()) {
+      parse_cmap_value(pdf, tounicode_it->second, &font->to_unicode_cmap);
     }
 
     return font;
