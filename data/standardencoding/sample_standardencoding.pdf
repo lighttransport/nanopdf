@@ -1,0 +1,48 @@
+%PDF-1.3
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842]
+   /Resources << /Font << /F1 4 0 R >> >>
+   /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman
+   /Encoding << /BaseEncoding /StandardEncoding
+                /Differences [159 /emdash 162 /oe 161 /exclamdown 191 /questiondown
+                              223 /germandbls 224 /agrave 225 /aacute 230 /ae 231 /ccedilla
+                              233 /eacute 241 /ntilde 243 /oacute 246 /odieresis 252 /udieresis] >> >>
+endobj
+5 0 obj
+<< /Length 318 >>
+stream
+BT
+/F1 14 Tf
+72 720 Td
+<a1486f6c612c207365f16f722120bf43f36d6f20657374e13f> Tj
+T*
+<4c27e9636f6e6f6d6965206672616ee7616973652065737420656e206861757373652e> Tj
+T*
+<53747261df652c206772fcdf2c206772f6df2c206661e76164652c2064e96ae0207675> Tj
+T*
+<666920666c206666692066666c206c6967617475726573209720e6209c> Tj
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000010 00000 n 
+0000000062 00000 n 
+0000000122 00000 n 
+0000000259 00000 n 
+0000000662 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1035
+%%EOF

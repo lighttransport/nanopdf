@@ -89,6 +89,7 @@ set(NANOPDF_SOURCES
   src/canvas-exporter.cc
   src/crypto.cc
   src/pdf-security.cc
+  src/stb_image_write_impl.cc
 )
 
 if(NANOPDF_USE_THORVG)
@@ -177,6 +178,9 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     "test_phase1|src/test-phase1-features.cc"
     "test_phase1_simple|src/test-phase1-simple.cc"
     "test_phase2|src/test-phase2-features.cc"
+    "test_phase2_standardencoding|src/test-phase2-standardencoding.cc"
+    "test_phase2_realpdf|src/test-phase2-real-pdfs.cc"
+    "test_phase2_text|src/test-phase2-text-extraction.cc"
     "test_phase3|src/test-phase3-features.cc"
     "test_phase4|src/test-phase4-features.cc"
     "test_phase5|src/test-phase5-features.cc"
@@ -189,6 +193,10 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     list(GET _spec_items 1 _test_source)
     add_nanopdf_test(${_test_name} ${_test_source})
   endforeach()
+
+  if(TARGET test_phase2_realpdf)
+    target_compile_definitions(test_phase2_realpdf PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  endif()
 
   # ThorVG backend test
   if(NANOPDF_USE_THORVG)

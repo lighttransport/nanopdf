@@ -151,6 +151,8 @@ struct ColorSpace {
   std::unique_ptr<ColorSpace> base_color_space;
   int hival{255};  // Maximum valid index value
   std::vector<uint8_t> lookup_table;
+  std::vector<std::string> colorant_names;
+  Value tint_function;
 
   // For CalRGB/CalGray
   std::vector<double> white_point;  // [X Y Z]
@@ -164,6 +166,50 @@ struct ColorSpace {
 
   ColorSpace() : type(ColorSpaceType::DeviceGray) {}
   explicit ColorSpace(ColorSpaceType t) : type(t) {}
+
+  ColorSpace(const ColorSpace& other)
+      : type(other.type),
+        name(other.name),
+        hival(other.hival),
+        lookup_table(other.lookup_table),
+        colorant_names(other.colorant_names),
+        tint_function(other.tint_function),
+        white_point(other.white_point),
+        black_point(other.black_point),
+        gamma(other.gamma),
+        matrix(other.matrix),
+        num_components(other.num_components),
+        icc_profile_data(other.icc_profile_data) {
+    if (other.base_color_space) {
+      base_color_space.reset(new ColorSpace(*other.base_color_space));
+    }
+  }
+
+  ColorSpace& operator=(const ColorSpace& other) {
+    if (this != &other) {
+      type = other.type;
+      name = other.name;
+      if (other.base_color_space) {
+        base_color_space.reset(new ColorSpace(*other.base_color_space));
+      } else {
+        base_color_space.reset();
+      }
+      hival = other.hival;
+      lookup_table = other.lookup_table;
+      colorant_names = other.colorant_names;
+      tint_function = other.tint_function;
+      white_point = other.white_point;
+      black_point = other.black_point;
+      gamma = other.gamma;
+      matrix = other.matrix;
+      num_components = other.num_components;
+      icc_profile_data = other.icc_profile_data;
+    }
+    return *this;
+  }
+
+  ColorSpace(ColorSpace&& other) noexcept = default;
+  ColorSpace& operator=(ColorSpace&& other) noexcept = default;
 };
 
 // Image XObject structure
@@ -187,10 +233,20 @@ struct ImageXObject {
   // Soft mask
   Value soft_mask;
 
+  // Filter information
+  std::string filter;
+
+  // Original encoded bytes from the stream
+  std::vector<uint8_t> raw_data;
+
   // Image data (after applying filters)
   std::vector<uint8_t> data;
 
   ImageXObject() = default;
+  ImageXObject(const ImageXObject& other) = default;
+  ImageXObject& operator=(const ImageXObject& other) = default;
+  ImageXObject(ImageXObject&& other) noexcept = default;
+  ImageXObject& operator=(ImageXObject&& other) noexcept = default;
 };
 
 // Forward declarations
@@ -1048,6 +1104,7 @@ struct ExtendedGraphicsState {
   // Soft mask
   SoftMaskType soft_mask_type{SoftMaskType::None};
   Dictionary soft_mask_dict;
+  Value soft_mask_value;
   Value transfer_function;  // Transfer function for soft mask
 
   // Rendering intent
@@ -1071,7 +1128,7 @@ struct ExtendedGraphicsState {
 
 // Transparency group attributes
 struct TransparencyGroup {
-  ColorSpace* color_space{nullptr};
+  std::unique_ptr<ColorSpace> color_space;
   bool isolated{false};
   bool knockout{false};
 };
@@ -1114,7 +1171,7 @@ enum class ShadingType {
 // Base shading structure
 struct Shading {
   ShadingType type;
-  ColorSpace* color_space{nullptr};
+  std::unique_ptr<ColorSpace> color_space;
   std::vector<double> bbox;  // Optional bounding box
   std::vector<double> background;  // Optional background color
   bool anti_alias{false};
