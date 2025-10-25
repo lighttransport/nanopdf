@@ -26,6 +26,7 @@
 namespace nanopdf {
 
 namespace {
+#include "adobe_glyph_list.inc"
 
 // parseInt(32bit)
 // 0 = success
@@ -78,6 +79,7 @@ int parseInt(const std::string &s, int *out_result) {
   if (negative) {
     (*out_result) = -int(result);
   } else {
+    (*out_result) = int(result);
   }
 
   return 0;  // OK
@@ -133,6 +135,7 @@ int parseInt64(const std::string &s, int64_t *out_result) {
   if (negative) {
     (*out_result) = -result;
   } else {
+    (*out_result) = result;
   }
 
   return 0;  // OK
@@ -3182,6 +3185,15 @@ void Value::SetType(Type new_type) {
 ColorSpace parse_color_space(const Pdf& pdf, const Value& cs_value) {
   ColorSpace color_space;
 
+  if (cs_value.type == Value::REFERENCE) {
+    ResolvedObject resolved = resolve_reference(pdf, cs_value.ref_object_number,
+                                                cs_value.ref_generation_number);
+    if (resolved.success) {
+      return parse_color_space(pdf, resolved.value);
+    }
+    return color_space;
+  }
+
   if (cs_value.type == Value::NAME) {
     // Simple color space name
     const std::string& name = cs_value.name;
@@ -3286,10 +3298,35 @@ ColorSpace parse_color_space(const Pdf& pdf, const Value& cs_value) {
             color_space.lookup_table = cs_value.array[3].stream.data;
           }
         }
-      } else if (type_name == "Separation" || type_name == "DeviceN") {
-        color_space.type = (type_name == "Separation") ?
-                          ColorSpaceType::Separation : ColorSpaceType::DeviceN;
-        // These require additional parsing of alternate color space and tint transform
+      } else if (type_name == "Separation") {
+        color_space.type = ColorSpaceType::Separation;
+        if (cs_value.array.size() > 1 && cs_value.array[1].type == Value::NAME) {
+          color_space.name = cs_value.array[1].name;
+        }
+        if (cs_value.array.size() > 2) {
+          color_space.base_color_space.reset(new ColorSpace(
+              parse_color_space(pdf, cs_value.array[2])));
+        }
+        if (cs_value.array.size() > 3) {
+          color_space.tint_function = cs_value.array[3];
+        }
+      } else if (type_name == "DeviceN") {
+        color_space.type = ColorSpaceType::DeviceN;
+        color_space.colorant_names.clear();
+        if (cs_value.array.size() > 1 && cs_value.array[1].type == Value::ARRAY) {
+          for (const auto& name_val : cs_value.array[1].array) {
+            if (name_val.type == Value::NAME) {
+              color_space.colorant_names.push_back(name_val.name);
+            }
+          }
+        }
+        if (cs_value.array.size() > 2) {
+          color_space.base_color_space.reset(new ColorSpace(
+              parse_color_space(pdf, cs_value.array[2])));
+        }
+        if (cs_value.array.size() > 3) {
+          color_space.tint_function = cs_value.array[3];
+        }
       }
     }
   }
@@ -3306,6 +3343,8 @@ ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value) {
   }
 
   const Dictionary& dict = stream_value.stream.dict;
+
+  image.raw_data = stream_value.stream.data;
 
   // Parse required entries
   auto width_it = dict.find("Width");
@@ -3352,6 +3391,26 @@ ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value) {
   auto interp_it = dict.find("Interpolate");
   if (interp_it != dict.end() && interp_it->second.type == Value::BOOLEAN) {
     image.interpolate = interp_it->second.boolean;
+  }
+
+  auto smask_entry = dict.find("SMask");
+  if (smask_entry != dict.end()) {
+    image.soft_mask = smask_entry->second;
+  }
+
+  // Track applied filter (single filter support for now)
+  auto filter_it = dict.find("Filter");
+  if (filter_it != dict.end()) {
+    if (filter_it->second.type == Value::NAME) {
+      image.filter = filter_it->second.name;
+    } else if (filter_it->second.type == Value::ARRAY) {
+      for (const auto& item : filter_it->second.array) {
+        if (item.type == Value::NAME) {
+          image.filter = item.name;
+          break;
+        }
+      }
+    }
   }
 
   // Decode the image data
@@ -3869,9 +3928,9 @@ private:
       return false;
     }
 
-    uint32_t diff_code = 0;
-    if (glyph_name_to_unicode(diff_it->second, &diff_code)) {
-      append_utf8(diff_code, out);
+    std::string glyph_utf8;
+    if (glyph_name_to_unicode(diff_it->second, &glyph_utf8)) {
+      out->append(glyph_utf8);
       return true;
     }
 
@@ -3931,9 +3990,9 @@ private:
 
       const char* name = kStandardEncodingNames[byte];
       if (name) {
-        uint32_t codepoint = 0;
-        if (glyph_name_to_unicode(name, &codepoint)) {
-          append_utf8(codepoint, &result);
+        std::string glyph_utf8;
+        if (glyph_name_to_unicode(name, &glyph_utf8)) {
+          result.append(glyph_utf8);
           continue;
         }
       }
@@ -4010,23 +4069,31 @@ private:
     }
   }
 
-  bool glyph_name_to_unicode(const std::string& name, uint32_t* codepoint) {
-    if (!codepoint || name.empty() || name == ".notdef") {
+  bool glyph_name_to_unicode(const std::string& name, std::string* utf8_out) {
+    if (!utf8_out || name.empty() || name == ".notdef") {
       return false;
     }
+
+    utf8_out->clear();
 
     // Handle names like "uniXXXX" or "uniXXXXYYYY"
     if (name.size() >= 7 && name.compare(0, 3, "uni") == 0) {
       size_t pos = 3;
-      if (name.size() >= pos + 4) {
+      if (((name.size() - pos) % 4) != 0) {
+        return false;
+      }
+      while (pos + 4 <= name.size()) {
         std::string hex = name.substr(pos, 4);
         char* end = nullptr;
         long value = std::strtol(hex.c_str(), &end, 16);
-        if (end && *end == '\0') {
-          *codepoint = static_cast<uint32_t>(value);
-          return true;
+        if (!(end && *end == '\0')) {
+          utf8_out->clear();
+          return false;
         }
+        append_utf8(static_cast<uint32_t>(value), utf8_out);
+        pos += 4;
       }
+      return !utf8_out->empty();
     }
 
     if (name.size() >= 5 && name.front() == 'u') {
@@ -4034,7 +4101,7 @@ private:
       char* end = nullptr;
       long value = std::strtol(hex.c_str(), &end, 16);
       if (end && *end == '\0') {
-        *codepoint = static_cast<uint32_t>(value);
+        append_utf8(static_cast<uint32_t>(value), utf8_out);
         return true;
       }
     }
@@ -4042,7 +4109,7 @@ private:
     if (name.size() == 1) {
       unsigned char ch = static_cast<unsigned char>(name[0]);
       if (ch >= 32) {
-        *codepoint = ch;
+        utf8_out->push_back(static_cast<char>(ch));
         return true;
       }
     }
@@ -4050,94 +4117,20 @@ private:
     const auto& table = glyph_name_map();
     auto it = table.find(name);
     if (it != table.end()) {
-      *codepoint = it->second;
+      *utf8_out = it->second;
       return true;
     }
 
     return false;
   }
-
-  const std::unordered_map<std::string, uint32_t>& glyph_name_map() {
-    static const std::unordered_map<std::string, uint32_t> kMap = {
-        {"space", 0x20},       {"exclam", 0x21},      {"quotedbl", 0x22},
-        {"numbersign", 0x23},  {"dollar", 0x24},      {"percent", 0x25},
-        {"ampersand", 0x26},   {"quotesingle", 0x27}, {"parenleft", 0x28},
-        {"parenright", 0x29},  {"asterisk", 0x2A},    {"plus", 0x2B},
-        {"comma", 0x2C},       {"hyphen", 0x2D},      {"minus", 0x2212},
-        {"period", 0x2E},      {"slash", 0x2F},       {"zero", 0x30},
-        {"one", 0x31},         {"two", 0x32},         {"three", 0x33},
-        {"four", 0x34},        {"five", 0x35},        {"six", 0x36},
-        {"seven", 0x37},       {"eight", 0x38},       {"nine", 0x39},
-        {"colon", 0x3A},       {"semicolon", 0x3B},   {"less", 0x3C},
-        {"equal", 0x3D},       {"greater", 0x3E},     {"question", 0x3F},
-        {"at", 0x40},          {"A", 0x41},           {"B", 0x42},
-        {"C", 0x43},           {"D", 0x44},           {"E", 0x45},
-        {"F", 0x46},           {"G", 0x47},           {"H", 0x48},
-        {"I", 0x49},           {"J", 0x4A},           {"K", 0x4B},
-        {"L", 0x4C},           {"M", 0x4D},           {"N", 0x4E},
-        {"O", 0x4F},           {"P", 0x50},           {"Q", 0x51},
-        {"R", 0x52},           {"S", 0x53},           {"T", 0x54},
-        {"U", 0x55},           {"V", 0x56},           {"W", 0x57},
-        {"X", 0x58},           {"Y", 0x59},           {"Z", 0x5A},
-        {"bracketleft", 0x5B}, {"backslash", 0x5C},   {"bracketright", 0x5D},
-        {"asciicircum", 0x5E}, {"underscore", 0x5F},  {"grave", 0x60},
-        {"a", 0x61},           {"b", 0x62},           {"c", 0x63},
-        {"d", 0x64},           {"e", 0x65},           {"f", 0x66},
-        {"g", 0x67},           {"h", 0x68},           {"i", 0x69},
-        {"j", 0x6A},           {"k", 0x6B},           {"l", 0x6C},
-        {"m", 0x6D},           {"n", 0x6E},           {"o", 0x6F},
-        {"p", 0x70},           {"q", 0x71},           {"r", 0x72},
-        {"s", 0x73},           {"t", 0x74},           {"u", 0x75},
-        {"v", 0x76},           {"w", 0x77},           {"x", 0x78},
-        {"y", 0x79},           {"z", 0x7A},           {"braceleft", 0x7B},
-        {"bar", 0x7C},         {"braceright", 0x7D},  {"asciitilde", 0x7E},
-        {"nbspace", 0xA0},     {"exclamdown", 0xA1},  {"cent", 0xA2},
-        {"sterling", 0xA3},    {"currency", 0xA4},    {"yen", 0xA5},
-        {"brokenbar", 0xA6},   {"section", 0xA7},     {"dieresis", 0xA8},
-        {"copyright", 0xA9},   {"ordfeminine", 0xAA}, {"guillemotleft", 0xAB},
-        {"logicalnot", 0xAC},  {"registered", 0xAE},  {"macron", 0xAF},
-        {"degree", 0xB0},      {"plusminus", 0xB1},   {"twosuperior", 0xB2},
-        {"threesuperior", 0xB3},{"acute", 0xB4},       {"mu", 0xB5},
-        {"paragraph", 0xB6},   {"periodcentered", 0xB7}, {"cedilla", 0xB8},
-        {"onesuperior", 0xB9}, {"ordmasculine", 0xBA},{"guillemotright", 0xBB},
-        {"onequarter", 0xBC},  {"onehalf", 0xBD},     {"threequarters", 0xBE},
-        {"questiondown", 0xBF}, {"Agrave", 0xC0},     {"Aacute", 0xC1},
-        {"Acircumflex", 0xC2}, {"Atilde", 0xC3},      {"Adieresis", 0xC4},
-        {"Aring", 0xC5},       {"AE", 0xC6},          {"Ccedilla", 0xC7},
-        {"Egrave", 0xC8},      {"Eacute", 0xC9},      {"Ecircumflex", 0xCA},
-        {"Edieresis", 0xCB},   {"Igrave", 0xCC},      {"Iacute", 0xCD},
-        {"Icircumflex", 0xCE}, {"Idieresis", 0xCF},   {"Eth", 0xD0},
-        {"Ntilde", 0xD1},      {"Ograve", 0xD2},      {"Oacute", 0xD3},
-        {"Ocircumflex", 0xD4}, {"Otilde", 0xD5},      {"Odieresis", 0xD6},
-        {"multiply", 0xD7},    {"Oslash", 0xD8},      {"Ugrave", 0xD9},
-        {"Uacute", 0xDA},      {"Ucircumflex", 0xDB}, {"Udieresis", 0xDC},
-        {"Yacute", 0xDD},      {"Thorn", 0xDE},       {"germandbls", 0xDF},
-        {"agrave", 0xE0},      {"aacute", 0xE1},      {"acircumflex", 0xE2},
-        {"atilde", 0xE3},      {"adieresis", 0xE4},   {"aring", 0xE5},
-        {"ae", 0xE6},          {"ccedilla", 0xE7},    {"egrave", 0xE8},
-        {"eacute", 0xE9},      {"ecircumflex", 0xEA}, {"edieresis", 0xEB},
-        {"igrave", 0xEC},      {"iacute", 0xED},      {"icircumflex", 0xEE},
-        {"idieresis", 0xEF},   {"eth", 0xF0},         {"ntilde", 0xF1},
-        {"ograve", 0xF2},      {"oacute", 0xF3},      {"ocircumflex", 0xF4},
-        {"otilde", 0xF5},      {"odieresis", 0xF6},   {"divide", 0xF7},
-        {"oslash", 0xF8},      {"ugrave", 0xF9},      {"uacute", 0xFA},
-        {"ucircumflex", 0xFB}, {"udieresis", 0xFC},   {"yacute", 0xFD},
-        {"thorn", 0xFE},       {"ydieresis", 0xFF},   {"emdash", 0x2014},
-        {"endash", 0x2013},    {"quoteleft", 0x2018}, {"quoteright", 0x2019},
-        {"quotesinglbase", 0x201A}, {"quotedblleft", 0x201C},
-        {"quotedblright", 0x201D}, {"quotedblbase", 0x201E},
-        {"bullet", 0x2022},    {"ellipsis", 0x2026},  {"dagger", 0x2020},
-        {"daggerdbl", 0x2021}, {"trademark", 0x2122}, {"guilsinglleft", 0x2039},
-        {"guilsinglright", 0x203A}, {"perthousand", 0x2030}, {"florin", 0x0192},
-        {"fraction", 0x2044}, {"ring", 0x02DA},      {"tilde", 0x02DC},
-        {"circumflex", 0x02C6}, {"macron", 0x00AF},   {"breve", 0x02D8},
-        {"dotaccent", 0x02D9}, {"hungarumlaut", 0x02DD}, {"ogonek", 0x02DB},
-        {"caron", 0x02C7},     {"fi", 0xFB01},        {"fl", 0xFB02},
-        {"dotlessi", 0x0131},  {"Lslash", 0x0141},    {"lslash", 0x0142},
-        {"Oslash", 0x00D8},    {"oslash", 0x00F8},    {"OE", 0x0152},
-        {"oe", 0x0153}}
-        ;
-    return kMap;
+  const std::unordered_map<std::string, std::string>& glyph_name_map() {
+    static std::unordered_map<std::string, std::string> map;
+    if (map.empty()) {
+      for (size_t i = 0; i < kAdobeGlyphListCount; ++i) {
+        map.emplace(kAdobeGlyphList[i].name, std::string(kAdobeGlyphList[i].utf8));
+      }
+    }
+    return map;
   }
 
   bool uses_identity_cmap(const CMap& cmap) const {
@@ -6439,17 +6432,24 @@ ExtendedGraphicsState parse_ext_gstate(const Pdf& pdf, const Dictionary& gs_dict
   if (it != gs_dict.end()) {
     if (it->second.type == Value::NAME && it->second.name == "None") {
       state.soft_mask_type = SoftMaskType::None;
-    } else if (it->second.type == Value::DICTIONARY) {
-      state.soft_mask_dict = it->second.dict;
-      auto type_it = it->second.dict.find("S");
-      if (type_it != it->second.dict.end() && type_it->second.type == Value::NAME) {
-        if (type_it->second.name == "Alpha") {
-          state.soft_mask_type = SoftMaskType::Alpha;
-        } else if (type_it->second.name == "Luminosity") {
-          state.soft_mask_type = SoftMaskType::Luminosity;
+      state.soft_mask_value = Value();
+    } else {
+      state.soft_mask_value = it->second;
+      if (it->second.type == Value::DICTIONARY) {
+        state.soft_mask_dict = it->second.dict;
+        auto type_it = it->second.dict.find("S");
+        if (type_it != it->second.dict.end() && type_it->second.type == Value::NAME) {
+          if (type_it->second.name == "Alpha") {
+            state.soft_mask_type = SoftMaskType::Alpha;
+          } else if (type_it->second.name == "Luminosity") {
+            state.soft_mask_type = SoftMaskType::Luminosity;
+          }
         }
       }
     }
+  }
+  else {
+    state.soft_mask_value = Value();
   }
 
   // Rendering intent
@@ -6602,8 +6602,7 @@ std::unique_ptr<Shading> parse_shading(const Pdf& pdf, const Dictionary& shading
   // Parse color space
   auto cs_it = shading_dict.find("ColorSpace");
   if (cs_it != shading_dict.end()) {
-    // Color space parsing would go here
-    // For now, just store nullptr
+    shading->color_space.reset(new ColorSpace(parse_color_space(pdf, cs_it->second)));
   }
 
   // Parse bounding box
@@ -6714,8 +6713,7 @@ TransparencyGroup parse_transparency_group(const Pdf& pdf, const Dictionary& gro
   // Parse color space
   auto cs_it = group_dict.find("CS");
   if (cs_it != group_dict.end()) {
-    // Color space parsing would go here
-    // For now, just store nullptr
+    group.color_space.reset(new ColorSpace(parse_color_space(pdf, cs_it->second)));
   }
 
   // Parse isolated flag

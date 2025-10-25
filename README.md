@@ -28,7 +28,18 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Optional flags: `-DNANOPDF_USE_THORVG=ON`, `-DNANOPDF_USE_STB_TRUETYPE=ON`, etc.
+### Optional build flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `NANOPDF_USE_CCACHE` | `ON` | Enable ccache when available to speed up incremental builds. |
+| `NANOPDF_USE_NANOSTL` | `OFF` | Use the bundled `nanostl` headers instead of the system STL (handy for restricted platforms). |
+| `NANOPDF_USE_STB_TRUETYPE` | `ON` | Include `stb_truetype` to parse embedded TrueType fonts. Disable if you ship your own font loader. |
+| `NANOPDF_USE_THORVG` | `OFF` | Build the ThorVG raster backend. Requires the ThorVG headers/libraries on your system. |
+| `NANOPDF_BUILD_TESTS` | `ON` (honours `BUILD_TESTING`) | Build the phase executables under `src/test-*.cc`. |
+| `NANOPDF_BUILD_WASM` | `OFF` | Target WebAssembly (requires configuring with Emscripten’s toolchain). |
+
+Pass any flag with `-DNAME=VALUE` while configuring via CMake.
 
 ## Tests
 
@@ -41,6 +52,23 @@ cmake --build build --target test_phase3
 
 A small harness (`build/manual_extract.cc`) can be compiled against the static library to
 exercise StandardEncoding text extraction.
+
+### Maintaining the glyph list
+
+`src/adobe_glyph_list.inc` is auto-generated from Adobe’s canonical glyph list. If the upstream
+data changes, refresh the header with:
+
+```bash
+scripts/update-glyph-list-inc.py
+```
+
+The script reads `data/adobe_glyph_list.txt` and rewrites the generated header in-place.
+
+### Sample PDFs
+
+`data/standardencoding/` contains real PDFs collected from PDF Association, SAS Global Forum, and
+NIST publications. They exercise StandardEncoding glyph differences in the wild—handy when you need
+to sanity-check text extraction regressions.
 
 ## Limitations
 

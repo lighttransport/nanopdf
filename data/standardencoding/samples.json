@@ -1,0 +1,36 @@
+{
+  "samples": [
+    {
+      "filename": "pdfa_font_encoding.pdf",
+      "description": "PDF Association presentation on PDF 2.0 font encoding; contains StandardEncoding with Differences entries.",
+      "url": "https://pdfa.org/wp-content/uploads/2018/06/1530_Seggern.pdf",
+      "has_differences": true,
+      "size_bytes": 3595582,
+      "differences_preview": ""
+    },
+    {
+      "filename": "sas_encoding_journey.pdf",
+      "description": "SAS Global Forum paper on character encoding challenges.",
+      "url": "https://support.sas.com/resources/papers/proceedings20/4561-2020.pdf",
+      "has_differences": false,
+      "size_bytes": 1187941,
+      "differences_preview": ""
+    },
+    {
+      "filename": "nist_traditional_encoding.pdf",
+      "description": "NIST ANSI/NIST traditional encoding reference.",
+      "url": "https://www.nist.gov/system/files/documents/2021/03/23/ansi-nist_2010_traditional_encoding.pdf",
+      "has_differences": false,
+      "size_bytes": 321601,
+      "differences_preview": ""
+    },
+    {
+      "filename": "sample_standardencoding.pdf",
+      "description": "Minimal regression PDF exercising StandardEncoding differences, handcrafted for tests.",
+      "url": "generated-in-repo",
+      "has_differences": true,
+      "size_bytes": 1232,
+      "differences_preview": "[/Differences ...]"
+    }
+  ]
+}
