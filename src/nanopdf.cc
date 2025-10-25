@@ -2343,21 +2343,25 @@ bool Pdf::build_object_offset_cache() const {
           p += 7;
           skip_ws_ptr(p);
 
-          uint64_t dict_offset = static_cast<uint64_t>(p - begin);
-          StreamReader sr(data, data_size, /*swap_endian=*/false);
-          Parser parser(sr);
-          if (!sr.seek_set(dict_offset)) {
-            return false;
-          }
+        uint64_t dict_offset = static_cast<uint64_t>(p - begin);
+        StreamReader sr(data, data_size, /*swap_endian=*/false);
+        Parser parser(sr);
+        if (!sr.seek_set(dict_offset)) {
+          return false;
+        }
 
-          Value trailer_val;
-          trailer_val.SetType(Value::DICTIONARY);
-          if (!parse_dictionary(sr, parser, &trailer_val.dict)) {
-            return false;
-          }
+        Value trailer_val;
+        trailer_val.SetType(Value::DICTIONARY);
+        uint8_t ch1 = 0, ch2 = 0;
+        if (!sr.read1(&ch1) || !sr.read1(&ch2) || ch1 != '<' || ch2 != '<') {
+          return false;
+        }
+        if (!parse_dictionary(sr, parser, &trailer_val.dict)) {
+          return false;
+        }
 
-          handle_trailer_offsets(trailer_val.dict, worklist);
-          any_entries = any_entries || !object_offsets.empty();
+        handle_trailer_offsets(trailer_val.dict, worklist);
+        any_entries = any_entries || !object_offsets.empty();
           return true;
         }
 
@@ -2566,6 +2570,144 @@ bool Pdf::build_object_offset_cache() const {
       parse_traditional_xref(current_offset);
     } else {
       parse_xref_stream(current_offset);
+    }
+  }
+
+  if (!any_entries && object_offsets.empty() && object_stream_entries.empty()) {
+    // Fallback scanning for traditional PDFs without xref tables.
+    auto update_trailer_fallback = [&]() {
+      const char trailer_kw[] = "trailer";
+      const size_t trailer_len = sizeof(trailer_kw) - 1;
+      if (data_size < trailer_len) {
+        return;
+      }
+
+      for (size_t pos = data_size - trailer_len;; --pos) {
+        if (std::memcmp(begin + pos, trailer_kw, trailer_len) == 0) {
+          uint64_t dict_offset = static_cast<uint64_t>((begin + pos + trailer_len) - begin);
+          while (dict_offset < data_size && is_whitespace_char(static_cast<char>(data[dict_offset]))) {
+            dict_offset++;
+          }
+          StreamReader sr(data, data_size, /*swap_endian=*/false);
+          Parser parser(sr);
+          if (!sr.seek_set(dict_offset)) {
+            return;
+          }
+          uint8_t ch1 = 0, ch2 = 0;
+          if (!sr.read1(&ch1) || !sr.read1(&ch2) || ch1 != '<' || ch2 != '<') {
+            return;
+          }
+          Value trailer_val;
+          trailer_val.SetType(Value::DICTIONARY);
+          if (parse_dictionary(sr, parser, &trailer_val.dict)) {
+            update_trailer(trailer_val.dict);
+          }
+          return;
+        }
+        if (pos == 0) {
+          break;
+        }
+      }
+    };
+
+    update_trailer_fallback();
+
+    const char* ptr = begin;
+    while (ptr < end) {
+      const char* start = ptr;
+      if (!std::isdigit(static_cast<unsigned char>(*ptr))) {
+        ++ptr;
+        continue;
+      }
+
+      uint32_t obj = 0;
+      while (ptr < end && std::isdigit(static_cast<unsigned char>(*ptr))) {
+        obj = obj * 10 + static_cast<uint32_t>(*ptr - '0');
+        ++ptr;
+      }
+      if (ptr >= end || !is_whitespace_char(*ptr)) {
+        ptr = start + 1;
+        continue;
+      }
+
+      ++ptr;  // skip whitespace before generation
+      if (ptr >= end || !std::isdigit(static_cast<unsigned char>(*ptr))) {
+        ptr = start + 1;
+        continue;
+      }
+
+      uint32_t gen = 0;
+      while (ptr < end && std::isdigit(static_cast<unsigned char>(*ptr))) {
+        gen = gen * 10 + static_cast<uint32_t>(*ptr - '0');
+        ++ptr;
+      }
+      if (ptr >= end || !is_whitespace_char(*ptr)) {
+        ptr = start + 1;
+        continue;
+      }
+
+      const char* keyword_ptr = ptr;
+      ++ptr;
+      if (keyword_ptr + 3 >= end) {
+        ptr = start + 1;
+        continue;
+      }
+      if (std::memcmp(keyword_ptr, " obj", 4) != 0) {
+        ptr = start + 1;
+        continue;
+      }
+
+      const char* body_ptr = keyword_ptr + 4;
+      while (body_ptr < end && is_whitespace_char(*body_ptr)) {
+        ++body_ptr;
+      }
+      if (body_ptr >= end) {
+        ptr = start + 1;
+        continue;
+      }
+
+      uint64_t key = (static_cast<uint64_t>(obj) << 32) |
+                     static_cast<uint64_t>(gen);
+      object_offsets[key] = static_cast<uint64_t>(body_ptr - begin);
+      any_entries = true;
+      ptr = body_ptr;
+    }
+
+    if (root == 0) {
+      uint32_t catalog_obj = 0;
+      for (const auto& entry : object_offsets) {
+        uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
+        uint64_t body_offset = entry.second;
+        if (body_offset >= data_size) {
+          continue;
+        }
+        size_t remaining = static_cast<size_t>(data_size - body_offset);
+        size_t sample_len = std::min<size_t>(remaining, 256);
+        std::string snippet(reinterpret_cast<const char*>(data + body_offset), sample_len);
+        if (snippet.find("/Type /Catalog") != std::string::npos) {
+          catalog_obj = obj_num;
+          break;
+        }
+      }
+      if (catalog_obj != 0) {
+        Pdf* self = const_cast<Pdf*>(this);
+        self->root = catalog_obj;
+      } else if (!object_offsets.empty()) {
+        Pdf* self = const_cast<Pdf*>(this);
+        self->root = static_cast<uint32_t>(object_offsets.begin()->first >> 32);
+      }
+    }
+
+    if (size == 0 && !object_offsets.empty()) {
+      uint32_t max_obj = 0;
+      for (const auto& entry : object_offsets) {
+        uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
+        if (obj_num > max_obj) {
+          max_obj = obj_num;
+        }
+      }
+      Pdf* self = const_cast<Pdf*>(this);
+      self->size = max_obj + 1;
     }
   }
 

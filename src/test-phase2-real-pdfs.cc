@@ -57,41 +57,11 @@ void test_pdfa_font_encoding_extracts_accented_text() {
   pdf.version_minor = 3;
   pdf.data = buffer.data();
   pdf.data_size = buffer.size();
-
-  auto find_body_offset = [&](uint32_t obj) -> uint64_t {
-    std::string token = std::to_string(obj) + " 0 obj";
-    std::string pdf_text(reinterpret_cast<const char*>(buffer.data()), buffer.size());
-    size_t pos = pdf_text.find(token);
-    while (pos != std::string::npos) {
-      bool boundary_before = pos == 0 || std::isspace(static_cast<unsigned char>(pdf_text[pos - 1]));
-      size_t after = pos + token.size();
-      bool boundary_after = after >= pdf_text.size() || std::isspace(static_cast<unsigned char>(pdf_text[after]));
-      if (boundary_before && boundary_after) {
-        size_t body = after;
-        while (body < buffer.size() && std::isspace(static_cast<unsigned char>(buffer[body]))) {
-          ++body;
-        }
-        return static_cast<uint64_t>(body);
-      }
-      pos = pdf_text.find(token, pos + 1);
-    }
-    return 0;
-  };
-
-  pdf.object_offsets.clear();
-  for (uint32_t obj = 1; obj <= 5; ++obj) {
-    uint64_t body = find_body_offset(obj);
-    if (body == 0) {
-      std::cerr << "Failed to locate object " << obj << " in sample PDF" << std::endl;
-      std::exit(1);
-    }
-    uint64_t key = (static_cast<uint64_t>(obj) << 32);
-    pdf.object_offsets[key] = body;
+  if (!pdf.build_object_offset_cache()) {
+    std::cerr << "Failed to build object offset cache" << std::endl;
+    std::exit(1);
   }
-  pdf.object_offsets_built = true;
-  pdf.object_offsets_failed = false;
-  pdf.size = 6;
-  pdf.root = 1;
+  std::cout << "  Catalog root: " << pdf.root << " Size: " << pdf.size << std::endl;
 
   if (!pdf.load_document_structure()) {
     std::cerr << "Failed to load document structure for sample PDF" << std::endl;
