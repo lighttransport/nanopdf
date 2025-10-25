@@ -942,6 +942,55 @@ DecodedStream decode_ascii85(const uint8_t *data, size_t size,
   return result;
 }
 
+DecodedStream decode_asciihex(const uint8_t *data, size_t size,
+                              const DecodeParams & /*params*/) {
+  DecodedStream result;
+  std::vector<uint8_t> output;
+  output.reserve(size / 2);
+
+  auto hex_value = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+  };
+
+  int high_nibble = -1;
+
+  for (size_t i = 0; i < size; ++i) {
+    char c = static_cast<char>(data[i]);
+
+    if (c == '>') {
+      break;
+    }
+
+    if (c == '\0' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == ' ')
+      continue;
+
+    int value = hex_value(c);
+    if (value < 0) {
+      result.error = "ASCIIHexDecode: invalid hex digit";
+      return result;
+    }
+
+    if (high_nibble < 0) {
+      high_nibble = value;
+    } else {
+      uint8_t byte = static_cast<uint8_t>((high_nibble << 4) | value);
+      output.push_back(byte);
+      high_nibble = -1;
+    }
+  }
+
+  if (high_nibble >= 0) {
+    output.push_back(static_cast<uint8_t>(high_nibble << 4));
+  }
+
+  result.data = std::move(output);
+  result.success = true;
+  return result;
+}
+
 DecodedStream decode_flate(const uint8_t *data, size_t size,
                            const DecodeParams &params) {
   DecodedStream result;
@@ -1404,6 +1453,9 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
   } else if (filter_name == "ASCII85Decode") {
     return filters::decode_ascii85(stream_obj.stream.data.data(),
                                    stream_obj.stream.data.size(), params);
+  } else if (filter_name == "ASCIIHexDecode") {
+    return filters::decode_asciihex(stream_obj.stream.data.data(),
+                                    stream_obj.stream.data.size(), params);
   } else if (filter_name == "LZWDecode") {
     return filters::decode_lzw(stream_obj.stream.data.data(),
                                stream_obj.stream.data.size(), params);

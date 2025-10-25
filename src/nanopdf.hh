@@ -1418,6 +1418,8 @@ DecodedStream decode_flate(const uint8_t* data, size_t size,
                            const DecodeParams& params);
 DecodedStream decode_ascii85(const uint8_t* data, size_t size,
                              const DecodeParams& params);
+DecodedStream decode_asciihex(const uint8_t* data, size_t size,
+                              const DecodeParams& params);
 DecodedStream decode_lzw(const uint8_t* data, size_t size,
                          const DecodeParams& params);
 DecodedStream decode_jbig2(const uint8_t* data, size_t size,

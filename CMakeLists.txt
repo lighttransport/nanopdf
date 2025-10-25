@@ -179,6 +179,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     "test_phase1_simple|src/test-phase1-simple.cc"
     "test_phase2|src/test-phase2-features.cc"
     "test_phase2_standardencoding|src/test-phase2-standardencoding.cc"
+    "test_phase2_rendering|src/test-phase2-rendering.cc"
     "test_phase2_realpdf|src/test-phase2-real-pdfs.cc"
     "test_phase2_text|src/test-phase2-text-extraction.cc"
     "test_phase3|src/test-phase3-features.cc"
