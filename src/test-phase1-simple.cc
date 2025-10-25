@@ -77,6 +77,31 @@ void test_dct_decode() {
   std::cout << "DCTDecode tests completed!" << std::endl << std::endl;
 }
 
+void test_asciihex_decode() {
+  std::cout << "Testing ASCIIHexDecode filter..." << std::endl;
+
+  const char* encoded = "48656C6C6F20576F726C64>";  // "Hello World"
+  filters::DecodeParams params;
+  DecodedStream result = filters::decode_asciihex(reinterpret_cast<const uint8_t*>(encoded),
+                                                  std::strlen(encoded), params);
+
+  assert(result.success);
+  std::string decoded(result.data.begin(), result.data.end());
+  assert(decoded == "Hello World");
+  std::cout << "  ASCIIHexDecode basic decode: PASSED" << std::endl;
+
+  const char* odd_encoded = "4F3>";  // should decode to 0x4F, 0x30
+  result = filters::decode_asciihex(reinterpret_cast<const uint8_t*>(odd_encoded),
+                                    std::strlen(odd_encoded), params);
+  assert(result.success);
+  assert(result.data.size() == 2);
+  assert(result.data[0] == static_cast<uint8_t>('O'));
+  assert(result.data[1] == static_cast<uint8_t>('0'));
+  std::cout << "  ASCIIHexDecode odd nibble handling: PASSED" << std::endl;
+
+  std::cout << "ASCIIHexDecode tests completed!" << std::endl << std::endl;
+}
+
 // Test basic ColorSpace and ImageXObject structures
 void test_structures() {
   std::cout << "Testing new structures..." << std::endl;
@@ -119,6 +144,7 @@ int main() {
 
   test_runlength_decode();
   test_dct_decode();
+  test_asciihex_decode();
   test_structures();
 
   std::cout << "=== All Phase 1 simple tests passed! ===" << std::endl;
