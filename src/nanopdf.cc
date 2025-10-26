@@ -1149,11 +1149,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                               const DecodeParams& params) {
   DecodedStream result;
 
-  if (params.k != 0) {
-    result.error = "CCITTFaxDecode: Only 1D (Group 3) encoding is supported.";
-    return result;
-  }
-
   struct BitReader {
     const uint8_t* data{nullptr};
     size_t size{0};
@@ -1367,6 +1362,92 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 
   std::vector<uint8_t> row_bytes(bytes_per_row, 0);
   std::vector<bool> pixels(width, false);
+  std::vector<bool> prev_pixels(width, false);
+
+  auto compute_transitions = [&](const std::vector<bool>& line) {
+    std::vector<int> trans;
+    bool current = false;  // start white
+    for (int i = 0; i < width; ++i) {
+      bool black = line[i];
+      if (black != current) {
+        trans.push_back(i);
+        current = black;
+      }
+    }
+    trans.push_back(width);
+    return trans;
+  };
+
+  auto apply_transitions_to_pixels = [&](const std::vector<int>& trans,
+                                         std::vector<bool>* line) {
+    if (!line) return;
+    std::fill(line->begin(), line->end(), false);
+    std::vector<int> sorted = trans;
+    if (sorted.empty() || sorted.back() != width) {
+      sorted.push_back(width);
+    }
+    // Remove duplicates
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+
+    int start = 0;
+    bool black = false;
+    for (int pos : sorted) {
+      if (pos < start) continue;
+      if (pos > width) pos = width;
+      if (black) {
+        for (int i = start; i < pos && i < width; ++i) {
+          (*line)[i] = true;
+        }
+      }
+      start = pos;
+      black = !black;
+    }
+  };
+
+  auto read_2d_code = [&](BitReader& reader, int* delta) -> int {
+    std::string bits;
+    while (bits.size() <= 7) {
+      int bit = reader.get_bit();
+      if (bit < 0) return -1;
+      bits.push_back(bit ? '1' : '0');
+
+      if (bits == "1") {
+        if (delta) *delta = 0;
+        return 0;  // vertical 0
+      }
+      if (bits == "011") {
+        if (delta) *delta = 1;
+        return 0;
+      }
+      if (bits == "010") {
+        if (delta) *delta = -1;
+        return 0;
+      }
+      if (bits == "001") {
+        return 1;  // horizontal
+      }
+      if (bits == "0001") {
+        return 2;  // pass
+      }
+      if (bits == "000011") {
+        if (delta) *delta = 2;
+        return 0;
+      }
+      if (bits == "000010") {
+        if (delta) *delta = -2;
+        return 0;
+      }
+      if (bits == "0000011") {
+        if (delta) *delta = 3;
+        return 0;
+      }
+      if (bits == "0000010") {
+        if (delta) *delta = -3;
+        return 0;
+      }
+    }
+    return -1;
+  };
 
   int decoded_rows = 0;
   while (reader.byte_pos < size && (height == 0 || decoded_rows < height)) {
@@ -1382,24 +1463,112 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 
     std::fill(pixels.begin(), pixels.end(), false);
 
-    int pos = 0;
-    bool is_white = true;
-    while (pos < width) {
-      int run = 0;
-      if (!decode_run(reader, is_white, &run)) {
-        result.error = "CCITTFaxDecode: Invalid code";
+    bool use_1d = false;
+    if (params.k == 0) {
+      use_1d = true;
+    } else if (params.k > 0) {
+      int mode = reader.get_bit();
+      if (mode < 0) {
+        result.error = "CCITTFaxDecode: Unexpected EOF";
         return result;
       }
-      if (pos + run > width) {
-        run = width - pos;
+      use_1d = (mode != 0);
+    } else {  // Group 4
+      use_1d = false;
+    }
+
+    if (use_1d) {
+      int pos = 0;
+      bool is_white = true;
+      while (pos < width) {
+        int run = 0;
+        if (!decode_run(reader, is_white, &run)) {
+          result.error = "CCITTFaxDecode: Invalid code";
+          return result;
+        }
+        if (pos + run > width) {
+          run = width - pos;
+        }
+        if (!is_white) {
+          for (int i = 0; i < run; ++i) {
+            pixels[pos + i] = true;
+          }
+        }
+        pos += run;
+        is_white = !is_white;
       }
-      if (!is_white) {
-        for (int i = 0; i < run; ++i) {
-          pixels[pos + i] = true;
+    } else {
+      std::vector<int> ref_transitions = compute_transitions(prev_pixels);
+      std::vector<int> cur_transitions;
+
+      int a0 = 0;
+      bool current_white = true;
+      size_t ref_idx = 0;
+
+      auto advance_ref = [&]() {
+        while (ref_idx < ref_transitions.size() && ref_transitions[ref_idx] <= a0) {
+          ref_idx++;
+        }
+      };
+
+      advance_ref();
+
+      auto get_b1 = [&]() -> int {
+        if (ref_idx >= ref_transitions.size()) {
+          return width;
+        }
+        return ref_transitions[ref_idx];
+      };
+
+      auto get_b2 = [&]() -> int {
+        if (ref_idx + 1 >= ref_transitions.size()) {
+          return width;
+        }
+        return ref_transitions[ref_idx + 1];
+      };
+
+      while (a0 < width) {
+        int delta = 0;
+        int op = read_2d_code(reader, &delta);
+        if (op == -1) {
+          result.error = "CCITTFaxDecode: Invalid 2D code";
+          return result;
+        }
+
+        int b1 = get_b1();
+        int b2 = get_b2();
+
+        if (op == 2) {  // Pass
+          int new_a0 = b2;
+          if (new_a0 > width) new_a0 = width;
+          a0 = new_a0;
+          advance_ref();
+        } else if (op == 1) {  // Horizontal
+          for (int pass = 0; pass < 2; ++pass) {
+            int run = 0;
+            if (!decode_run(reader, current_white, &run)) {
+              result.error = "CCITTFaxDecode: Invalid horizontal run";
+              return result;
+            }
+            int new_a0 = a0 + run;
+            if (new_a0 > width) new_a0 = width;
+            cur_transitions.push_back(new_a0);
+            a0 = new_a0;
+            current_white = !current_white;
+          }
+          advance_ref();
+        } else {  // Vertical
+          int new_a0 = b1 + delta;
+          if (new_a0 < 0) new_a0 = 0;
+          if (new_a0 > width) new_a0 = width;
+          cur_transitions.push_back(new_a0);
+          a0 = new_a0;
+          current_white = !current_white;
+          advance_ref();
         }
       }
-      pos += run;
-      is_white = !is_white;
+
+      apply_transitions_to_pixels(cur_transitions, &pixels);
     }
 
     std::fill(row_bytes.begin(), row_bytes.end(), 0);
@@ -1412,6 +1581,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     }
 
     output.insert(output.end(), row_bytes.begin(), row_bytes.end());
+    prev_pixels = pixels;
     ++decoded_rows;
   }
 
