@@ -53,6 +53,18 @@ cmake --build build --target test_phase3
 A small harness (`build/manual_extract.cc`) can be compiled against the static library to
 exercise StandardEncoding text extraction.
 
+### CI helper
+
+Run the full Release + Debug test sweep with CMake:
+
+```bash
+cmake -P scripts/run-ci.cmake
+```
+
+If you have an existing build tree, the helper is also exposed as `cmake --build build --target ci`.
+Set `NANOPDF_CI_CMAKE_ARGS` (e.g. `-DNANOPDF_USE_THORVG=ON`) to forward extra configure flags, and
+`NANOPDF_CI_CONFIGS` to override the configuration list.
+
 ### Maintaining the glyph list
 
 `src/adobe_glyph_list.inc` is auto-generated from Adobe’s canonical glyph list. If the upstream

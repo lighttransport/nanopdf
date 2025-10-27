@@ -55,7 +55,7 @@ void test_standard_encoding_difference() {
       [](BaseFont* font) {
         font->encoding_differences[65] = "Agrave";
       },
-      std::string(u8"\u00C0"));
+      std::string(u8"\u00C0\n"));
 
   std::cout << "  Encoding Differences remap glyphs: PASS" << std::endl;
 }
@@ -64,7 +64,7 @@ void test_standard_encoding_lookup() {
   std::cout << "Testing StandardEncoding fallback glyph names..." << std::endl;
 
   const std::string ops = "BT /F1 12 Tf (\\241) Tj ET";  // octal 241 -> code 0xA1
-  run_text_extraction_scenario(ops, nullptr, std::string(u8"\u00A1"));
+  run_text_extraction_scenario(ops, nullptr, std::string(u8"\u00A1\n"));
 
   std::cout << "  StandardEncoding lookup maps 0xA1 -> \u00A1: PASS" << std::endl;
 }
@@ -78,7 +78,7 @@ void test_multi_codepoint_difference() {
       [](BaseFont* font) {
         font->encoding_differences[90] = "dalethiriq";  // Maps to U+05D3 U+05B4
       },
-      std::string(u8"\u05D3\u05B4"));
+      std::string(u8"\u05D3\u05B4\n"));
 
   std::cout << "  Multi-codepoint Differences mapping: PASS" << std::endl;
 }

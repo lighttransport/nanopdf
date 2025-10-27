@@ -521,6 +521,21 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
     }
   } else if (op == "w" && operands.size() >= 1) {
     add_canvas_command("lineWidth", {operands[0]});
+  } else if (op == "gs" && !operands.empty()) {
+    std::string name;
+    for (auto it = operands.rbegin(); it != operands.rend(); ++it) {
+      if (it->empty() || *it == "/") {
+        continue;
+      }
+      name = *it;
+      break;
+    }
+    if (!name.empty() && name.front() == '/') {
+      name.erase(0, 1);
+    }
+    if (!name.empty()) {
+      apply_extended_graphics_state(name);
+    }
   } else if (op == "cm" && operands.size() >= 6) {
     add_canvas_command("transform", {
       operands[0], operands[1], operands[2],

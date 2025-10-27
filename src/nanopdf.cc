@@ -20,6 +20,7 @@
 #include <zlib.h>
 
 #include "common-macros.inc"
+#include "crypto.hh"
 #include "nanopdf.hh"
 #include "stream-reader.hh"
 
@@ -1803,6 +1804,54 @@ bool Pdf::parse_acro_form_fields(const Pdf& pdf, const Dictionary& acro_form,
   return true;
 }
 
+namespace {
+
+std::vector<uint8_t> compute_signature_digest(const Pdf& pdf,
+                                              const std::vector<uint64_t>& byte_range) {
+  std::vector<uint8_t> digest;
+
+  if (!pdf.data || pdf.data_size == 0 || byte_range.size() < 2 ||
+      (byte_range.size() % 2) != 0) {
+    return digest;
+  }
+
+  nanopdf::crypto::SHA256 sha256;
+  bool has_data = false;
+
+  for (size_t i = 0; i < byte_range.size(); i += 2) {
+    uint64_t offset = byte_range[i];
+    uint64_t length = byte_range[i + 1];
+
+    if (length == 0) {
+      continue;
+    }
+
+    if (offset > pdf.data_size || length > pdf.data_size) {
+      return {};
+    }
+
+    if (offset + length < offset || offset + length > pdf.data_size) {
+      return {};
+    }
+
+    const uint8_t* segment_begin = pdf.data + static_cast<size_t>(offset);
+    size_t segment_length = static_cast<size_t>(length);
+    sha256.update(segment_begin, segment_length);
+    has_data = true;
+  }
+
+  if (!has_data) {
+    return digest;
+  }
+
+  sha256.finalize();
+  digest.resize(nanopdf::crypto::SHA256::DIGEST_SIZE);
+  sha256.get_digest(digest.data());
+  return digest;
+}
+
+}  // namespace
+
 SignatureField Pdf::parse_signature_field(const Pdf& pdf, const Dictionary& field_dict) {
   SignatureField sig_field;
   
@@ -1863,6 +1912,39 @@ SignatureField Pdf::parse_signature_field(const Pdf& pdf, const Dictionary& fiel
           contact_it->second.type == Value::STRING) {
         sig_field.signing_contact_info = contact_it->second.str;
       }
+
+      auto contents_it = sig_field.signature_dict.find("Contents");
+      if (contents_it != sig_field.signature_dict.end()) {
+        if (contents_it->second.type == Value::STRING) {
+          sig_field.signature_contents.assign(contents_it->second.str.begin(),
+                                              contents_it->second.str.end());
+          sig_field.signature_present = true;
+        } else if (contents_it->second.type == Value::STREAM) {
+          sig_field.signature_contents = contents_it->second.stream.data;
+          sig_field.signature_present = true;
+        }
+      }
+
+      auto byte_range_it = sig_field.signature_dict.find("ByteRange");
+      if (byte_range_it != sig_field.signature_dict.end() &&
+          byte_range_it->second.type == Value::ARRAY) {
+        const auto& arr = byte_range_it->second.array;
+        std::vector<uint64_t> ranges;
+        ranges.reserve(arr.size());
+        for (const Value& v : arr) {
+          if (v.type == Value::NUMBER) {
+            ranges.push_back(static_cast<uint64_t>(v.number));
+          }
+        }
+        if (!ranges.empty() && ranges.size() % 2 == 0) {
+          sig_field.byte_range = std::move(ranges);
+          sig_field.byte_range_valid = true;
+          if (sig_field.signature_present) {
+            sig_field.signed_data_digest = compute_signature_digest(pdf, sig_field.byte_range);
+            sig_field.digest_algorithm = "SHA256";
+          }
+        }
+      }
       
       auto date_it = sig_field.signature_dict.find("M");
       if (date_it != sig_field.signature_dict.end() && 
@@ -1876,6 +1958,39 @@ SignatureField Pdf::parse_signature_field(const Pdf& pdf, const Dictionary& fiel
       if (resolved.success && resolved.value.type == Value::DICTIONARY) {
         sig_field.signature_dict = resolved.value.dict;
         sig_field.is_signed = true;
+
+        auto contents_ref_it = sig_field.signature_dict.find("Contents");
+        if (contents_ref_it != sig_field.signature_dict.end()) {
+          if (contents_ref_it->second.type == Value::STRING) {
+            sig_field.signature_contents.assign(contents_ref_it->second.str.begin(),
+                                                contents_ref_it->second.str.end());
+            sig_field.signature_present = true;
+          } else if (contents_ref_it->second.type == Value::STREAM) {
+            sig_field.signature_contents = contents_ref_it->second.stream.data;
+            sig_field.signature_present = true;
+          }
+        }
+
+        auto byte_range_ref_it = sig_field.signature_dict.find("ByteRange");
+        if (byte_range_ref_it != sig_field.signature_dict.end() &&
+            byte_range_ref_it->second.type == Value::ARRAY) {
+          const auto& arr = byte_range_ref_it->second.array;
+          std::vector<uint64_t> ranges;
+          ranges.reserve(arr.size());
+          for (const Value& v : arr) {
+            if (v.type == Value::NUMBER) {
+              ranges.push_back(static_cast<uint64_t>(v.number));
+            }
+          }
+          if (!ranges.empty() && ranges.size() % 2 == 0) {
+            sig_field.byte_range = std::move(ranges);
+            sig_field.byte_range_valid = true;
+            if (sig_field.signature_present) {
+              sig_field.signed_data_digest = compute_signature_digest(pdf, sig_field.byte_range);
+              sig_field.digest_algorithm = "SHA256";
+            }
+          }
+        }
       }
     }
   }
@@ -4073,6 +4188,7 @@ private:
       text_state_.reset();
     } else if (op == "ET") {
       // End text block
+      ensure_line_break();
       flush_text();
     } else if (op == "Td" && operands.size() >= 2) {
       // Move text position
