@@ -172,7 +172,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     endif()
   endfunction()
 
-  add_nanopdf_test(${TEST_TARGET} src/test-nanopdf.cc ${PROJECT_SOURCE_DIR}/data/HelloWorld_xr.pdf)
+  add_nanopdf_test(${TEST_TARGET} src/test-nanopdf.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
 
   set(_NANOPDF_PHASE_TEST_SPECS
     "test_phase1|src/test-phase1-features.cc"
@@ -221,6 +221,11 @@ if(NANOPDF_BUILD_WASM)
   install(FILES src/nanopdf.hh DESTINATION include)
   install(TARGETS ${BUILD_TARGET} DESTINATION lib)
 endif()
+
+add_custom_target(ci
+  COMMAND ${CMAKE_COMMAND} -P ${PROJECT_SOURCE_DIR}/scripts/run-ci.cmake
+  COMMENT "Configure, build, and test Release + Debug via scripts/run-ci.cmake"
+)
 
 ## [VisualStudio]
 #if(MSVC)

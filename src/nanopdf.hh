@@ -604,6 +604,12 @@ struct SignatureField {
   // Signature-specific data
   Dictionary signature_dict;           // Signature dictionary (V)
   Dictionary lock_dict;                // Signature lock dictionary (Lock)
+  std::vector<uint64_t> byte_range;
+  std::vector<uint8_t> signature_contents;
+  bool byte_range_valid{false};
+  bool signature_present{false};
+  std::string digest_algorithm;
+  std::vector<uint8_t> signed_data_digest;
   
   // Signature validation info
   bool is_signed{false};
