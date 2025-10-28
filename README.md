@@ -65,6 +65,8 @@ If you have an existing build tree, the helper is also exposed as `cmake --build
 Set `NANOPDF_CI_CMAKE_ARGS` (e.g. `-DNANOPDF_USE_THORVG=ON`) to forward extra configure flags, and
 `NANOPDF_CI_CONFIGS` to override the configuration list.
 
+GitHub Actions runs this helper on `ubuntu-latest` and `macos-latest` for every push and pull request, plus dedicated AddressSanitizer, UndefinedBehaviorSanitizer, and ThreadSanitizer Debug builds on `ubuntu-latest`. Each job uploads the generated CMake and ctest logs as artifacts for debugging failures.
+
 ### Maintaining the glyph list
 
 `src/adobe_glyph_list.inc` is auto-generated from Adobe’s canonical glyph list. If the upstream
