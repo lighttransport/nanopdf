@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends ninja-build
+
+      - name: Show toolchain versions
+        run: |
+          cmake --version
+          ninja --version
+          "${CXX:-c++}" --version
+
+      - name: Run CI helper
+        run: cmake -P scripts/run-ci.cmake
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.os }}
+          path: |
+            build/**/CMakeFiles/CMakeOutput.log
+            build/**/CMakeFiles/CMakeError.log
+            build/**/Testing/Temporary/LastTest.log
+            build/**/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
+
+  asan:
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      NANOPDF_CI_CONFIGS: Debug
+      NANOPDF_CI_CMAKE_ARGS: -DSANITIZE_ADDRESS=ON
+      ASAN_OPTIONS: detect_leaks=1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends ninja-build
+
+      - name: Show toolchain versions
+        run: |
+          cmake --version
+          ninja --version
+          "${CXX:-c++}" --version
+
+      - name: Run CI helper (ASan)
+        run: cmake -P scripts/run-ci.cmake
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-asan
+          path: |
+            build/**/CMakeFiles/CMakeOutput.log
+            build/**/CMakeFiles/CMakeError.log
+            build/**/Testing/Temporary/LastTest.log
+            build/**/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
+
+  ubsan:
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      CC: clang
+      CXX: clang++
+      NANOPDF_CI_CONFIGS: Debug
+      NANOPDF_CI_CMAKE_ARGS: -DSANITIZE_UNDEFINED=ON
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends ninja-build clang
+
+      - name: Show toolchain versions
+        run: |
+          cmake --version
+          ninja --version
+          clang --version
+
+      - name: Run CI helper (UBSan)
+        run: cmake -P scripts/run-ci.cmake
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-ubsan
+          path: |
+            build/**/CMakeFiles/CMakeOutput.log
+            build/**/CMakeFiles/CMakeError.log
+            build/**/Testing/Temporary/LastTest.log
+            build/**/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
+
+  tsan:
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      CC: clang
+      CXX: clang++
+      NANOPDF_CI_CONFIGS: Debug
+      NANOPDF_CI_CMAKE_ARGS: -DSANITIZE_THREAD=ON
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends ninja-build clang
+
+      - name: Show toolchain versions
+        run: |
+          cmake --version
+          ninja --version
+          clang --version
+
+      - name: Run CI helper (TSan)
+        run: cmake -P scripts/run-ci.cmake
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-tsan
+          path: |
+            build/**/CMakeFiles/CMakeOutput.log
+            build/**/CMakeFiles/CMakeError.log
+            build/**/Testing/Temporary/LastTest.log
+            build/**/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
