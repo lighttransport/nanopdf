@@ -3,9 +3,9 @@
 
 #pragma once
 
-#ifdef NANOPDF_USE_THORVG
+#ifdef NANOPDF_USE_BLEND2D
 
-#include <thorvg.h>
+#include <blend2d.h>
 #include <memory>
 #include <vector>
 #include <string>
@@ -29,7 +29,7 @@ using namespace nanostl;
 
 namespace nanopdf {
 
-struct ThorVGRenderResult {
+struct Blend2DRenderResult {
   bool success{false};
   std::string error;
   std::vector<uint8_t> pixels;  // RGBA8888 format
@@ -38,7 +38,7 @@ struct ThorVGRenderResult {
 };
 
 // Render options for output quality and format
-struct ThorVGRenderOptions {
+struct RenderOptions {
   // Output format
   enum class Format {
     PNG,
@@ -64,16 +64,16 @@ struct ThorVGRenderOptions {
   uint8_t bg_r{255}, bg_g{255}, bg_b{255}, bg_a{255};
 };
 
-class ThorVGBackend {
+class Blend2DBackend {
 public:
-  ThorVGBackend();
-  ~ThorVGBackend();
+  Blend2DBackend();
+  ~Blend2DBackend();
 
-  // Initialize ThorVG with given canvas size
+  // Initialize Blend2D with given canvas size
   bool initialize(uint32_t width, uint32_t height);
 
   // Render a PDF page
-  ThorVGRenderResult render_page(const Pdf& pdf, const Page& page);
+  Blend2DRenderResult render_page(const Pdf& pdf, const Page& page);
 
   // Direct drawing API for testing
   bool begin_scene();
@@ -84,7 +84,7 @@ public:
                       uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
   bool draw_circle(float cx, float cy, float radius,
                   uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
-  bool draw_path(const std::vector<tvg::PathCommand>& cmds, const std::vector<tvg::Point>& pts,
+  bool draw_path(const BLPath& path,
                 uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
 
   // Text drawing (basic support)
@@ -96,19 +96,19 @@ public:
                 uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
 
   // Get rendered buffer
-  ThorVGRenderResult get_buffer();
+  Blend2DRenderResult get_buffer();
 
   // Save to PNG file
   bool save_to_png(const std::string& filename);
 
   // Save to file with options
-  bool save_to_file(const std::string& filename, const ThorVGRenderOptions& options = ThorVGRenderOptions());
+  bool save_to_file(const std::string& filename, const RenderOptions& options = RenderOptions());
 
   // Render page with options (handles DPI scaling)
-  ThorVGRenderResult render_page(const Pdf& pdf, const Page& page, const ThorVGRenderOptions& options);
+  Blend2DRenderResult render_page(const Pdf& pdf, const Page& page, const RenderOptions& options);
 
 private:
-  // Parse PDF content stream and convert to ThorVG shapes
+  // Parse PDF content stream and convert to Blend2D shapes
   bool parse_pdf_content(const std::vector<uint8_t>& content_data);
 
   // Graphics state for PDF rendering
@@ -126,7 +126,7 @@ private:
     float dash_phase{0.0f};           // d - dash phase (offset)
     float fill_opacity{1.0f};    // ca - fill alpha (0-1)
     float stroke_opacity{1.0f};  // CA - stroke alpha (0-1)
-    int blend_mode{0};           // BM - blend mode (0=Normal)
+    int blend_mode{0};           // BM - blend mode (0=Normal, see BLCompOp)
 
     // Extended graphics state parameters
     bool alpha_is_shape{false};     // AIS - alpha source (false=opacity, true=shape)
@@ -152,14 +152,12 @@ private:
 
     bool in_text_block{false};
     bool in_path{false};
-    std::vector<tvg::PathCommand> path_commands;
-    std::vector<tvg::Point> path_points;
+    BLPath current_path;
 
     // Clipping path state
     bool has_clip{false};
     bool clip_even_odd{false};  // true for W* (even-odd), false for W (non-zero)
-    std::vector<tvg::PathCommand> clip_commands;
-    std::vector<tvg::Point> clip_points;
+    BLPath clip_path;
 
     // Page coordinate system info (set by render_page)
     float page_width{612.0f};
@@ -249,17 +247,16 @@ private:
   bool draw_shading(const std::string& shading_name);
 
   // Apply pattern fill to a shape
-  bool apply_pattern_fill(tvg::Shape* shape, const std::string& pattern_name, bool is_stroke);
+  bool apply_pattern_fill(BLPath& path, const std::string& pattern_name, bool is_stroke);
 
-  // Apply clipping path and push shape to scene
-  bool push_with_clip(tvg::Shape* shape);
+  // Push shape with clipping
+  bool push_with_clip(BLPath& path, bool fill, bool stroke);
 
   // Parse and render inline image (BI/ID/EI operators)
   bool parse_inline_image(const std::string& content, size_t& pos);
 
-  tvg::SwCanvas* canvas_{nullptr};
-  tvg::Scene* scene_{nullptr};
-  std::vector<uint32_t> buffer_;
+  BLImage image_;
+  BLContext ctx_;
   uint32_t width_{0};
   uint32_t height_{0};
   bool initialized_{false};
@@ -286,4 +283,4 @@ private:
 
 }  // namespace nanopdf
 
-#endif // NANOPDF_USE_THORVG
+#endif // NANOPDF_USE_BLEND2D
