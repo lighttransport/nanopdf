@@ -13,6 +13,7 @@ option(NANOPDF_USE_STB_TRUETYPE "Use stb_truetype to load fonts." ON)
 option(NANOPDF_BUILD_TESTS "Build test executables" ${BUILD_TESTING})
 option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
+option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 
 # cmake modules
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -90,10 +91,20 @@ set(NANOPDF_SOURCES
   src/crypto.cc
   src/pdf-security.cc
   src/stb_image_write_impl.cc
+  src/stb_truetype_impl.cc
 )
 
 if(NANOPDF_USE_THORVG)
   list(APPEND NANOPDF_SOURCES src/thorvg-backend.cc)
+endif()
+
+if(NANOPDF_USE_BLEND2D)
+  list(APPEND NANOPDF_SOURCES src/blend2d-backend.cc)
+endif()
+
+# Add WASM API for Emscripten builds
+if(NANOPDF_BUILD_WASM)
+  list(APPEND NANOPDF_SOURCES src/wasm-api.cc)
 endif()
 
 add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
@@ -122,7 +133,7 @@ if (NANOPDF_USE_THORVG)
   # Find ThorVG package or use FetchContent
   find_package(PkgConfig)
   if (PkgConfig_FOUND)
-    pkg_check_modules(THORVG thorvg)
+    pkg_check_modules(THORVG IMPORTED_TARGET thorvg)
   endif()
 
   if (NOT THORVG_FOUND)
@@ -147,11 +158,36 @@ if (NANOPDF_USE_THORVG)
   endif()
 
   if (THORVG_FOUND)
-    target_include_directories(${BUILD_TARGET} PUBLIC ${THORVG_INCLUDE_DIRS})
-    target_link_libraries(${BUILD_TARGET} PUBLIC ${THORVG_LIBRARIES})
+    if (TARGET PkgConfig::THORVG)
+      # Use imported target from pkg-config (has proper link directories)
+      target_link_libraries(${BUILD_TARGET} PUBLIC PkgConfig::THORVG)
+    else()
+      # Use manual paths
+      target_include_directories(${BUILD_TARGET} PUBLIC ${THORVG_INCLUDE_DIRS})
+      target_link_libraries(${BUILD_TARGET} PUBLIC ${THORVG_LIBRARIES})
+    endif()
     target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_THORVG")
   endif()
 endif ()
+
+# Blend2D support
+if (NANOPDF_USE_BLEND2D)
+  # Disable AsmJit as requested
+  set(BLEND2D_NO_JIT ON CACHE BOOL "Disable AsmJit for Blend2D" FORCE)
+  set(BLEND2D_STATIC ON CACHE BOOL "Build Blend2D as static library" FORCE)
+
+  # Add Blend2D subdirectory
+  add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/blend2d EXCLUDE_FROM_ALL)
+
+  # Add Blend2D include directory (for <blend2d.h>)
+  target_include_directories(${BUILD_TARGET} PUBLIC ${PROJECT_SOURCE_DIR}/third_party/blend2d/blend2d)
+
+  # Link Blend2D to nanopdf
+  target_link_libraries(${BUILD_TARGET} PUBLIC blend2d::blend2d)
+  target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_BLEND2D")
+
+  message(STATUS "Blend2D support enabled (no JIT)")
+endif()
 
 # Only add sanitizers for non-WASM builds
 if(NOT NANOPDF_BUILD_WASM)
@@ -201,12 +237,36 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   endif()
 
   # ThorVG backend test
-  if(NANOPDF_USE_THORVG)
+  if(NANOPDF_USE_THORVG AND THORVG_FOUND)
     add_nanopdf_test(test_thorvg src/test-thorvg-backend.cc ${PROJECT_SOURCE_DIR}/data/HelloWorld_xr.pdf)
-    if (THORVG_FOUND)
+    if (TARGET PkgConfig::THORVG)
+      target_link_libraries(test_thorvg PRIVATE PkgConfig::THORVG)
+    else()
       target_include_directories(test_thorvg PRIVATE ${THORVG_INCLUDE_DIRS})
       target_link_libraries(test_thorvg PRIVATE ${THORVG_LIBRARIES})
     endif()
+  endif()
+
+  # Blend2D backend test
+  if(NANOPDF_USE_BLEND2D)
+    add_nanopdf_test(test_blend2d src/test-blend2d-backend.cc ${PROJECT_SOURCE_DIR}/data/HelloWorld_xr.pdf)
+    target_link_libraries(test_blend2d PRIVATE blend2d::blend2d)
+  endif()
+
+  # Benchmark executable (not a test, just a tool)
+  add_executable(benchmark src/benchmark.cc)
+  target_link_libraries(benchmark PRIVATE ${BUILD_TARGET})
+  add_sanitizers(benchmark)
+  if(NANOPDF_USE_THORVG AND THORVG_FOUND)
+    if (TARGET PkgConfig::THORVG)
+      target_link_libraries(benchmark PRIVATE PkgConfig::THORVG)
+    else()
+      target_include_directories(benchmark PRIVATE ${THORVG_INCLUDE_DIRS})
+      target_link_libraries(benchmark PRIVATE ${THORVG_LIBRARIES})
+    endif()
+  endif()
+  if(NANOPDF_USE_BLEND2D)
+    target_link_libraries(benchmark PRIVATE blend2d::blend2d)
   endif()
 endif()
 
