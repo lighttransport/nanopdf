@@ -10,6 +10,7 @@ A CLI tool to dump PDF document structure information in YAML or JSON format.
 - Image information (dimensions, color space, compression)
 - Annotations summary
 - Form fields summary
+- **Digital signatures** with integrity verification
 - Bookmarks/outlines summary
 - **Revision history** with hashes and diff information
 
@@ -180,6 +181,34 @@ revisions:
 }
 ```
 
+## Digital Signatures
+
+pdfdump detects and reports digital signatures in PDF documents:
+
+```yaml
+signatures:
+  total_fields: 2
+  signed_count: 1
+  list:
+    - name: Signature1
+      is_signed: true
+      reason: "Document approval"
+      location: "Tokyo, Japan"
+      date: "D:20240101120000+09'00'"
+      algorithm: SHA256
+      byte_range: "[0, 1234, 5678, 9012]"
+      bytes_covered: 10246
+      signature_size: 8192
+      integrity: intact
+```
+
+**Integrity status values:**
+- `intact` - Document unchanged since signing
+- `modified_after_signing` - Content appended after signature
+- `invalid_byte_range` - Signature byte range is malformed
+- `no_byte_range` - No byte range specified
+- `not_signed` - Signature field exists but is unsigned
+
 ## Revision History
 
 PDFs can contain incremental updates (revisions). Each revision appends new data
@@ -202,6 +231,7 @@ With `--verbose`, additional details are included:
 - Font metrics (ascent, descent, family)
 - Image raw and decoded sizes
 - Full annotation and form field details
+- Signature page references and rectangles
 - Bookmark counts
 - Revision SHA256 hashes and xref offsets
 - Previous xref pointers for revision chain
