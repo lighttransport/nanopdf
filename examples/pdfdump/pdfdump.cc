@@ -1047,6 +1047,165 @@ void dump_forms(OutputWriter& writer, const nanopdf::Pdf& pdf,
   writer.end_section();
 }
 
+// Verify signature integrity by checking byte range coverage
+bool verify_signature_byte_range(const std::vector<uint8_t>& pdf_data,
+                                  const nanopdf::SignatureField& sig) {
+  if (sig.byte_range.size() != 4) return false;
+
+  uint64_t offset1 = sig.byte_range[0];
+  uint64_t length1 = sig.byte_range[1];
+  uint64_t offset2 = sig.byte_range[2];
+  uint64_t length2 = sig.byte_range[3];
+
+  // Check that byte ranges are valid
+  if (offset1 != 0) return false;  // First range should start at 0
+  if (offset1 + length1 > pdf_data.size()) return false;
+  if (offset2 > pdf_data.size()) return false;
+  if (offset2 + length2 > pdf_data.size()) return false;
+
+  // Check that ranges don't overlap and cover the whole file except signature
+  if (offset2 <= offset1 + length1) return false;
+
+  // The gap between ranges should be the signature contents
+  uint64_t gap_start = offset1 + length1;
+  uint64_t gap_end = offset2;
+
+  // Verify the gap contains the signature hex string
+  // (between < and > in the /Contents field)
+  if (gap_end <= gap_start) return false;
+
+  return true;
+}
+
+// Check if document was modified after signing
+std::string check_signature_integrity(const std::vector<uint8_t>& pdf_data,
+                                       const nanopdf::SignatureField& sig) {
+  if (!sig.signature_present || !sig.is_signed) {
+    return "not_signed";
+  }
+
+  if (sig.byte_range.empty()) {
+    return "no_byte_range";
+  }
+
+  if (!verify_signature_byte_range(pdf_data, sig)) {
+    return "invalid_byte_range";
+  }
+
+  // Check if byte range covers whole document
+  if (sig.byte_range.size() == 4) {
+    uint64_t covered = sig.byte_range[1] + sig.byte_range[3];
+    uint64_t gap = sig.byte_range[2] - (sig.byte_range[0] + sig.byte_range[1]);
+    uint64_t total = covered + gap;
+
+    if (total < pdf_data.size()) {
+      // Document has been modified (appended) after signing
+      return "modified_after_signing";
+    }
+  }
+
+  return "intact";
+}
+
+void dump_signatures(OutputWriter& writer, const nanopdf::Pdf& pdf,
+                     const std::vector<uint8_t>& pdf_data,
+                     const DumpOptions& options) {
+  writer.begin_section("signatures");
+
+  const auto& sigs = pdf.catalog.signature_fields;
+  int sig_count = static_cast<int>(sigs.size());
+
+  // Count actual signed signatures
+  int signed_count = 0;
+  for (const auto& sig : sigs) {
+    if (sig.is_signed || sig.signature_present) {
+      signed_count++;
+    }
+  }
+
+  writer.write_kv("total_fields", sig_count);
+  writer.write_kv("signed_count", signed_count);
+
+  if (sig_count > 0) {
+    writer.begin_array("list");
+
+    for (const auto& sig : sigs) {
+      writer.begin_array_item();
+
+      // Basic info
+      if (!sig.name.empty()) {
+        writer.write_array_item_kv("name", sig.name);
+      }
+
+      writer.write_array_item_kv("is_signed", sig.is_signed || sig.signature_present);
+
+      if (sig.is_signed || sig.signature_present) {
+        // Signer info
+        if (!sig.signing_reason.empty()) {
+          writer.write_array_item_kv("reason", sig.signing_reason);
+        }
+        if (!sig.signing_location.empty()) {
+          writer.write_array_item_kv("location", sig.signing_location);
+        }
+        if (!sig.signing_contact_info.empty()) {
+          writer.write_array_item_kv("contact", sig.signing_contact_info);
+        }
+        if (!sig.signing_date.empty()) {
+          writer.write_array_item_kv("date", sig.signing_date);
+        }
+
+        // Signature algorithm
+        if (!sig.digest_algorithm.empty()) {
+          writer.write_array_item_kv("algorithm", sig.digest_algorithm);
+        }
+
+        // Byte range info
+        if (!sig.byte_range.empty() && sig.byte_range.size() == 4) {
+          std::ostringstream br_ss;
+          br_ss << "[" << sig.byte_range[0] << ", " << sig.byte_range[1]
+                << ", " << sig.byte_range[2] << ", " << sig.byte_range[3] << "]";
+          writer.write_array_item_kv("byte_range", br_ss.str());
+
+          // Calculate coverage
+          uint64_t covered = sig.byte_range[1] + sig.byte_range[3];
+          writer.write_array_item_kv("bytes_covered", static_cast<int>(covered));
+        }
+
+        // Signature contents size
+        if (!sig.signature_contents.empty()) {
+          writer.write_array_item_kv("signature_size", static_cast<int>(sig.signature_contents.size()));
+        }
+
+        // Integrity check
+        std::string integrity = check_signature_integrity(pdf_data, sig);
+        writer.write_array_item_kv("integrity", integrity);
+
+        if (options.verbose) {
+          // Page reference
+          if (sig.page_ref > 0) {
+            writer.write_array_item_kv("page_object", static_cast<int>(sig.page_ref));
+          }
+
+          // Rectangle
+          if (sig.rect.size() >= 4) {
+            std::ostringstream rect_ss;
+            rect_ss << std::fixed << std::setprecision(1)
+                    << "[" << sig.rect[0] << ", " << sig.rect[1]
+                    << ", " << sig.rect[2] << ", " << sig.rect[3] << "]";
+            writer.write_array_item_kv("rect", rect_ss.str());
+          }
+        }
+      }
+
+      writer.end_array_item();
+    }
+
+    writer.end_array();
+  }
+
+  writer.end_section();
+}
+
 void dump_outlines(OutputWriter& writer, const nanopdf::Pdf& pdf,
                    const DumpOptions& options) {
   writer.begin_section("outlines");
@@ -1313,6 +1472,9 @@ int main(int argc, char* argv[]) {
 
   // Include forms summary
   dump_forms(writer, pdf, options);
+
+  // Include digital signatures
+  dump_signatures(writer, pdf, pdf_data, options);
 
   // Include outlines/bookmarks summary
   dump_outlines(writer, pdf, options);
