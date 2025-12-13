@@ -1202,6 +1202,29 @@ void dump_signatures(OutputWriter& writer, const nanopdf::Pdf& pdf,
           writer.write_array_item_kv("locked_fields", fields_ss.str());
         }
 
+        // Timestamp information
+        if (sig.has_timestamp) {
+          writer.write_array_item_kv("has_timestamp", true);
+
+          if (sig.is_document_timestamp) {
+            writer.write_array_item_kv("timestamp_type", "document_timestamp");
+          } else {
+            writer.write_array_item_kv("timestamp_type", "embedded");
+          }
+
+          if (!sig.timestamp_hash_algorithm.empty()) {
+            writer.write_array_item_kv("timestamp_algorithm", sig.timestamp_hash_algorithm);
+          }
+
+          if (!sig.timestamp_authority.empty()) {
+            writer.write_array_item_kv("timestamp_authority", sig.timestamp_authority);
+          }
+
+          if (!sig.timestamp_date.empty()) {
+            writer.write_array_item_kv("timestamp_date", sig.timestamp_date);
+          }
+        }
+
         // Byte range info
         if (!sig.byte_range.empty() && sig.byte_range.size() == 4) {
           std::ostringstream br_ss;

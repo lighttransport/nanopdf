@@ -626,6 +626,14 @@ struct SignatureField {
   std::string subfilter;                   // SubFilter: adbe.pkcs7.detached, adbe.pkcs7.sha1, ETSI.CAdES.detached, etc.
   std::string filter;                      // Filter: Adobe.PPKLite, Entrust.PPKEF, etc.
 
+  // Timestamp information
+  bool has_timestamp{false};               // True if signature contains a timestamp
+  bool is_document_timestamp{false};       // True if this is a document timestamp signature (ETSI.RFC3161)
+  std::string timestamp_date;              // Timestamp date/time if available
+  std::string timestamp_authority;         // TSA (Time Stamp Authority) name if available
+  std::string timestamp_hash_algorithm;    // Hash algorithm used for timestamp (SHA256, SHA384, SHA512)
+  std::vector<uint8_t> timestamp_token;    // Raw RFC 3161 timestamp token
+
   SignatureField() = default;
 };
 
