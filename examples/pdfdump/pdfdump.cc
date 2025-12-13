@@ -1159,6 +1159,49 @@ void dump_signatures(OutputWriter& writer, const nanopdf::Pdf& pdf,
           writer.write_array_item_kv("algorithm", sig.digest_algorithm);
         }
 
+        // Signature filter/subfilter
+        if (!sig.filter.empty()) {
+          writer.write_array_item_kv("filter", sig.filter);
+        }
+        if (!sig.subfilter.empty()) {
+          writer.write_array_item_kv("subfilter", sig.subfilter);
+        }
+
+        // MDP (Modification Detection and Prevention) / Certification signature
+        if (sig.is_certification_signature) {
+          writer.write_array_item_kv("type", "certification");
+
+          // DocMDP permissions
+          if (sig.mdp_permissions > 0) {
+            std::string perm_desc;
+            switch (sig.mdp_permissions) {
+              case 1: perm_desc = "no_changes"; break;
+              case 2: perm_desc = "form_fill_and_sign"; break;
+              case 3: perm_desc = "form_fill_sign_annotate"; break;
+              default: perm_desc = "unknown"; break;
+            }
+            writer.write_array_item_kv("mdp_permissions", sig.mdp_permissions);
+            writer.write_array_item_kv("allowed_changes", perm_desc);
+          }
+        } else if (!sig.transform_method.empty()) {
+          writer.write_array_item_kv("type", "approval");
+          writer.write_array_item_kv("transform_method", sig.transform_method);
+        } else {
+          writer.write_array_item_kv("type", "approval");
+        }
+
+        // Locked fields (for FieldMDP)
+        if (!sig.locked_fields.empty()) {
+          std::ostringstream fields_ss;
+          bool first = true;
+          for (const auto& field : sig.locked_fields) {
+            if (!first) fields_ss << ", ";
+            fields_ss << field;
+            first = false;
+          }
+          writer.write_array_item_kv("locked_fields", fields_ss.str());
+        }
+
         // Byte range info
         if (!sig.byte_range.empty() && sig.byte_range.size() == 4) {
           std::ostringstream br_ss;

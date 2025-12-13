@@ -183,24 +183,41 @@ revisions:
 
 ## Digital Signatures
 
-pdfdump detects and reports digital signatures in PDF documents:
+pdfdump detects and reports digital signatures in PDF documents, including
+MDP (Modification Detection and Prevention) certification signatures.
 
 ```yaml
 signatures:
   total_fields: 2
-  signed_count: 1
+  signed_count: 2
   list:
     - name: Signature1
       is_signed: true
-      reason: "Document approval"
+      reason: "Document certified"
       location: "Tokyo, Japan"
       date: "D:20240101120000+09'00'"
       algorithm: SHA256
+      filter: Adobe.PPKLite
+      subfilter: adbe.pkcs7.detached
+      type: certification
+      mdp_permissions: 2
+      allowed_changes: form_fill_and_sign
       byte_range: "[0, 1234, 5678, 9012]"
-      bytes_covered: 10246
-      signature_size: 8192
+      integrity: intact
+    - name: Signature2
+      is_signed: true
+      type: approval
       integrity: intact
 ```
+
+**Signature types:**
+- `certification` - MDP/DocMDP signature that certifies the document
+- `approval` - Regular approval signature
+
+**MDP permission levels (mdp_permissions):**
+- `1` (no_changes) - No changes allowed after signing
+- `2` (form_fill_and_sign) - Only form filling and additional signatures allowed
+- `3` (form_fill_sign_annotate) - Form filling, signatures, and annotations allowed
 
 **Integrity status values:**
 - `intact` - Document unchanged since signing

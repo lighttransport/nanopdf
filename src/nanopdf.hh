@@ -293,7 +293,7 @@ struct TextState {
 
   // Current font
   std::string font_name;
-  BaseFont* current_font = nullptr;
+  const BaseFont* current_font = nullptr;
 
   // Text accumulator
   std::string current_text;
@@ -617,7 +617,15 @@ struct SignatureField {
   std::string signing_location;
   std::string signing_contact_info;
   std::string signing_date;
-  
+
+  // MDP (Modification Detection and Prevention) / Certification signature
+  bool is_certification_signature{false};  // True if this is a DocMDP/certification signature
+  int mdp_permissions{0};                  // DocMDP permissions: 1=no changes, 2=form fill+sign, 3=+annotations
+  std::string transform_method;            // TransformMethod: DocMDP, UR, FieldMDP
+  std::vector<std::string> locked_fields;  // Fields locked by FieldMDP
+  std::string subfilter;                   // SubFilter: adbe.pkcs7.detached, adbe.pkcs7.sha1, ETSI.CAdES.detached, etc.
+  std::string filter;                      // Filter: Adobe.PPKLite, Entrust.PPKEF, etc.
+
   SignatureField() = default;
 };
 
@@ -760,10 +768,13 @@ struct Page {
   std::vector<double> media_box;  // [left, bottom, right, top]
   std::vector<double> crop_box;
   double rotate{0.0};
-  std::map<std::string, std::unique_ptr<BaseFont>> fonts;  // Font resources
+  mutable std::map<std::string, std::unique_ptr<BaseFont>> fonts;  // Font resources
+  mutable bool fonts_loaded{false};  // Lazy font loading flag
   std::vector<std::unique_ptr<Annotation>> annotations;  // Page annotations
 
   PageContent load_contents(const Pdf& pdf) const;
+  void ensure_fonts_loaded(const Pdf& pdf) const;  // Lazy font loading
+  const BaseFont* get_font(const std::string& name, const Pdf& pdf) const;
 };
 
 // Phase 4: Document Structure
@@ -993,7 +1004,24 @@ struct Pdf {
   static const size_t kDefaultObjectStreamCacheCapacity = 32;
   mutable size_t object_stream_cache_capacity{kDefaultObjectStreamCacheCapacity};
 
+  // Lazy loading state flags
+  mutable bool pages_loaded{false};
+  mutable bool acro_form_loaded{false};
+  mutable bool outline_loaded{false};
+  mutable bool page_labels_loaded{false};
+  mutable bool named_destinations_loaded{false};
+  mutable bool document_info_loaded{false};
+  mutable bool xmp_metadata_loaded{false};
+
   bool load_document_structure();
+
+  // Lazy loading API - ensure specific parts are loaded
+  void ensure_pages_loaded() const;
+  void ensure_acro_form_loaded() const;
+  void ensure_outline_loaded() const;
+  void ensure_page_labels_loaded() const;
+  void ensure_named_destinations_loaded() const;
+  void ensure_metadata_loaded() const;
   const Page* get_page(uint32_t page_number) const;
   ResolvedObject load_object(uint32_t obj_num, uint16_t gen_num) const;
   bool build_object_offset_cache() const;
