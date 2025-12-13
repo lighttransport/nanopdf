@@ -219,6 +219,21 @@ signatures:
 - `2` (form_fill_and_sign) - Only form filling and additional signatures allowed
 - `3` (form_fill_sign_annotate) - Form filling, signatures, and annotations allowed
 
+**Timestamp support:**
+
+Signatures may include RFC 3161 timestamps from a Time Stamp Authority (TSA):
+
+```yaml
+    - name: Signature1
+      has_timestamp: true
+      timestamp_type: embedded       # or "document_timestamp"
+      timestamp_algorithm: SHA-256
+      timestamp_authority: "TSA Server"
+```
+
+- `embedded` - Timestamp embedded within the signature (unsigned attribute)
+- `document_timestamp` - Standalone document timestamp (ETSI.RFC3161 SubFilter)
+
 **Integrity status values:**
 - `intact` - Document unchanged since signing
 - `modified_after_signing` - Content appended after signature

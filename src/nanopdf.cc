@@ -2281,6 +2281,69 @@ SignatureField Pdf::parse_signature_field(const Pdf& pdf, const Dictionary& fiel
         }
       }
     }
+
+    // Detect document timestamp signature (ETSI.RFC3161)
+    if (sig_field.subfilter == "ETSI.RFC3161") {
+      sig_field.is_document_timestamp = true;
+      sig_field.has_timestamp = true;
+    }
+
+    // Check for embedded timestamp in signature contents
+    // Timestamps are typically found as unsigned attributes in CMS/PKCS#7
+    // The timestamp token contains OID 1.2.840.113549.1.9.16.2.14 (id-aa-timeStampToken)
+    if (!sig_field.signature_contents.empty() && sig_field.signature_contents.size() > 100) {
+      // Look for timestamp OID: 1.2.840.113549.1.9.16.2.14
+      // DER encoded: 06 0B 2A 86 48 86 F7 0D 01 09 10 02 0E
+      const uint8_t timestamp_oid[] = {0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E};
+      const size_t oid_len = sizeof(timestamp_oid);
+
+      for (size_t i = 0; i + oid_len < sig_field.signature_contents.size(); ++i) {
+        if (std::memcmp(sig_field.signature_contents.data() + i, timestamp_oid, oid_len) == 0) {
+          sig_field.has_timestamp = true;
+          break;
+        }
+      }
+
+      // Also check for RFC 3161 content type OID: 1.2.840.113549.1.9.16.1.4
+      // DER encoded: 06 0B 2A 86 48 86 F7 0D 01 09 10 01 04
+      if (!sig_field.has_timestamp) {
+        const uint8_t tst_content_oid[] = {0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04};
+        for (size_t i = 0; i + sizeof(tst_content_oid) < sig_field.signature_contents.size(); ++i) {
+          if (std::memcmp(sig_field.signature_contents.data() + i, tst_content_oid, sizeof(tst_content_oid)) == 0) {
+            sig_field.has_timestamp = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // Try to extract timestamp hash algorithm from signature contents
+    // SHA-256 OID: 2.16.840.1.101.3.4.2.1 -> 06 09 60 86 48 01 65 03 04 02 01
+    // SHA-384 OID: 2.16.840.1.101.3.4.2.2 -> 06 09 60 86 48 01 65 03 04 02 02
+    // SHA-512 OID: 2.16.840.1.101.3.4.2.3 -> 06 09 60 86 48 01 65 03 04 02 03
+    if (sig_field.has_timestamp && !sig_field.signature_contents.empty()) {
+      const uint8_t sha256_oid[] = {0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01};
+      const uint8_t sha384_oid[] = {0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02};
+      const uint8_t sha512_oid[] = {0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03};
+      const uint8_t sha1_oid[] = {0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A};
+
+      for (size_t i = 0; i + 11 < sig_field.signature_contents.size(); ++i) {
+        if (std::memcmp(sig_field.signature_contents.data() + i, sha256_oid, sizeof(sha256_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-256";
+          break;
+        } else if (std::memcmp(sig_field.signature_contents.data() + i, sha384_oid, sizeof(sha384_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-384";
+          break;
+        } else if (std::memcmp(sig_field.signature_contents.data() + i, sha512_oid, sizeof(sha512_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-512";
+          break;
+        } else if (i + 7 < sig_field.signature_contents.size() &&
+                   std::memcmp(sig_field.signature_contents.data() + i, sha1_oid, sizeof(sha1_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-1";
+          break;
+        }
+      }
+    }
   }
 
   return sig_field;
