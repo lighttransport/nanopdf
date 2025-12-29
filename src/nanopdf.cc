@@ -21,7 +21,9 @@
 
 #include "common-macros.inc"
 #include "crypto.hh"
+#include "jpx-decoder.hh"
 #include "nanopdf.hh"
+#include "stb_image.h"
 #include "stream-reader.hh"
 
 namespace nanopdf {
@@ -629,23 +631,89 @@ namespace filters {
 
 namespace {
 
+// Maximum output size to prevent memory exhaustion (256 MB)
+constexpr size_t kMaxDecodedSize = 256 * 1024 * 1024;
+
+// Validate decode parameters for sanity
+std::string validate_params(const DecodeParams &params) {
+  if (params.colors < 1 || params.colors > 32) {
+    return "Invalid Colors parameter: " + std::to_string(params.colors) +
+           " (must be 1-32)";
+  }
+  if (params.bits_per_component < 1 || params.bits_per_component > 32) {
+    return "Invalid BitsPerComponent parameter: " +
+           std::to_string(params.bits_per_component) + " (must be 1-32)";
+  }
+  if (params.columns < 1 || params.columns > 65535) {
+    return "Invalid Columns parameter: " + std::to_string(params.columns) +
+           " (must be 1-65535)";
+  }
+  // Check for potential overflow in bytes_per_row calculation
+  int64_t bits_per_row =
+      static_cast<int64_t>(params.bits_per_component) * params.colors * params.columns;
+  if (bits_per_row > static_cast<int64_t>(kMaxDecodedSize) * 8) {
+    return "Row size too large: would require " +
+           std::to_string((bits_per_row + 7) / 8) + " bytes per row";
+  }
+  return "";  // No error
+}
+
 // Apply PNG predictor row filter
-bool apply_predictor(std::vector<uint8_t> &data, const DecodeParams &params) {
+bool apply_predictor(std::vector<uint8_t> &data, const DecodeParams &params,
+                     std::string &error) {
   if (params.predictor < 10 || params.predictor > 15) {
     return true;  // No predictor or unsupported
+  }
+
+  // Validate parameters first
+  std::string validation_error = validate_params(params);
+  if (!validation_error.empty()) {
+    error = "Predictor parameter validation failed: " + validation_error;
+    return false;
   }
 
   int bytes_per_pixel = (params.bits_per_component * params.colors + 7) / 8;
   int bytes_per_row =
       (params.bits_per_component * params.colors * params.columns + 7) / 8;
-  int row_count = data.size() / (bytes_per_row + 1);
+
+  // Check for empty or insufficient data
+  if (data.empty()) {
+    error = "Predictor: empty input data";
+    return false;
+  }
+  if (bytes_per_row <= 0) {
+    error = "Predictor: invalid bytes_per_row calculation";
+    return false;
+  }
+
+  int row_count = static_cast<int>(data.size() / (bytes_per_row + 1));
+  if (row_count <= 0) {
+    error = "Predictor: insufficient data for even one row (need " +
+            std::to_string(bytes_per_row + 1) + " bytes, have " +
+            std::to_string(data.size()) + ")";
+    return false;
+  }
 
   std::vector<uint8_t> output;
   output.reserve(row_count * bytes_per_row);
 
   for (int row = 0; row < row_count; row++) {
-    int filter = data[row * (bytes_per_row + 1)];
-    const uint8_t *row_data = &data[row * (bytes_per_row + 1) + 1];
+    size_t row_offset = static_cast<size_t>(row) * (bytes_per_row + 1);
+    // Bounds check before accessing filter byte
+    if (row_offset >= data.size()) {
+      error = "Predictor: row " + std::to_string(row) +
+              " offset out of bounds";
+      return false;
+    }
+    int filter = data[row_offset];
+
+    // Bounds check for row data access
+    if (row_offset + 1 + bytes_per_row > data.size()) {
+      error = "Predictor: insufficient data for row " + std::to_string(row) +
+              " (need " + std::to_string(bytes_per_row) + " bytes)";
+      return false;
+    }
+    const uint8_t *row_data = &data[row_offset + 1];
 
     // Previous row for 'up' filter
     const uint8_t *prev_row =
@@ -688,6 +756,8 @@ bool apply_predictor(std::vector<uint8_t> &data, const DecodeParams &params) {
             val = row_data[col] + up_left;
         } break;
         default:
+          error = "Predictor: unknown filter type " + std::to_string(filter) +
+                  " at row " + std::to_string(row);
           return false;
       }
       output.push_back(val);
@@ -1004,6 +1074,11 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
   DecodedStream result;
   std::vector<uint8_t> output;
 
+  if (size == 0) {
+    result.error = "FlateDecode: empty input data";
+    return result;
+  }
+
   // Decompress using zlib
   z_stream strm;
   memset(&strm, 0, sizeof(strm));
@@ -1011,20 +1086,49 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
   strm.avail_in = static_cast<uInt>(size);
 
   if (inflateInit(&strm) != Z_OK) {
-    result.error = "Failed to initialize zlib";
+    result.error = "FlateDecode: failed to initialize zlib decompressor";
     return result;
   }
 
   int ret;
   do {
+    // Check for excessive output size
+    if (output.size() >= kMaxDecodedSize) {
+      inflateEnd(&strm);
+      result.error = "FlateDecode: output exceeds maximum size limit (" +
+                     std::to_string(kMaxDecodedSize / (1024 * 1024)) + " MB)";
+      return result;
+    }
+
     output.resize(output.size() + 4096);
     strm.next_out = output.data() + strm.total_out;
     strm.avail_out = static_cast<uInt>(output.size() - strm.total_out);
 
     ret = inflate(&strm, Z_NO_FLUSH);
     if (ret != Z_OK && ret != Z_STREAM_END) {
+      std::string zlib_error;
+      switch (ret) {
+        case Z_DATA_ERROR:
+          zlib_error = "corrupted or invalid deflate data";
+          break;
+        case Z_MEM_ERROR:
+          zlib_error = "out of memory";
+          break;
+        case Z_BUF_ERROR:
+          zlib_error = "buffer error (incomplete data)";
+          break;
+        case Z_STREAM_ERROR:
+          zlib_error = "stream state error";
+          break;
+        default:
+          zlib_error = "unknown error (code " + std::to_string(ret) + ")";
+          break;
+      }
+      if (strm.msg) {
+        zlib_error += std::string(": ") + strm.msg;
+      }
       inflateEnd(&strm);
-      result.error = "Failed to decompress data";
+      result.error = "FlateDecode: " + zlib_error;
       return result;
     }
   } while (ret != Z_STREAM_END);
@@ -1033,8 +1137,9 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
   output.resize(strm.total_out);
 
   // Apply predictor if needed
-  if (!apply_predictor(output, params)) {
-    result.error = "Failed to apply PNG predictor";
+  std::string predictor_error;
+  if (!apply_predictor(output, params, predictor_error)) {
+    result.error = "FlateDecode: " + predictor_error;
     return result;
   }
 
@@ -1051,19 +1156,20 @@ DecodedStream decode_lzw(const uint8_t *data, size_t size,
   // Initialize LZW decoder
   LZWDecoder decoder;
   if (!decoder.init(data, size, params.early_change)) {
-    result.error = "Failed to initialize LZW decoder";
+    result.error = "LZWDecode: failed to initialize decoder (empty or invalid data)";
     return result;
   }
 
   // Decode data
   if (!decoder.decode(output)) {
-    result.error = "Failed to decode LZW data";
+    result.error = "LZWDecode: failed to decode data (invalid code sequence)";
     return result;
   }
 
   // Apply predictor if needed
-  if (!apply_predictor(output, params)) {
-    result.error = "Failed to apply PNG predictor";
+  std::string predictor_error;
+  if (!apply_predictor(output, params, predictor_error)) {
+    result.error = "LZWDecode: " + predictor_error;
     return result;
   }
 
@@ -1128,7 +1234,6 @@ DecodedStream decode_dct(const uint8_t *data, size_t size,
                         const DecodeParams & /*params*/) {
   DecodedStream result;
 
-#ifdef STB_IMAGE_IMPLEMENTATION
   // Use stb_image to decode JPEG data
   int width, height, channels;
   unsigned char *decoded = stbi_load_from_memory(data, static_cast<int>(size),
@@ -1139,16 +1244,29 @@ DecodedStream decode_dct(const uint8_t *data, size_t size,
   }
 
   // Copy decoded data to result
-  size_t decoded_size = width * height * channels;
+  size_t decoded_size = static_cast<size_t>(width) * height * channels;
   result.data.assign(decoded, decoded + decoded_size);
   stbi_image_free(decoded);
   result.success = true;
-#else
-  // Fallback: just copy the JPEG data as-is for now
-  result.data.assign(data, data + size);
-  result.success = true;
-#endif
 
+  return result;
+}
+
+// JPXDecode (JPEG2000) implementation
+DecodedStream decode_jpx(const uint8_t *data, size_t size,
+                         const DecodeParams & /*params*/) {
+  DecodedStream result;
+
+  jpx::JPXDecoder decoder;
+  auto decode_result = decoder.decode(data, size);
+
+  if (!decode_result.success) {
+    result.error = "JPXDecode: " + decode_result.error;
+    return result;
+  }
+
+  result.data = std::move(decode_result.pixels);
+  result.success = true;
   return result;
 }
 
@@ -1659,10 +1777,47 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 }  // namespace filters
 }  // namespace filters
 
+// Helper to apply a single filter
+static DecodedStream apply_single_filter(const std::string &filter_name,
+                                         const uint8_t *data, size_t size,
+                                         const filters::DecodeParams &params) {
+  DecodedStream result;
+
+  if (filter_name == "FlateDecode" || filter_name == "Fl") {
+    return filters::decode_flate(data, size, params);
+  } else if (filter_name == "ASCII85Decode" || filter_name == "A85") {
+    return filters::decode_ascii85(data, size, params);
+  } else if (filter_name == "ASCIIHexDecode" || filter_name == "AHx") {
+    return filters::decode_asciihex(data, size, params);
+  } else if (filter_name == "LZWDecode" || filter_name == "LZW") {
+    return filters::decode_lzw(data, size, params);
+  } else if (filter_name == "JBIG2Decode") {
+    return filters::decode_jbig2(data, size, params);
+  } else if (filter_name == "RunLengthDecode" || filter_name == "RL") {
+    return filters::decode_runlength(data, size, params);
+  } else if (filter_name == "DCTDecode" || filter_name == "DCT") {
+    return filters::decode_dct(data, size, params);
+  } else if (filter_name == "CCITTFaxDecode" || filter_name == "CCF") {
+    return filters::decode_ccittfax(data, size, params);
+  } else if (filter_name == "JPXDecode") {
+    return filters::decode_jpx(data, size, params);
+  } else if (filter_name == "Crypt") {
+    // Crypt filter is handled at a higher level; pass through
+    result.data.assign(data, data + size);
+    result.success = true;
+    return result;
+  }
+
+  result.error = "Unsupported filter type: " + filter_name;
+  return result;
+}
+
 DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
   DecodedStream result;
+  (void)pdf;  // May be used for reference resolution in future
+
   if (stream_obj.type != Value::STREAM) {
-    result.error = "Not a stream object";
+    result.error = "decode_stream: not a stream object";
     return result;
   }
 
@@ -1675,42 +1830,83 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
     return result;
   }
 
-  // Get decode parameters if present
-  filters::DecodeParams params;
+  // Build list of filters to apply (PDF applies filters in order)
+  std::vector<std::string> filter_names;
+  if (filter_it->second.type == Value::NAME) {
+    filter_names.push_back(filter_it->second.name);
+  } else if (filter_it->second.type == Value::ARRAY) {
+    for (const auto &item : filter_it->second.array) {
+      if (item.type == Value::NAME) {
+        filter_names.push_back(item.name);
+      } else {
+        result.error = "decode_stream: Filter array contains non-name element";
+        return result;
+      }
+    }
+  } else {
+    result.error = "decode_stream: Filter must be a name or array, got type " +
+                   std::to_string(static_cast<int>(filter_it->second.type));
+    return result;
+  }
+
+  // Build list of decode parameters (one per filter, or empty)
+  std::vector<filters::DecodeParams> params_list;
   auto params_it = stream_obj.stream.dict.find("DecodeParms");
   if (params_it != stream_obj.stream.dict.end()) {
-    params = filters::parse_decode_params(params_it->second.dict);
+    if (params_it->second.type == Value::DICTIONARY) {
+      // Single params dict applies to single filter
+      params_list.push_back(filters::parse_decode_params(params_it->second.dict));
+    } else if (params_it->second.type == Value::ARRAY) {
+      // Array of params, one per filter
+      for (const auto &item : params_it->second.array) {
+        if (item.type == Value::DICTIONARY) {
+          params_list.push_back(filters::parse_decode_params(item.dict));
+        } else if (item.type == Value::NULL_OBJ) {
+          // null means default params for this filter
+          params_list.push_back(filters::DecodeParams{});
+        } else {
+          result.error = "decode_stream: DecodeParms array contains invalid element";
+          return result;
+        }
+      }
+    } else if (params_it->second.type != Value::NULL_OBJ) {
+      result.error = "decode_stream: DecodeParms must be dictionary, array, or null";
+      return result;
+    }
   }
 
-  // Handle different filter types
-  std::string filter_name = filter_it->second.name;
-  if (filter_name == "FlateDecode") {
-    return filters::decode_flate(stream_obj.stream.data.data(),
-                                 stream_obj.stream.data.size(), params);
-  } else if (filter_name == "ASCII85Decode") {
-    return filters::decode_ascii85(stream_obj.stream.data.data(),
-                                   stream_obj.stream.data.size(), params);
-  } else if (filter_name == "ASCIIHexDecode") {
-    return filters::decode_asciihex(stream_obj.stream.data.data(),
-                                    stream_obj.stream.data.size(), params);
-  } else if (filter_name == "LZWDecode") {
-    return filters::decode_lzw(stream_obj.stream.data.data(),
-                               stream_obj.stream.data.size(), params);
-  } else if (filter_name == "JBIG2Decode") {
-    return filters::decode_jbig2(stream_obj.stream.data.data(),
-                                 stream_obj.stream.data.size(), params);
-  } else if (filter_name == "RunLengthDecode") {
-    return filters::decode_runlength(stream_obj.stream.data.data(),
-                                     stream_obj.stream.data.size(), params);
-  } else if (filter_name == "DCTDecode") {
-    return filters::decode_dct(stream_obj.stream.data.data(),
-                              stream_obj.stream.data.size(), params);
-  } else if (filter_name == "CCITTFaxDecode") {
-    return filters::decode_ccittfax(stream_obj.stream.data.data(),
-                                    stream_obj.stream.data.size(), params);
+  // Pad params_list to match filter count (use defaults for missing)
+  while (params_list.size() < filter_names.size()) {
+    params_list.push_back(filters::DecodeParams{});
   }
 
-  result.error = "Unsupported filter type: " + filter_name;
+  // Apply filters in sequence
+  std::vector<uint8_t> current_data = stream_obj.stream.data;
+
+  for (size_t i = 0; i < filter_names.size(); ++i) {
+    const std::string &filter_name = filter_names[i];
+    const filters::DecodeParams &params = params_list[i];
+
+    DecodedStream step_result =
+        apply_single_filter(filter_name, current_data.data(),
+                            current_data.size(), params);
+
+    if (!step_result.success) {
+      if (filter_names.size() > 1) {
+        result.error = "Filter chain step " + std::to_string(i + 1) + "/" +
+                       std::to_string(filter_names.size()) + " (" +
+                       filter_name + "): " + step_result.error;
+      } else {
+        result.error = step_result.error;
+      }
+      return result;
+    }
+
+    current_data = std::move(step_result.data);
+  }
+
+  result.data = std::move(current_data);
+  result.success = true;
   return result;
 }
 
@@ -2074,7 +2270,148 @@ SignatureField Pdf::parse_signature_field(const Pdf& pdf, const Dictionary& fiel
       }
     }
   }
-  
+
+  // Parse MDP (Modification Detection and Prevention) signature information
+  if (sig_field.is_signed && !sig_field.signature_dict.empty()) {
+    // Extract Filter (e.g., Adobe.PPKLite)
+    auto filter_it = sig_field.signature_dict.find("Filter");
+    if (filter_it != sig_field.signature_dict.end() && filter_it->second.type == Value::NAME) {
+      sig_field.filter = filter_it->second.name;
+    }
+
+    // Extract SubFilter (e.g., adbe.pkcs7.detached, ETSI.CAdES.detached)
+    auto subfilter_it = sig_field.signature_dict.find("SubFilter");
+    if (subfilter_it != sig_field.signature_dict.end() && subfilter_it->second.type == Value::NAME) {
+      sig_field.subfilter = subfilter_it->second.name;
+    }
+
+    // Parse Reference array for TransformMethod and TransformParams
+    auto ref_it = sig_field.signature_dict.find("Reference");
+    if (ref_it != sig_field.signature_dict.end() && ref_it->second.type == Value::ARRAY) {
+      for (const auto& ref_entry : ref_it->second.array) {
+        Dictionary ref_dict;
+        if (ref_entry.type == Value::DICTIONARY) {
+          ref_dict = ref_entry.dict;
+        } else if (ref_entry.type == Value::REFERENCE) {
+          ResolvedObject resolved = resolve_reference(pdf, ref_entry.ref_object_number,
+                                                      ref_entry.ref_generation_number);
+          if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+            ref_dict = resolved.value.dict;
+          }
+        }
+
+        if (!ref_dict.empty()) {
+          // Extract TransformMethod
+          auto tm_it = ref_dict.find("TransformMethod");
+          if (tm_it != ref_dict.end() && tm_it->second.type == Value::NAME) {
+            sig_field.transform_method = tm_it->second.name;
+
+            // Check if this is a DocMDP (certification) signature
+            if (sig_field.transform_method == "DocMDP") {
+              sig_field.is_certification_signature = true;
+            }
+          }
+
+          // Extract TransformParams
+          auto tp_it = ref_dict.find("TransformParams");
+          if (tp_it != ref_dict.end()) {
+            Dictionary tp_dict;
+            if (tp_it->second.type == Value::DICTIONARY) {
+              tp_dict = tp_it->second.dict;
+            } else if (tp_it->second.type == Value::REFERENCE) {
+              ResolvedObject resolved = resolve_reference(pdf, tp_it->second.ref_object_number,
+                                                          tp_it->second.ref_generation_number);
+              if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+                tp_dict = resolved.value.dict;
+              }
+            }
+
+            if (!tp_dict.empty()) {
+              // Extract P (permissions) for DocMDP
+              auto p_it = tp_dict.find("P");
+              if (p_it != tp_dict.end() && p_it->second.type == Value::NUMBER) {
+                sig_field.mdp_permissions = static_cast<int>(p_it->second.number);
+              }
+
+              // Extract locked fields for FieldMDP
+              auto fields_it = tp_dict.find("Fields");
+              if (fields_it != tp_dict.end() && fields_it->second.type == Value::ARRAY) {
+                for (const auto& field_name : fields_it->second.array) {
+                  if (field_name.type == Value::STRING) {
+                    sig_field.locked_fields.push_back(field_name.str);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Detect document timestamp signature (ETSI.RFC3161)
+    if (sig_field.subfilter == "ETSI.RFC3161") {
+      sig_field.is_document_timestamp = true;
+      sig_field.has_timestamp = true;
+    }
+
+    // Check for embedded timestamp in signature contents
+    // Timestamps are typically found as unsigned attributes in CMS/PKCS#7
+    // The timestamp token contains OID 1.2.840.113549.1.9.16.2.14 (id-aa-timeStampToken)
+    if (!sig_field.signature_contents.empty() && sig_field.signature_contents.size() > 100) {
+      // Look for timestamp OID: 1.2.840.113549.1.9.16.2.14
+      // DER encoded: 06 0B 2A 86 48 86 F7 0D 01 09 10 02 0E
+      const uint8_t timestamp_oid[] = {0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E};
+      const size_t oid_len = sizeof(timestamp_oid);
+
+      for (size_t i = 0; i + oid_len < sig_field.signature_contents.size(); ++i) {
+        if (std::memcmp(sig_field.signature_contents.data() + i, timestamp_oid, oid_len) == 0) {
+          sig_field.has_timestamp = true;
+          break;
+        }
+      }
+
+      // Also check for RFC 3161 content type OID: 1.2.840.113549.1.9.16.1.4
+      // DER encoded: 06 0B 2A 86 48 86 F7 0D 01 09 10 01 04
+      if (!sig_field.has_timestamp) {
+        const uint8_t tst_content_oid[] = {0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04};
+        for (size_t i = 0; i + sizeof(tst_content_oid) < sig_field.signature_contents.size(); ++i) {
+          if (std::memcmp(sig_field.signature_contents.data() + i, tst_content_oid, sizeof(tst_content_oid)) == 0) {
+            sig_field.has_timestamp = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // Try to extract timestamp hash algorithm from signature contents
+    // SHA-256 OID: 2.16.840.1.101.3.4.2.1 -> 06 09 60 86 48 01 65 03 04 02 01
+    // SHA-384 OID: 2.16.840.1.101.3.4.2.2 -> 06 09 60 86 48 01 65 03 04 02 02
+    // SHA-512 OID: 2.16.840.1.101.3.4.2.3 -> 06 09 60 86 48 01 65 03 04 02 03
+    if (sig_field.has_timestamp && !sig_field.signature_contents.empty()) {
+      const uint8_t sha256_oid[] = {0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01};
+      const uint8_t sha384_oid[] = {0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02};
+      const uint8_t sha512_oid[] = {0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03};
+      const uint8_t sha1_oid[] = {0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A};
+
+      for (size_t i = 0; i + 11 < sig_field.signature_contents.size(); ++i) {
+        if (std::memcmp(sig_field.signature_contents.data() + i, sha256_oid, sizeof(sha256_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-256";
+          break;
+        } else if (std::memcmp(sig_field.signature_contents.data() + i, sha384_oid, sizeof(sha384_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-384";
+          break;
+        } else if (std::memcmp(sig_field.signature_contents.data() + i, sha512_oid, sizeof(sha512_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-512";
+          break;
+        } else if (i + 7 < sig_field.signature_contents.size() &&
+                   std::memcmp(sig_field.signature_contents.data() + i, sha1_oid, sizeof(sha1_oid)) == 0) {
+          sig_field.timestamp_hash_algorithm = "SHA-1";
+          break;
+        }
+      }
+    }
+  }
+
   return sig_field;
 }
 
@@ -3432,9 +3769,11 @@ bool Pdf::load_document_structure() {
     }
     if (has_resources) {
       page.resources = std::move(resources);
-      parse_font_resources(page, page.resources);
+      // Fonts are now loaded lazily via ensure_fonts_loaded()
+      page.fonts_loaded = false;
     } else {
       page.fonts.clear();
+      page.fonts_loaded = true;  // No resources = no fonts to load
     }
 
     auto media_it = dict.find("MediaBox");
@@ -3532,13 +3871,25 @@ bool Pdf::load_document_structure() {
   }
 
   catalog.pages_count = static_cast<uint32_t>(catalog.pages.size());
+  pages_loaded = true;
 
+  // Metadata is now loaded lazily via ensure_*_loaded() methods
+  // Keeping eager loading for backward compatibility, but can be disabled
+  // by setting NANOPDF_LAZY_METADATA=1 at compile time
+#ifndef NANOPDF_LAZY_METADATA
   parse_acro_form(*this, catalog);
+  acro_form_loaded = true;
   parse_document_outline(*this, catalog);
+  outline_loaded = true;
   parse_page_labels(*this, catalog);
+  page_labels_loaded = true;
   parse_named_destinations(*this, catalog);
+  named_destinations_loaded = true;
   parse_document_info(*this, catalog);
   parse_xmp_metadata(*this, catalog);
+  document_info_loaded = true;
+  xmp_metadata_loaded = true;
+#endif
   return true;
 }
 
@@ -3556,6 +3907,73 @@ const Page* Pdf::get_page(uint32_t page_number) const {
   }
 
   return nullptr;
+}
+
+// Lazy loading implementation methods
+void Pdf::ensure_pages_loaded() const {
+  if (!pages_loaded) {
+    // Pages are loaded during load_document_structure
+    // This method exists for explicit control
+    const_cast<Pdf*>(this)->load_document_structure();
+  }
+}
+
+void Pdf::ensure_acro_form_loaded() const {
+  if (!acro_form_loaded) {
+    ensure_pages_loaded();
+    parse_acro_form(*this, const_cast<DocumentCatalog&>(catalog));
+    acro_form_loaded = true;
+  }
+}
+
+void Pdf::ensure_outline_loaded() const {
+  if (!outline_loaded) {
+    ensure_pages_loaded();
+    parse_document_outline(*this, const_cast<DocumentCatalog&>(catalog));
+    outline_loaded = true;
+  }
+}
+
+void Pdf::ensure_page_labels_loaded() const {
+  if (!page_labels_loaded) {
+    ensure_pages_loaded();
+    parse_page_labels(*this, const_cast<DocumentCatalog&>(catalog));
+    page_labels_loaded = true;
+  }
+}
+
+void Pdf::ensure_named_destinations_loaded() const {
+  if (!named_destinations_loaded) {
+    ensure_pages_loaded();
+    parse_named_destinations(*this, const_cast<DocumentCatalog&>(catalog));
+    named_destinations_loaded = true;
+  }
+}
+
+void Pdf::ensure_metadata_loaded() const {
+  if (!document_info_loaded) {
+    ensure_pages_loaded();
+    parse_document_info(*this, const_cast<DocumentCatalog&>(catalog));
+    document_info_loaded = true;
+  }
+  if (!xmp_metadata_loaded) {
+    parse_xmp_metadata(*this, const_cast<DocumentCatalog&>(catalog));
+    xmp_metadata_loaded = true;
+  }
+}
+
+// Page lazy font loading
+void Page::ensure_fonts_loaded(const Pdf& pdf) const {
+  if (!fonts_loaded) {
+    Pdf::parse_font_resources(pdf, const_cast<Page&>(*this), resources);
+    fonts_loaded = true;
+  }
+}
+
+const BaseFont* Page::get_font(const std::string& name, const Pdf& pdf) const {
+  ensure_fonts_loaded(pdf);
+  auto it = fonts.find(name);
+  return it != fonts.end() ? it->second.get() : nullptr;
 }
 
 PageContent Page::load_contents(const Pdf& pdf) const {
@@ -4328,11 +4746,9 @@ private:
     } else if (op == "Tf" && operands.size() >= 2) {
       text_state_.font_name = operands[0];
       text_state_.font_size = parse_number(operands[1]);
-      // Look up font in page resources
-      auto font_it = page_.fonts.find(text_state_.font_name.substr(1)); // Remove leading /
-      if (font_it != page_.fonts.end()) {
-        text_state_.current_font = font_it->second.get();
-      }
+      // Look up font in page resources (lazy load if needed)
+      std::string font_name = text_state_.font_name.substr(1);  // Remove leading /
+      text_state_.current_font = page_.get_font(font_name, pdf_);
     } else if (op == "Tr" && operands.size() >= 1) {
       int mode = static_cast<int>(parse_number(operands[0]));
       if (mode >= 0 && mode <= 7) {
@@ -5741,12 +6157,22 @@ private:
 
 // Parse font descriptor
 std::unique_ptr<FontDescriptor> Pdf::parse_font_descriptor(const Pdf& pdf, const Value& desc_val) {
-  if (desc_val.type != Value::DICTIONARY) {
+  // Resolve reference if needed
+  Value resolved_val = desc_val;
+  if (desc_val.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, desc_val.ref_object_number, desc_val.ref_generation_number);
+    if (!resolved.success) {
+      return nullptr;
+    }
+    resolved_val = resolved.value;
+  }
+
+  if (resolved_val.type != Value::DICTIONARY) {
     return nullptr;
   }
 
   auto descriptor = std::unique_ptr<FontDescriptor>(new FontDescriptor());
-  const Dictionary& dict = desc_val.dict;
+  const Dictionary& dict = resolved_val.dict;
 
   // Parse font name
   auto name_it = dict.find("FontName");
@@ -5789,6 +6215,22 @@ std::unique_ptr<FontDescriptor> Pdf::parse_font_descriptor(const Pdf& pdf, const
         descriptor->font_bbox.push_back(val.number);
       }
     }
+  }
+
+  // Parse embedded font file (FontFile, FontFile2, FontFile3)
+  // FontFile = Type1 font program
+  // FontFile2 = TrueType font program
+  // FontFile3 = CFF font program (Type1C, CIDFontType0C, OpenType)
+  auto fontfile_it = dict.find("FontFile2");  // TrueType
+  if (fontfile_it == dict.end()) {
+    fontfile_it = dict.find("FontFile3");  // CFF/OpenType
+  }
+  if (fontfile_it == dict.end()) {
+    fontfile_it = dict.find("FontFile");  // Type1
+  }
+  if (fontfile_it != dict.end()) {
+    // Store the reference/stream for later decoding
+    descriptor->font_file = fontfile_it->second;
   }
 
   return descriptor;
