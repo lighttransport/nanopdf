@@ -1775,7 +1775,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 }
 
 }  // namespace filters
-}  // namespace filters
 
 // Helper to apply a single filter
 static DecodedStream apply_single_filter(const std::string &filter_name,
