@@ -112,6 +112,11 @@ private:
   std::string canvas_color_string(const std::string& hex, double alpha) const;
   void update_canvas_fill_style();
   void update_canvas_stroke_style();
+  void update_canvas_line_width();
+  void update_canvas_line_cap();
+  void update_canvas_line_join();
+  void update_canvas_miter_limit();
+  void update_canvas_line_dash();
   void update_canvas_blend_mode();
   std::string blend_mode_to_canvas(BlendMode mode) const;
   std::string blend_mode_to_css(const std::string& canvas_mode) const;
@@ -119,6 +124,7 @@ private:
   Matrix2D multiply_matrices(const Matrix2D& lhs, const Matrix2D& rhs) const;
   void apply_matrix_to_point(const Matrix2D& matrix, double& x, double& y) const;
   std::string dash_pattern_to_string(const std::vector<double>& pattern) const;
+  std::string dash_pattern_to_canvas_array(const std::vector<double>& pattern) const;
   void parse_dash_pattern(const std::vector<std::string>& operands,
                           std::vector<double>* pattern,
                           double* phase) const;
