@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nanopdf WASM Demo</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 {
+      color: #333;
+    }
+    .controls {
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      margin-bottom: 20px;
+    }
+    .controls input[type="file"] {
+      margin-right: 10px;
+    }
+    .controls button {
+      background: #007bff;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-right: 8px;
+    }
+    .controls button:hover {
+      background: #0056b3;
+    }
+    .controls button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    #status {
+      margin-top: 10px;
+      padding: 10px;
+      background: #e7f3ff;
+      border-radius: 4px;
+      display: none;
+    }
+    #status.error {
+      background: #ffe7e7;
+      color: #cc0000;
+    }
+    #canvas-container {
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      text-align: center;
+    }
+    #pdf-canvas {
+      border: 1px solid #ddd;
+      max-width: 100%;
+    }
+    #page-info {
+      margin-top: 10px;
+      color: #666;
+    }
+    .page-nav {
+      margin-top: 10px;
+    }
+    #text-output {
+      margin-top: 20px;
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      white-space: pre-wrap;
+      font-family: monospace;
+      max-height: 300px;
+      overflow-y: auto;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <h1>nanopdf WASM Demo</h1>
+
+  <div class="controls">
+    <input type="file" id="pdf-input" accept=".pdf" />
+    <button id="render-btn" disabled>Render Page</button>
+    <button id="extract-btn" disabled>Extract Text</button>
+    <div id="status"></div>
+  </div>
+
+  <div id="canvas-container">
+    <canvas id="pdf-canvas" width="800" height="600"></canvas>
+    <div id="page-info"></div>
+    <div class="page-nav">
+      <button id="prev-btn" disabled>&larr; Previous</button>
+      <span id="page-display">Page 0 / 0</span>
+      <button id="next-btn" disabled>Next &rarr;</button>
+    </div>
+  </div>
+
+  <div id="text-output"></div>
+
+  <script type="module">
+    // Import the nanopdf WASM module
+    // Adjust the path based on your build output location
+    import createModule from '../../build_wasm/nanopdf.js';
+
+    let Module = null;
+    let pdf = null;
+    let currentPage = 0;
+    let totalPages = 0;
+
+    const pdfInput = document.getElementById('pdf-input');
+    const renderBtn = document.getElementById('render-btn');
+    const extractBtn = document.getElementById('extract-btn');
+    const prevBtn = document.getElementById('prev-btn');
+    const nextBtn = document.getElementById('next-btn');
+    const canvas = document.getElementById('pdf-canvas');
+    const status = document.getElementById('status');
+    const pageInfo = document.getElementById('page-info');
+    const pageDisplay = document.getElementById('page-display');
+    const textOutput = document.getElementById('text-output');
+
+    function showStatus(msg, isError = false) {
+      status.textContent = msg;
+      status.style.display = 'block';
+      status.className = isError ? 'error' : '';
+    }
+
+    function hideStatus() {
+      status.style.display = 'none';
+    }
+
+    function updatePageDisplay() {
+      pageDisplay.textContent = `Page ${currentPage + 1} / ${totalPages}`;
+      prevBtn.disabled = currentPage <= 0;
+      nextBtn.disabled = currentPage >= totalPages - 1;
+    }
+
+    async function init() {
+      showStatus('Loading WASM module...');
+      try {
+        Module = await createModule();
+
+        // Initialize nanopdf
+        const result = Module._nanopdf_init();
+        if (result !== 1) {
+          throw new Error('Failed to initialize nanopdf');
+        }
+
+        // Check if rendering is available
+        const hasRendering = Module._nanopdf_has_rendering() === 1;
+        if (!hasRendering) {
+          showStatus('Note: Rendering not available. Build with NANOPDF_USE_THORVG=ON or NANOPDF_USE_BLEND2D=ON for rendering support. Text extraction is still available.');
+          renderBtn.style.display = 'none';
+          canvas.style.display = 'none';
+        } else {
+          hideStatus();
+        }
+
+        console.log('nanopdf WASM module loaded successfully');
+        console.log('Rendering available:', hasRendering);
+      } catch (err) {
+        showStatus('Failed to load WASM module: ' + err.message, true);
+        console.error(err);
+      }
+    }
+
+    pdfInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file || !Module) return;
+
+      showStatus('Loading PDF...');
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+
+        // Allocate memory and copy data
+        const ptr = Module._nanopdf_malloc(bytes.length);
+        Module.HEAPU8.set(bytes, ptr);
+
+        // Load PDF
+        totalPages = Module._nanopdf_load_pdf(ptr, bytes.length);
+        Module._nanopdf_free(ptr);
+
+        if (totalPages <= 0) {
+          const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+          throw new Error(error || 'Failed to load PDF');
+        }
+
+        currentPage = 0;
+        renderBtn.disabled = false;
+        extractBtn.disabled = false;
+        prevBtn.disabled = false;
+        nextBtn.disabled = false;
+
+        updatePageDisplay();
+        showStatus(`Loaded ${file.name}: ${totalPages} page(s)`);
+
+        // Auto-render first page
+        renderCurrentPage();
+      } catch (err) {
+        showStatus('Error: ' + err.message, true);
+        console.error(err);
+      }
+    });
+
+    function renderCurrentPage() {
+      if (!Module || totalPages <= 0) return;
+
+      // Get page dimensions
+      const pageWidth = Module._nanopdf_get_page_width(currentPage);
+      const pageHeight = Module._nanopdf_get_page_height(currentPage);
+
+      // Calculate canvas size (scale to fit)
+      const maxWidth = 800;
+      const scale = maxWidth / pageWidth;
+      const width = Math.floor(pageWidth * scale);
+      const height = Math.floor(pageHeight * scale);
+
+      canvas.width = width;
+      canvas.height = height;
+
+      // Render page
+      const dpi = 72 * scale;
+      const result = Module._nanopdf_render_page(currentPage, width, height, dpi);
+
+      if (result !== 1) {
+        const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+        showStatus('Render error: ' + error, true);
+        return;
+      }
+
+      // Get render buffer
+      const bufferPtr = Module._nanopdf_get_render_buffer();
+      const bufferSize = Module._nanopdf_get_render_buffer_size();
+      const renderWidth = Module._nanopdf_get_render_width();
+      const renderHeight = Module._nanopdf_get_render_height();
+
+      // Copy to canvas
+      const ctx = canvas.getContext('2d');
+      const imageData = ctx.createImageData(renderWidth, renderHeight);
+      const srcData = new Uint8ClampedArray(Module.HEAPU8.buffer, bufferPtr, bufferSize);
+      imageData.data.set(srcData);
+      ctx.putImageData(imageData, 0, 0);
+
+      pageInfo.textContent = `Page size: ${pageWidth.toFixed(1)} x ${pageHeight.toFixed(1)} pts (${(pageWidth/72).toFixed(2)}" x ${(pageHeight/72).toFixed(2)}")`;
+      updatePageDisplay();
+      hideStatus();
+    }
+
+    renderBtn.addEventListener('click', renderCurrentPage);
+
+    extractBtn.addEventListener('click', () => {
+      if (!Module || totalPages <= 0) return;
+
+      const textPtr = Module._nanopdf_extract_text(currentPage);
+      const text = Module.UTF8ToString(textPtr);
+
+      textOutput.style.display = 'block';
+      textOutput.textContent = text || '(No text extracted)';
+    });
+
+    prevBtn.addEventListener('click', () => {
+      if (currentPage > 0) {
+        currentPage--;
+        renderCurrentPage();
+      }
+    });
+
+    nextBtn.addEventListener('click', () => {
+      if (currentPage < totalPages - 1) {
+        currentPage++;
+        renderCurrentPage();
+      }
+    });
+
+    // Initialize on load
+    init();
+  </script>
+</body>
+</html>
