@@ -980,6 +980,7 @@ struct Pdf {
 
   const uint8_t* data{nullptr};
   size_t data_size{0};
+  bool swap_endian{false};
 
   DocumentCatalog catalog;
   SecurityHandler security;

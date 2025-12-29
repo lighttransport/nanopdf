@@ -29,6 +29,12 @@ namespace nanopdf {
 namespace {
 #include "adobe_glyph_list.inc"
 
+bool is_system_little_endian() {
+  const uint16_t value = 0x0102;
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
+  return bytes[0] == 0x02;
+}
+
 // parseInt(32bit)
 // 0 = success
 // -1 = bad input
@@ -605,6 +611,7 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
 
   out_pdf->data = addr;
   out_pdf->data_size = size;
+  out_pdf->swap_endian = !is_system_little_endian();
 
   // Parse PDF version from header
   if ((addr[0] != '%') || (addr[1] != 'P') || (addr[2] != 'D') ||
@@ -1150,6 +1157,11 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                               const DecodeParams& params) {
   DecodedStream result;
 
+  if (!data || size == 0) {
+    result.error = "CCITTFaxDecode: Empty stream";
+    return result;
+  }
+
   struct BitReader {
     const uint8_t* data{nullptr};
     size_t size{0};
@@ -1157,6 +1169,21 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     int bit_pos{7};
 
     BitReader(const uint8_t* d, size_t s) : data(d), size(s) {}
+
+    struct State {
+      size_t byte_pos;
+      int bit_pos;
+    };
+
+    State save() const { return State{byte_pos, bit_pos}; }
+
+    void restore(const State& state) {
+      byte_pos = state.byte_pos;
+      bit_pos = state.bit_pos;
+      if (bit_pos < 0) bit_pos = 0;
+      if (bit_pos > 7) bit_pos = 7;
+      if (byte_pos > size) byte_pos = size;
+    }
 
     int get_bit() {
       if (byte_pos >= size) {
@@ -1183,7 +1210,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       return byte_pos <= size;
     }
 
-    bool find_eol() {
+    bool skip_eol() {
       int zero_count = 0;
       while (byte_pos < size) {
         int bit = get_bit();
@@ -1294,109 +1321,137 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       {0x1F, 12, 2560, true},
   };
 
-  auto decode_code = [](BitReader& reader, const CodeEntry* term_table,
-                        size_t term_count, const CodeEntry* makeup_table,
-                        size_t makeup_count, int max_length,
-                        CodeEntry* out) -> bool {
-    uint32_t code = 0;
-    for (int length = 1; length <= max_length; ++length) {
-      int bit = reader.get_bit();
-      if (bit < 0) {
-        return false;
-      }
-      code = (code << 1) | static_cast<uint32_t>(bit);
-
-      for (size_t i = 0; i < term_count; ++i) {
-        if (term_table[i].length == length && term_table[i].code == code) {
-          *out = term_table[i];
-          return true;
-        }
-      }
-      for (size_t i = 0; i < makeup_count; ++i) {
-        if (makeup_table[i].length == length && makeup_table[i].code == code) {
-          *out = makeup_table[i];
-          return true;
-        }
+  auto find_code = [](const CodeEntry* table, size_t count, uint32_t code,
+                      int length) -> const CodeEntry* {
+    for (size_t i = 0; i < count; ++i) {
+      if (table[i].length == length && table[i].code == code) {
+        return &table[i];
       }
     }
-    return false;
+    return nullptr;
   };
 
-  auto decode_run = [&](BitReader& reader, bool white, int* out_run) -> bool {
-    static const size_t kWhiteTermCount =
-        sizeof(kWhiteTerminating) / sizeof(kWhiteTerminating[0]);
-    static const size_t kBlackTermCount =
-        sizeof(kBlackTerminating) / sizeof(kBlackTerminating[0]);
-    static const size_t kWhiteMakeupCount =
-        sizeof(kWhiteMakeup) / sizeof(kWhiteMakeup[0]);
-    static const size_t kBlackMakeupCount =
-        sizeof(kBlackMakeup) / sizeof(kBlackMakeup[0]);
-
+  auto decode_run = [&](BitReader& reader, bool white, int* run_length,
+                        std::string* err) -> bool {
     const CodeEntry* term_table = white ? kWhiteTerminating : kBlackTerminating;
     const CodeEntry* makeup_table = white ? kWhiteMakeup : kBlackMakeup;
-    size_t term_count = white ? kWhiteTermCount : kBlackTermCount;
-    size_t makeup_count = white ? kWhiteMakeupCount : kBlackMakeupCount;
-    int max_len = white ? 13 : 13;
-
+    const size_t term_count = white ? sizeof(kWhiteTerminating) / sizeof(CodeEntry)
+                                    : sizeof(kBlackTerminating) / sizeof(CodeEntry);
+    const size_t makeup_count = white ? sizeof(kWhiteMakeup) / sizeof(CodeEntry)
+                                      : sizeof(kBlackMakeup) / sizeof(CodeEntry);
     int total = 0;
+
     while (true) {
-      CodeEntry entry{};
-      if (!decode_code(reader, term_table, term_count, makeup_table,
-                       makeup_count, max_len, &entry)) {
-        return false;
+      uint32_t code = 0;
+      BitReader::State state_before = reader.save();
+      for (int length = 1; length <= 13; ++length) {
+        int bit = reader.get_bit();
+        if (bit < 0) {
+          if (err) {
+            *err = "Unexpected EOF while decoding run";
+          }
+          return false;
+        }
+        code = (code << 1) | static_cast<uint32_t>(bit);
+
+        if (const CodeEntry* entry = find_code(term_table, term_count, code, length)) {
+          total += entry->run;
+          *run_length = total;
+          return true;
+        }
+        if (const CodeEntry* entry = find_code(makeup_table, makeup_count, code, length)) {
+          total += entry->run;
+          goto decode_more;
+        }
       }
-      total += entry.run;
-      if (!entry.is_makeup) {
-        *out_run = total;
-        return true;
+
+      reader.restore(state_before);
+      if (err) {
+        *err = "Invalid code word";
       }
+      return false;
+
+    decode_more:
+      continue;
     }
   };
 
-  int width = params.columns > 0 ? params.columns : 1728;
-  int height = params.rows;
+  auto decode_row_1d = [&](BitReader& reader, std::vector<bool>& line,
+                           bool allow_indicator_skip, int width,
+                           std::string* err) -> bool {
+    std::fill(line.begin(), line.end(), false);
+    int pos = 0;
+    bool is_white = true;
+    bool skipped_indicator = false;
 
-  BitReader reader(data, size);
-  const int bytes_per_row = (width + 7) / 8;
-  std::vector<uint8_t> output;
-  output.reserve((height > 0 ? height : 1) * bytes_per_row);
+    while (pos < width) {
+      BitReader::State state_before = reader.save();
+      int run = 0;
+      if (!decode_run(reader, is_white, &run, err)) {
+        if (allow_indicator_skip && !skipped_indicator && pos == 0) {
+          reader.restore(state_before);
+          int indicator = reader.get_bit();
+          if (indicator == 0 || indicator == 1) {
+            skipped_indicator = true;
+            continue;
+          }
+          reader.restore(state_before);
+        }
+        return false;
+      }
 
-  std::vector<uint8_t> row_bytes(bytes_per_row, 0);
-  std::vector<bool> pixels(width, false);
-  std::vector<bool> prev_pixels(width, false);
+      if (run < 0) {
+        run = 0;
+      }
+      if (pos + run > width) {
+        run = width - pos;
+      }
+      if (!is_white) {
+        for (int i = 0; i < run; ++i) {
+          line[pos + i] = true;
+        }
+      }
+      pos += run;
+      is_white = !is_white;
+    }
+    return true;
+  };
 
   auto compute_transitions = [&](const std::vector<bool>& line) {
-    std::vector<int> trans;
-    bool current = false;  // start white
-    for (int i = 0; i < width; ++i) {
+    std::vector<int> transitions;
+    bool current = false;
+    for (int i = 0; i < static_cast<int>(line.size()); ++i) {
       bool black = line[i];
       if (black != current) {
-        trans.push_back(i);
+        transitions.push_back(i);
         current = black;
       }
     }
-    trans.push_back(width);
-    return trans;
+    transitions.push_back(static_cast<int>(line.size()));
+    return transitions;
   };
 
-  auto apply_transitions_to_pixels = [&](const std::vector<int>& trans,
-                                         std::vector<bool>* line) {
+  auto apply_transitions = [&](const std::vector<int>& transitions,
+                               std::vector<bool>* line) {
     if (!line) return;
     std::fill(line->begin(), line->end(), false);
-    std::vector<int> sorted = trans;
-    if (sorted.empty() || sorted.back() != width) {
-      sorted.push_back(width);
+    std::vector<int> sorted = transitions;
+    if (sorted.empty() || sorted.back() != static_cast<int>(line->size())) {
+      sorted.push_back(static_cast<int>(line->size()));
     }
-    // Remove duplicates
     sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
 
     int start = 0;
     bool black = false;
     for (int pos : sorted) {
-      if (pos < start) continue;
-      if (pos > width) pos = width;
+      if (pos < start) {
+        continue;
+      }
+      if (pos > static_cast<int>(line->size())) {
+        pos = static_cast<int>(line->size());
+      }
       if (black) {
-        for (int i = start; i < pos && i < width; ++i) {
+        for (int i = start; i < pos; ++i) {
           (*line)[i] = true;
         }
       }
@@ -1406,43 +1461,36 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   };
 
   auto read_2d_code = [&](BitReader& reader, int* delta) -> int {
-    std::string bits;
-    while (bits.size() <= 7) {
+    uint32_t code = 0;
+    for (int length = 1; length <= 7; ++length) {
       int bit = reader.get_bit();
-      if (bit < 0) return -1;
-      bits.push_back(bit ? '1' : '0');
-
-      if (bits == "1") {
-        if (delta) *delta = 0;
-        return 0;  // vertical 0
+      if (bit < 0) {
+        return -1;
       }
-      if (bits == "011") {
+      code = (code << 1) | static_cast<uint32_t>(bit);
+      if (code == 0b1 && length == 1) {
+        if (delta) *delta = 0;
+        return 0;
+      } else if (code == 0b011 && length == 3) {
         if (delta) *delta = 1;
         return 0;
-      }
-      if (bits == "010") {
+      } else if (code == 0b010 && length == 3) {
         if (delta) *delta = -1;
         return 0;
-      }
-      if (bits == "001") {
-        return 1;  // horizontal
-      }
-      if (bits == "0001") {
-        return 2;  // pass
-      }
-      if (bits == "000011") {
+      } else if (code == 0b001 && length == 3) {
+        return 1;
+      } else if (code == 0b0001 && length == 4) {
+        return 2;
+      } else if (code == 0b000011 && length == 6) {
         if (delta) *delta = 2;
         return 0;
-      }
-      if (bits == "000010") {
+      } else if (code == 0b000010 && length == 6) {
         if (delta) *delta = -2;
         return 0;
-      }
-      if (bits == "0000011") {
+      } else if (code == 0b0000011 && length == 7) {
         if (delta) *delta = 3;
         return 0;
-      }
-      if (bits == "0000010") {
+      } else if (code == 0b0000010 && length == 7) {
         if (delta) *delta = -3;
         return 0;
       }
@@ -1450,10 +1498,101 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     return -1;
   };
 
+  auto decode_row_2d = [&](BitReader& reader, const std::vector<bool>& reference,
+                           std::vector<bool>& line, int width,
+                           std::string* err) -> bool {
+    std::fill(line.begin(), line.end(), false);
+    std::vector<int> ref_transitions = compute_transitions(reference);
+    std::vector<int> cur_transitions;
+
+    int a0 = 0;
+    bool color_is_white = true;
+    size_t ref_index = 0;
+
+    auto advance_ref = [&]() {
+      while (ref_index < ref_transitions.size() && ref_transitions[ref_index] <= a0) {
+        ++ref_index;
+      }
+    };
+
+    auto get_b1 = [&]() -> int {
+      if (ref_index >= ref_transitions.size()) {
+        return width;
+      }
+      return ref_transitions[ref_index];
+    };
+
+    auto get_b2 = [&]() -> int {
+      if (ref_index + 1 >= ref_transitions.size()) {
+        return width;
+      }
+      return ref_transitions[ref_index + 1];
+    };
+
+    advance_ref();
+
+    while (a0 < width) {
+      int delta = 0;
+      int mode = read_2d_code(reader, &delta);
+      if (mode == -1) {
+        if (err) *err = "Invalid 2D code";
+        return false;
+      }
+
+      if (mode == 2) {
+        a0 = get_b2();
+        if (a0 > width) {
+          a0 = width;
+        }
+        advance_ref();
+      } else if (mode == 1) {
+        for (int pass = 0; pass < 2; ++pass) {
+          int run = 0;
+          if (!decode_run(reader, color_is_white, &run, err)) {
+            return false;
+          }
+          if (run < 0) run = 0;
+          int new_a0 = a0 + run;
+          if (new_a0 > width) new_a0 = width;
+          cur_transitions.push_back(new_a0);
+          a0 = new_a0;
+          color_is_white = !color_is_white;
+        }
+        advance_ref();
+      } else {
+        int b1 = get_b1();
+        int new_a0 = b1 + delta;
+        if (new_a0 < 0) new_a0 = 0;
+        if (new_a0 > width) new_a0 = width;
+        cur_transitions.push_back(new_a0);
+        a0 = new_a0;
+        color_is_white = !color_is_white;
+        advance_ref();
+      }
+    }
+
+    apply_transitions(cur_transitions, &line);
+    return true;
+  };
+
+  int width = params.columns > 0 ? params.columns : 1728;
+  int bytes_per_row = (width + 7) / 8;
+  int max_rows = params.rows;
+  BitReader reader(data, size);
+
+  std::vector<uint8_t> output;
+  output.reserve(static_cast<size_t>(bytes_per_row) * (max_rows > 0 ? max_rows : 1));
+
+  std::vector<bool> prev_line(width, false);
+  std::vector<bool> line(width, false);
+  std::vector<uint8_t> row_bytes(bytes_per_row, 0);
+
   int decoded_rows = 0;
-  while (reader.byte_pos < size && (height == 0 || decoded_rows < height)) {
+  int damaged_rows = 0;
+
+  while (reader.byte_pos < size && (max_rows <= 0 || decoded_rows < max_rows)) {
     if (params.end_of_line) {
-      if (!reader.find_eol()) {
+      if (!reader.skip_eol()) {
         result.error = "CCITTFaxDecode: Missing EOL";
         return result;
       }
@@ -1462,127 +1601,53 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       }
     }
 
-    std::fill(pixels.begin(), pixels.end(), false);
-
-    bool use_1d = false;
+    bool allow_indicator_skip = (params.k == 0);
+    bool row_is_1d = false;
     if (params.k == 0) {
-      use_1d = true;
+      row_is_1d = true;
     } else if (params.k > 0) {
       int mode = reader.get_bit();
       if (mode < 0) {
-        result.error = "CCITTFaxDecode: Unexpected EOF";
+        result.error = "CCITTFaxDecode: Unexpected EOF while reading row mode";
         return result;
       }
-      use_1d = (mode != 0);
-    } else {  // Group 4
-      use_1d = false;
+      row_is_1d = (mode != 0);
+    } else {
+      row_is_1d = false;
     }
 
-    if (use_1d) {
-      int pos = 0;
-      bool is_white = true;
-      while (pos < width) {
-        int run = 0;
-        if (!decode_run(reader, is_white, &run)) {
-          result.error = "CCITTFaxDecode: Invalid code";
-          return result;
-        }
-        if (pos + run > width) {
-          run = width - pos;
-        }
-        if (!is_white) {
-          for (int i = 0; i < run; ++i) {
-            pixels[pos + i] = true;
-          }
-        }
-        pos += run;
-        is_white = !is_white;
+    std::string row_error;
+    bool ok = false;
+    if (row_is_1d) {
+      ok = decode_row_1d(reader, line, allow_indicator_skip, width, &row_error);
+    } else {
+      ok = decode_row_2d(reader, prev_line, line, width, &row_error);
+    }
+
+    if (!ok) {
+      if (params.damaged_rows_before_error > 0 &&
+          damaged_rows < params.damaged_rows_before_error) {
+        ++damaged_rows;
+        line = prev_line;
+      } else {
+        result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+        return result;
       }
     } else {
-      std::vector<int> ref_transitions = compute_transitions(prev_pixels);
-      std::vector<int> cur_transitions;
-
-      int a0 = 0;
-      bool current_white = true;
-      size_t ref_idx = 0;
-
-      auto advance_ref = [&]() {
-        while (ref_idx < ref_transitions.size() && ref_transitions[ref_idx] <= a0) {
-          ref_idx++;
-        }
-      };
-
-      advance_ref();
-
-      auto get_b1 = [&]() -> int {
-        if (ref_idx >= ref_transitions.size()) {
-          return width;
-        }
-        return ref_transitions[ref_idx];
-      };
-
-      auto get_b2 = [&]() -> int {
-        if (ref_idx + 1 >= ref_transitions.size()) {
-          return width;
-        }
-        return ref_transitions[ref_idx + 1];
-      };
-
-      while (a0 < width) {
-        int delta = 0;
-        int op = read_2d_code(reader, &delta);
-        if (op == -1) {
-          result.error = "CCITTFaxDecode: Invalid 2D code";
-          return result;
-        }
-
-        int b1 = get_b1();
-        int b2 = get_b2();
-
-        if (op == 2) {  // Pass
-          int new_a0 = b2;
-          if (new_a0 > width) new_a0 = width;
-          a0 = new_a0;
-          advance_ref();
-        } else if (op == 1) {  // Horizontal
-          for (int pass = 0; pass < 2; ++pass) {
-            int run = 0;
-            if (!decode_run(reader, current_white, &run)) {
-              result.error = "CCITTFaxDecode: Invalid horizontal run";
-              return result;
-            }
-            int new_a0 = a0 + run;
-            if (new_a0 > width) new_a0 = width;
-            cur_transitions.push_back(new_a0);
-            a0 = new_a0;
-            current_white = !current_white;
-          }
-          advance_ref();
-        } else {  // Vertical
-          int new_a0 = b1 + delta;
-          if (new_a0 < 0) new_a0 = 0;
-          if (new_a0 > width) new_a0 = width;
-          cur_transitions.push_back(new_a0);
-          a0 = new_a0;
-          current_white = !current_white;
-          advance_ref();
-        }
-      }
-
-      apply_transitions_to_pixels(cur_transitions, &pixels);
+      damaged_rows = 0;
     }
 
     std::fill(row_bytes.begin(), row_bytes.end(), 0);
     for (int i = 0; i < width; ++i) {
-      bool black_pixel = pixels[i];
-      bool bit = params.black_is_1 ? black_pixel : !black_pixel;
+      bool black = line[i];
+      bool bit = params.black_is_1 ? black : !black;
       if (bit) {
         row_bytes[i / 8] |= static_cast<uint8_t>(1 << (7 - (i % 8)));
       }
     }
 
     output.insert(output.end(), row_bytes.begin(), row_bytes.end());
-    prev_pixels = pixels;
+    prev_line = line;
     ++decoded_rows;
   }
 
@@ -1591,6 +1656,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   return result;
 }
 
+}  // namespace filters
 }  // namespace filters
 
 DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
@@ -1740,7 +1806,7 @@ bool parse_from_memory(const uint8_t *addr, const size_t size) {
     return false;
   }
 
-  bool swap_endian = false;  // TODO: detect endianness if needed
+  const bool swap_endian = !is_system_little_endian();
   nanopdf::StreamReader sr(addr, size, swap_endian);
 
   int minor_version{0};
@@ -2252,7 +2318,7 @@ bool compute_object_body_offset(const Pdf& pdf, uint64_t header_offset,
     return false;
   }
 
-  StreamReader sr(pdf.data, pdf.data_size, /*swap_endian=*/false);
+  StreamReader sr(pdf.data, pdf.data_size, pdf.swap_endian);
   Parser parser(sr);
 
   if (!sr.seek_set(header_offset)) {
@@ -2455,7 +2521,7 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
     }
   }
 
-  StreamReader sr(data, data_size, /*swap_endian=*/false);
+  StreamReader sr(data, data_size, swap_endian);
   Parser parser(sr);
 
   if (!sr.seek_set(body_offset)) {
@@ -2681,7 +2747,7 @@ bool Pdf::build_object_offset_cache() const {
           skip_ws_ptr(p);
 
         uint64_t dict_offset = static_cast<uint64_t>(p - begin);
-        StreamReader sr(data, data_size, /*swap_endian=*/false);
+        StreamReader sr(data, data_size, swap_endian);
         Parser parser(sr);
         if (!sr.seek_set(dict_offset)) {
           return false;
@@ -2771,7 +2837,7 @@ bool Pdf::build_object_offset_cache() const {
     };
 
     auto parse_xref_stream = [&](uint64_t offset) -> bool {
-      StreamReader sr(data, data_size, /*swap_endian=*/false);
+      StreamReader sr(data, data_size, swap_endian);
       Parser parser(sr);
       if (!sr.seek_set(offset)) {
         return false;
@@ -2925,7 +2991,7 @@ bool Pdf::build_object_offset_cache() const {
           while (dict_offset < data_size && is_whitespace_char(static_cast<char>(data[dict_offset]))) {
             dict_offset++;
           }
-          StreamReader sr(data, data_size, /*swap_endian=*/false);
+          StreamReader sr(data, data_size, swap_endian);
           Parser parser(sr);
           if (!sr.seek_set(dict_offset)) {
             return;
@@ -3197,7 +3263,7 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
   }
 
   StreamReader sr(data.data() + content_start, content_end - content_start,
-                  /*swap_endian=*/false);
+                  swap_endian);
   Parser parser(sr);
 
   Value parsed;
