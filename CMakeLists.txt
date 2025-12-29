@@ -87,9 +87,11 @@ set(NANOPDF_EXT_LIBRARIES_PUBLIC "")
 set(NANOPDF_SOURCES
   src/nanopdf.cc
   src/jbig2-decoder.cc
+  src/jpx-decoder.cc
   src/canvas-exporter.cc
   src/crypto.cc
   src/pdf-security.cc
+  src/stb_image_impl.cc
   src/stb_image_write_impl.cc
   src/stb_truetype_impl.cc
 )
