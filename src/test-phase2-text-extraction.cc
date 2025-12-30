@@ -40,6 +40,7 @@ void build_standard_encoding_page(Pdf& pdf, Page& page) {
   font->encoding_differences[0xFC] = "udieresis";
 
   page.fonts["F1"] = std::move(font);
+  page.fonts_loaded = true;  // Prevent lazy loading from overwriting test font
 
   const char* content =
       "BT\n"
