@@ -544,6 +544,9 @@ void MD5::finalize() {
     return;
   }
 
+  // Save the original count (in bits) before padding
+  uint64_t original_count = count;
+
   uint8_t padding[64];
   memset(padding, 0, sizeof(padding));
   padding[0] = 0x80;
@@ -552,10 +555,10 @@ void MD5::finalize() {
   uint32_t pad_len = (index < 56) ? (56 - index) : (120 - index);
   update(padding, pad_len);
 
-  // Append length
+  // Append original length (before padding)
   uint8_t bits[8];
   for (int i = 0; i < 8; i++) {
-    bits[i] = (count >> (i * 8)) & 0xff;
+    bits[i] = (original_count >> (i * 8)) & 0xff;
   }
   update(bits, 8);
 

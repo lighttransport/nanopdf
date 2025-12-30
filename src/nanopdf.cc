@@ -1397,29 +1397,30 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       {0x1F, 12, 2560, true},
   };
 
+  // Black terminating codes per ITU-T T.4 Table 2
   static const CodeEntry kBlackTerminating[] = {
       {0x037, 10, 0, false}, {0x02, 3, 1, false},   {0x03, 2, 2, false},
-      {0x03, 3, 3, false},   {0x03, 4, 4, false},   {0x02, 4, 5, false},
-      {0x03, 5, 6, false},   {0x05, 6, 7, false},   {0x04, 6, 8, false},
-      {0x04, 7, 9, false},   {0x05, 7, 10, false},  {0x07, 7, 11, false},
-      {0x04, 8, 12, false},  {0x07, 8, 13, false},  {0x18, 9, 14, false},
-      {0x17, 10, 15, false}, {0x18, 10, 16, false}, {0x08, 10, 17, false},
-      {0x67, 11, 18, false}, {0x68, 11, 19, false}, {0x6C, 11, 20, false},
-      {0x37, 11, 21, false}, {0x28, 11, 22, false}, {0x17, 11, 23, false},
-      {0x18, 11, 24, false}, {0xCA, 12, 25, false}, {0xCB, 12, 26, false},
-      {0xCC, 12, 27, false}, {0xCD, 12, 28, false}, {0x68, 12, 29, false},
-      {0x69, 12, 30, false}, {0x6A, 12, 31, false}, {0x6B, 12, 32, false},
-      {0xD2, 12, 33, false}, {0xD3, 12, 34, false}, {0xD4, 12, 35, false},
-      {0xD5, 12, 36, false}, {0xD6, 12, 37, false}, {0xD7, 12, 38, false},
-      {0x6C, 12, 39, false}, {0x6D, 12, 40, false}, {0xDA, 12, 41, false},
-      {0xDB, 12, 42, false}, {0x54, 12, 43, false}, {0x55, 12, 44, false},
-      {0x56, 12, 45, false}, {0x57, 12, 46, false}, {0x64, 12, 47, false},
-      {0x65, 12, 48, false}, {0x52, 12, 49, false}, {0x53, 12, 50, false},
-      {0x24, 12, 51, false}, {0x37, 12, 52, false}, {0x38, 12, 53, false},
-      {0x27, 12, 54, false}, {0x28, 12, 55, false}, {0x58, 12, 56, false},
-      {0x59, 12, 57, false}, {0x2B, 12, 58, false}, {0x2C, 12, 59, false},
-      {0x5A, 12, 60, false}, {0x66, 12, 61, false}, {0x67, 12, 62, false},
-      {0x0F, 10, 63, false},
+      {0x02, 2, 3, false},   {0x03, 3, 4, false},   {0x03, 4, 5, false},
+      {0x02, 4, 6, false},   {0x03, 5, 7, false},   {0x05, 6, 8, false},
+      {0x04, 6, 9, false},   {0x04, 7, 10, false},  {0x05, 7, 11, false},
+      {0x07, 7, 12, false},  {0x04, 8, 13, false},  {0x07, 8, 14, false},
+      {0x18, 9, 15, false},  {0x17, 10, 16, false}, {0x18, 10, 17, false},
+      {0x08, 10, 18, false}, {0x67, 11, 19, false}, {0x68, 11, 20, false},
+      {0x6C, 11, 21, false}, {0x37, 11, 22, false}, {0x28, 11, 23, false},
+      {0x17, 11, 24, false}, {0x18, 11, 25, false}, {0xCA, 12, 26, false},
+      {0xCB, 12, 27, false}, {0xCC, 12, 28, false}, {0xCD, 12, 29, false},
+      {0x68, 12, 30, false}, {0x69, 12, 31, false}, {0x6A, 12, 32, false},
+      {0x6B, 12, 33, false}, {0xD2, 12, 34, false}, {0xD3, 12, 35, false},
+      {0xD4, 12, 36, false}, {0xD5, 12, 37, false}, {0xD6, 12, 38, false},
+      {0xD7, 12, 39, false}, {0x6C, 12, 40, false}, {0x6D, 12, 41, false},
+      {0xDA, 12, 42, false}, {0xDB, 12, 43, false}, {0x54, 12, 44, false},
+      {0x55, 12, 45, false}, {0x56, 12, 46, false}, {0x57, 12, 47, false},
+      {0x64, 12, 48, false}, {0x65, 12, 49, false}, {0x52, 12, 50, false},
+      {0x53, 12, 51, false}, {0x24, 12, 52, false}, {0x37, 12, 53, false},
+      {0x38, 12, 54, false}, {0x27, 12, 55, false}, {0x28, 12, 56, false},
+      {0x58, 12, 57, false}, {0x59, 12, 58, false}, {0x2B, 12, 59, false},
+      {0x2C, 12, 60, false}, {0x5A, 12, 61, false}, {0x66, 12, 62, false},
+      {0x67, 12, 63, false},
   };
 
   static const CodeEntry kBlackMakeup[] = {
@@ -1811,20 +1812,38 @@ static DecodedStream apply_single_filter(const std::string &filter_name,
   return result;
 }
 
-DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
+DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
+                           uint32_t obj_num, uint16_t gen_num) {
   DecodedStream result;
-  (void)pdf;  // May be used for reference resolution in future
 
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
     return result;
   }
 
+  // Start with raw stream data
+  std::vector<uint8_t> current_data = stream_obj.stream.data;
+
+  // Decrypt stream data if PDF is encrypted
+  // Note: Decryption must happen BEFORE decompression
+  if (pdf.security.authenticated && !pdf.security.encryption_key.empty()) {
+    // Check if this is a Crypt filter that should not be decrypted
+    // or if this is an XRef stream (XRef streams are not encrypted)
+    auto type_it = stream_obj.stream.dict.find("Type");
+    bool is_xref = (type_it != stream_obj.stream.dict.end() &&
+                    type_it->second.type == Value::NAME &&
+                    type_it->second.name == "XRef");
+
+    if (!is_xref) {
+      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num);
+    }
+  }
+
   // Get filter type from stream dictionary
   auto filter_it = stream_obj.stream.dict.find("Filter");
   if (filter_it == stream_obj.stream.dict.end()) {
-    // No filter, return raw data
-    result.data = stream_obj.stream.data;
+    // No filter, return (possibly decrypted) data
+    result.data = std::move(current_data);
     result.success = true;
     return result;
   }
@@ -1880,8 +1899,6 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
   }
 
   // Apply filters in sequence
-  std::vector<uint8_t> current_data = stream_obj.stream.data;
-
   for (size_t i = 0; i < filter_names.size(); ++i) {
     const std::string &filter_name = filter_names[i];
     const filters::DecodeParams &params = params_list[i];
@@ -1907,6 +1924,14 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
   result.data = std::move(current_data);
   result.success = true;
   return result;
+}
+
+// Legacy version without object number - cannot decrypt
+DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
+  // For backward compatibility, call with obj_num=0, gen_num=0
+  // This means streams decoded via this function won't be decrypted
+  // if the PDF is encrypted. Callers should use the overload with object numbers.
+  return decode_stream(pdf, stream_obj, 0, 0);
 }
 
 bool parse_object_stream(StreamReader &sr, Parser &parser,
@@ -3507,7 +3532,9 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
 
   auto cache_it = object_stream_cache.find(stream_object_number);
   if (cache_it == object_stream_cache.end()) {
-    DecodedStream decoded = decode_stream(*this, stream_obj.value);
+    // Use overload with object number for proper decryption
+    DecodedStream decoded = decode_stream(*this, stream_obj.value,
+                                          stream_object_number, 0);
     if (!decoded.success) {
       return false;
     }
@@ -3653,6 +3680,11 @@ bool Pdf::load_document_structure() {
   ensure_field_from_trailer("Root", &root);
   ensure_field_from_trailer("Info", &info);
   ensure_field_from_trailer("Encrypt", &encrypt);
+
+  // Initialize security handler if document is encrypted
+  if (encrypt != 0) {
+    security = create_security_handler(*this);
+  }
 
   catalog.object_number = root;
   catalog.pages.clear();
@@ -3985,15 +4017,18 @@ PageContent Page::load_contents(const Pdf& pdf) const {
 
   std::vector<uint8_t> aggregate;
   std::vector<std::unique_ptr<Value>> owned_values;
-  std::vector<const Value*> stack;
+  // Stack holds (Value*, object_number, generation_number) for decryption
+  std::vector<std::tuple<const Value*, uint32_t, uint16_t>> stack;
 
   stack.reserve(contents.size());
   for (auto it = contents.rbegin(); it != contents.rend(); ++it) {
-    stack.push_back(&*it);
+    stack.push_back(std::make_tuple(&*it, 0u, static_cast<uint16_t>(0)));
   }
 
   while (!stack.empty()) {
-    const Value* node = stack.back();
+    const Value* node = std::get<0>(stack.back());
+    uint32_t obj_num = std::get<1>(stack.back());
+    uint16_t gen_num = std::get<2>(stack.back());
     stack.pop_back();
 
     switch (node->type) {
@@ -4007,19 +4042,22 @@ PageContent Page::load_contents(const Pdf& pdf) const {
           return content;
         }
         owned_values.push_back(std::unique_ptr<Value>(new Value(std::move(resolved.value))));
-        stack.push_back(owned_values.back().get());
+        // Track the object number for decryption
+        stack.push_back(std::make_tuple(owned_values.back().get(),
+                                        node->ref_object_number,
+                                        node->ref_generation_number));
         break;
       }
 
       case Value::ARRAY: {
         for (auto it = node->array.rbegin(); it != node->array.rend(); ++it) {
-          stack.push_back(&*it);
+          stack.push_back(std::make_tuple(&*it, obj_num, gen_num));
         }
         break;
       }
 
       case Value::STREAM: {
-        DecodedStream decoded = decode_stream(pdf, *node);
+        DecodedStream decoded = decode_stream(pdf, *node, obj_num, gen_num);
         if (!decoded.success) {
           content.error = decoded.error;
           content.success = false;
