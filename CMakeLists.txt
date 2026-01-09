@@ -87,9 +87,11 @@ set(NANOPDF_EXT_LIBRARIES_PUBLIC "")
 set(NANOPDF_SOURCES
   src/nanopdf.cc
   src/jbig2-decoder.cc
+  src/jpx-decoder.cc
   src/canvas-exporter.cc
   src/crypto.cc
   src/pdf-security.cc
+  src/stb_image_impl.cc
   src/stb_image_write_impl.cc
   src/stb_truetype_impl.cc
 )
@@ -238,7 +240,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
 
   # ThorVG backend test
   if(NANOPDF_USE_THORVG AND THORVG_FOUND)
-    add_nanopdf_test(test_thorvg src/test-thorvg-backend.cc ${PROJECT_SOURCE_DIR}/data/HelloWorld_xr.pdf)
+    add_nanopdf_test(test_thorvg src/test-thorvg-backend.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
     if (TARGET PkgConfig::THORVG)
       target_link_libraries(test_thorvg PRIVATE PkgConfig::THORVG)
     else()
@@ -249,7 +251,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
 
   # Blend2D backend test
   if(NANOPDF_USE_BLEND2D)
-    add_nanopdf_test(test_blend2d src/test-blend2d-backend.cc ${PROJECT_SOURCE_DIR}/data/HelloWorld_xr.pdf)
+    add_nanopdf_test(test_blend2d src/test-blend2d-backend.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
     target_link_libraries(test_blend2d PRIVATE blend2d::blend2d)
   endif()
 
