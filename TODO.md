@@ -18,7 +18,7 @@
 ## Testing & Tooling
 - [x] Promote `build/manual_extract.cc` into a formal regression test (Phase 2/3)
 - [x] Capture real-world PDFs exhibiting StandardEncoding differences and add to `data/`
-- [ ] Add CI target that runs all `test_phase*` executables in release + debug modes
+- [x] Add CI target that runs all `test_phase*` executables in release + debug modes
 
 ## Documentation
 - [x] Refresh README with current feature set and StandardEncoding changes

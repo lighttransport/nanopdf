@@ -13,6 +13,7 @@
 //   --dpi <n>          DPI for rendering (default: 72)
 //   --all              Render all pages (creates multiple PNG files)
 //   --verbose          Verbose output
+//   --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace
 
 #include <iostream>
 #include <fstream>
@@ -28,6 +29,7 @@
 #endif
 
 #include "../../src/nanopdf.hh"
+#include "../../src/nanopdf-log.hh"
 
 struct RasterizeOptions {
   std::string input_file;
@@ -39,6 +41,7 @@ struct RasterizeOptions {
   float dpi = 72.0f;
   bool render_all_pages = false;
   bool verbose = false;
+  int log_level = 3;  // Default: Info
 };
 
 void print_usage(const char* program_name) {
@@ -54,6 +57,7 @@ void print_usage(const char* program_name) {
   std::cout << "  --dpi <n>          DPI for rendering (default: 72)\n";
   std::cout << "  --all              Render all pages (creates multiple PNG files)\n";
   std::cout << "  --verbose          Verbose output\n";
+  std::cout << "  --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace\n";
   std::cout << "  --help             Show this help message\n";
   std::cout << "\n";
   std::cout << "Examples:\n";
@@ -109,6 +113,12 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
       options.render_all_pages = true;
     } else if (arg == "--verbose") {
       options.verbose = true;
+    } else if (arg == "--log-level" && i + 1 < argc) {
+      options.log_level = std::atoi(argv[++i]);
+      if (options.log_level < 0 || options.log_level > 5) {
+        std::cerr << "Error: Log level must be 0-5\n";
+        return false;
+      }
     } else if (arg == "--help") {
       return false;
     } else {
@@ -142,9 +152,13 @@ std::string generate_output_filename(const std::string& base_output, int page_nu
 bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_num,
                 const RasterizeOptions& options, const std::string& output_file) {
 #ifdef NANOPDF_USE_THORVG
-  // Get page dimensions
-  double page_width = page.media_box.width();
-  double page_height = page.media_box.height();
+  // Get page dimensions from media_box [left, bottom, right, top]
+  double page_width = 612.0;   // Default letter size
+  double page_height = 792.0;
+  if (page.media_box.size() >= 4) {
+    page_width = page.media_box[2] - page.media_box[0];
+    page_height = page.media_box[3] - page.media_box[1];
+  }
 
   if (options.verbose) {
     std::cout << "  Page " << page_num << " dimensions: "
@@ -221,6 +235,9 @@ int main(int argc, char* argv[]) {
     print_usage(argv[0]);
     return 1;
   }
+
+  // Set log level from command line option
+  nanopdf::log::set_log_level(static_cast<nanopdf::log::Level>(options.log_level));
 
   // Check for ThorVG support
 #ifndef NANOPDF_USE_THORVG
@@ -299,6 +316,10 @@ int main(int argc, char* argv[]) {
 
     if (options.verbose) {
       std::cout << "\nProcessing page " << page_num << " of " << total_pages << ":\n";
+      std::cout << "  Page contents count: " << page.contents.size() << "\n";
+      for (size_t i = 0; i < page.contents.size(); i++) {
+        std::cout << "    Content " << i << " type: " << page.contents[i].type << "\n";
+      }
     }
 
     if (render_page(pdf, page, page_num, options, output_file)) {

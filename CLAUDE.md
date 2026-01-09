@@ -42,6 +42,7 @@ make test_nanopdf     # Build test executable
 - `NANOPDF_BUILD_TESTS`: Build test executables (default: ON)
 - `NANOPDF_BUILD_WASM`: Build for WebAssembly with Emscripten (default: OFF)
 - `NANOPDF_USE_THORVG`: Use ThorVG for rendering backend (default: OFF)
+- `NANOPDF_USE_LIBTIFF`: Use libtiff for CCITT/Fax decoding (default: OFF, experimental)
 - `SANITIZE_ADDRESS`: Enable address sanitizer for debugging
 
 ### Testing

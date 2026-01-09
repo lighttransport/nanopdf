@@ -127,20 +127,21 @@ int main(int argc, char** argv) {
     ifs.close();
 
     nanopdf::Pdf pdf;
-    if (!pdf.parse(pdf_data.data(), pdf_data.size())) {
+    if (!nanopdf::parse_from_memory(pdf_data.data(), pdf_data.size(), &pdf)) {
       std::cerr << "Failed to parse PDF" << std::endl;
       return 1;
     }
 
-    std::cout << "PDF Info:" << std::endl;
-    std::cout << "  Version: " << pdf.version << std::endl;
-
-    // Load document catalog
-    nanopdf::DocumentCatalog catalog;
-    if (!pdf.load_document_catalog(catalog)) {
-      std::cerr << "Failed to load document catalog" << std::endl;
+    if (!pdf.load_document_structure()) {
+      std::cerr << "Failed to load document structure" << std::endl;
       return 1;
     }
+
+    std::cout << "PDF Info:" << std::endl;
+    std::cout << "  Version: " << pdf.version_major << "." << pdf.version_minor << std::endl;
+
+    // Get document catalog
+    const nanopdf::DocumentCatalog& catalog = pdf.catalog;
 
     std::cout << "  Pages: " << catalog.pages.size() << std::endl;
 
@@ -148,9 +149,13 @@ int main(int argc, char** argv) {
     if (!catalog.pages.empty()) {
       const auto& page = catalog.pages[0];
 
-      // Get page dimensions
-      double page_width = page.media_box.width();
-      double page_height = page.media_box.height();
+      // Get page dimensions from media_box [left, bottom, right, top]
+      double page_width = 612.0;   // Default letter size
+      double page_height = 792.0;
+      if (page.media_box.size() >= 4) {
+        page_width = page.media_box[2] - page.media_box[0];
+        page_height = page.media_box[3] - page.media_box[1];
+      }
 
       std::cout << "  First page dimensions: " << page_width << " x " << page_height << std::endl;
 

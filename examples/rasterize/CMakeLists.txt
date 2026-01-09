@@ -15,18 +15,46 @@ include_directories(${NANOPDF_ROOT}/src)
 # Find ThorVG if enabled
 option(USE_THORVG "Enable ThorVG backend" ON)
 if(USE_THORVG)
-  find_package(PkgConfig)
-  if(PkgConfig_FOUND)
-    pkg_check_modules(THORVG thorvg)
+  # First check if ThorVG is in the dist/ directory
+  set(THORVG_DIST_DIR ${NANOPDF_ROOT}/dist)
+  if(EXISTS ${THORVG_DIST_DIR}/include/thorvg-1/thorvg.h)
+    set(THORVG_FOUND TRUE)
+    set(THORVG_INCLUDE_DIRS ${THORVG_DIST_DIR}/include/thorvg-1)
+    # Find the library based on architecture
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/x86_64-linux-gnu)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/aarch64-linux-gnu)
+    else()
+      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+    endif()
+    find_library(THORVG_LIBRARY NAMES thorvg-1 thorvg
+      PATHS ${THORVG_LIB_DIR}
+      NO_DEFAULT_PATH)
+    if(THORVG_LIBRARY)
+      set(THORVG_LIBRARIES ${THORVG_LIBRARY})
+      set(THORVG_LIBRARY_DIRS ${THORVG_LIB_DIR})
+      message(STATUS "Found ThorVG in dist/: ${THORVG_LIBRARY}")
+    else()
+      set(THORVG_FOUND FALSE)
+    endif()
+  endif()
+
+  # Fall back to pkg-config if not found in dist/
+  if(NOT THORVG_FOUND)
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(THORVG thorvg)
+    endif()
   endif()
 
   if(NOT THORVG_FOUND)
     # Try to find ThorVG manually
     find_path(THORVG_INCLUDE_DIR thorvg.h
       PATHS /usr/local/include/thorvg /usr/include/thorvg
-      PATH_SUFFIXES thorvg)
+      PATH_SUFFIXES thorvg thorvg-1)
 
-    find_library(THORVG_LIBRARY NAMES thorvg
+    find_library(THORVG_LIBRARY NAMES thorvg thorvg-1
       PATHS /usr/local/lib /usr/lib
       PATH_SUFFIXES thorvg)
 
@@ -59,11 +87,57 @@ endif()
 # Link with ThorVG if found
 if(THORVG_FOUND)
   target_link_libraries(rasterize ${THORVG_LIBRARIES})
+  # Set RPATH so the executable can find ThorVG at runtime
+  if(THORVG_LIBRARY_DIRS)
+    set_target_properties(rasterize PROPERTIES
+      BUILD_RPATH "${THORVG_LIBRARY_DIRS}"
+      INSTALL_RPATH "${THORVG_LIBRARY_DIRS}")
+  endif()
 endif()
 
 # Link with zlib (required by nanopdf)
 find_package(ZLIB REQUIRED)
 target_link_libraries(rasterize ZLIB::ZLIB)
+
+# Link with libtiff if nanopdf was built with it
+option(USE_LIBTIFF "Enable libtiff for CCITT decoding" ON)
+if(USE_LIBTIFF)
+  # Try to find libtiff in ref/tiff-4.7.1 first
+  set(LIBTIFF_REF_DIR ${NANOPDF_ROOT}/ref/tiff-4.7.1)
+  if(EXISTS ${LIBTIFF_REF_DIR}/libtiff/tiff.h)
+    find_library(LIBTIFF_LIBRARY NAMES tiff
+      PATHS ${LIBTIFF_REF_DIR}/build/libtiff
+      NO_DEFAULT_PATH)
+    if(LIBTIFF_LIBRARY)
+      set(LIBTIFF_FOUND TRUE)
+      set(LIBTIFF_INCLUDE_DIRS ${LIBTIFF_REF_DIR}/libtiff)
+      set(LIBTIFF_LIBRARIES ${LIBTIFF_LIBRARY})
+      message(STATUS "Found libtiff in ref/: ${LIBTIFF_LIBRARY}")
+    endif()
+  endif()
+
+  # Fall back to system libtiff
+  if(NOT LIBTIFF_FOUND)
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(LIBTIFF IMPORTED_TARGET libtiff-4)
+      if(NOT LIBTIFF_FOUND)
+        pkg_check_modules(LIBTIFF IMPORTED_TARGET libtiff)
+      endif()
+    endif()
+  endif()
+
+  if(LIBTIFF_FOUND)
+    add_compile_definitions(NANOPDF_USE_LIBTIFF)
+    if(TARGET PkgConfig::LIBTIFF)
+      target_link_libraries(rasterize PkgConfig::LIBTIFF)
+    else()
+      include_directories(${LIBTIFF_INCLUDE_DIRS})
+      target_link_libraries(rasterize ${LIBTIFF_LIBRARIES})
+    endif()
+    message(STATUS "libtiff CCITT decoder enabled for rasterize")
+  endif()
+endif()
 
 # Platform-specific libraries
 if(UNIX AND NOT APPLE)

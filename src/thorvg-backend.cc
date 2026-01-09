@@ -5,9 +5,10 @@
 
 #include "thorvg-backend.hh"
 #include <cmath>
-#include <iostream>
 #include <fstream>
 #include <sstream>
+
+#include "nanopdf-log.hh"
 
 // For PNG saving - implementation in stb_image_write_impl.cc
 #include "stb_image_write.h"
@@ -419,7 +420,7 @@ static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
 ThorVGBackend::ThorVGBackend() {
   // Initialize ThorVG engine (v1.0+ API - no canvas engine param)
   if (tvg::Initializer::init(0) != tvg::Result::Success) {
-    std::cerr << "Failed to initialize ThorVG" << std::endl;
+    NANOPDF_LOG_ERROR("ThorVG", "Failed to initialize ThorVG engine");
   }
 }
 
@@ -839,9 +840,7 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
       if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
         cache.initialized = true;
         font_cache_[font_name] = std::move(cache);
-#if NANOPDF_DEBUG_PRINT
-        std::cerr << "[ThorVG] Using fallback font: " << *path << " for '" << font_name << "'" << std::endl;
-#endif
+        NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s'", *path, font_name.c_str());
         return true;
       }
     }
@@ -856,18 +855,14 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
-#if NANOPDF_DEBUG_PRINT
-          std::cerr << "[ThorVG] Using fallback font: " << *path << " for '" << font_name << "'" << std::endl;
-#endif
+          NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s'", *path, font_name.c_str());
           return true;
         }
       }
     }
   }
 
-#if NANOPDF_DEBUG_PRINT
-  std::cerr << "[ThorVG] Font '" << font_name << "' - no fallback font found" << std::endl;
-#endif
+  NANOPDF_LOG_WARN("ThorVG", "Font '%s' - no fallback font found", font_name.c_str());
   return false;
 }
 
@@ -919,7 +914,7 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
 
   cache.initialized = true;
   font_cache_[font_name] = std::move(cache);
-  std::cerr << "[ThorVG] Successfully loaded font '" << font_name << "' (" << decoded.data.size() << " bytes)" << std::endl;
+  NANOPDF_LOG_INFO("ThorVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), decoded.data.size());
   return true;
 }
 
@@ -1081,8 +1076,8 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
 
     // Apply clip to the shape (clip() takes ownership of clipper)
     if (shape->clip(clipper) != tvg::Result::Success) {
-      // Clipping failed, delete clipper and push shape without clip
-      delete clipper;
+      // Clipping failed, release clipper and push shape without clip
+      tvg::Paint::rel(clipper);
       scene_->push(shape);
       return true;
     }
@@ -1093,7 +1088,12 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
 }
 
 bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height) {
+  NANOPDF_LOG_DEBUG("ThorVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
+                    image.width, image.height, x, y, width, height, image.data.size());
+
   if (!scene_ || image.data.empty()) {
+    NANOPDF_LOG_WARN("ThorVG", "draw_image: skipped (scene=%p, data.empty=%d)",
+                     (void*)scene_, image.data.empty() ? 1 : 0);
     return false;
   }
 
@@ -1190,9 +1190,29 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   }
   // Handle grayscale
   else if (num_components == 1) {
-    for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
-      uint8_t gray = image.data[i];
-      argb_data[i] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
+    // Check if this is 1-bit per pixel (packed bits)
+    if (image.bits_per_component == 1) {
+      // Unpack 1-bit data: 8 pixels per byte
+      int stride = (img_width + 7) / 8;  // Bytes per row
+      for (int row = 0; row < img_height; row++) {
+        for (int col = 0; col < img_width; col++) {
+          int byte_idx = row * stride + col / 8;
+          int bit_idx = 7 - (col % 8);  // MSB first
+
+          if (byte_idx < static_cast<int>(image.data.size())) {
+            bool bit_set = (image.data[byte_idx] >> bit_idx) & 1;
+            // CCITT decoder outputs: 1=white, 0=black (when BlackIs1=false, which is typical)
+            uint8_t gray = bit_set ? 0xFF : 0x00;
+            argb_data[row * img_width + col] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
+          }
+        }
+      }
+    } else {
+      // 8-bit grayscale
+      for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
+        uint8_t gray = image.data[i];
+        argb_data[i] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
+      }
     }
   }
   // Handle RGB
@@ -1253,6 +1273,9 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   float canvas_x = x * state_.scale;
   float canvas_y = (state_.page_height - y - height) * state_.scale;
 
+  NANOPDF_LOG_DEBUG("ThorVG", "draw_image transform: page_h=%.1f, scale=%.3f, canvas=(%.1f,%.1f)",
+                    state_.page_height, state_.scale, canvas_x, canvas_y);
+
   // Apply transformation using matrix for non-uniform scaling
   tvg::Matrix m;
   m.e11 = scale_x * state_.scale;
@@ -1267,7 +1290,8 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   picture->transform(m);
 
   // Push to scene
-  scene_->push(std::move(picture));
+  auto push_result = scene_->push(std::move(picture));
+  NANOPDF_LOG_DEBUG("ThorVG", "draw_image: pushed to scene, result=%d", static_cast<int>(push_result));
 
   return true;
 }
@@ -1566,7 +1590,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Linear gradient
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -1593,7 +1617,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Radial gradient
     auto gradient = tvg::RadialGradient::gen();
     if (!gradient) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -1863,9 +1887,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
   // Look up pattern from page resources
   auto pattern_dict_it = current_page_->resources.find("Pattern");
   if (pattern_dict_it == current_page_->resources.end()) {
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: No Pattern resources in page\n");
-#endif
+    NANOPDF_LOG_TRACE("ThorVG", "No Pattern resources in page");
     return false;
   }
 
@@ -1888,9 +1910,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
   // Look up the specific pattern
   auto pattern_it = pattern_resources.find(pattern_name);
   if (pattern_it == pattern_resources.end()) {
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: Pattern '%s' not found\n", pattern_name.c_str());
-#endif
+    NANOPDF_LOG_DEBUG("ThorVG", "Pattern '%s' not found", pattern_name.c_str());
     return false;
   }
 
@@ -1913,16 +1933,12 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
   // Parse the pattern
   auto pattern = parse_pattern(*current_pdf_, pattern_dict);
   if (!pattern) {
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: Failed to parse pattern '%s'\n", pattern_name.c_str());
-#endif
+    NANOPDF_LOG_DEBUG("ThorVG", "Failed to parse pattern '%s'", pattern_name.c_str());
     return false;
   }
 
-#if NANOPDF_DEBUG_PRINT
-  printf("DEBUG: Applying pattern '%s', type=%d\n", pattern_name.c_str(),
-         static_cast<int>(pattern->type));
-#endif
+  NANOPDF_LOG_TRACE("ThorVG", "Applying pattern '%s', type=%d", pattern_name.c_str(),
+                    static_cast<int>(pattern->type));
 
   if (pattern->type == PatternType::Shading && pattern->shading) {
     // Shading pattern - apply as gradient fill
@@ -2046,9 +2062,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
     // This is a placeholder; proper tiling would require rendering the tile
     // and repeating it
 
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: Tiling pattern not fully supported, using placeholder\n");
-#endif
+    NANOPDF_LOG_DEBUG("ThorVG", "Tiling pattern not fully supported, using placeholder");
 
     // Use a distinctive color to indicate pattern areas
     if (is_stroke) {
@@ -2477,9 +2491,13 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
 
+    uint32_t obj_num = 0;
+    uint16_t gen_num = 0;
+
     if (content_obj.type == Value::REFERENCE) {
-      auto resolved = resolve_reference(pdf, content_obj.ref_object_number,
-                                        content_obj.ref_generation_number);
+      obj_num = content_obj.ref_object_number;
+      gen_num = content_obj.ref_generation_number;
+      auto resolved = resolve_reference(pdf, obj_num, gen_num);
       if (resolved.success) {
         resolved_obj = resolved.value;
       } else {
@@ -2488,7 +2506,7 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
     }
 
     if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj);
+      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
       if (decoded_result.success) {
         state_ = GraphicsState();
         state_.page_width = page_width;
@@ -2549,11 +2567,14 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
   // Parse and render page content
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
+    uint32_t obj_num = 0;
+    uint16_t gen_num = 0;
 
     // Resolve reference if needed
     if (content_obj.type == Value::REFERENCE) {
-      auto resolved = resolve_reference(pdf, content_obj.ref_object_number,
-                                        content_obj.ref_generation_number);
+      obj_num = content_obj.ref_object_number;
+      gen_num = content_obj.ref_generation_number;
+      auto resolved = resolve_reference(pdf, obj_num, gen_num);
       if (resolved.success) {
         resolved_obj = resolved.value;
       } else {
@@ -2562,7 +2583,8 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
     }
 
     if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj);
+      // Pass object numbers for proper decryption
+      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
       if (decoded_result.success) {
         state_ = GraphicsState();  // Reset state
         // Set page coordinate info
@@ -3063,9 +3085,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           }
           state_.fill_color_space = cs_name;
           state_.fill_pattern.clear();  // Clear any previous pattern
-#if NANOPDF_DEBUG_PRINT
-          printf("DEBUG: cs set fill color space to: %s\n", cs_name.c_str());
-#endif
+          NANOPDF_LOG_TRACE("ThorVG", "cs: set fill color space to '%s'", cs_name.c_str());
         }
       } else if (token == "CS") {  // Set stroking color space
         if (operands.size() >= 1) {
@@ -3075,9 +3095,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           }
           state_.stroke_color_space = cs_name;
           state_.stroke_pattern.clear();  // Clear any previous pattern
-#if NANOPDF_DEBUG_PRINT
-          printf("DEBUG: CS set stroke color space to: %s\n", cs_name.c_str());
-#endif
+          NANOPDF_LOG_TRACE("ThorVG", "CS: set stroke color space to '%s'", cs_name.c_str());
         }
       } else if (token == "sc" || token == "scn") {  // Set non-stroking color
         // Check if last operand is a pattern name (starts with /)
@@ -3089,9 +3107,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             std::string pattern_name = last.substr(1);
             state_.fill_pattern = pattern_name;
             is_pattern = true;
-#if NANOPDF_DEBUG_PRINT
-            printf("DEBUG: scn set fill pattern to: %s\n", pattern_name.c_str());
-#endif
+            NANOPDF_LOG_TRACE("ThorVG", "scn: set fill pattern to '%s'", pattern_name.c_str());
           }
         }
 
@@ -3118,9 +3134,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             std::string pattern_name = last.substr(1);
             state_.stroke_pattern = pattern_name;
             is_pattern = true;
-#if NANOPDF_DEBUG_PRINT
-            printf("DEBUG: SCN set stroke pattern to: %s\n", pattern_name.c_str());
-#endif
+            NANOPDF_LOG_TRACE("ThorVG", "SCN: set stroke pattern to '%s'", pattern_name.c_str());
           }
         }
 
@@ -3467,9 +3481,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         // 4 = Fill+Clip, 5 = Stroke+Clip, 6 = Fill+Stroke+Clip, 7 = Clip only
         if (operands.size() >= 1) {
           state_.text_render_mode = std::stoi(operands[0]);
-#if NANOPDF_DEBUG_PRINT
-          printf("DEBUG: Tr set text rendering mode to: %d\n", state_.text_render_mode);
-#endif
+          NANOPDF_LOG_TRACE("ThorVG", "Tr: set text rendering mode to %d", state_.text_render_mode);
         }
       } else if (token == "Tf") {  // Set font and size
         if (operands.size() >= 2) {
@@ -3715,10 +3727,13 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             xobj_name = xobj_name.substr(1);
           }
 
+          NANOPDF_LOG_DEBUG("ThorVG", "Do operator: looking up XObject '%s'", xobj_name.c_str());
+
           // Look up XObject in page resources
           auto xobj_it = current_page_->resources.find("XObject");
           if (xobj_it == current_page_->resources.end()) {
             // No XObject dictionary
+            NANOPDF_LOG_DEBUG("ThorVG", "Do: no XObject dictionary in resources");
           } else if (xobj_it->second.type == Value::REFERENCE) {
             // XObject dict may be a reference, resolve it
             ResolvedObject resolved = resolve_reference(*current_pdf_,
@@ -3728,10 +3743,12 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
               auto entry_it = resolved.value.dict.find(xobj_name);
               if (entry_it != resolved.value.dict.end()) {
                 Value xobj_value;
+                uint32_t xobj_num = 0;
+                uint16_t xobj_gen = 0;
                 if (entry_it->second.type == Value::REFERENCE) {
-                  ResolvedObject xobj_resolved = resolve_reference(*current_pdf_,
-                      entry_it->second.ref_object_number,
-                      entry_it->second.ref_generation_number);
+                  xobj_num = entry_it->second.ref_object_number;
+                  xobj_gen = entry_it->second.ref_generation_number;
+                  ResolvedObject xobj_resolved = resolve_reference(*current_pdf_, xobj_num, xobj_gen);
                   if (xobj_resolved.success) {
                     xobj_value = std::move(xobj_resolved.value);
                   }
@@ -3744,7 +3761,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                   if (subtype_it != xobj_value.stream.dict.end() &&
                       subtype_it->second.type == Value::NAME) {
                     if (subtype_it->second.name == "Image") {
-                      ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value);
+                      ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                       float img_x = state_.transform.e;
                       float img_y = state_.transform.f;
                       float img_width = state_.transform.a;
@@ -3756,7 +3773,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                       draw_image(image, img_x, img_y, img_width, img_height);
                     } else if (subtype_it->second.name == "Form") {
                       // Form XObject - decode and parse its content stream
-                      auto decoded = decode_stream(*current_pdf_, xobj_value);
+                      auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                       if (decoded.success && !decoded.data.empty()) {
                         // Save current state and apply Form's matrix if present
                         GraphicsState saved_state = state_;
@@ -3819,10 +3836,12 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             if (entry_it != xobj_it->second.dict.end()) {
               // Resolve reference if needed
               Value xobj_value;
+              uint32_t xobj_num = 0;
+              uint16_t xobj_gen = 0;
               if (entry_it->second.type == Value::REFERENCE) {
-                ResolvedObject resolved = resolve_reference(*current_pdf_,
-                    entry_it->second.ref_object_number,
-                    entry_it->second.ref_generation_number);
+                xobj_num = entry_it->second.ref_object_number;
+                xobj_gen = entry_it->second.ref_generation_number;
+                ResolvedObject resolved = resolve_reference(*current_pdf_, xobj_num, xobj_gen);
                 if (resolved.success) {
                   xobj_value = std::move(resolved.value);
                 }
@@ -3836,8 +3855,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                 if (subtype_it != xobj_value.stream.dict.end() &&
                     subtype_it->second.type == Value::NAME) {
                   if (subtype_it->second.name == "Image") {
-                    // Parse and render the image
-                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value);
+                    // Parse and render the image (pass object numbers for decryption)
+                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
 
                     // Get image dimensions from CTM (current transformation matrix)
                     float img_x = state_.transform.e;
@@ -3854,7 +3873,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                     draw_image(image, img_x, img_y, img_width, img_height);
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream
-                    auto decoded = decode_stream(*current_pdf_, xobj_value);
+                    auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                     if (decoded.success && !decoded.data.empty()) {
                       // Save current state and apply Form's matrix if present
                       GraphicsState saved_state = state_;

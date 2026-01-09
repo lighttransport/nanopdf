@@ -1799,10 +1799,10 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
               return true;
             }
           }
-          // No valid partial code, return terminating code with 0 run
-          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF with no valid partial code, returning run=0");
-          *run_length = 0;
-          return true;
+          // No valid partial code at EOF - return false to signal end of data
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF with no valid partial code, signaling end");
+          if (err) *err = "EOF while decoding run";
+          return false;
         }
         code = (code << 1) | static_cast<uint32_t>(bit);
 
@@ -1869,6 +1869,12 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
             continue;
           }
           reader.restore(state_before);
+        }
+        // Check if it's an EOF error - if so, fill rest of row with current color and succeed
+        if (err && err->find("EOF") != std::string::npos) {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF in 1D decode at pos=%d, filling rest of row", pos);
+          // Rest of row remains as initialized (white=false, black=true as needed)
+          break;  // Exit loop, row is complete
         }
         return false;
       }
@@ -2023,7 +2029,10 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
           eol_check = (eol_check << 1) | static_cast<uint32_t>(bit);
         }
         if (eof_reached) {
-          return 3;  // EOF = treat as end of data
+          // Hit EOF while checking for EOFB - this is NOT a valid EOFB
+          // Return mode 6 to signal "fill rest of row" rather than treating as EOFB
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF while checking EOFB pattern, filling row");
+          return 6;  // Fill rest of row and continue
         }
         // First 12 bits should be 000000000001 for valid EOL
         if (eol_check == 0b000000000001) {
@@ -2127,6 +2136,17 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       NANOPDF_LOG_TRACE("CCITTFaxDecode", "2D mode=%d delta=%d at byte=%zu bit=%d a0=%d",
                         mode, delta, mode_state.byte_pos, mode_state.bit_pos, a0);
       if (mode == -1) {
+        // Invalid 2D code - check if we're just out of data
+        // Check current reader position (after read_2d_code attempted to read)
+        if (reader.byte_pos >= reader.size) {
+          // Out of data - fill rest of row and succeed
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "2D mode: out of data at a0=%d (byte_pos=%zu >= size=%zu), filling rest of row",
+                            a0, reader.byte_pos, reader.size);
+          break;  // Exit loop, row is complete with what we have
+        }
+        // Not out of data, this is a real invalid code error
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "2D mode: invalid code at byte=%zu (size=%zu), a0=%d",
+                          reader.byte_pos, reader.size, a0);
         if (err) *err = "Invalid 2D code";
         return false;
       }
@@ -2280,7 +2300,8 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         while (a0 < width) {
           int bit = reader.get_bit();
           if (bit < 0) {
-            hit_eofb = true;
+            // EOF during uncompressed mode - just exit this mode, don't set hit_eofb
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF in uncompressed mode at a0=%d, exiting mode", a0);
             break;
           }
 
@@ -2290,7 +2311,8 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
               // Could be exit sequence 00000001T - check next bit
               int exit_bit = reader.get_bit();
               if (exit_bit < 0) {
-                hit_eofb = true;
+                // EOF while checking exit sequence - just exit this mode
+                NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF checking exit sequence at a0=%d, exiting mode", a0);
                 break;
               }
               if (exit_bit == 1) {
@@ -2408,7 +2430,9 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   int decoded_rows = 0;
   int damaged_rows = 0;
 
-  while (reader.byte_pos < size && (max_rows <= 0 || decoded_rows < max_rows)) {
+  // Loop until we've decoded the expected rows or hit EOFB
+  // If max_rows is specified, we must decode that many rows even if we run out of data
+  while ((max_rows > 0 && decoded_rows < max_rows) || (max_rows <= 0 && reader.byte_pos < size)) {
     if (params.end_of_line) {
       if (!reader.skip_eol()) {
         result.error = "CCITTFaxDecode: Missing EOL";
@@ -2438,10 +2462,18 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     bool ok = false;
     NANOPDF_LOG_TRACE("CCITTFaxDecode", "Starting row %d at byte=%zu bit=%d",
                       decoded_rows, reader.byte_pos, reader.bit_pos);
-    if (row_is_1d) {
-      ok = decode_row_1d(reader, line, allow_indicator_skip, width, &row_error);
+
+    // If we're out of data but need more rows, repeat previous line
+    if (reader.byte_pos >= size) {
+      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Out of data at row %d, repeating previous line", decoded_rows);
+      line = prev_line;
+      ok = true;
     } else {
-      ok = decode_row_2d(reader, prev_line, line, width, &row_error);
+      if (row_is_1d) {
+        ok = decode_row_1d(reader, line, allow_indicator_skip, width, &row_error);
+      } else {
+        ok = decode_row_2d(reader, prev_line, line, width, &row_error);
+      }
     }
 
     // Check if we hit EOFB during 2D decode
@@ -2497,8 +2529,15 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         }
       } else {
         // No EOL markers - use "just plow on" approach
-        if (params.damaged_rows_before_error > 0 &&
-            damaged_rows < params.damaged_rows_before_error) {
+        // For EOF errors during row decode, we should have already handled it gracefully
+        // by filling the rest of the row. Don't treat it as a failure.
+        if (row_error.find("EOF") != std::string::npos) {
+          // EOF was encountered but row was completed, just log and continue
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row %d completed with EOF handling", decoded_rows);
+          damaged_rows = 0;  // Reset since we recovered
+          // Don't break, continue to next row
+        } else if (params.damaged_rows_before_error > 0 &&
+                   damaged_rows < params.damaged_rows_before_error) {
           ++damaged_rows;
           line = prev_line;
         } else {
