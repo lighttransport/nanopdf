@@ -2168,9 +2168,11 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       if (mode == 6) {
         // Fill rest of row - 7-zeros found that isn't EOFB
         // This typically indicates end of row padding or sync pattern
-        // Fill remaining pixels as white (most common padding) and end row
-        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Fill rest of row from a0=%d to width=%d", a0, width);
-        // Row ends here - do not add any transitions, remaining pixels are same color as current
+        // Keep current color for remaining pixels (don't add transition)
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Fill rest of row from a0=%d to width=%d, keeping current_color=%s",
+                          a0, width, a0_color_is_white ? "white" : "black");
+        // Don't add transition - remaining pixels stay in current color
+        // The transition count parity will determine the final color
         a0 = width;  // Mark row as complete
         break;  // Exit the mode loop, will proceed to next row
       }
@@ -2402,16 +2404,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     }
 
     apply_transitions(cur_transitions, &line);
-    // Debug: show transitions for problematic rows
-    if (cur_transitions.size() < 30) {
-      std::string trans_str;
-      for (size_t i = 0; i < cur_transitions.size(); ++i) {
-        if (i > 0) trans_str += ",";
-        trans_str += std::to_string(cur_transitions[i]);
-      }
-      NANOPDF_LOG_TRACE("CCITTFaxDecode", "Row done: %zu transitions [%s]",
-                        cur_transitions.size(), trans_str.c_str());
-    }
     return true;
   };
 
