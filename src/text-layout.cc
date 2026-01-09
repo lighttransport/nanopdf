@@ -477,16 +477,413 @@ std::unique_ptr<TextPage> extract_text_layout_with_collector(
   return page;
 }
 
+// Character collector for extracting positioned characters from content streams
+class CharacterCollector {
+public:
+  CharacterCollector(const Pdf& pdf, const Page& page)
+      : pdf_(pdf), page_(page) {}
+
+  std::vector<TextChar> collect_characters() {
+    PageContent content = page_.load_contents(pdf_);
+    if (!content.success) {
+      return chars_;
+    }
+
+    text_state_.reset();
+    process_content_stream(content.data);
+    return chars_;
+  }
+
+private:
+  const Pdf& pdf_;
+  const Page& page_;
+  TextState text_state_;
+  std::vector<TextChar> chars_;
+
+  void process_content_stream(const std::vector<uint8_t>& data) {
+    std::string content(data.begin(), data.end());
+    std::vector<std::string> tokens = tokenize_content(content);
+    std::vector<std::string> operand_stack;
+
+    for (const auto& token : tokens) {
+      if (is_operator(token)) {
+        execute_operator(token, operand_stack);
+        operand_stack.clear();
+      } else {
+        operand_stack.push_back(token);
+      }
+    }
+  }
+
+  std::vector<std::string> tokenize_content(const std::string& content) {
+    std::vector<std::string> tokens;
+    size_t pos = 0;
+
+    while (pos < content.size()) {
+      while (pos < content.size() && std::isspace(content[pos])) {
+        pos++;
+      }
+      if (pos >= content.size()) break;
+
+      if (content[pos] == '(') {
+        std::string str = "(";
+        pos++;
+        int paren_depth = 1;
+        while (pos < content.size() && paren_depth > 0) {
+          if (content[pos] == '\\' && pos + 1 < content.size()) {
+            str += content[pos++];
+            str += content[pos++];
+          } else if (content[pos] == '(') {
+            paren_depth++;
+            str += content[pos++];
+          } else if (content[pos] == ')') {
+            paren_depth--;
+            str += content[pos++];
+          } else {
+            str += content[pos++];
+          }
+        }
+        tokens.push_back(str);
+      } else if (content[pos] == '<' && pos + 1 < content.size() && content[pos + 1] == '<') {
+        tokens.push_back("<<");
+        pos += 2;
+      } else if (content[pos] == '>' && pos + 1 < content.size() && content[pos + 1] == '>') {
+        tokens.push_back(">>");
+        pos += 2;
+      } else if (content[pos] == '<') {
+        std::string hex = "<";
+        pos++;
+        while (pos < content.size() && content[pos] != '>') {
+          hex += content[pos++];
+        }
+        if (pos < content.size()) {
+          hex += content[pos++];
+        }
+        tokens.push_back(hex);
+      } else if (content[pos] == '[' || content[pos] == ']') {
+        tokens.push_back(std::string(1, content[pos]));
+        pos++;
+      } else if (content[pos] == '/') {
+        std::string name = "/";
+        pos++;
+        while (pos < content.size() && !std::isspace(content[pos]) &&
+               content[pos] != '/' && content[pos] != '[' && content[pos] != ']' &&
+               content[pos] != '<' && content[pos] != '>' && content[pos] != '(') {
+          name += content[pos++];
+        }
+        tokens.push_back(name);
+      } else {
+        std::string token;
+        while (pos < content.size() && !std::isspace(content[pos]) &&
+               content[pos] != '/' && content[pos] != '[' && content[pos] != ']' &&
+               content[pos] != '<' && content[pos] != '>' && content[pos] != '(') {
+          token += content[pos++];
+        }
+        tokens.push_back(token);
+      }
+    }
+    return tokens;
+  }
+
+  bool is_operator(const std::string& token) {
+    static const std::set<std::string> operators = {
+      "BT", "ET", "Td", "TD", "Tm", "T*", "Tj", "TJ", "'", "\"",
+      "Tc", "Tw", "Tz", "TL", "Tf", "Tr", "Ts",
+      "q", "Q", "cm"
+    };
+    return operators.find(token) != operators.end();
+  }
+
+  void execute_operator(const std::string& op, const std::vector<std::string>& operands) {
+    if (op == "BT") {
+      text_state_.reset();
+    } else if (op == "ET") {
+      // End text block
+    } else if (op == "Td" && operands.size() >= 2) {
+      double tx = parse_number(operands[0]);
+      double ty = parse_number(operands[1]);
+      text_state_.line_matrix[4] += tx * text_state_.line_matrix[0] + ty * text_state_.line_matrix[2];
+      text_state_.line_matrix[5] += tx * text_state_.line_matrix[1] + ty * text_state_.line_matrix[3];
+      std::copy(text_state_.line_matrix, text_state_.line_matrix + 6, text_state_.text_matrix);
+    } else if (op == "TD" && operands.size() >= 2) {
+      double tx = parse_number(operands[0]);
+      double ty = parse_number(operands[1]);
+      text_state_.leading = -ty;
+      text_state_.line_matrix[4] += tx * text_state_.line_matrix[0] + ty * text_state_.line_matrix[2];
+      text_state_.line_matrix[5] += tx * text_state_.line_matrix[1] + ty * text_state_.line_matrix[3];
+      std::copy(text_state_.line_matrix, text_state_.line_matrix + 6, text_state_.text_matrix);
+    } else if (op == "Tm" && operands.size() >= 6) {
+      for (int i = 0; i < 6; i++) {
+        text_state_.text_matrix[i] = parse_number(operands[i]);
+      }
+      std::copy(text_state_.text_matrix, text_state_.text_matrix + 6, text_state_.line_matrix);
+    } else if (op == "T*") {
+      text_state_.line_matrix[5] -= text_state_.leading;
+      std::copy(text_state_.line_matrix, text_state_.line_matrix + 6, text_state_.text_matrix);
+    } else if (op == "Tj" && operands.size() >= 1) {
+      extract_characters_from_string(operands[0]);
+    } else if (op == "TJ" && operands.size() >= 1) {
+      extract_characters_from_array(operands[0]);
+    } else if (op == "'" && operands.size() >= 1) {
+      execute_operator("T*", {});
+      execute_operator("Tj", operands);
+    } else if (op == "\"" && operands.size() >= 3) {
+      text_state_.word_spacing = parse_number(operands[0]);
+      text_state_.char_spacing = parse_number(operands[1]);
+      execute_operator("T*", {});
+      execute_operator("Tj", {operands[2]});
+    } else if (op == "Tc" && operands.size() >= 1) {
+      text_state_.char_spacing = parse_number(operands[0]);
+    } else if (op == "Tw" && operands.size() >= 1) {
+      text_state_.word_spacing = parse_number(operands[0]);
+    } else if (op == "Tz" && operands.size() >= 1) {
+      text_state_.horizontal_scaling = parse_number(operands[0]);
+    } else if (op == "TL" && operands.size() >= 1) {
+      text_state_.leading = parse_number(operands[0]);
+    } else if (op == "Tf" && operands.size() >= 2) {
+      text_state_.font_name = operands[0];
+      text_state_.font_size = parse_number(operands[1]);
+      std::string font_name = text_state_.font_name.substr(1);
+      text_state_.current_font = page_.get_font(font_name, pdf_);
+    } else if (op == "Tr" && operands.size() >= 1) {
+      int mode = static_cast<int>(parse_number(operands[0]));
+      if (mode >= 0 && mode <= 7) {
+        text_state_.render_mode = static_cast<TextRenderingMode>(mode);
+      }
+    } else if (op == "Ts" && operands.size() >= 1) {
+      text_state_.text_rise = parse_number(operands[0]);
+    }
+  }
+
+  void extract_characters_from_string(const std::string& str) {
+    std::string raw = decode_pdf_string_raw(str);
+
+    for (size_t i = 0; i < raw.size(); ) {
+      // Extract character code (single or multi-byte)
+      uint32_t char_code = static_cast<uint8_t>(raw[i]);
+      size_t code_len = 1;
+
+      // For CID fonts, use 2-byte codes
+      if (text_state_.current_font && text_state_.current_font->subtype == "Type0") {
+        if (i + 1 < raw.size()) {
+          char_code = (static_cast<uint8_t>(raw[i]) << 8) | static_cast<uint8_t>(raw[i + 1]);
+          code_len = 2;
+        }
+      }
+
+      // Map to Unicode
+      uint32_t unicode = map_to_unicode(char_code);
+
+      // Create TextChar
+      TextChar ch;
+      ch.unicode = unicode;
+      ch.x = text_state_.text_matrix[4];
+      ch.y = text_state_.text_matrix[5];
+      ch.font_size = text_state_.font_size;
+      ch.font_name = text_state_.font_name.empty() ? "Unknown" : text_state_.font_name.substr(1);
+      ch.char_spacing = text_state_.char_spacing;
+      ch.word_spacing = text_state_.word_spacing;
+      std::copy(text_state_.text_matrix, text_state_.text_matrix + 6, ch.matrix);
+      ch.rotation = calculate_rotation(ch.matrix);
+
+      // Get character width from font
+      double char_width = get_char_width(char_code);
+      ch.width = char_width * text_state_.font_size * 0.001;  // PDF units
+      ch.height = text_state_.font_size;
+
+      // Apply horizontal scaling
+      ch.width *= text_state_.horizontal_scaling / 100.0;
+
+      chars_.push_back(ch);
+
+      // Advance text matrix
+      double tx = (char_width * text_state_.font_size + text_state_.char_spacing) * text_state_.horizontal_scaling / 100.0;
+      if (unicode == ' ') {
+        tx += text_state_.word_spacing;
+      }
+      text_state_.text_matrix[4] += tx * text_state_.text_matrix[0] / 1000.0;
+      text_state_.text_matrix[5] += tx * text_state_.text_matrix[1] / 1000.0;
+
+      i += code_len;
+    }
+  }
+
+  void extract_characters_from_array(const std::string& array_str) {
+    if (array_str.front() != '[' || array_str.back() != ']') return;
+
+    std::string content = array_str.substr(1, array_str.size() - 2);
+    std::vector<std::string> elements = parse_array_elements(content);
+
+    for (const auto& elem : elements) {
+      if (elem.front() == '(' || elem.front() == '<') {
+        extract_characters_from_string(elem);
+      } else {
+        // Numeric adjustment - adjust text matrix
+        double adjustment = parse_number(elem);
+        double tx = -adjustment * text_state_.font_size * text_state_.horizontal_scaling / 100000.0;
+        text_state_.text_matrix[4] += tx * text_state_.text_matrix[0];
+        text_state_.text_matrix[5] += tx * text_state_.text_matrix[1];
+      }
+    }
+  }
+
+  std::vector<std::string> parse_array_elements(const std::string& content) {
+    std::vector<std::string> elements;
+    size_t pos = 0;
+
+    while (pos < content.size()) {
+      while (pos < content.size() && std::isspace(content[pos])) pos++;
+      if (pos >= content.size()) break;
+
+      if (content[pos] == '(') {
+        size_t start = pos++;
+        int depth = 1;
+        while (pos < content.size() && depth > 0) {
+          if (content[pos] == '\\' && pos + 1 < content.size()) {
+            pos += 2;
+          } else if (content[pos] == '(') {
+            depth++;
+            pos++;
+          } else if (content[pos] == ')') {
+            depth--;
+            pos++;
+          } else {
+            pos++;
+          }
+        }
+        elements.push_back(content.substr(start, pos - start));
+      } else if (content[pos] == '<') {
+        size_t start = pos++;
+        while (pos < content.size() && content[pos] != '>') pos++;
+        if (pos < content.size()) pos++;
+        elements.push_back(content.substr(start, pos - start));
+      } else {
+        size_t start = pos;
+        while (pos < content.size() && !std::isspace(content[pos]) &&
+               content[pos] != '(' && content[pos] != '<') {
+          pos++;
+        }
+        elements.push_back(content.substr(start, pos - start));
+      }
+    }
+    return elements;
+  }
+
+  uint32_t map_to_unicode(uint32_t char_code) {
+    if (!text_state_.current_font) {
+      return char_code < 128 ? char_code : '?';
+    }
+
+    const BaseFont* font = text_state_.current_font;
+
+    // Try ToUnicode CMap first
+    if (!font->to_unicode_cmap.code_to_unicode.empty()) {
+      auto it = font->to_unicode_cmap.code_to_unicode.find(char_code);
+      if (it != font->to_unicode_cmap.code_to_unicode.end()) {
+        return it->second;
+      }
+    }
+
+    // For simple fonts, use character code directly
+    if (font->subtype != "Type0") {
+      return char_code < 256 ? char_code : '?';
+    }
+
+    // For Type0 fonts with Identity-H/V, use CID as Unicode (approximation)
+    return char_code;
+  }
+
+  double get_char_width(uint32_t char_code) {
+    if (!text_state_.current_font) {
+      return 500.0;  // Default width
+    }
+
+    const BaseFont* font = text_state_.current_font;
+
+    // For Type0 fonts, check CID widths
+    if (font->subtype == "Type0") {
+      const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+      if (type0) {
+        auto it = type0->cid_widths.find(char_code);
+        if (it != type0->cid_widths.end()) {
+          return static_cast<double>(it->second);
+        }
+        return static_cast<double>(type0->default_width);
+      }
+    }
+
+    // Check widths array for simple fonts
+    if (!font->widths.empty() && char_code >= font->first_char) {
+      size_t index = char_code - font->first_char;
+      if (index < font->widths.size()) {
+        return static_cast<double>(font->widths[index]);
+      }
+    }
+
+    return 500.0;  // Fallback
+  }
+
+  std::string decode_pdf_string_raw(const std::string& str) {
+    if (str.empty()) return "";
+
+    if (str[0] == '(') {
+      std::string result = str.substr(1, str.size() - 2);
+      size_t pos = 0;
+      while ((pos = result.find("\\", pos)) != std::string::npos) {
+        if (pos + 1 < result.size()) {
+          char next = result[pos + 1];
+          if (next == 'n') {
+            result.replace(pos, 2, "\n");
+          } else if (next == 'r') {
+            result.replace(pos, 2, "\r");
+          } else if (next == 't') {
+            result.replace(pos, 2, "\t");
+          } else if (next == '\\' || next == '(' || next == ')') {
+            result.erase(pos, 1);
+          } else if (next >= '0' && next <= '7') {
+            std::string octal;
+            size_t i = pos + 1;
+            while (i < result.size() && i < pos + 4 && result[i] >= '0' && result[i] <= '7') {
+              octal += result[i++];
+            }
+            int value = std::stoi(octal, nullptr, 8);
+            result.replace(pos, i - pos, 1, static_cast<char>(value));
+          } else {
+            pos++;
+          }
+        } else {
+          pos++;
+        }
+      }
+      return result;
+    } else if (str[0] == '<') {
+      std::string hex = str.substr(1, str.size() - 2);
+      std::string result;
+      for (size_t i = 0; i < hex.size(); i += 2) {
+        std::string byte = hex.substr(i, 2);
+        if (byte.size() == 1) byte += "0";
+        result += static_cast<char>(std::stoi(byte, nullptr, 16));
+      }
+      return result;
+    }
+    return str;
+  }
+
+  double parse_number(const std::string& str) {
+    try {
+      return std::stod(str);
+    } catch (...) {
+      return 0.0;
+    }
+  }
+};
+
 std::unique_ptr<TextPage> extract_text_layout(
     const Pdf& pdf,
     const Page& page,
     const TextLayoutOptions& options) {
 
-  // TODO: Implement character collection from content streams
-  // This requires integrating with the existing text extraction code
-  // For now, return empty page
-
-  std::vector<TextChar> chars;
+  // Get page dimensions
   double width = 612.0;  // Default US Letter
   double height = 792.0;
 
@@ -494,6 +891,10 @@ std::unique_ptr<TextPage> extract_text_layout(
     width = page.media_box[2] - page.media_box[0];
     height = page.media_box[3] - page.media_box[1];
   }
+
+  // Collect characters from content streams
+  CharacterCollector collector(pdf, page);
+  std::vector<TextChar> chars = collector.collect_characters();
 
   return extract_text_layout_with_collector(chars, width, height, options);
 }
