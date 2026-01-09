@@ -82,6 +82,10 @@ clang-format -i src/*.cc src/*.hh
 
 **thorvg-backend.hh/cc**: ThorVG rendering backend for vector graphics rendering (optional, enabled with NANOPDF_USE_THORVG).
 
+**crypto.hh/cc**: Pure C++ cryptographic implementations for PDF security (RC4, AES-128/256, MD5, SHA-256).
+
+**pdf-security.cc**: PDF encryption handling including standard security handler, password authentication, and permission flags.
+
 ### Key Data Structures
 
 - `XRef`/`XRefSection`: Cross-reference table entries for object location tracking
@@ -106,16 +110,18 @@ clang-format -i src/*.cc src/*.hh
 The `filters` namespace provides decoders for:
 - FlateDecode (zlib/deflate compression)
 - ASCII85Decode (Base85 encoding)
+- ASCIIHexDecode (Hexadecimal encoding)
 - LZWDecode (Lempel-Ziv-Welch compression)
 - RunLengthDecode (Run-length encoding compression)
 - DCTDecode (JPEG compression via stb_image)
+- CCITTFaxDecode (Group 3/4 fax, 1D and 2D modes)
 - JBIG2Decode (monochrome bitmap compression - partial)
 
 ### Dependencies
 
 - **Required**: zlib for FlateDecode stream decompression
-- **Embedded**: miniz.c/h, stb_truetype.h, stb_image.h, tiny_dng_loader.h, fpng for various format support
-- **Optional**: nanostl for reduced standard library footprint
+- **Embedded**: miniz.c/h, stb_truetype.h, stb_image.h, stb_image_write.h, tiny_dng_loader.h, fpng for various format support
+- **Optional**: nanostl for reduced standard library footprint, ThorVG for rasterization
 
 ## Development Patterns
 
@@ -129,13 +135,17 @@ Uses RAII with smart pointers (`std::unique_ptr`) for font resources and manual 
 Objects are resolved through the `resolve_reference()` function using object number and generation number from xref tables.
 
 ### Stream Processing
-Stream data is decoded through a pipeline: raw bytes → filter decoding → final decoded content using the `decode_stream()` function.
+Stream data is decoded through a pipeline: raw bytes → filter decoding → final decoded content using the `decode_stream()` function. Filter chains (multiple filters) are supported and applied in sequence.
+
+### Lazy Loading
+Fonts are loaded lazily per page - only when text extraction is performed. Use `Page::ensure_fonts_loaded()` or `Page::get_font()` for explicit control. Metadata (forms, outlines, labels) can be loaded lazily by compiling with `NANOPDF_LAZY_METADATA=1`.
 
 ## Compilation Defines
 
 - `NANOPDF_DEBUG_PRINT`: Enable debug output (set to 1 in CMakeLists.txt by default)
 - `NANOPDF_USE_NANOSTL`: Use nanostl library instead of standard library
 - `NANOPDF_USE_STB_TRUETYPE`: Enable TrueType font support via stb_truetype
+- `NANOPDF_LAZY_METADATA`: Enable lazy loading of metadata (forms, outlines, labels)
 
 ## Testing Files
 
@@ -143,11 +153,10 @@ The repository includes `data/blank.pdf` as a sample PDF file for testing. The m
 
 Test executables:
 - `test_nanopdf`: Main PDF parsing test
-- `test_phase1`: Phase 1 comprehensive features test
-- `test_phase1_simple`: Phase 1 features (filters, images, color spaces)
-- `test_phase2`: Phase 2 features (text extraction, fonts, rendering modes)
+- `test_phase1`, `test_phase1_simple`: Phase 1 features (filters, images, color spaces)
+- `test_phase2_features`, `test_phase2_text_extraction`, `test_phase2_standardencoding`, `test_phase2_rendering`, `test_phase2_real_pdfs`: Phase 2 features (text extraction, fonts, encoding)
 - `test_phase3`: Phase 3 features (annotations, forms, interactivity)
-- `test_phase4`: Phase 4 features (advanced typography, OpenType)
-- `test_phase5`: Phase 5 features (security, encryption, digital signatures)
-- `test_phase6`: Phase 6 features (advanced PDF features)
+- `test_phase4`: Phase 4 features (document navigation, metadata, outlines)
+- `test_phase5`: Phase 5 features (security, encryption, cryptographic algorithms)
+- `test_phase6`: Phase 6 features (CCITTFaxDecode, advanced filters)
 - `test_thorvg`: ThorVG backend test (when NANOPDF_USE_THORVG is enabled)

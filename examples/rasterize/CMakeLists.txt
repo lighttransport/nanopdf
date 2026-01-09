@@ -17,7 +17,7 @@ option(USE_THORVG "Enable ThorVG backend" ON)
 if(USE_THORVG)
   find_package(PkgConfig)
   if(PkgConfig_FOUND)
-    pkg_check_modules(THORVG thorvg)
+    pkg_check_modules(THORVG IMPORTED_TARGET thorvg)
   endif()
 
   if(NOT THORVG_FOUND)
@@ -42,7 +42,9 @@ if(USE_THORVG)
 
   if(THORVG_FOUND)
     add_compile_definitions(NANOPDF_USE_THORVG)
-    include_directories(${THORVG_INCLUDE_DIRS})
+    if(NOT TARGET PkgConfig::THORVG)
+      include_directories(${THORVG_INCLUDE_DIRS})
+    endif()
   endif()
 endif()
 
@@ -58,7 +60,11 @@ endif()
 
 # Link with ThorVG if found
 if(THORVG_FOUND)
-  target_link_libraries(rasterize ${THORVG_LIBRARIES})
+  if(TARGET PkgConfig::THORVG)
+    target_link_libraries(rasterize PkgConfig::THORVG)
+  else()
+    target_link_libraries(rasterize ${THORVG_LIBRARIES})
+  endif()
 endif()
 
 # Link with zlib (required by nanopdf)

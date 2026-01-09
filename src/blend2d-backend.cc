@@ -995,37 +995,57 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
     else if (image.color_space.type == ColorSpaceType::DeviceCMYK) components = 4;
     else if (image.color_space.type == ColorSpaceType::DeviceGray) components = 1;
 
-    for (int row = 0; row < img_height; row++) {
-      for (int col = 0; col < img_width; col++) {
-        size_t src_idx = (row * img_width + col) * components;
-        size_t dst_idx = row * img_data.stride + col * 4;
+    size_t src_size = image.data.size();
+    size_t expected_size = static_cast<size_t>(img_width) * img_height * components;
 
-        uint8_t r_val, g_val, b_val, a_val = 255;
-
-        if (components == 1) {
-          r_val = g_val = b_val = src[src_idx];
-        } else if (components == 3) {
-          r_val = src[src_idx];
-          g_val = src[src_idx + 1];
-          b_val = src[src_idx + 2];
-        } else if (components == 4) {
-          // CMYK to RGB
-          float c = src[src_idx] / 255.0f;
-          float m = src[src_idx + 1] / 255.0f;
-          float y_val = src[src_idx + 2] / 255.0f;
-          float k = src[src_idx + 3] / 255.0f;
-          r_val = static_cast<uint8_t>((1.0f - c) * (1.0f - k) * 255);
-          g_val = static_cast<uint8_t>((1.0f - m) * (1.0f - k) * 255);
-          b_val = static_cast<uint8_t>((1.0f - y_val) * (1.0f - k) * 255);
-        } else {
-          r_val = g_val = b_val = 128;
+    // Bounds check - if data is too small, fill with gray
+    if (src_size < expected_size) {
+#ifdef NANOPDF_DEBUG_PRINT
+      printf("DEBUG: Image data size mismatch: got %zu, expected %zu\n", src_size, expected_size);
+#endif
+      // Fill with gray placeholder
+      for (int row = 0; row < img_height; row++) {
+        for (int col = 0; col < img_width; col++) {
+          size_t dst_idx = row * img_data.stride + col * 4;
+          dst[dst_idx + 0] = 200;  // B
+          dst[dst_idx + 1] = 200;  // G
+          dst[dst_idx + 2] = 200;  // R
+          dst[dst_idx + 3] = 255;  // A
         }
+      }
+    } else {
+      for (int row = 0; row < img_height; row++) {
+        for (int col = 0; col < img_width; col++) {
+          size_t src_idx = (row * img_width + col) * components;
+          size_t dst_idx = row * img_data.stride + col * 4;
 
-        // PRGB32 is BGRA
-        dst[dst_idx + 0] = b_val;
-        dst[dst_idx + 1] = g_val;
-        dst[dst_idx + 2] = r_val;
-        dst[dst_idx + 3] = a_val;
+          uint8_t r_val, g_val, b_val, a_val = 255;
+
+          if (components == 1) {
+            r_val = g_val = b_val = src[src_idx];
+          } else if (components == 3) {
+            r_val = src[src_idx];
+            g_val = src[src_idx + 1];
+            b_val = src[src_idx + 2];
+          } else if (components == 4) {
+            // CMYK to RGB
+            float c = src[src_idx] / 255.0f;
+            float m = src[src_idx + 1] / 255.0f;
+            float y_val = src[src_idx + 2] / 255.0f;
+            float k = src[src_idx + 3] / 255.0f;
+            r_val = static_cast<uint8_t>((1.0f - c) * (1.0f - k) * 255);
+            g_val = static_cast<uint8_t>((1.0f - m) * (1.0f - k) * 255);
+            b_val = static_cast<uint8_t>((1.0f - y_val) * (1.0f - k) * 255);
+          } else {
+            r_val = g_val = b_val = 128;
+          }
+
+          // PRGB32 is BGRA
+          dst[dst_idx + 0] = b_val;
+          dst[dst_idx + 1] = g_val;
+          dst[dst_idx + 2] = r_val;
+          dst[dst_idx + 3] = a_val;
+        }
       }
     }
   }
@@ -2041,9 +2061,11 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                         state_.soft_mask_type = 2;
                       }
                     }
-                    // Note: Full soft mask rendering would require rendering the G (transparency group)
-                    // XObject to a separate buffer and using it as a mask. This is complex and
-                    // not fully implemented here - we just track the soft mask state.
+                    // Get and render the G (transparency group) XObject
+                    auto g_it = smask_dict.find("G");
+                    if (g_it != smask_dict.end()) {
+                      render_soft_mask_group(g_it->second, state_.soft_mask_type);
+                    }
                   }
                 }
               }
@@ -2554,14 +2576,424 @@ bool Blend2DBackend::parse_inline_image(const std::string& content, size_t& pos)
 }
 
 bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern_name, bool is_stroke) {
-  // Similar to ThorVG implementation
-  // For now, use placeholder color
+  if (!current_pdf_ || !current_page_) {
+    return false;
+  }
+
+  // Look up pattern resources
+  auto pattern_dict_it = current_page_->resources.find("Pattern");
+  if (pattern_dict_it == current_page_->resources.end()) {
+    return false;
+  }
+
+  Dictionary pattern_resources;
+  if (pattern_dict_it->second.type == Value::DICTIONARY) {
+    pattern_resources = pattern_dict_it->second.dict;
+  } else if (pattern_dict_it->second.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_,
+                                      pattern_dict_it->second.ref_object_number,
+                                      pattern_dict_it->second.ref_generation_number);
+    if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
+      return false;
+    }
+    pattern_resources = resolved.value.dict;
+  } else {
+    return false;
+  }
+
+  // Look up the specific pattern
+  auto pattern_it = pattern_resources.find(pattern_name);
+  if (pattern_it == pattern_resources.end()) {
+    return false;
+  }
+
+  // Resolve pattern reference if needed
+  Dictionary pattern_dict;
+  if (pattern_it->second.type == Value::DICTIONARY) {
+    pattern_dict = pattern_it->second.dict;
+  } else if (pattern_it->second.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_,
+                                      pattern_it->second.ref_object_number,
+                                      pattern_it->second.ref_generation_number);
+    if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
+      return false;
+    }
+    pattern_dict = resolved.value.dict;
+  } else {
+    return false;
+  }
+
+  // Parse the pattern
+  auto pattern = parse_pattern(*current_pdf_, pattern_dict);
+  if (!pattern) {
+    return false;
+  }
+
+  if (pattern->type == PatternType::Shading && pattern->shading) {
+    // Shading pattern - apply as gradient fill
+    auto shading = pattern->shading.get();
+
+    if (shading->type == ShadingType::Axial && shading->coords.size() >= 4) {
+      // Linear gradient
+      float x0 = static_cast<float>(shading->coords[0]);
+      float y0 = static_cast<float>(shading->coords[1]);
+      float x1 = static_cast<float>(shading->coords[2]);
+      float y1 = static_cast<float>(shading->coords[3]);
+
+      // Transform through pattern matrix
+      if (pattern->matrix.size() >= 6) {
+        float a = static_cast<float>(pattern->matrix[0]);
+        float b = static_cast<float>(pattern->matrix[1]);
+        float c = static_cast<float>(pattern->matrix[2]);
+        float d = static_cast<float>(pattern->matrix[3]);
+        float e = static_cast<float>(pattern->matrix[4]);
+        float f = static_cast<float>(pattern->matrix[5]);
+
+        float new_x0 = a * x0 + c * y0 + e;
+        float new_y0 = b * x0 + d * y0 + f;
+        float new_x1 = a * x1 + c * y1 + e;
+        float new_y1 = b * x1 + d * y1 + f;
+
+        x0 = new_x0; y0 = new_y0;
+        x1 = new_x1; y1 = new_y1;
+      }
+
+      // Apply page scale and Y-flip
+      x0 *= state_.scale;
+      y0 = (state_.page_height - y0) * state_.scale;
+      x1 *= state_.scale;
+      y1 = (state_.page_height - y1) * state_.scale;
+
+      BLGradient gradient(BLLinearGradientValues(x0, y0, x1, y1));
+
+      // Get colors from function
+      uint8_t start_r = 0, start_g = 0, start_b = 0;
+      uint8_t end_r = 255, end_g = 255, end_b = 255;
+
+      if (shading->function.type == Value::DICTIONARY) {
+        auto func_type_it = shading->function.dict.find("FunctionType");
+        if (func_type_it != shading->function.dict.end() &&
+            func_type_it->second.type == Value::NUMBER &&
+            static_cast<int>(func_type_it->second.number) == 2) {
+          auto c0_it = shading->function.dict.find("C0");
+          auto c1_it = shading->function.dict.find("C1");
+
+          if (c0_it != shading->function.dict.end() && c0_it->second.type == Value::ARRAY) {
+            const auto& c0 = c0_it->second.array;
+            if (c0.size() >= 3) {
+              start_r = static_cast<uint8_t>(c0[0].number * 255);
+              start_g = static_cast<uint8_t>(c0[1].number * 255);
+              start_b = static_cast<uint8_t>(c0[2].number * 255);
+            }
+          }
+          if (c1_it != shading->function.dict.end() && c1_it->second.type == Value::ARRAY) {
+            const auto& c1 = c1_it->second.array;
+            if (c1.size() >= 3) {
+              end_r = static_cast<uint8_t>(c1[0].number * 255);
+              end_g = static_cast<uint8_t>(c1[1].number * 255);
+              end_b = static_cast<uint8_t>(c1[2].number * 255);
+            }
+          }
+        }
+      }
+
+      gradient.add_stop(0.0, BLRgba32(start_r, start_g, start_b, 255));
+      gradient.add_stop(1.0, BLRgba32(end_r, end_g, end_b, 255));
+
+      if (is_stroke) {
+        ctx_.set_stroke_style(gradient);
+      } else {
+        ctx_.set_fill_style(gradient);
+      }
+      return true;
+    }
+    else if (shading->type == ShadingType::Radial && shading->coords.size() >= 6) {
+      // Radial gradient
+      float x0 = static_cast<float>(shading->coords[0]);
+      float y0 = static_cast<float>(shading->coords[1]);
+      float r0 = static_cast<float>(shading->coords[2]);
+      float x1 = static_cast<float>(shading->coords[3]);
+      float y1 = static_cast<float>(shading->coords[4]);
+      float r1 = static_cast<float>(shading->coords[5]);
+
+      // Transform through pattern matrix
+      if (pattern->matrix.size() >= 6) {
+        float a = static_cast<float>(pattern->matrix[0]);
+        float b = static_cast<float>(pattern->matrix[1]);
+        float c = static_cast<float>(pattern->matrix[2]);
+        float d = static_cast<float>(pattern->matrix[3]);
+        float e = static_cast<float>(pattern->matrix[4]);
+        float f = static_cast<float>(pattern->matrix[5]);
+
+        float new_x0 = a * x0 + c * y0 + e;
+        float new_y0 = b * x0 + d * y0 + f;
+        float new_x1 = a * x1 + c * y1 + e;
+        float new_y1 = b * x1 + d * y1 + f;
+
+        float scale_factor = std::sqrt(std::abs(a * d - b * c));
+        r0 *= scale_factor;
+        r1 *= scale_factor;
+
+        x0 = new_x0; y0 = new_y0;
+        x1 = new_x1; y1 = new_y1;
+      }
+
+      // Apply page scale and Y-flip
+      x0 *= state_.scale;
+      y0 = (state_.page_height - y0) * state_.scale;
+      r0 *= state_.scale;
+      x1 *= state_.scale;
+      y1 = (state_.page_height - y1) * state_.scale;
+      r1 *= state_.scale;
+
+      BLGradient gradient(BLRadialGradientValues(x1, y1, x0, y0, r1, r0));
+
+      // Get colors from function (similar to axial)
+      uint8_t start_r = 0, start_g = 0, start_b = 0;
+      uint8_t end_r = 255, end_g = 255, end_b = 255;
+
+      if (shading->function.type == Value::DICTIONARY) {
+        auto func_type_it = shading->function.dict.find("FunctionType");
+        if (func_type_it != shading->function.dict.end() &&
+            func_type_it->second.type == Value::NUMBER &&
+            static_cast<int>(func_type_it->second.number) == 2) {
+          auto c0_it = shading->function.dict.find("C0");
+          auto c1_it = shading->function.dict.find("C1");
+
+          if (c0_it != shading->function.dict.end() && c0_it->second.type == Value::ARRAY) {
+            const auto& c0 = c0_it->second.array;
+            if (c0.size() >= 3) {
+              start_r = static_cast<uint8_t>(c0[0].number * 255);
+              start_g = static_cast<uint8_t>(c0[1].number * 255);
+              start_b = static_cast<uint8_t>(c0[2].number * 255);
+            }
+          }
+          if (c1_it != shading->function.dict.end() && c1_it->second.type == Value::ARRAY) {
+            const auto& c1 = c1_it->second.array;
+            if (c1.size() >= 3) {
+              end_r = static_cast<uint8_t>(c1[0].number * 255);
+              end_g = static_cast<uint8_t>(c1[1].number * 255);
+              end_b = static_cast<uint8_t>(c1[2].number * 255);
+            }
+          }
+        }
+      }
+
+      gradient.add_stop(0.0, BLRgba32(start_r, start_g, start_b, 255));
+      gradient.add_stop(1.0, BLRgba32(end_r, end_g, end_b, 255));
+
+      if (is_stroke) {
+        ctx_.set_stroke_style(gradient);
+      } else {
+        ctx_.set_fill_style(gradient);
+      }
+      return true;
+    }
+  }
+  else if (pattern->type == PatternType::Tiling && pattern->tiling) {
+    // Tiling pattern - render tile to an image and create BLPattern
+    auto& tiling = *pattern->tiling;
+
+    // Calculate tile dimensions from bbox
+    float tile_width = 1.0f, tile_height = 1.0f;
+    if (tiling.bbox.size() >= 4) {
+      tile_width = static_cast<float>(tiling.bbox[2] - tiling.bbox[0]);
+      tile_height = static_cast<float>(tiling.bbox[3] - tiling.bbox[1]);
+    }
+
+    // Apply step if specified
+    float x_step = tiling.x_step > 0 ? static_cast<float>(tiling.x_step) : tile_width;
+    float y_step = tiling.y_step > 0 ? static_cast<float>(tiling.y_step) : tile_height;
+
+    // Scale tile dimensions
+    uint32_t img_width = static_cast<uint32_t>(x_step * state_.scale);
+    uint32_t img_height = static_cast<uint32_t>(y_step * state_.scale);
+
+    if (img_width == 0) img_width = 32;
+    if (img_height == 0) img_height = 32;
+    if (img_width > 512) img_width = 512;  // Limit size for performance
+    if (img_height > 512) img_height = 512;
+
+    // Create tile image
+    BLImage tile_image(img_width, img_height, BL_FORMAT_PRGB32);
+    BLContext tile_ctx(tile_image);
+
+    // Clear with transparent
+    tile_ctx.set_comp_op(BL_COMP_OP_CLEAR);
+    tile_ctx.fill_all();
+    tile_ctx.set_comp_op(BL_COMP_OP_SRC_OVER);
+
+    // For colored tiles, we would render the content stream
+    // For now, use a simple placeholder pattern
+    if (tiling.paint_type == TilingPaintType::ColoredTiles) {
+      // Use a checkered pattern as placeholder
+      tile_ctx.set_fill_style(BLRgba32(200, 200, 200, 255));
+      tile_ctx.fill_rect(0, 0, img_width / 2, img_height / 2);
+      tile_ctx.fill_rect(img_width / 2, img_height / 2, img_width / 2, img_height / 2);
+      tile_ctx.set_fill_style(BLRgba32(230, 230, 230, 255));
+      tile_ctx.fill_rect(img_width / 2, 0, img_width / 2, img_height / 2);
+      tile_ctx.fill_rect(0, img_height / 2, img_width / 2, img_height / 2);
+    } else {
+      // Uncolored tiles - use current fill color
+      tile_ctx.set_fill_style(BLRgba32(state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a));
+      tile_ctx.fill_all();
+    }
+
+    tile_ctx.end();
+
+    // Create repeating pattern
+    BLPattern bl_pattern(tile_image, BL_EXTEND_MODE_REPEAT);
+
+    // Apply pattern matrix
+    if (pattern->matrix.size() >= 6) {
+      BLMatrix2D mat(
+        pattern->matrix[0], pattern->matrix[1],
+        pattern->matrix[2], pattern->matrix[3],
+        pattern->matrix[4] * state_.scale,
+        (state_.page_height - pattern->matrix[5]) * state_.scale
+      );
+      bl_pattern.set_transform(mat);
+    }
+
+    if (is_stroke) {
+      ctx_.set_stroke_style(bl_pattern);
+    } else {
+      ctx_.set_fill_style(bl_pattern);
+    }
+    return true;
+  }
+
+  // Fallback to placeholder color
   if (is_stroke) {
     ctx_.set_stroke_style(BLRgba32(128, 128, 128, 255));
   } else {
     ctx_.set_fill_style(BLRgba32(200, 200, 200, 255));
   }
   return true;
+}
+
+bool Blend2DBackend::render_soft_mask_group(const Value& group_xobject, int mask_type) {
+  if (!current_pdf_) return false;
+
+  // Get the XObject stream
+  Value xobject_value = group_xobject;
+  if (xobject_value.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_,
+                                      xobject_value.ref_object_number,
+                                      xobject_value.ref_generation_number);
+    if (!resolved.success) return false;
+    xobject_value = resolved.value;
+  }
+
+  if (xobject_value.type != Value::STREAM) return false;
+
+  // Check that it's a Form XObject
+  auto subtype_it = xobject_value.stream.dict.find("Subtype");
+  if (subtype_it == xobject_value.stream.dict.end() ||
+      subtype_it->second.type != Value::NAME ||
+      subtype_it->second.name != "Form") {
+    return false;
+  }
+
+  // Get dimensions from BBox
+  float bbox[4] = {0, 0, 100, 100};  // Default
+  auto bbox_it = xobject_value.stream.dict.find("BBox");
+  if (bbox_it != xobject_value.stream.dict.end() && bbox_it->second.type == Value::ARRAY) {
+    const auto& arr = bbox_it->second.array;
+    for (size_t i = 0; i < 4 && i < arr.size(); ++i) {
+      if (arr[i].type == Value::NUMBER) {
+        bbox[i] = static_cast<float>(arr[i].number);
+      }
+    }
+  }
+
+  uint32_t mask_width = static_cast<uint32_t>(std::abs(bbox[2] - bbox[0]) * state_.scale);
+  uint32_t mask_height = static_cast<uint32_t>(std::abs(bbox[3] - bbox[1]) * state_.scale);
+
+  if (mask_width == 0) mask_width = width_;
+  if (mask_height == 0) mask_height = height_;
+
+  // Create a temporary image for rendering the soft mask
+  BLImage mask_image(mask_width, mask_height, BL_FORMAT_PRGB32);
+  BLContext mask_ctx(mask_image);
+
+  // Clear with white (for luminosity) or transparent (for alpha)
+  if (mask_type == 2) {  // Luminosity
+    mask_ctx.set_fill_style(BLRgba32(255, 255, 255, 255));
+  } else {  // Alpha
+    mask_ctx.set_fill_style(BLRgba32(0, 0, 0, 0));
+  }
+  mask_ctx.fill_all();
+
+  // Decode the XObject stream content
+  auto decoded = decode_stream(*current_pdf_, xobject_value);
+  if (!decoded.success) {
+    return false;
+  }
+
+  // TODO: Full implementation would parse and render the XObject content
+  // to the mask_ctx. For now, we store basic mask info.
+
+  // Store mask data
+  state_.soft_mask_width = mask_width;
+  state_.soft_mask_height = mask_height;
+
+  // Get the rendered pixels
+  BLImageData data;
+  mask_image.get_data(&data);
+
+  // Convert to grayscale mask values
+  state_.soft_mask_data.resize(mask_width * mask_height);
+  const uint8_t* pixels = static_cast<const uint8_t*>(data.pixel_data);
+
+  for (uint32_t y = 0; y < mask_height; ++y) {
+    for (uint32_t x = 0; x < mask_width; ++x) {
+      size_t src_idx = (y * data.stride) + (x * 4);
+      size_t dst_idx = y * mask_width + x;
+
+      if (mask_type == 2) {  // Luminosity mask
+        // Convert RGB to luminance using standard coefficients
+        float r = pixels[src_idx + 2] / 255.0f;
+        float g = pixels[src_idx + 1] / 255.0f;
+        float b = pixels[src_idx + 0] / 255.0f;
+        float luminance = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        state_.soft_mask_data[dst_idx] = static_cast<uint8_t>(luminance * 255.0f);
+      } else {  // Alpha mask
+        state_.soft_mask_data[dst_idx] = pixels[src_idx + 3];  // Alpha channel
+      }
+    }
+  }
+
+  mask_ctx.end();
+  return true;
+}
+
+void Blend2DBackend::apply_soft_mask_to_context() {
+  if (!state_.has_soft_mask || state_.soft_mask_data.empty()) {
+    return;
+  }
+
+  // Blend2D doesn't have direct soft mask support like PDF
+  // We simulate by adjusting the global alpha based on mask values
+  // This is a simplified approximation
+
+  // For proper implementation, we would need to:
+  // 1. Render to an offscreen buffer
+  // 2. Apply the soft mask as a per-pixel alpha multiplier
+  // 3. Composite the result to the main image
+
+  // For now, calculate average mask value as a global alpha approximation
+  if (state_.soft_mask_width > 0 && state_.soft_mask_height > 0) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < state_.soft_mask_data.size(); ++i) {
+      sum += state_.soft_mask_data[i];
+    }
+    float avg_alpha = static_cast<float>(sum) / (state_.soft_mask_data.size() * 255.0f);
+
+    // Multiply current opacity by mask average
+    state_.fill_opacity *= avg_alpha;
+    state_.stroke_opacity *= avg_alpha;
+  }
 }
 
 }  // namespace nanopdf

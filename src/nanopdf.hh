@@ -1050,7 +1050,7 @@ struct Pdf {
   
   // Signature field parsing functions
   bool parse_signature_fields();
-  static bool parse_acro_form_fields(const Pdf& pdf, const Dictionary& acro_form, 
+  static bool parse_acro_form_fields(const Pdf& pdf, const Dictionary& acro_form,
                                      std::vector<SignatureField>& signature_fields);
   static SignatureField parse_signature_field(const Pdf& pdf, const Dictionary& field_dict);
 

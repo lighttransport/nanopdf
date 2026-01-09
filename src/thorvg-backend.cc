@@ -3369,9 +3369,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                         state_.soft_mask_type = 2;
                       }
                     }
-                    // Note: Full soft mask rendering would require rendering the G (transparency group)
-                    // XObject to a separate buffer and using it as a mask. This is complex and
-                    // not fully implemented here - we just track the soft mask state.
+                    // Get and render the G (transparency group) XObject
+                    auto g_it = smask_dict.find("G");
+                    if (g_it != smask_dict.end()) {
+                      render_soft_mask_group(g_it->second, state_.soft_mask_type);
+                    }
                   }
                 }
               }
@@ -3932,6 +3934,93 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
   }
 
   return true;
+}
+
+bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_type) {
+  if (!current_pdf_) return false;
+
+  // Get the XObject stream
+  Value xobject_value = group_xobject;
+  if (xobject_value.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_,
+                                      xobject_value.ref_object_number,
+                                      xobject_value.ref_generation_number);
+    if (!resolved.success) return false;
+    xobject_value = resolved.value;
+  }
+
+  if (xobject_value.type != Value::STREAM) return false;
+
+  // Check that it's a Form XObject
+  auto subtype_it = xobject_value.stream.dict.find("Subtype");
+  if (subtype_it == xobject_value.stream.dict.end() ||
+      subtype_it->second.type != Value::NAME ||
+      subtype_it->second.name != "Form") {
+    return false;
+  }
+
+  // Get dimensions from BBox
+  float bbox[4] = {0, 0, 100, 100};  // Default
+  auto bbox_it = xobject_value.stream.dict.find("BBox");
+  if (bbox_it != xobject_value.stream.dict.end() && bbox_it->second.type == Value::ARRAY) {
+    const auto& arr = bbox_it->second.array;
+    for (size_t i = 0; i < 4 && i < arr.size(); ++i) {
+      if (arr[i].type == Value::NUMBER) {
+        bbox[i] = static_cast<float>(arr[i].number);
+      }
+    }
+  }
+
+  uint32_t mask_width = static_cast<uint32_t>(std::abs(bbox[2] - bbox[0]) * state_.scale);
+  uint32_t mask_height = static_cast<uint32_t>(std::abs(bbox[3] - bbox[1]) * state_.scale);
+
+  if (mask_width == 0) mask_width = width_;
+  if (mask_height == 0) mask_height = height_;
+
+  // Decode the XObject stream content
+  auto decoded = decode_stream(*current_pdf_, xobject_value);
+  if (!decoded.success) {
+    return false;
+  }
+
+  // TODO: Full implementation would create a separate ThorVG canvas,
+  // render the XObject content to it, then extract mask values.
+  // For now, we just store basic mask info as a placeholder.
+
+  // Store mask data (fill with white/opaque as default)
+  state_.soft_mask_width = mask_width;
+  state_.soft_mask_height = mask_height;
+  state_.soft_mask_data.resize(mask_width * mask_height, 255);
+
+  return true;
+}
+
+void ThorVGBackend::apply_soft_mask_to_context() {
+  if (!state_.has_soft_mask || state_.soft_mask_data.empty()) {
+    return;
+  }
+
+  // ThorVG doesn't have direct soft mask support like PDF
+  // We simulate by adjusting the global alpha based on mask values
+  // This is a simplified approximation
+
+  // For proper implementation, we would need to:
+  // 1. Render to an offscreen buffer
+  // 2. Apply the soft mask as a per-pixel alpha multiplier
+  // 3. Composite the result to the main canvas
+
+  // For now, calculate average mask value as a global alpha approximation
+  if (state_.soft_mask_width > 0 && state_.soft_mask_height > 0) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < state_.soft_mask_data.size(); ++i) {
+      sum += state_.soft_mask_data[i];
+    }
+    float avg_alpha = static_cast<float>(sum) / (state_.soft_mask_data.size() * 255.0f);
+
+    // Multiply current opacity by mask average
+    state_.fill_opacity *= avg_alpha;
+    state_.stroke_opacity *= avg_alpha;
+  }
 }
 
 }  // namespace nanopdf
