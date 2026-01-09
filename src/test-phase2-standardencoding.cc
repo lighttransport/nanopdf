@@ -23,6 +23,7 @@ BaseFont* add_standard_font(Page& page, const std::string& name) {
   font->encoding = "StandardEncoding";
   BaseFont* raw = font.get();
   page.fonts[name] = std::move(font);
+  page.fonts_loaded = true;  // Prevent lazy loading from overwriting our test font
   return raw;
 }
 

@@ -64,6 +64,34 @@ void append_black(BitBuilder& bb, int run) {
   throw std::runtime_error("Unsupported black run length");
 }
 
+// Build pure 1D CCITT data (for k=0 mode)
+std::vector<uint8_t> build_ccitt_1d_sample() {
+  BitBuilder bb;
+  const uint16_t kEolCode = 0x001;  // 000000000001
+  const uint8_t kEolLength = 12;
+
+  // Line 1: 8 white pixels, 8 black pixels (pure 1D)
+  bb.append(kEolCode, kEolLength);
+  append_white(bb, 8);
+  append_black(bb, 8);
+
+  // Line 2: same as line 1 (pure 1D encoding)
+  bb.append(kEolCode, kEolLength);
+  append_white(bb, 8);
+  append_black(bb, 8);
+
+  // Final EOL to terminate block
+  bb.append(kEolCode, kEolLength);
+
+  // Pad with zeros to the next byte boundary
+  while (bb.bits.size() % 8 != 0) {
+    bb.bits.push_back(0);
+  }
+
+  return bb.to_bytes();
+}
+
+// Build mixed 1D/2D CCITT data (for k>0 mode with mode indicators)
 std::vector<uint8_t> build_ccitt_sample(bool include_mode_flag) {
   BitBuilder bb;
   const uint16_t kEolCode = 0x001;  // 000000000001
@@ -83,7 +111,7 @@ std::vector<uint8_t> build_ccitt_sample(bool include_mode_flag) {
   append_white(bb, 8);
   append_black(bb, 8);
 
-  // Line 2: replicate first line
+  // Line 2: replicate first line using 2D coding
   bb.append(kEolCode, kEolLength);
   if (include_mode_flag) {
     append_bits("0");  // 2D indicator
@@ -106,14 +134,52 @@ std::vector<uint8_t> build_ccitt_2d_sample() {
   return build_ccitt_sample(true);
 }
 
-// Test CCITTFaxDecode filter
+// Build Group 4 (pure 2D) CCITT data
+// All lines use 2D coding; Line 1 relative to imaginary all-white ref line
+std::vector<uint8_t> build_ccitt_group4_sample() {
+  BitBuilder bb;
+  const uint16_t kEolCode = 0x001;  // 000000000001
+  const uint8_t kEolLength = 12;
+
+  auto append_bits = [&](const std::string& bits) {
+    for (char c : bits) {
+      bb.bits.push_back(c == '1' ? 1 : 0);
+    }
+  };
+
+  // Line 1: 8 white + 8 black (relative to all-white ref line)
+  // Use Horizontal (H) mode since transition is far from reference
+  bb.append(kEolCode, kEolLength);
+  append_bits("001");  // H mode
+  append_white(bb, 8);  // 1D code for white run
+  append_black(bb, 8);  // 1D code for black run
+
+  // Line 2: same as Line 1 (relative to Line 1)
+  // Both transitions are at same positions, use V(0) twice
+  bb.append(kEolCode, kEolLength);
+  append_bits("1");  // Vertical 0 (a1 at same pos as b1)
+  append_bits("1");  // Vertical 0 (a2 at same pos as b2)
+
+  // Final EOL (or EOFB for Group 4 - two EOLs)
+  bb.append(kEolCode, kEolLength);
+  bb.append(kEolCode, kEolLength);
+
+  // Pad to byte boundary
+  while (bb.bits.size() % 8 != 0) {
+    bb.bits.push_back(0);
+  }
+
+  return bb.to_bytes();
+}
+
+// Test CCITTFaxDecode filter (pure 1D / Group 3)
 void test_ccittfax_decode() {
   std::cout << "Testing CCITTFaxDecode..." << std::endl;
 
-  auto encoded = build_ccitt_sample(true);
+  auto encoded = build_ccitt_1d_sample();  // Pure 1D data for k=0 mode
 
   filters::DecodeParams params;
-  params.k = 0;
+  params.k = 0;  // Pure 1D mode (no mode indicators)
   params.columns = 16;
   params.rows = 2;
   params.end_of_line = true;
@@ -122,16 +188,18 @@ void test_ccittfax_decode() {
   DecodedStream result = filters::decode_ccittfax(encoded.data(), encoded.size(), params);
   assert(result.success);
   assert(result.data.size() == 4);
-  assert(result.data[0] == 0xFF && result.data[1] == 0x00);
-  assert(result.data[2] == 0xFF && result.data[3] == 0xFF);
+  // Both lines are 8 white + 8 black: white=1, black=0 when black_is_1=false
+  assert(result.data[0] == 0xFF && result.data[1] == 0x00);  // Line 1
+  assert(result.data[2] == 0xFF && result.data[3] == 0x00);  // Line 2
   std::cout << "  CCITTFaxDecode (BlackIs1=0): PASS" << std::endl;
 
   params.black_is_1 = true;
   result = filters::decode_ccittfax(encoded.data(), encoded.size(), params);
   assert(result.success);
   assert(result.data.size() == 4);
-  assert(result.data[0] == 0x00 && result.data[1] == 0xFF);
-  assert(result.data[2] == 0x00 && result.data[3] == 0x00);
+  // Both lines are 8 white + 8 black: white=0, black=1 when black_is_1=true
+  assert(result.data[0] == 0x00 && result.data[1] == 0xFF);  // Line 1
+  assert(result.data[2] == 0x00 && result.data[3] == 0xFF);  // Line 2
   std::cout << "  CCITTFaxDecode (BlackIs1=1): PASS" << std::endl;
 }
 
@@ -166,7 +234,7 @@ void test_ccittfax_decode_2d() {
 void test_ccittfax_decode_group4() {
   std::cout << "Testing CCITTFaxDecode (Group 4)..." << std::endl;
 
-  auto encoded = build_ccitt_sample(false);
+  auto encoded = build_ccitt_group4_sample();
 
   filters::DecodeParams params;
   params.k = -1;

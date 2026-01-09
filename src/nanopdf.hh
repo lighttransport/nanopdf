@@ -929,6 +929,7 @@ struct SecurityHandler {
   EncryptionAlgorithm algorithm = EncryptionAlgorithm::None;
   EncryptionDictionary encrypt_dict;
   std::vector<uint8_t> encryption_key;
+  std::string file_id;  // First element of trailer ID array
   bool authenticated = false;
   bool is_owner = false;
 
@@ -937,14 +938,14 @@ struct SecurityHandler {
   bool authenticate_owner_password(const std::string& password);
 
   // Encryption/decryption
-  std::vector<uint8_t> decrypt_string(const std::string& str, uint32_t obj_num, uint16_t gen_num);
-  std::vector<uint8_t> decrypt_stream(const std::vector<uint8_t>& data, uint32_t obj_num, uint16_t gen_num);
+  std::vector<uint8_t> decrypt_string(const std::string& str, uint32_t obj_num, uint16_t gen_num) const;
+  std::vector<uint8_t> decrypt_stream(const std::vector<uint8_t>& data, uint32_t obj_num, uint16_t gen_num) const;
   std::vector<uint8_t> encrypt_string(const std::string& str, uint32_t obj_num, uint16_t gen_num);
   std::vector<uint8_t> encrypt_stream(const std::vector<uint8_t>& data, uint32_t obj_num, uint16_t gen_num);
 
   // Key generation
   void compute_encryption_key(const std::string& password, bool is_owner_password);
-  std::vector<uint8_t> compute_object_key(uint32_t obj_num, uint16_t gen_num);
+  std::vector<uint8_t> compute_object_key(uint32_t obj_num, uint16_t gen_num) const;
 };
 
 // PDF password padding
@@ -999,6 +1000,7 @@ struct Pdf {
 
   const uint8_t* data{nullptr};
   size_t data_size{0};
+  bool swap_endian{false};
 
   DocumentCatalog catalog;
   SecurityHandler security;
@@ -1066,6 +1068,8 @@ ResolvedObject resolve_reference(const Pdf& pdf, uint32_t obj_num,
                                  uint16_t gen_num);
 bool parse_indirect_object(StreamReader& sr, Parser& parser, Value* out_value);
 DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj);
+DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj,
+                           uint32_t obj_num, uint16_t gen_num);
 
 // Add parse_string function declaration
 bool parse_string(StreamReader& sr, Parser& parser, std::string* out_str);
