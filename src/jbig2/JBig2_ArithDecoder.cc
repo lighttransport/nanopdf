@@ -17,9 +17,9 @@ namespace jbig2 {
 
 namespace {
 
-// QE probability estimation table for MQ arithmetic coder (46 states)
+// QE probability estimation table for MQ arithmetic coder (47 states, indices 0-46)
 // Based on Annex E of JBIG2 specification (ISO/IEC 14492)
-const JBig2ArithCtx::JBig2ArithQe kQeTable[46] = {
+const JBig2ArithCtx::JBig2ArithQe kQeTable[47] = {
     {0x5601, 1, 1, true},    {0x3401, 2, 6, false},   {0x1801, 3, 9, false},
     {0x0AC1, 4, 12, false},  {0x0521, 5, 29, false},  {0x0221, 38, 33, false},
     {0x5601, 7, 6, true},    {0x5401, 8, 14, false},  {0x4801, 9, 14, false},

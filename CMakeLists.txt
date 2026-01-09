@@ -94,6 +94,7 @@ set(NANOPDF_SOURCES
   src/pdf-attachments.cc
   src/color-transform.cc
   src/tiff-decoder.cc
+  src/text-layout.cc
   src/stb_image_impl.cc
   src/stb_image_write_impl.cc
   src/stb_truetype_impl.cc
@@ -239,6 +240,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     "test_phase2_rendering|src/test-phase2-rendering.cc"
     "test_phase2_realpdf|src/test-phase2-real-pdfs.cc"
     "test_phase2_text|src/test-phase2-text-extraction.cc"
+    "test_phase2_text_layout|test_phase2_text_layout.cc"
     "test_phase3|src/test-phase3-features.cc"
     "test_phase4|src/test-phase4-features.cc"
     "test_phase5|src/test-phase5-features.cc"
