@@ -7,19 +7,60 @@ for constrained environments.
 
 ## Features
 
+### Core Parsing
 - Document structure parsing (catalog, pages, outlines, named destinations)
-- Stream decoding (Flate, ASCII85, LZW, RunLength, DCT, JBIG2 – partial)
-- Fonts: Type1, TrueType, Type0 (CID), Type3, font descriptors, substitution fallbacks
-- Text extraction with matrix tracking, word spacing, StandardEncoding + Differences support
-- Color spaces, image XObjects, ICC profiles, basic raster helpers
-- Annotation and form field parsing (AcroForm widgets, appearance streams)
-- Encryption handler for RC4/AES (standard security handler)
+- Cross-reference tables (linear and compressed object streams)
+- Fallback xref scanning for malformed PDFs
+
+### Stream Filters
+- FlateDecode (zlib/deflate)
+- ASCII85Decode, ASCIIHexDecode
+- LZWDecode, RunLengthDecode
+- DCTDecode (JPEG via stb_image)
+- CCITTFaxDecode (Group 3/4 fax, 1D and 2D modes)
+- JBIG2Decode (partial)
+
+### Fonts
+- Type1, TrueType, Type0 (CID), Type3 fonts
+- Font descriptors and metrics
+- CMap and ToUnicode mappings
+- StandardEncoding with glyph-name fallback via Adobe Glyph List
+- Font substitution for Standard 14 fonts
+
+### Text Extraction
+- Text positioning operators (Td, TD, Tm, T*)
+- Text matrix transformations and rendering modes
+- Character/word spacing support
+- Automatic line break injection
+
+### Graphics
+- Color spaces: DeviceGray, DeviceRGB, DeviceCMYK, CalRGB, CalGray, Lab, ICCBased, Indexed, Separation, DeviceN
+- Image XObjects with decode arrays and masks
+- Extended graphics state (transparency, blend modes)
+- Pattern and shading parsing
+
+### Interactive Features
+- Annotations: Text, Link, Markup, FreeText, Stamp, Ink, Line, Shape, Widget
+- Form fields: Text, Button, Choice, Signature (AcroForm)
+- Appearance streams (Normal, Rollover, Down states)
+- Bookmarks/outlines with destinations
+- Page labels and named destinations
+
+### Security
+- Standard security handler (RC4/AES-128/AES-256)
+- User/owner password authentication
+- Permission flags
+- Pure C++ crypto implementation (no external libraries)
 
 ## Recent Updates
 
-- Capture `/Encoding` dictionaries for simple fonts, recording `Differences`
-- StandardEncoding fallback now maps ligatures/accents via glyph names instead of raw bytes
-- Text extractor injects line breaks when the content stream moves to a new line or block
+- Lazy loading for fonts (loaded on first text extraction per page)
+- Filter chain support (multiple filters applied in sequence)
+- Improved error reporting with detailed messages and bounds checking
+- CCITTFaxDecode filter with Group 3/4 support (1D and 2D modes)
+- ASCIIHexDecode filter
+- CI workflow with AddressSanitizer, UBSan, and ThreadSanitizer builds
+- Fallback xref scanning for corrupted or non-standard PDFs
 
 ## Building
 
@@ -37,7 +78,8 @@ cmake --build build
 | `NANOPDF_USE_STB_TRUETYPE` | `ON` | Include `stb_truetype` to parse embedded TrueType fonts. Disable if you ship your own font loader. |
 | `NANOPDF_USE_THORVG` | `OFF` | Build the ThorVG raster backend. Requires the ThorVG headers/libraries on your system. |
 | `NANOPDF_BUILD_TESTS` | `ON` (honours `BUILD_TESTING`) | Build the phase executables under `src/test-*.cc`. |
-| `NANOPDF_BUILD_WASM` | `OFF` | Target WebAssembly (requires configuring with Emscripten’s toolchain). |
+| `NANOPDF_BUILD_WASM` | `OFF` | Target WebAssembly (requires configuring with Emscripten's toolchain). |
+| `NANOPDF_LAZY_METADATA` | `OFF` | Enable lazy loading of metadata (forms, outlines, labels). |
 
 Pass any flag with `-DNAME=VALUE` while configuring via CMake.
 
@@ -86,9 +128,9 @@ to sanity-check text extraction regressions.
 
 ## Limitations
 
-- CCITTFaxDecode and JPXDecode filters are stubs; monochrome fax streams are only partially supported
-- Advanced transparency, blending, and pattern rendering are parsed but not rendered
-- No writing support (modifying or regenerating PDFs)
+- JPXDecode (JPEG2000) filter not implemented
+- Advanced transparency, blending, and pattern rendering are parsed but not fully rendered
+- No writing support (read-only library)
 
 ## Contributing
 

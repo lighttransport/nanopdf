@@ -91,9 +91,24 @@ set(NANOPDF_SOURCES
   src/canvas-exporter.cc
   src/crypto.cc
   src/pdf-security.cc
+  src/pdf-attachments.cc
+  src/color-transform.cc
+  src/tiff-decoder.cc
   src/stb_image_impl.cc
   src/stb_image_write_impl.cc
   src/stb_truetype_impl.cc
+  src/tiny_dng_impl.cc
+  # JBIG2 decoder infrastructure (Phase 1.4)
+  src/jbig2/JBig2_BitStream.cc
+  src/jbig2/JBig2_Image.cc
+  src/jbig2/JBig2_Segment.cc
+  src/jbig2/JBig2_SymbolDict.cc
+  src/jbig2/JBig2_PatternDict.cc
+  src/jbig2/JBig2_HuffmanTable.cc
+  src/jbig2/JBig2_ArithDecoder.cc
+  src/jbig2/JBig2_ArithIntDecoder.cc
+  src/jbig2/JBig2_GrdProc.cc
+  src/jbig2/JBig2_GrrdProc.cc
 )
 
 if(NANOPDF_USE_THORVG)
@@ -216,6 +231,9 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   set(_NANOPDF_PHASE_TEST_SPECS
     "test_phase1|src/test-phase1-features.cc"
     "test_phase1_simple|src/test-phase1-simple.cc"
+    "test_phase1_attachments|test_phase1_attachments.cc"
+    "test_phase1_color|test_phase1_color.cc"
+    "test_phase1_tiff|test_phase1_tiff.cc"
     "test_phase2|src/test-phase2-features.cc"
     "test_phase2_standardencoding|src/test-phase2-standardencoding.cc"
     "test_phase2_rendering|src/test-phase2-rendering.cc"

@@ -257,6 +257,12 @@ private:
   // Parse and render inline image (BI/ID/EI operators)
   bool parse_inline_image(const std::string& content, size_t& pos);
 
+  // Render a transparency group XObject to create a soft mask
+  bool render_soft_mask_group(const Value& group_xobject, int mask_type);
+
+  // Apply soft mask to current rendering (if active)
+  void apply_soft_mask_to_context();
+
   tvg::SwCanvas* canvas_{nullptr};
   tvg::Scene* scene_{nullptr};
   std::vector<uint32_t> buffer_;

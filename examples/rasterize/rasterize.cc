@@ -142,9 +142,13 @@ std::string generate_output_filename(const std::string& base_output, int page_nu
 bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_num,
                 const RasterizeOptions& options, const std::string& output_file) {
 #ifdef NANOPDF_USE_THORVG
-  // Get page dimensions
-  double page_width = page.media_box.width();
-  double page_height = page.media_box.height();
+  // Get page dimensions from media_box [left, bottom, right, top]
+  double page_width = 612.0;  // Default US Letter
+  double page_height = 792.0;
+  if (page.media_box.size() >= 4) {
+    page_width = page.media_box[2] - page.media_box[0];
+    page_height = page.media_box[3] - page.media_box[1];
+  }
 
   if (options.verbose) {
     std::cout << "  Page " << page_num << " dimensions: "
