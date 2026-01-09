@@ -1070,13 +1070,17 @@ bool parse_indirect_object(StreamReader& sr, Parser& parser, Value* out_value);
 DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj);
 DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj,
                            uint32_t obj_num, uint16_t gen_num);
+DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj,
+                           uint32_t obj_num, uint16_t gen_num,
+                           int image_width, int image_height);
 
 // Add parse_string function declaration
 bool parse_string(StreamReader& sr, Parser& parser, std::string* out_str);
 
 // Color space and image parsing functions
 ColorSpace parse_color_space(const Pdf& pdf, const Value& cs_value);
-ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value);
+ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
+                                 uint32_t obj_num = 0, uint16_t gen_num = 0);
 std::map<std::string, ImageXObject> parse_xobject_resources(const Pdf& pdf, const Dictionary& resources);
 
 // Text extraction functions

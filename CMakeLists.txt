@@ -14,6 +14,12 @@ option(NANOPDF_BUILD_TESTS "Build test executables" ${BUILD_TESTING})
 option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
+option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
+option(NANOPDF_USE_POPPLER_CCITT "Use Poppler for CCITT/Fax decoding (GPL)" OFF)
+
+# Log level: 0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
+set(NANOPDF_LOG_LEVEL "3" CACHE STRING "Log level (0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace)")
+set_property(CACHE NANOPDF_LOG_LEVEL PROPERTY STRINGS "0" "1" "2" "3" "4" "5")
 
 # cmake modules
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -110,7 +116,7 @@ if(NANOPDF_BUILD_WASM)
 endif()
 
 add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
-target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_DEBUG_PRINT=1")
+target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_LOG_LEVEL=${NANOPDF_LOG_LEVEL}")
 
 # Link with zlib - Emscripten provides it via USE_ZLIB flag
 if(NANOPDF_BUILD_WASM)
@@ -132,10 +138,37 @@ if (NANOPDF_USE_STB_TRUETYPE)
 endif ()
 
 if (NANOPDF_USE_THORVG)
-  # Find ThorVG package or use FetchContent
-  find_package(PkgConfig)
-  if (PkgConfig_FOUND)
-    pkg_check_modules(THORVG IMPORTED_TARGET thorvg)
+  # First check if ThorVG is in the dist/ directory
+  set(THORVG_DIST_DIR ${CMAKE_SOURCE_DIR}/dist)
+  if(EXISTS ${THORVG_DIST_DIR}/include/thorvg-1/thorvg.h)
+    set(THORVG_FOUND TRUE)
+    set(THORVG_INCLUDE_DIRS ${THORVG_DIST_DIR}/include/thorvg-1)
+    # Find the library based on architecture
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/x86_64-linux-gnu)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/aarch64-linux-gnu)
+    else()
+      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+    endif()
+    find_library(THORVG_LIBRARY NAMES thorvg-1 thorvg
+      PATHS ${THORVG_LIB_DIR}
+      NO_DEFAULT_PATH)
+    if(THORVG_LIBRARY)
+      set(THORVG_LIBRARIES ${THORVG_LIBRARY})
+      set(THORVG_LIBRARY_DIRS ${THORVG_LIB_DIR})
+      message(STATUS "Found ThorVG in dist/: ${THORVG_LIBRARY}")
+    else()
+      set(THORVG_FOUND FALSE)
+    endif()
+  endif()
+
+  # Fall back to pkg-config if not found in dist/
+  if (NOT THORVG_FOUND)
+    find_package(PkgConfig)
+    if (PkgConfig_FOUND)
+      pkg_check_modules(THORVG IMPORTED_TARGET thorvg)
+    endif()
   endif()
 
   if (NOT THORVG_FOUND)
@@ -143,9 +176,9 @@ if (NANOPDF_USE_THORVG)
     # Assumes ThorVG headers are in /usr/local/include/thorvg or similar
     find_path(THORVG_INCLUDE_DIR thorvg.h
       PATHS /usr/local/include/thorvg /usr/include/thorvg
-      PATH_SUFFIXES thorvg)
+      PATH_SUFFIXES thorvg thorvg-1)
 
-    find_library(THORVG_LIBRARY NAMES thorvg
+    find_library(THORVG_LIBRARY NAMES thorvg thorvg-1
       PATHS /usr/local/lib /usr/lib
       PATH_SUFFIXES thorvg)
 
@@ -167,10 +200,126 @@ if (NANOPDF_USE_THORVG)
       # Use manual paths
       target_include_directories(${BUILD_TARGET} PUBLIC ${THORVG_INCLUDE_DIRS})
       target_link_libraries(${BUILD_TARGET} PUBLIC ${THORVG_LIBRARIES})
+      # Add link directory for runtime library lookup
+      if(THORVG_LIBRARY_DIRS)
+        target_link_directories(${BUILD_TARGET} PUBLIC ${THORVG_LIBRARY_DIRS})
+      endif()
     endif()
     target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_THORVG")
   endif()
 endif ()
+
+# libtiff support for CCITT/Fax decoding
+if (NANOPDF_USE_LIBTIFF)
+  # First try to find libtiff in ref/tiff-4.7.1
+  set(LIBTIFF_REF_DIR ${CMAKE_SOURCE_DIR}/ref/tiff-4.7.1)
+  if(EXISTS ${LIBTIFF_REF_DIR}/libtiff/tiff.h)
+    set(LIBTIFF_FOUND TRUE)
+    set(LIBTIFF_INCLUDE_DIRS ${LIBTIFF_REF_DIR}/libtiff)
+    # Try to find built library
+    find_library(LIBTIFF_LIBRARY NAMES tiff
+      PATHS ${LIBTIFF_REF_DIR}/build/libtiff ${LIBTIFF_REF_DIR}/libtiff
+      NO_DEFAULT_PATH)
+    if(LIBTIFF_LIBRARY)
+      set(LIBTIFF_LIBRARIES ${LIBTIFF_LIBRARY})
+      message(STATUS "Found libtiff in ref/: ${LIBTIFF_LIBRARY}")
+    else()
+      set(LIBTIFF_FOUND FALSE)
+      message(STATUS "libtiff headers found in ref/ but library not built")
+    endif()
+  endif()
+
+  # Fall back to system libtiff
+  if (NOT LIBTIFF_FOUND)
+    find_package(PkgConfig)
+    if (PkgConfig_FOUND)
+      pkg_check_modules(LIBTIFF IMPORTED_TARGET libtiff-4)
+      if (NOT LIBTIFF_FOUND)
+        pkg_check_modules(LIBTIFF IMPORTED_TARGET libtiff)
+      endif()
+    endif()
+  endif()
+
+  # Manual search as final fallback
+  if (NOT LIBTIFF_FOUND)
+    find_path(LIBTIFF_INCLUDE_DIR tiff.h
+      PATHS /usr/local/include /usr/include
+      PATH_SUFFIXES libtiff)
+
+    find_library(LIBTIFF_LIBRARY NAMES tiff libtiff
+      PATHS /usr/local/lib /usr/lib)
+
+    if (LIBTIFF_INCLUDE_DIR AND LIBTIFF_LIBRARY)
+      set(LIBTIFF_FOUND TRUE)
+      set(LIBTIFF_INCLUDE_DIRS ${LIBTIFF_INCLUDE_DIR})
+      set(LIBTIFF_LIBRARIES ${LIBTIFF_LIBRARY})
+      message(STATUS "Found libtiff: ${LIBTIFF_LIBRARY}")
+    else()
+      message(WARNING "libtiff not found. Please install libtiff or disable NANOPDF_USE_LIBTIFF")
+      message(STATUS "To build libtiff from ref/: cd ref/tiff-4.7.1 && mkdir -p build && cd build && cmake .. && make")
+    endif()
+  endif()
+
+  if (LIBTIFF_FOUND)
+    if (TARGET PkgConfig::LIBTIFF)
+      # Use imported target from pkg-config
+      target_link_libraries(${BUILD_TARGET} PUBLIC PkgConfig::LIBTIFF)
+    else()
+      # Use manual paths
+      target_include_directories(${BUILD_TARGET} PRIVATE ${LIBTIFF_INCLUDE_DIRS})
+      target_link_libraries(${BUILD_TARGET} PRIVATE ${LIBTIFF_LIBRARIES})
+    endif()
+    target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_LIBTIFF")
+    message(STATUS "libtiff CCITT decoder enabled")
+  endif()
+endif ()
+
+# Poppler CCITT decoder support (GPL-licensed)
+if (NANOPDF_USE_POPPLER_CCITT)
+  message(STATUS "")
+  message(WARNING "NANOPDF_USE_POPPLER_CCITT is enabled. This links against GPL-licensed Poppler.")
+  message(WARNING "Your binary will be subject to GPL-2.0 licensing requirements.")
+  message(STATUS "")
+
+  # Try to find poppler in ref/poppler first
+  set(POPPLER_REF_DIR ${CMAKE_SOURCE_DIR}/ref/poppler)
+  if(EXISTS ${POPPLER_REF_DIR}/poppler/Stream.h)
+    set(POPPLER_FOUND TRUE)
+    set(POPPLER_INCLUDE_DIRS ${POPPLER_REF_DIR} ${POPPLER_REF_DIR}/poppler)
+    # Try to find built library
+    find_library(POPPLER_LIBRARY NAMES poppler
+      PATHS ${POPPLER_REF_DIR}/build
+      NO_DEFAULT_PATH)
+    if(POPPLER_LIBRARY)
+      set(POPPLER_LIBRARIES ${POPPLER_LIBRARY})
+      message(STATUS "Found Poppler in ref/: ${POPPLER_LIBRARY}")
+    else()
+      set(POPPLER_FOUND FALSE)
+      message(STATUS "Poppler headers found in ref/ but library not built")
+      message(STATUS "Build poppler: cd ref/poppler/build && cmake .. && make")
+    endif()
+  endif()
+
+  if (POPPLER_FOUND)
+    # Poppler requires C++17, so upgrade project standard
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    message(STATUS "Upgraded to C++17 for Poppler compatibility")
+
+    # Add poppler wrapper to build
+    target_sources(${BUILD_TARGET} PRIVATE src/poppler-ccitt-wrapper.cc)
+    # Include both source and build directories (for poppler-config.h)
+    target_include_directories(${BUILD_TARGET} PRIVATE
+      ${POPPLER_INCLUDE_DIRS}
+      ${POPPLER_REF_DIR}/build
+      ${POPPLER_REF_DIR}/build/poppler)
+    target_link_libraries(${BUILD_TARGET} PRIVATE ${POPPLER_LIBRARIES})
+    target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_POPPLER_CCITT")
+    message(STATUS "Poppler CCITT decoder enabled (GPL)")
+  else()
+    message(WARNING "Poppler not found. Please build from ref/poppler or disable NANOPDF_USE_POPPLER_CCITT")
+  endif()
+endif()
 
 # Blend2D support
 if (NANOPDF_USE_BLEND2D)

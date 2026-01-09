@@ -1322,6 +1322,182 @@ DecodedStream decode_jpx(const uint8_t *data, size_t size,
   return result;
 }
 
+#ifdef NANOPDF_USE_LIBTIFF
+// libtiff-based CCITTFaxDecode implementation
+#include <tiffio.h>
+#include <cstring>
+
+// Memory buffer for in-memory TIFF operations
+struct TIFFMemoryBuffer {
+  std::vector<uint8_t> data;
+  size_t pos;
+
+  TIFFMemoryBuffer() : pos(0) {}
+};
+
+// I/O callbacks for in-memory TIFF
+static tmsize_t tiff_mem_read(thandle_t handle, void* buf, tmsize_t size) {
+  TIFFMemoryBuffer* mb = reinterpret_cast<TIFFMemoryBuffer*>(handle);
+  size_t available = mb->data.size() - mb->pos;
+  size_t to_read = std::min(static_cast<size_t>(size), available);
+  if (to_read > 0) {
+    std::memcpy(buf, mb->data.data() + mb->pos, to_read);
+    mb->pos += to_read;
+  }
+  return static_cast<tmsize_t>(to_read);
+}
+
+static tmsize_t tiff_mem_write(thandle_t handle, void* buf, tmsize_t size) {
+  TIFFMemoryBuffer* mb = reinterpret_cast<TIFFMemoryBuffer*>(handle);
+  size_t new_size = mb->pos + size;
+  if (new_size > mb->data.size()) {
+    mb->data.resize(new_size);
+  }
+  std::memcpy(mb->data.data() + mb->pos, buf, size);
+  mb->pos += size;
+  return size;
+}
+
+static uint64_t tiff_mem_seek(thandle_t handle, uint64_t off, int whence) {
+  TIFFMemoryBuffer* mb = reinterpret_cast<TIFFMemoryBuffer*>(handle);
+  uint64_t new_pos = mb->pos;
+
+  if (whence == SEEK_SET) {
+    new_pos = off;
+  } else if (whence == SEEK_CUR) {
+    new_pos = mb->pos + off;
+  } else if (whence == SEEK_END) {
+    new_pos = mb->data.size() + off;
+  }
+
+  if (new_pos > mb->data.size()) {
+    return static_cast<uint64_t>(-1);
+  }
+  mb->pos = static_cast<size_t>(new_pos);
+  return new_pos;
+}
+
+static int tiff_mem_close(thandle_t) {
+  return 0;
+}
+
+static uint64_t tiff_mem_size(thandle_t handle) {
+  TIFFMemoryBuffer* mb = reinterpret_cast<TIFFMemoryBuffer*>(handle);
+  return mb->data.size();
+}
+
+DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
+                                      const DecodeParams& params) {
+  DecodedStream result;
+
+  int width = params.columns > 0 ? params.columns : 1728;
+  int height = params.rows > 0 ? params.rows : 1;
+
+  NANOPDF_LOG_TRACE("CCITTFaxDecode_libtiff", "Using libtiff: width=%d, height=%d, k=%d",
+                    width, height, params.k);
+
+  // Determine compression type based on k parameter
+  // k < 0: Group 4 (COMPRESSION_CCITT_T6)
+  // k = 0: Group 3 1D (COMPRESSION_CCITT_T4)
+  // k > 0: Group 3 2D (COMPRESSION_CCITT_T4)
+  uint16_t compression = (params.k < 0) ? COMPRESSION_CCITT_T6 : COMPRESSION_CCITT_T4;
+
+  // Use temporary file approach (simpler and more reliable)
+  char temp_path[] = "/tmp/nanopdf_ccitt_XXXXXX";
+  int fd = mkstemp(temp_path);
+  if (fd < 0) {
+    result.success = false;
+    result.error = "Failed to create temporary file";
+    NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
+    return result;
+  }
+  close(fd);
+
+  // Write TIFF with raw CCITT data
+  TIFF* tif = TIFFOpen(temp_path, "w");
+  if (!tif) {
+    unlink(temp_path);
+    result.success = false;
+    result.error = "Failed to create TIFF file";
+    NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
+    return result;
+  }
+
+  // Set required TIFF tags
+  TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, static_cast<uint32_t>(width));
+  TIFFSetField(tif, TIFFTAG_IMAGELENGTH, static_cast<uint32_t>(height));
+  TIFFSetField(tif, TIFFTAG_COMPRESSION, compression);
+  // PDF's CCITT uses different photometric than TIFF standard
+  // Try MINISBLACK if black_is_1 is true, otherwise MINISWHITE
+  uint16_t photometric = params.black_is_1 ? PHOTOMETRIC_MINISBLACK : PHOTOMETRIC_MINISWHITE;
+  TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, photometric);
+  TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 1);
+  TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+  TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, static_cast<uint32_t>(height));
+  TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+
+  // For Group 3, set additional options
+  if (compression == COMPRESSION_CCITT_T4) {
+    uint32_t g3opts = 0;
+    if (params.k != 0) {
+      g3opts |= GROUP3OPT_2DENCODING;
+    }
+    TIFFSetField(tif, TIFFTAG_GROUP3OPTIONS, g3opts);
+  }
+
+  // Write the raw compressed data as a strip
+  tmsize_t written = TIFFWriteRawStrip(tif, 0, const_cast<void*>(reinterpret_cast<const void*>(data)), size);
+
+  if (written != static_cast<tmsize_t>(size)) {
+    TIFFClose(tif);
+    unlink(temp_path);
+    result.success = false;
+    result.error = "Failed to write CCITT data to TIFF strip";
+    NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
+    return result;
+  }
+
+  TIFFClose(tif);
+
+  // Now open for reading
+  tif = TIFFOpen(temp_path, "r");
+  if (!tif) {
+    unlink(temp_path);
+    result.success = false;
+    result.error = "Failed to reopen TIFF file for reading";
+    NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
+    return result;
+  }
+
+  // Read decoded data
+  int bytes_per_row = (width + 7) / 8;
+  size_t output_size = bytes_per_row * height;
+  result.data.resize(output_size);
+
+  // Read strip by strip (we have one strip containing all rows)
+  tmsize_t read_bytes = TIFFReadEncodedStrip(tif, 0, result.data.data(), output_size);
+
+  TIFFClose(tif);
+  unlink(temp_path);
+
+  if (read_bytes < 0) {
+    result.success = false;
+    result.error = "libtiff failed to decode CCITT data";
+    NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
+    return result;
+  }
+
+  result.data.resize(read_bytes);
+  result.success = true;
+
+  NANOPDF_LOG_INFO("CCITTFaxDecode_libtiff",
+                   "Successfully decoded %d bytes (expected %zu)",
+                   read_bytes, output_size);
+
+  return result;
+}
+#endif
+
 // CCITTFaxDecode implementation
 DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                               const DecodeParams& params) {
@@ -1332,6 +1508,36 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                     params.k, params.columns, params.rows, params.end_of_line,
                     params.encoded_byte_align, params.black_is_1,
                     params.damaged_rows_before_error, size);
+
+#ifdef NANOPDF_USE_POPPLER_CCITT
+  // Use Poppler's CCITT decoder if available (highest priority - most accurate)
+  {
+    NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using Poppler decoder");
+    extern std::vector<uint8_t> decode_ccitt_poppler_wrapper(
+        const uint8_t* data, size_t size,
+        int encoding, bool endOfLine, bool byteAlign,
+        int columns, int rows, bool endOfBlock, bool blackIs1);
+
+    auto decoded = decode_ccitt_poppler_wrapper(
+        data, size,
+        params.k,
+        params.end_of_line,
+        params.encoded_byte_align,
+        params.columns,
+        params.rows,
+        params.end_of_block,
+        params.black_is_1
+    );
+    result.data = std::move(decoded);
+    result.success = true;
+    NANOPDF_LOG_INFO("CCITTFaxDecode", "Poppler decoded %zu bytes", result.data.size());
+    return result;
+  }
+#elif defined(NANOPDF_USE_LIBTIFF)
+  // Use libtiff for CCITT decoding if available
+  NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using libtiff decoder");
+  return decode_ccittfax_libtiff(data, size, params);
+#endif
 
   if (size >= 8) {
     NANOPDF_LOG_TRACE("CCITTFaxDecode", "First bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
@@ -1903,8 +2109,24 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         for (int pass = 0; pass < 2; ++pass) {
           bool decoding_white = (pass == 0) ? first_run_is_white : !first_run_is_white;
           BitReader::State run_state = reader.save();
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "H-mode pass %d: BEFORE decode_run, byte=%zu bit=%d",
+                            pass, run_state.byte_pos, run_state.bit_pos);
           int run = 0;
           if (!decode_run(reader, decoding_white, &run, err)) {
+            // Try recovery: skip 1 bit and retry (handles bit misalignment from encoding errors)
+            if (pass == 1) {
+              reader.restore(run_state);
+              int skip_bit = reader.get_bit();  // Skip 1 bit
+              NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode pass 1 failed, trying 1-bit skip (skipped bit=%d)", skip_bit);
+              if (decode_run(reader, decoding_white, &run, nullptr)) {
+                NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode pass 1 SUCCESS after 1-bit skip, run=%d", run);
+                // Success with 1-bit skip - continue with this run
+                goto h_mode_success;
+              }
+              // Recovery failed, restore and continue with original error handling
+              reader.restore(run_state);
+            }
+
             // Check if the failure position looks like a mode/extension code
             // If so, abort H-mode and let the outer loop handle it
             reader.restore(run_state);
@@ -1947,9 +2169,11 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
             a0 = width;
             break;
           }
-          NANOPDF_LOG_TRACE("CCITTFaxDecode", "H-mode pass %d: %s run=%d at byte=%zu bit=%d",
+        h_mode_success:
+          BitReader::State after_state = reader.save();
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "H-mode pass %d: %s run=%d, AFTER decode_run byte=%zu bit=%d",
                             pass, decoding_white ? "white" : "black", run,
-                            run_state.byte_pos, run_state.bit_pos);
+                            after_state.byte_pos, after_state.bit_pos);
           if (run < 0) run = 0;
           int new_a0 = a0 + run;
           if (new_a0 > width) new_a0 = width;
@@ -2302,6 +2526,158 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   // Pad params_list to match filter count (use defaults for missing)
   while (params_list.size() < filter_names.size()) {
     params_list.push_back(filters::DecodeParams{});
+  }
+
+  // Apply filters in sequence
+  for (size_t i = 0; i < filter_names.size(); ++i) {
+    const std::string &filter_name = filter_names[i];
+    const filters::DecodeParams &params = params_list[i];
+
+    DecodedStream step_result =
+        apply_single_filter(filter_name, current_data.data(),
+                            current_data.size(), params);
+
+    if (!step_result.success) {
+      if (filter_names.size() > 1) {
+        result.error = "Filter chain step " + std::to_string(i + 1) + "/" +
+                       std::to_string(filter_names.size()) + " (" +
+                       filter_name + "): " + step_result.error;
+      } else {
+        result.error = step_result.error;
+      }
+      return result;
+    }
+
+    current_data = std::move(step_result.data);
+  }
+
+  result.data = std::move(current_data);
+  result.success = true;
+  return result;
+}
+
+// Overload with image dimensions for CCITT decoding
+DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
+                           uint32_t obj_num, uint16_t gen_num,
+                           int image_width, int image_height) {
+  DecodedStream result;
+
+  if (stream_obj.type != Value::STREAM) {
+    result.error = "decode_stream: not a stream object";
+    return result;
+  }
+
+  // Start with raw stream data
+  std::vector<uint8_t> current_data = stream_obj.stream.data;
+
+  // Decrypt stream data if PDF is encrypted
+  // Note: Decryption must happen BEFORE decompression
+  if (pdf.security.authenticated && !pdf.security.encryption_key.empty()) {
+    // Check if this is a Crypt filter that should not be decrypted
+    // or if this is an XRef stream (XRef streams are not encrypted)
+    auto type_it = stream_obj.stream.dict.find("Type");
+    bool is_xref = (type_it != stream_obj.stream.dict.end() &&
+                    type_it->second.type == Value::NAME &&
+                    type_it->second.name == "XRef");
+
+    if (!is_xref) {
+      NANOPDF_LOG_TRACE("decode_stream", "Decrypting obj %u %u, before: %zu bytes",
+                        obj_num, gen_num, current_data.size());
+      if (current_data.size() >= 8) {
+        NANOPDF_LOG_TRACE("decode_stream", "Pre-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
+                          current_data[0], current_data[1], current_data[2], current_data[3],
+                          current_data[4], current_data[5], current_data[6], current_data[7]);
+      }
+      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num);
+      NANOPDF_LOG_TRACE("decode_stream", "After decrypt: %zu bytes", current_data.size());
+      if (current_data.size() >= 8) {
+        NANOPDF_LOG_TRACE("decode_stream", "Post-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
+                          current_data[0], current_data[1], current_data[2], current_data[3],
+                          current_data[4], current_data[5], current_data[6], current_data[7]);
+      }
+    }
+  }
+
+  // Get filter type from stream dictionary
+  auto filter_it = stream_obj.stream.dict.find("Filter");
+  if (filter_it == stream_obj.stream.dict.end()) {
+    // No filter, return (possibly decrypted) data
+    result.data = std::move(current_data);
+    result.success = true;
+    return result;
+  }
+
+  // Build list of filters to apply (PDF applies filters in order)
+  std::vector<std::string> filter_names;
+  if (filter_it->second.type == Value::NAME) {
+    filter_names.push_back(filter_it->second.name);
+  } else if (filter_it->second.type == Value::ARRAY) {
+    for (const auto &item : filter_it->second.array) {
+      if (item.type == Value::NAME) {
+        filter_names.push_back(item.name);
+      } else {
+        result.error = "decode_stream: Filter array contains non-name element";
+        return result;
+      }
+    }
+  } else {
+    result.error = "decode_stream: Filter must be a name or array, got type " +
+                   std::to_string(static_cast<int>(filter_it->second.type));
+    return result;
+  }
+
+  // Build list of decode parameters (one per filter, or empty)
+  std::vector<filters::DecodeParams> params_list;
+  auto params_it = stream_obj.stream.dict.find("DecodeParms");
+  if (params_it != stream_obj.stream.dict.end()) {
+    if (params_it->second.type == Value::DICTIONARY) {
+      // Single params dict applies to single filter
+      params_list.push_back(filters::parse_decode_params(params_it->second.dict));
+    } else if (params_it->second.type == Value::ARRAY) {
+      // Array of params, one per filter
+      for (const auto &item : params_it->second.array) {
+        if (item.type == Value::DICTIONARY) {
+          params_list.push_back(filters::parse_decode_params(item.dict));
+        } else if (item.type == Value::NULL_OBJ) {
+          // null means default params for this filter
+          params_list.push_back(filters::DecodeParams{});
+        } else {
+          result.error = "decode_stream: DecodeParms array contains invalid element";
+          return result;
+        }
+      }
+    } else if (params_it->second.type != Value::NULL_OBJ) {
+      result.error = "decode_stream: DecodeParms must be dictionary, array, or null";
+      return result;
+    }
+  }
+
+  // Pad params_list to match filter count (use defaults for missing)
+  while (params_list.size() < filter_names.size()) {
+    params_list.push_back(filters::DecodeParams{});
+  }
+
+  // Fix CCITT parameters if image dimensions are provided
+  for (size_t i = 0; i < filter_names.size(); ++i) {
+    const std::string &filter_name = filter_names[i];
+    filters::DecodeParams &params = params_list[i];
+
+    if ((filter_name == "CCITTFaxDecode" || filter_name == "CCF")) {
+      // If rows not specified in DecodeParms but we have image height, use it
+      if (params.rows == 0 && image_height > 0) {
+        params.rows = image_height;
+        NANOPDF_LOG_DEBUG("decode_stream",
+                         "CCITT: Using image height %d for missing Rows param",
+                         image_height);
+      }
+      // If columns not specified in DecodeParms but we have image width, use it
+      if (params.columns == 0 && image_width > 0) {
+        params.columns = image_width;
+        NANOPDF_LOG_DEBUG("decode_stream",
+                         "CCITT: Using image width %d for missing Columns param",
+                         image_width);
+      }
+    }
   }
 
   // Apply filters in sequence
@@ -4827,7 +5203,9 @@ ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
   }
 
   // Decode the image data (use obj_num/gen_num for decryption if needed)
-  DecodedStream decoded = decode_stream(pdf, stream_value, obj_num, gen_num);
+  // Pass image dimensions to handle CCITT images with missing Rows/Columns params
+  DecodedStream decoded = decode_stream(pdf, stream_value, obj_num, gen_num,
+                                        image.width, image.height);
   if (decoded.success) {
     image.data = std::move(decoded.data);
   }
