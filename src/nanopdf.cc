@@ -22,6 +22,7 @@
 #include "common-macros.inc"
 #include "crypto.hh"
 #include "jpx-decoder.hh"
+#include "nanopdf-log.hh"
 #include "nanopdf.hh"
 #include "stb_image.h"
 #include "stream-reader.hh"
@@ -30,6 +31,12 @@ namespace nanopdf {
 
 namespace {
 #include "adobe_glyph_list.inc"
+
+bool is_system_little_endian() {
+  const uint16_t value = 0x0102;
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
+  return bytes[0] == 0x02;
+}
 
 // parseInt(32bit)
 // 0 = success
@@ -259,10 +266,58 @@ bool parse_stream(StreamReader &sr, Parser &parser, Value *out_value) {
   // Get stream length from dictionary
   size_t length = 0;
   auto it = out_value->dict.find("Length");
-  if (it == out_value->dict.end() || it->second.type != Value::NUMBER) {
+  if (it == out_value->dict.end()) {
     return false;
   }
-  length = static_cast<size_t>(it->second.number);
+  if (it->second.type == Value::NUMBER) {
+    length = static_cast<size_t>(it->second.number);
+  } else if (it->second.type == Value::REFERENCE) {
+    // Length is an indirect reference - we need to find the endstream keyword
+    // to determine the actual length, as we can't resolve references here
+    uint64_t stream_start = sr.tell();
+    const uint8_t* data = sr.data() + stream_start;
+    size_t remaining = static_cast<size_t>(sr.size() - stream_start);
+
+    NANOPDF_LOG_DEBUG("parse_stream",
+                       "Length is indirect ref %u %u, stream_start=%lu, remaining=%zu",
+                       it->second.ref_object_number, it->second.ref_generation_number,
+                       (unsigned long)stream_start, remaining);
+    NANOPDF_LOG_TRACE("parse_stream", "First bytes: %s",
+                      log::format_hex_bytes(data, remaining, 50).c_str());
+
+    // Search for "endstream" keyword
+    const char* endstream_kw = "endstream";
+    const size_t endstream_len = 9;
+
+    for (size_t i = 0; i + endstream_len <= remaining; i++) {
+      if (std::memcmp(data + i, endstream_kw, endstream_len) == 0) {
+        // Found endstream - check that it's preceded by whitespace
+        if (i > 0) {
+          char before = static_cast<char>(data[i - 1]);
+          if (before == '\n' || before == '\r') {
+            // Trim trailing whitespace from stream data
+            length = i;
+            while (length > 0) {
+              char c = static_cast<char>(data[length - 1]);
+              if (c == '\n' || c == '\r') {
+                length--;
+              } else {
+                break;
+              }
+            }
+            NANOPDF_LOG_DEBUG("parse_stream", "Found endstream at i=%zu, length=%zu", i, length);
+            break;
+          }
+        }
+      }
+    }
+
+    if (length == 0) {
+      return false;  // Couldn't find endstream
+    }
+  } else {
+    return false;
+  }
 
   Dictionary dict_copy = std::move(out_value->dict);
 
@@ -607,6 +662,7 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
 
   out_pdf->data = addr;
   out_pdf->data_size = size;
+  out_pdf->swap_endian = !is_system_little_endian();
 
   // Parse PDF version from header
   if ((addr[0] != '%') || (addr[1] != 'P') || (addr[2] != 'D') ||
@@ -1236,6 +1292,9 @@ DecodedStream decode_dct(const uint8_t *data, size_t size,
     return result;
   }
 
+  NANOPDF_LOG_DEBUG("DCTDecode", "Decoded JPEG: %dx%d, channels=%d, size=%zu",
+                    width, height, channels, static_cast<size_t>(width) * height * channels);
+
   // Copy decoded data to result
   size_t decoded_size = static_cast<size_t>(width) * height * channels;
   result.data.assign(decoded, decoded + decoded_size);
@@ -1268,6 +1327,22 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                               const DecodeParams& params) {
   DecodedStream result;
 
+  NANOPDF_LOG_DEBUG("CCITTFaxDecode", "params: k=%d, columns=%d, rows=%d, eol=%d, align=%d, "
+                    "black_is_1=%d, damaged=%d, data=%zu bytes",
+                    params.k, params.columns, params.rows, params.end_of_line,
+                    params.encoded_byte_align, params.black_is_1,
+                    params.damaged_rows_before_error, size);
+
+  if (size >= 8) {
+    NANOPDF_LOG_TRACE("CCITTFaxDecode", "First bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+                      data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+  }
+
+  if (!data || size == 0) {
+    result.error = "CCITTFaxDecode: Empty stream";
+    return result;
+  }
+
   struct BitReader {
     const uint8_t* data{nullptr};
     size_t size{0};
@@ -1275,6 +1350,21 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     int bit_pos{7};
 
     BitReader(const uint8_t* d, size_t s) : data(d), size(s) {}
+
+    struct State {
+      size_t byte_pos;
+      int bit_pos;
+    };
+
+    State save() const { return State{byte_pos, bit_pos}; }
+
+    void restore(const State& state) {
+      byte_pos = state.byte_pos;
+      bit_pos = state.bit_pos;
+      if (bit_pos < 0) bit_pos = 0;
+      if (bit_pos > 7) bit_pos = 7;
+      if (byte_pos > size) byte_pos = size;
+    }
 
     int get_bit() {
       if (byte_pos >= size) {
@@ -1301,7 +1391,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       return byte_pos <= size;
     }
 
-    bool find_eol() {
+    bool skip_eol() {
       int zero_count = 0;
       while (byte_pos < size) {
         int bit = get_bit();
@@ -1328,6 +1418,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     bool is_makeup;
   };
 
+  // White terminating codes per ITU-T T.4 Table 1
   static const CodeEntry kWhiteTerminating[] = {
       {0x35, 8, 0, false},   {0x07, 6, 1, false},   {0x07, 4, 2, false},
       {0x08, 4, 3, false},   {0x0B, 4, 4, false},   {0x0C, 4, 5, false},
@@ -1353,6 +1444,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       {0x34, 8, 63, false},
   };
 
+  // White makeup codes per ITU-T T.4 Table 1
   static const CodeEntry kWhiteMakeup[] = {
       {0x1B, 5, 64, true},   {0x12, 5, 128, true},  {0x17, 6, 192, true},
       {0x37, 7, 256, true},  {0x36, 8, 320, true},  {0x37, 8, 384, true},
@@ -1370,31 +1462,33 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       {0x1F, 12, 2560, true},
   };
 
+  // Black terminating codes per ITU-T T.4 Table 2
   static const CodeEntry kBlackTerminating[] = {
       {0x037, 10, 0, false}, {0x02, 3, 1, false},   {0x03, 2, 2, false},
-      {0x03, 3, 3, false},   {0x03, 4, 4, false},   {0x02, 4, 5, false},
-      {0x03, 5, 6, false},   {0x05, 6, 7, false},   {0x04, 6, 8, false},
-      {0x04, 7, 9, false},   {0x05, 7, 10, false},  {0x07, 7, 11, false},
-      {0x04, 8, 12, false},  {0x07, 8, 13, false},  {0x18, 9, 14, false},
-      {0x17, 10, 15, false}, {0x18, 10, 16, false}, {0x08, 10, 17, false},
-      {0x67, 11, 18, false}, {0x68, 11, 19, false}, {0x6C, 11, 20, false},
-      {0x37, 11, 21, false}, {0x28, 11, 22, false}, {0x17, 11, 23, false},
-      {0x18, 11, 24, false}, {0xCA, 12, 25, false}, {0xCB, 12, 26, false},
-      {0xCC, 12, 27, false}, {0xCD, 12, 28, false}, {0x68, 12, 29, false},
-      {0x69, 12, 30, false}, {0x6A, 12, 31, false}, {0x6B, 12, 32, false},
-      {0xD2, 12, 33, false}, {0xD3, 12, 34, false}, {0xD4, 12, 35, false},
-      {0xD5, 12, 36, false}, {0xD6, 12, 37, false}, {0xD7, 12, 38, false},
-      {0x6C, 12, 39, false}, {0x6D, 12, 40, false}, {0xDA, 12, 41, false},
-      {0xDB, 12, 42, false}, {0x54, 12, 43, false}, {0x55, 12, 44, false},
-      {0x56, 12, 45, false}, {0x57, 12, 46, false}, {0x64, 12, 47, false},
-      {0x65, 12, 48, false}, {0x52, 12, 49, false}, {0x53, 12, 50, false},
-      {0x24, 12, 51, false}, {0x37, 12, 52, false}, {0x38, 12, 53, false},
-      {0x27, 12, 54, false}, {0x28, 12, 55, false}, {0x58, 12, 56, false},
-      {0x59, 12, 57, false}, {0x2B, 12, 58, false}, {0x2C, 12, 59, false},
-      {0x5A, 12, 60, false}, {0x66, 12, 61, false}, {0x67, 12, 62, false},
-      {0x0F, 10, 63, false},
+      {0x02, 2, 3, false},   {0x03, 3, 4, false},   {0x03, 4, 5, false},
+      {0x02, 4, 6, false},   {0x03, 5, 7, false},   {0x05, 6, 8, false},
+      {0x04, 6, 9, false},   {0x04, 7, 10, false},  {0x05, 7, 11, false},
+      {0x07, 7, 12, false},  {0x04, 8, 13, false},  {0x07, 8, 14, false},
+      {0x18, 9, 15, false},  {0x17, 10, 16, false}, {0x18, 10, 17, false},
+      {0x08, 10, 18, false}, {0x67, 11, 19, false}, {0x68, 11, 20, false},
+      {0x6C, 11, 21, false}, {0x37, 11, 22, false}, {0x28, 11, 23, false},
+      {0x17, 11, 24, false}, {0x18, 11, 25, false}, {0xCA, 12, 26, false},
+      {0xCB, 12, 27, false}, {0xCC, 12, 28, false}, {0xCD, 12, 29, false},
+      {0x68, 12, 30, false}, {0x69, 12, 31, false}, {0x6A, 12, 32, false},
+      {0x6B, 12, 33, false}, {0xD2, 12, 34, false}, {0xD3, 12, 35, false},
+      {0xD4, 12, 36, false}, {0xD5, 12, 37, false}, {0xD6, 12, 38, false},
+      {0xD7, 12, 39, false}, {0x6C, 12, 40, false}, {0x6D, 12, 41, false},
+      {0xDA, 12, 42, false}, {0xDB, 12, 43, false}, {0x54, 12, 44, false},
+      {0x55, 12, 45, false}, {0x56, 12, 46, false}, {0x57, 12, 47, false},
+      {0x64, 12, 48, false}, {0x65, 12, 49, false}, {0x52, 12, 50, false},
+      {0x53, 12, 51, false}, {0x24, 12, 52, false}, {0x37, 12, 53, false},
+      {0x38, 12, 54, false}, {0x27, 12, 55, false}, {0x28, 12, 56, false},
+      {0x58, 12, 57, false}, {0x59, 12, 58, false}, {0x2B, 12, 59, false},
+      {0x2C, 12, 60, false}, {0x5A, 12, 61, false}, {0x66, 12, 62, false},
+      {0x67, 12, 63, false},
   };
 
+  // Black makeup codes per ITU-T T.4 Table 2
   static const CodeEntry kBlackMakeup[] = {
       {0x0F, 10, 64, true},  {0xC8, 12, 128, true},  {0xC9, 12, 192, true},
       {0x5B, 12, 256, true}, {0x33, 12, 320, true}, {0x34, 12, 384, true},
@@ -1412,109 +1506,156 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       {0x1F, 12, 2560, true},
   };
 
-  auto decode_code = [](BitReader& reader, const CodeEntry* term_table,
-                        size_t term_count, const CodeEntry* makeup_table,
-                        size_t makeup_count, int max_length,
-                        CodeEntry* out) -> bool {
-    uint32_t code = 0;
-    for (int length = 1; length <= max_length; ++length) {
-      int bit = reader.get_bit();
-      if (bit < 0) {
-        return false;
-      }
-      code = (code << 1) | static_cast<uint32_t>(bit);
-
-      for (size_t i = 0; i < term_count; ++i) {
-        if (term_table[i].length == length && term_table[i].code == code) {
-          *out = term_table[i];
-          return true;
-        }
-      }
-      for (size_t i = 0; i < makeup_count; ++i) {
-        if (makeup_table[i].length == length && makeup_table[i].code == code) {
-          *out = makeup_table[i];
-          return true;
-        }
+  // Simple code lookup - tables now use correct MSB-first bit order
+  auto find_code = [](const CodeEntry* table, size_t count, uint32_t code,
+                      int length) -> const CodeEntry* {
+    for (size_t i = 0; i < count; ++i) {
+      if (table[i].length == length && table[i].code == code) {
+        return &table[i];
       }
     }
-    return false;
+    return nullptr;
   };
 
-  auto decode_run = [&](BitReader& reader, bool white, int* out_run) -> bool {
-    static const size_t kWhiteTermCount =
-        sizeof(kWhiteTerminating) / sizeof(kWhiteTerminating[0]);
-    static const size_t kBlackTermCount =
-        sizeof(kBlackTerminating) / sizeof(kBlackTerminating[0]);
-    static const size_t kWhiteMakeupCount =
-        sizeof(kWhiteMakeup) / sizeof(kWhiteMakeup[0]);
-    static const size_t kBlackMakeupCount =
-        sizeof(kBlackMakeup) / sizeof(kBlackMakeup[0]);
-
+  auto decode_run = [&](BitReader& reader, bool white, int* run_length,
+                        std::string* err) -> bool {
     const CodeEntry* term_table = white ? kWhiteTerminating : kBlackTerminating;
     const CodeEntry* makeup_table = white ? kWhiteMakeup : kBlackMakeup;
-    size_t term_count = white ? kWhiteTermCount : kBlackTermCount;
-    size_t makeup_count = white ? kWhiteMakeupCount : kBlackMakeupCount;
-    int max_len = white ? 13 : 13;
-
+    const size_t term_count = white ? sizeof(kWhiteTerminating) / sizeof(CodeEntry)
+                                    : sizeof(kBlackTerminating) / sizeof(CodeEntry);
+    const size_t makeup_count = white ? sizeof(kWhiteMakeup) / sizeof(CodeEntry)
+                                      : sizeof(kBlackMakeup) / sizeof(CodeEntry);
     int total = 0;
+
     while (true) {
-      CodeEntry entry{};
-      if (!decode_code(reader, term_table, term_count, makeup_table,
-                       makeup_count, max_len, &entry)) {
-        return false;
+      uint32_t code = 0;
+      BitReader::State state_before = reader.save();
+      for (int length = 1; length <= 13; ++length) {
+        int bit = reader.get_bit();
+        if (bit < 0) {
+          if (err) {
+            *err = "Unexpected EOF while decoding run";
+          }
+          return false;
+        }
+        code = (code << 1) | static_cast<uint32_t>(bit);
+
+        if (const CodeEntry* entry = find_code(term_table, term_count, code, length)) {
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Found term code: len=%d code=0x%x run=%d white=%d",
+                            length, code, entry->run, white ? 1 : 0);
+          total += entry->run;
+          *run_length = total;
+          return true;
+        }
+        if (const CodeEntry* entry = find_code(makeup_table, makeup_count, code, length)) {
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Found makeup code: len=%d code=0x%x run=%d white=%d",
+                            length, code, entry->run, white ? 1 : 0);
+          total += entry->run;
+          goto decode_more;
+        }
       }
-      total += entry.run;
-      if (!entry.is_makeup) {
-        *out_run = total;
-        return true;
+
+      reader.restore(state_before);
+      if (err) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Invalid code word: 0x%x at byte %zu bit %d (white=%d)",
+                 code, state_before.byte_pos, state_before.bit_pos, white ? 1 : 0);
+        *err = buf;
       }
+      NANOPDF_LOG_TRACE("CCITTFaxDecode", "decode_run failed: code=0x%x, byte=%zu, bit=%d, white=%d",
+                        code, state_before.byte_pos, state_before.bit_pos, white ? 1 : 0);
+      // Dump bytes around failure position
+      if (state_before.byte_pos < reader.size) {
+        char hex_buf[128];
+        int hex_len = 0;
+        for (size_t i = state_before.byte_pos; i < std::min(state_before.byte_pos + 5, reader.size); ++i) {
+          hex_len += snprintf(hex_buf + hex_len, sizeof(hex_buf) - hex_len, "%02x ", reader.data[i]);
+        }
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "Bytes at failure: %s", hex_buf);
+      }
+      return false;
+
+    decode_more:
+      continue;
     }
   };
 
-  int width = params.columns > 0 ? params.columns : 1728;
-  int height = params.rows;
+  auto decode_row_1d = [&](BitReader& reader, std::vector<bool>& line,
+                           bool allow_indicator_skip, int width,
+                           std::string* err) -> bool {
+    std::fill(line.begin(), line.end(), false);
+    int pos = 0;
+    bool is_white = true;
+    bool skipped_indicator = false;
 
-  BitReader reader(data, size);
-  const int bytes_per_row = (width + 7) / 8;
-  std::vector<uint8_t> output;
-  output.reserve((height > 0 ? height : 1) * bytes_per_row);
+    while (pos < width) {
+      BitReader::State state_before = reader.save();
+      int run = 0;
+      if (!decode_run(reader, is_white, &run, err)) {
+        if (allow_indicator_skip && !skipped_indicator && pos == 0) {
+          reader.restore(state_before);
+          int indicator = reader.get_bit();
+          if (indicator == 0 || indicator == 1) {
+            skipped_indicator = true;
+            continue;
+          }
+          reader.restore(state_before);
+        }
+        return false;
+      }
 
-  std::vector<uint8_t> row_bytes(bytes_per_row, 0);
-  std::vector<bool> pixels(width, false);
-  std::vector<bool> prev_pixels(width, false);
+      if (run < 0) {
+        run = 0;
+      }
+      if (pos + run > width) {
+        run = width - pos;
+      }
+      if (!is_white) {
+        for (int i = 0; i < run; ++i) {
+          line[pos + i] = true;
+        }
+      }
+      pos += run;
+      is_white = !is_white;
+    }
+    return true;
+  };
 
   auto compute_transitions = [&](const std::vector<bool>& line) {
-    std::vector<int> trans;
-    bool current = false;  // start white
-    for (int i = 0; i < width; ++i) {
+    std::vector<int> transitions;
+    bool current = false;
+    for (int i = 0; i < static_cast<int>(line.size()); ++i) {
       bool black = line[i];
       if (black != current) {
-        trans.push_back(i);
+        transitions.push_back(i);
         current = black;
       }
     }
-    trans.push_back(width);
-    return trans;
+    transitions.push_back(static_cast<int>(line.size()));
+    return transitions;
   };
 
-  auto apply_transitions_to_pixels = [&](const std::vector<int>& trans,
-                                         std::vector<bool>* line) {
+  auto apply_transitions = [&](const std::vector<int>& transitions,
+                               std::vector<bool>* line) {
     if (!line) return;
     std::fill(line->begin(), line->end(), false);
-    std::vector<int> sorted = trans;
-    if (sorted.empty() || sorted.back() != width) {
-      sorted.push_back(width);
+    std::vector<int> sorted = transitions;
+    if (sorted.empty() || sorted.back() != static_cast<int>(line->size())) {
+      sorted.push_back(static_cast<int>(line->size()));
     }
-    // Remove duplicates
     sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
 
     int start = 0;
     bool black = false;
     for (int pos : sorted) {
-      if (pos < start) continue;
-      if (pos > width) pos = width;
+      if (pos < start) {
+        continue;
+      }
+      if (pos > static_cast<int>(line->size())) {
+        pos = static_cast<int>(line->size());
+      }
       if (black) {
-        for (int i = start; i < pos && i < width; ++i) {
+        for (int i = start; i < pos; ++i) {
           (*line)[i] = true;
         }
       }
@@ -1523,55 +1664,435 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     }
   };
 
+  // Return codes: 0=vertical, 1=horizontal, 2=pass, 3=EOFB/extension, -1=error
   auto read_2d_code = [&](BitReader& reader, int* delta) -> int {
-    std::string bits;
-    while (bits.size() <= 7) {
+    uint32_t code = 0;
+    auto saved_state = reader.save();
+    for (int length = 1; length <= 7; ++length) {
       int bit = reader.get_bit();
-      if (bit < 0) return -1;
-      bits.push_back(bit ? '1' : '0');
-
-      if (bits == "1") {
-        if (delta) *delta = 0;
-        return 0;  // vertical 0
+      if (bit < 0) {
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "read_2d_code: EOF at length %d", length);
+        return 3;  // Treat EOF as end of data
       }
-      if (bits == "011") {
+      code = (code << 1) | static_cast<uint32_t>(bit);
+      if (code == 0b1 && length == 1) {
+        if (delta) *delta = 0;
+        return 0;
+      } else if (code == 0b011 && length == 3) {
         if (delta) *delta = 1;
         return 0;
-      }
-      if (bits == "010") {
+      } else if (code == 0b010 && length == 3) {
         if (delta) *delta = -1;
         return 0;
-      }
-      if (bits == "001") {
-        return 1;  // horizontal
-      }
-      if (bits == "0001") {
-        return 2;  // pass
-      }
-      if (bits == "000011") {
+      } else if (code == 0b001 && length == 3) {
+        return 1;
+      } else if (code == 0b0001 && length == 4) {
+        return 2;
+      } else if (code == 0b000011 && length == 6) {
         if (delta) *delta = 2;
         return 0;
-      }
-      if (bits == "000010") {
+      } else if (code == 0b000010 && length == 6) {
         if (delta) *delta = -2;
         return 0;
-      }
-      if (bits == "0000011") {
+      } else if (code == 0b0000011 && length == 7) {
         if (delta) *delta = 3;
         return 0;
-      }
-      if (bits == "0000010") {
+      } else if (code == 0b0000010 && length == 7) {
         if (delta) *delta = -3;
         return 0;
+      } else if (code == 0b0000001 && length == 7) {
+        // Extension code prefix (0000001xxx)
+        // Check next 3 bits to determine if it's uncompressed mode or extension
+        int b1 = reader.get_bit();
+        int b2 = reader.get_bit();
+        int b3 = reader.get_bit();
+        if (b1 < 0 || b2 < 0 || b3 < 0) {
+          return 3;  // EOF
+        }
+        int ext_code = (b1 << 2) | (b2 << 1) | b3;
+        // Extension codes: 0000001 xxx (10 bits total)
+        // According to ITU-T T.6:
+        //   xxx=111: Enter uncompressed mode (standard)
+        //   xxx=000-110: Reserved for future use
+        if (ext_code == 7) {
+          // Standard uncompressed mode entry (xxx=111)
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Uncompressed mode entry (xxx=7) at byte=%zu bit=%d",
+                            saved_state.byte_pos, saved_state.bit_pos);
+          return 4;  // Signal uncompressed mode
+        } else {
+          // Reserved extension code (xxx=000-110)
+          // Some encoders use these as markers or no-ops
+          // Consume the 10 bits and continue with normal 2D decoding
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Reserved extension code 0000001%d%d%d at byte=%zu - skipping",
+                            b1, b2, b3, saved_state.byte_pos);
+          return -2;  // Signal "skip and continue"
+        }
+      } else if (code == 0b0000000 && length == 7) {
+        // 7 zeros - could be start of EOFB (000000000001 000000000001)
+        // Need to verify by checking for full EOFB pattern (24 bits total)
+        // Read 5 more bits to complete first potential EOL (12 bits)
+        uint32_t eol_check = code;
+        bool eof_reached = false;
+        for (int i = 0; i < 5; ++i) {
+          int bit = reader.get_bit();
+          if (bit < 0) {
+            eof_reached = true;
+            break;
+          }
+          eol_check = (eol_check << 1) | static_cast<uint32_t>(bit);
+        }
+        if (eof_reached) {
+          return 3;  // EOF = treat as end of data
+        }
+        // First 12 bits should be 000000000001 for valid EOL
+        if (eol_check == 0b000000000001) {
+          // Check for second EOL
+          uint32_t eol2 = 0;
+          for (int i = 0; i < 12; ++i) {
+            int bit = reader.get_bit();
+            if (bit < 0) break;
+            eol2 = (eol2 << 1) | static_cast<uint32_t>(bit);
+          }
+          if (eol2 == 0b000000000001) {
+            NANOPDF_LOG_TRACE("CCITTFaxDecode", "Found valid EOFB at byte=%zu bit=%d",
+                              saved_state.byte_pos, saved_state.bit_pos);
+            return 3;  // Valid EOFB
+          }
+        }
+        // Not a valid EOFB - this could be padding zeros indicating end of row
+        // Signal "fill rest of row" - the caller will complete the row and move to next
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Non-EOFB 7-zeros at byte=%zu bit=%d (eol=0x%03x), fill row",
+                          saved_state.byte_pos, saved_state.bit_pos, eol_check);
+        // Leave reader at position after the 12 bits we read (for possible alignment)
+        return 6;  // Signal "fill rest of row and continue"
       }
     }
+    // Show bytes around error position for debugging
+    size_t start_byte = saved_state.byte_pos > 2 ? saved_state.byte_pos - 2 : 0;
+    size_t end_byte = saved_state.byte_pos + 4 < size ? saved_state.byte_pos + 4 : size;
+    std::string hex_dump;
+    for (size_t i = start_byte; i < end_byte; ++i) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%02x ", data[i]);
+      hex_dump += buf;
+    }
+    NANOPDF_LOG_TRACE("CCITTFaxDecode", "read_2d_code: Invalid code 0x%x at byte %zu bit %d, bytes: %s",
+                      code, saved_state.byte_pos, saved_state.bit_pos, hex_dump.c_str());
     return -1;
   };
 
+  bool hit_eofb = false;  // Flag to signal end of facsimile block
+
+  auto decode_row_2d = [&](BitReader& reader, const std::vector<bool>& reference,
+                           std::vector<bool>& line, int width,
+                           std::string* err) -> bool {
+    std::fill(line.begin(), line.end(), false);
+    std::vector<int> ref_transitions = compute_transitions(reference);
+    std::vector<int> cur_transitions;
+
+    // Debug: show reference transitions for early rows (limited to first 30)
+    if (ref_transitions.size() < 30) {
+      std::string ref_str;
+      for (size_t i = 0; i < ref_transitions.size(); ++i) {
+        if (i > 0) ref_str += ",";
+        ref_str += std::to_string(ref_transitions[i]);
+      }
+      NANOPDF_LOG_TRACE("CCITTFaxDecode", "Ref transitions (%zu): [%s]",
+                        ref_transitions.size(), ref_str.c_str());
+    }
+
+    // In CCITT T.6:
+    // - a0: current position on coding line (starts at imaginary position before line)
+    // - a0_color: color at a0 (white at start)
+    // - b1: first changing element on reference line to the right of a0 and of OPPOSITE color to a0
+    // - b2: next changing element to the right of b1
+    //
+    // Transitions alternate: ref_transitions[0] is white->black, [1] is black->white, etc.
+    // So even indices are white->black transitions, odd indices are black->white transitions.
+    // If a0_color is white, b1 should be a white->black transition (even index)
+    // If a0_color is black, b1 should be a black->white transition (odd index)
+
+    int a0 = 0;
+    bool a0_color_is_white = true;
+
+    // Find b1: first transition of opposite color to a0, after position a0
+    // Returns (b1_position, b1_index) where b1_index is the index in ref_transitions
+    auto find_b1 = [&]() -> std::pair<int, size_t> {
+      // b1 must be of opposite color to a0
+      // If a0_color is white, we need white->black transition (even index)
+      // If a0_color is black, we need black->white transition (odd index)
+      size_t start_parity = a0_color_is_white ? 0 : 1;
+
+      for (size_t i = start_parity; i < ref_transitions.size(); i += 2) {
+        if (ref_transitions[i] > a0) {
+          return {ref_transitions[i], i};
+        }
+      }
+      return {width, ref_transitions.size()};
+    };
+
+    // Find b2: next transition after b1
+    auto find_b2 = [&](size_t b1_index) -> int {
+      if (b1_index + 1 < ref_transitions.size()) {
+        return ref_transitions[b1_index + 1];
+      }
+      return width;
+    };
+
+    while (a0 < width) {
+      BitReader::State mode_state = reader.save();
+      int delta = 0;
+      int mode = read_2d_code(reader, &delta);
+      NANOPDF_LOG_TRACE("CCITTFaxDecode", "2D mode=%d delta=%d at byte=%zu bit=%d a0=%d",
+                        mode, delta, mode_state.byte_pos, mode_state.bit_pos, a0);
+      if (mode == -1) {
+        if (err) *err = "Invalid 2D code";
+        return false;
+      }
+
+      if (mode == -2) {
+        // Reserved extension code - skip and continue (bits already consumed)
+        // Some encoders use these as no-op markers; just continue decoding
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "Skipping reserved extension at a0=%d", a0);
+        continue;
+      }
+
+      if (mode == 5) {
+        // Reserved/unused - was resync, now deprecated
+        // Continue to read the next mode code from this position
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "Mode 5 (deprecated resync) at a0=%d", a0);
+        continue;
+      }
+
+      if (mode == 6) {
+        // Fill rest of row - 7-zeros found that isn't EOFB
+        // This typically indicates end of row padding or sync pattern
+        // Fill remaining pixels as white (most common padding) and end row
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Fill rest of row from a0=%d to width=%d", a0, width);
+        // Row ends here - do not add any transitions, remaining pixels are same color as current
+        a0 = width;  // Mark row as complete
+        break;  // Exit the mode loop, will proceed to next row
+      }
+
+      if (mode == 3) {
+        // EOFB or extension code - end of image data
+        // Fill rest of line as white and signal end
+        hit_eofb = true;
+        break;
+      } else if (mode == 2) {
+        // Pass mode: b2 is under a0, skip to position just under b2
+        std::pair<int, size_t> b1_result = find_b1();
+        int b1 = b1_result.first;
+        size_t b1_idx = b1_result.second;
+        int b2 = find_b2(b1_idx);
+        a0 = b2;
+        if (a0 > width) a0 = width;
+        // Color doesn't change in pass mode
+        (void)b1; // unused in pass mode
+      } else if (mode == 1) {
+        // Horizontal mode: encode a0a1 and a1a2 run lengths
+        // Color determination using libtiff approach: use transition count parity
+        // Even transitions = white at a0, Odd transitions = black at a0
+        bool first_run_is_white = ((cur_transitions.size() & 1) == 0);
+
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "H-mode at byte=%zu bit=%d a0=%d trans=%zu first_white=%d",
+                          reader.byte_pos, reader.bit_pos, a0, cur_transitions.size(),
+                          first_run_is_white ? 1 : 0);
+
+        // Decode two runs: first run's color, then opposite color
+        for (int pass = 0; pass < 2; ++pass) {
+          bool decoding_white = (pass == 0) ? first_run_is_white : !first_run_is_white;
+          BitReader::State run_state = reader.save();
+          int run = 0;
+          if (!decode_run(reader, decoding_white, &run, err)) {
+            // Check if the failure position looks like a mode/extension code
+            // If so, abort H-mode and let the outer loop handle it
+            reader.restore(run_state);
+            uint32_t peek = 0;
+            for (int i = 0; i < 7 && reader.byte_pos < reader.size; ++i) {
+              int b = reader.get_bit();
+              if (b < 0) break;
+              peek = (peek << 1) | static_cast<uint32_t>(b);
+            }
+            reader.restore(run_state);
+
+            // Check for patterns that indicate we should exit H-mode
+            // 0000001 = extension prefix, 0000000 = potential EOFB/padding start
+            if (peek == 0b0000001) {
+              NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode interrupted by extension pattern at byte=%zu bit=%d",
+                                run_state.byte_pos, run_state.bit_pos);
+              // Exit H-mode early, let outer loop handle this as extension code
+              break;
+            }
+            if (peek == 0b0000000) {
+              // 7 zeros - likely end of row padding or EOFB start
+              // Let outer loop handle it (will use mode=6 to fill rest of row)
+              NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode interrupted by 7-zeros at byte=%zu bit=%d, a0=%d",
+                                run_state.byte_pos, run_state.bit_pos, a0);
+              break;
+            }
+
+            // H-mode failed with invalid code - try error recovery
+            // Instead of failing completely, fill rest of row and continue
+            // This handles cases where data might have non-standard patterns
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode pass %d failed at a0=%d with unknown pattern 0x%x at byte=%zu bit=%d",
+                              pass, a0, peek, run_state.byte_pos, run_state.bit_pos);
+            // Skip the invalid bits (we peeked 7 bits) to try to resync
+            // Reader is at run_state, advance past the 7 bits we peeked
+            reader.restore(run_state);
+            for (int i = 0; i < 7 && reader.byte_pos < reader.size; ++i) {
+              reader.get_bit();
+            }
+            // Fill rest of row with current color and break out
+            a0 = width;
+            break;
+          }
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "H-mode pass %d: %s run=%d at byte=%zu bit=%d",
+                            pass, decoding_white ? "white" : "black", run,
+                            run_state.byte_pos, run_state.bit_pos);
+          if (run < 0) run = 0;
+          int new_a0 = a0 + run;
+          if (new_a0 > width) new_a0 = width;
+          if (new_a0 > a0) {
+            cur_transitions.push_back(new_a0);
+          }
+          a0 = new_a0;
+        }
+        // Update a0_color_is_white based on current transition count
+        a0_color_is_white = ((cur_transitions.size() & 1) == 0);
+      } else if (mode == 4) {
+        // Uncompressed mode: read raw pixel bits until exit sequence
+        // In uncompressed mode, we read bits directly as pixel values
+        // Exit when we see "00000001T" where T is the tag bit for next mode
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "Entering uncompressed mode at a0=%d", a0);
+
+        int zero_count = 0;
+        while (a0 < width) {
+          int bit = reader.get_bit();
+          if (bit < 0) {
+            hit_eofb = true;
+            break;
+          }
+
+          if (bit == 0) {
+            zero_count++;
+            if (zero_count == 8) {
+              // Could be exit sequence 00000001T - check next bit
+              int exit_bit = reader.get_bit();
+              if (exit_bit < 0) {
+                hit_eofb = true;
+                break;
+              }
+              if (exit_bit == 1) {
+                // Exit sequence found - next bit is tag for following codeword
+                // The tag bit determines if we return to 2D mode (0) or need special handling
+                int tag = reader.get_bit();
+                NANOPDF_LOG_TRACE("CCITTFaxDecode", "Exiting uncompressed mode at a0=%d, tag=%d", a0, tag);
+                // Continue with normal 2D decoding
+                // Note: the tag bit is already consumed, affecting next codeword interpretation
+                break;
+              } else {
+                // Not exit sequence - the 8 zeros are actual white pixels
+                // Write 8 white pixels and the 0 we just read
+                for (int i = 0; i < 8 && a0 < width; ++i) {
+                  if (!a0_color_is_white) {
+                    cur_transitions.push_back(a0);
+                    a0_color_is_white = true;
+                  }
+                  a0++;
+                }
+                // Write the 0 bit as white
+                if (a0 < width) {
+                  if (!a0_color_is_white) {
+                    cur_transitions.push_back(a0);
+                    a0_color_is_white = true;
+                  }
+                  a0++;
+                }
+                zero_count = 0;
+              }
+            }
+          } else {
+            // Non-zero bit - write any accumulated zeros as white, then the 1 as black
+            for (int i = 0; i < zero_count && a0 < width; ++i) {
+              if (!a0_color_is_white) {
+                cur_transitions.push_back(a0);
+                a0_color_is_white = true;
+              }
+              a0++;
+            }
+            zero_count = 0;
+
+            // Write the 1 bit as black
+            if (a0 < width) {
+              if (a0_color_is_white) {
+                cur_transitions.push_back(a0);
+                a0_color_is_white = false;
+              }
+              a0++;
+            }
+          }
+        }
+
+        // Write any remaining zeros
+        for (int i = 0; i < zero_count && a0 < width; ++i) {
+          if (!a0_color_is_white) {
+            cur_transitions.push_back(a0);
+            a0_color_is_white = true;
+          }
+          a0++;
+        }
+      } else if (mode == 0) {
+        // Vertical mode: a1 = b1 + delta
+        std::pair<int, size_t> b1_result = find_b1();
+        int b1 = b1_result.first;
+        int new_a0 = b1 + delta;
+        if (new_a0 < 0) new_a0 = 0;
+        if (new_a0 > width) new_a0 = width;
+        // Debug: log if b1 causes row to end early
+        if (b1 >= width && a0 < width - 100) {
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "V mode: b1=%d (width) at a0=%d, white=%d, ref_trans=%zu",
+                            b1, a0, a0_color_is_white ? 1 : 0, ref_transitions.size());
+        }
+        cur_transitions.push_back(new_a0);
+        a0 = new_a0;
+        // Update color from transition count (libtiff approach)
+        a0_color_is_white = ((cur_transitions.size() & 1) == 0);
+      }
+    }
+
+    apply_transitions(cur_transitions, &line);
+    // Debug: show transitions for problematic rows
+    if (cur_transitions.size() < 30) {
+      std::string trans_str;
+      for (size_t i = 0; i < cur_transitions.size(); ++i) {
+        if (i > 0) trans_str += ",";
+        trans_str += std::to_string(cur_transitions[i]);
+      }
+      NANOPDF_LOG_TRACE("CCITTFaxDecode", "Row done: %zu transitions [%s]",
+                        cur_transitions.size(), trans_str.c_str());
+    }
+    return true;
+  };
+
+  int width = params.columns > 0 ? params.columns : 1728;
+  int bytes_per_row = (width + 7) / 8;
+  int max_rows = params.rows;
+  BitReader reader(data, size);
+
+  std::vector<uint8_t> output;
+  output.reserve(static_cast<size_t>(bytes_per_row) * (max_rows > 0 ? max_rows : 1));
+
+  std::vector<bool> prev_line(width, false);
+  std::vector<bool> line(width, false);
+  std::vector<uint8_t> row_bytes(bytes_per_row, 0);
+
   int decoded_rows = 0;
-  while (reader.byte_pos < size && (height == 0 || decoded_rows < height)) {
+  int damaged_rows = 0;
+
+  while (reader.byte_pos < size && (max_rows <= 0 || decoded_rows < max_rows)) {
     if (params.end_of_line) {
-      if (!reader.find_eol()) {
+      if (!reader.skip_eol()) {
         result.error = "CCITTFaxDecode: Missing EOL";
         return result;
       }
@@ -1580,127 +2101,65 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       }
     }
 
-    std::fill(pixels.begin(), pixels.end(), false);
-
-    bool use_1d = false;
+    bool allow_indicator_skip = (params.k == 0);
+    bool row_is_1d = false;
     if (params.k == 0) {
-      use_1d = true;
+      row_is_1d = true;
     } else if (params.k > 0) {
       int mode = reader.get_bit();
       if (mode < 0) {
-        result.error = "CCITTFaxDecode: Unexpected EOF";
+        result.error = "CCITTFaxDecode: Unexpected EOF while reading row mode";
         return result;
       }
-      use_1d = (mode != 0);
-    } else {  // Group 4
-      use_1d = false;
+      row_is_1d = (mode != 0);
+    } else {
+      row_is_1d = false;
     }
 
-    if (use_1d) {
-      int pos = 0;
-      bool is_white = true;
-      while (pos < width) {
-        int run = 0;
-        if (!decode_run(reader, is_white, &run)) {
-          result.error = "CCITTFaxDecode: Invalid code";
-          return result;
-        }
-        if (pos + run > width) {
-          run = width - pos;
-        }
-        if (!is_white) {
-          for (int i = 0; i < run; ++i) {
-            pixels[pos + i] = true;
-          }
-        }
-        pos += run;
-        is_white = !is_white;
+    std::string row_error;
+    bool ok = false;
+    NANOPDF_LOG_TRACE("CCITTFaxDecode", "Starting row %d at byte=%zu bit=%d",
+                      decoded_rows, reader.byte_pos, reader.bit_pos);
+    if (row_is_1d) {
+      ok = decode_row_1d(reader, line, allow_indicator_skip, width, &row_error);
+    } else {
+      ok = decode_row_2d(reader, prev_line, line, width, &row_error);
+    }
+
+    // Check if we hit EOFB during 2D decode
+    if (hit_eofb) {
+      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Hit EOFB at row %d, stopping decode", decoded_rows);
+      break;
+    }
+
+    if (!ok) {
+      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row %d failed: %s (row_is_1d=%d)",
+                        decoded_rows, row_error.c_str(), row_is_1d);
+      if (params.damaged_rows_before_error > 0 &&
+          damaged_rows < params.damaged_rows_before_error) {
+        ++damaged_rows;
+        line = prev_line;
+      } else {
+        result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+        NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
+                          decoded_rows, result.error.c_str());
+        return result;
       }
     } else {
-      std::vector<int> ref_transitions = compute_transitions(prev_pixels);
-      std::vector<int> cur_transitions;
-
-      int a0 = 0;
-      bool current_white = true;
-      size_t ref_idx = 0;
-
-      auto advance_ref = [&]() {
-        while (ref_idx < ref_transitions.size() && ref_transitions[ref_idx] <= a0) {
-          ref_idx++;
-        }
-      };
-
-      advance_ref();
-
-      auto get_b1 = [&]() -> int {
-        if (ref_idx >= ref_transitions.size()) {
-          return width;
-        }
-        return ref_transitions[ref_idx];
-      };
-
-      auto get_b2 = [&]() -> int {
-        if (ref_idx + 1 >= ref_transitions.size()) {
-          return width;
-        }
-        return ref_transitions[ref_idx + 1];
-      };
-
-      while (a0 < width) {
-        int delta = 0;
-        int op = read_2d_code(reader, &delta);
-        if (op == -1) {
-          result.error = "CCITTFaxDecode: Invalid 2D code";
-          return result;
-        }
-
-        int b1 = get_b1();
-        int b2 = get_b2();
-
-        if (op == 2) {  // Pass
-          int new_a0 = b2;
-          if (new_a0 > width) new_a0 = width;
-          a0 = new_a0;
-          advance_ref();
-        } else if (op == 1) {  // Horizontal
-          for (int pass = 0; pass < 2; ++pass) {
-            int run = 0;
-            if (!decode_run(reader, current_white, &run)) {
-              result.error = "CCITTFaxDecode: Invalid horizontal run";
-              return result;
-            }
-            int new_a0 = a0 + run;
-            if (new_a0 > width) new_a0 = width;
-            cur_transitions.push_back(new_a0);
-            a0 = new_a0;
-            current_white = !current_white;
-          }
-          advance_ref();
-        } else {  // Vertical
-          int new_a0 = b1 + delta;
-          if (new_a0 < 0) new_a0 = 0;
-          if (new_a0 > width) new_a0 = width;
-          cur_transitions.push_back(new_a0);
-          a0 = new_a0;
-          current_white = !current_white;
-          advance_ref();
-        }
-      }
-
-      apply_transitions_to_pixels(cur_transitions, &pixels);
+      damaged_rows = 0;
     }
 
     std::fill(row_bytes.begin(), row_bytes.end(), 0);
     for (int i = 0; i < width; ++i) {
-      bool black_pixel = pixels[i];
-      bool bit = params.black_is_1 ? black_pixel : !black_pixel;
+      bool black = line[i];
+      bool bit = params.black_is_1 ? black : !black;
       if (bit) {
         row_bytes[i / 8] |= static_cast<uint8_t>(1 << (7 - (i % 8)));
       }
     }
 
     output.insert(output.end(), row_bytes.begin(), row_bytes.end());
-    prev_pixels = pixels;
+    prev_line = line;
     ++decoded_rows;
   }
 
@@ -1746,20 +2205,51 @@ static DecodedStream apply_single_filter(const std::string &filter_name,
   return result;
 }
 
-DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
+DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
+                           uint32_t obj_num, uint16_t gen_num) {
   DecodedStream result;
-  (void)pdf;  // May be used for reference resolution in future
 
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
     return result;
   }
 
+  // Start with raw stream data
+  std::vector<uint8_t> current_data = stream_obj.stream.data;
+
+  // Decrypt stream data if PDF is encrypted
+  // Note: Decryption must happen BEFORE decompression
+  if (pdf.security.authenticated && !pdf.security.encryption_key.empty()) {
+    // Check if this is a Crypt filter that should not be decrypted
+    // or if this is an XRef stream (XRef streams are not encrypted)
+    auto type_it = stream_obj.stream.dict.find("Type");
+    bool is_xref = (type_it != stream_obj.stream.dict.end() &&
+                    type_it->second.type == Value::NAME &&
+                    type_it->second.name == "XRef");
+
+    if (!is_xref) {
+      NANOPDF_LOG_TRACE("decode_stream", "Decrypting obj %u %u, before: %zu bytes",
+                        obj_num, gen_num, current_data.size());
+      if (current_data.size() >= 8) {
+        NANOPDF_LOG_TRACE("decode_stream", "Pre-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
+                          current_data[0], current_data[1], current_data[2], current_data[3],
+                          current_data[4], current_data[5], current_data[6], current_data[7]);
+      }
+      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num);
+      NANOPDF_LOG_TRACE("decode_stream", "After decrypt: %zu bytes", current_data.size());
+      if (current_data.size() >= 8) {
+        NANOPDF_LOG_TRACE("decode_stream", "Post-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
+                          current_data[0], current_data[1], current_data[2], current_data[3],
+                          current_data[4], current_data[5], current_data[6], current_data[7]);
+      }
+    }
+  }
+
   // Get filter type from stream dictionary
   auto filter_it = stream_obj.stream.dict.find("Filter");
   if (filter_it == stream_obj.stream.dict.end()) {
-    // No filter, return raw data
-    result.data = stream_obj.stream.data;
+    // No filter, return (possibly decrypted) data
+    result.data = std::move(current_data);
     result.success = true;
     return result;
   }
@@ -1815,8 +2305,6 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
   }
 
   // Apply filters in sequence
-  std::vector<uint8_t> current_data = stream_obj.stream.data;
-
   for (size_t i = 0; i < filter_names.size(); ++i) {
     const std::string &filter_name = filter_names[i];
     const filters::DecodeParams &params = params_list[i];
@@ -1842,6 +2330,14 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
   result.data = std::move(current_data);
   result.success = true;
   return result;
+}
+
+// Legacy version without object number - cannot decrypt
+DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj) {
+  // For backward compatibility, call with obj_num=0, gen_num=0
+  // This means streams decoded via this function won't be decrypted
+  // if the PDF is encrypted. Callers should use the overload with object numbers.
+  return decode_stream(pdf, stream_obj, 0, 0);
 }
 
 bool parse_object_stream(StreamReader &sr, Parser &parser,
@@ -1936,7 +2432,7 @@ bool parse_from_memory(const uint8_t *addr, const size_t size) {
     return false;
   }
 
-  bool swap_endian = false;  // TODO: detect endianness if needed
+  const bool swap_endian = !is_system_little_endian();
   nanopdf::StreamReader sr(addr, size, swap_endian);
 
   int minor_version{0};
@@ -2589,7 +3085,7 @@ bool compute_object_body_offset(const Pdf& pdf, uint64_t header_offset,
     return false;
   }
 
-  StreamReader sr(pdf.data, pdf.data_size, /*swap_endian=*/false);
+  StreamReader sr(pdf.data, pdf.data_size, pdf.swap_endian);
   Parser parser(sr);
 
   if (!sr.seek_set(header_offset)) {
@@ -2745,8 +3241,6 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
       object_offsets_failed = true;
     }
   }
-  // DEBUG
-
   uint64_t body_offset = 0;
   bool have_offset = false;
 
@@ -2792,7 +3286,7 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
     }
   }
 
-  StreamReader sr(data, data_size, /*swap_endian=*/false);
+  StreamReader sr(data, data_size, swap_endian);
   Parser parser(sr);
 
   if (!sr.seek_set(body_offset)) {
@@ -2809,6 +3303,14 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
 
   if (!parse_object(sr, parser, &result.value)) {
     result.success = false;
+    NANOPDF_LOG_WARN("load_object",
+                     "Failed to parse object %u %u at body_offset=%lu have_offset=%d",
+                     obj_num, gen_num, (unsigned long)body_offset, have_offset);
+    if (body_offset < data_size) {
+      NANOPDF_LOG_DEBUG("load_object", "Bytes at offset: %s",
+                        log::format_hex_bytes(data + body_offset,
+                                              data_size - body_offset, 40).c_str());
+    }
     result.error = "Failed to parse object";
     return result;
   }
@@ -3018,7 +3520,7 @@ bool Pdf::build_object_offset_cache() const {
           skip_ws_ptr(p);
 
         uint64_t dict_offset = static_cast<uint64_t>(p - begin);
-        StreamReader sr(data, data_size, /*swap_endian=*/false);
+        StreamReader sr(data, data_size, swap_endian);
         Parser parser(sr);
         if (!sr.seek_set(dict_offset)) {
           return false;
@@ -3108,7 +3610,7 @@ bool Pdf::build_object_offset_cache() const {
     };
 
     auto parse_xref_stream = [&](uint64_t offset) -> bool {
-      StreamReader sr(data, data_size, /*swap_endian=*/false);
+      StreamReader sr(data, data_size, swap_endian);
       Parser parser(sr);
       if (!sr.seek_set(offset)) {
         return false;
@@ -3262,7 +3764,7 @@ bool Pdf::build_object_offset_cache() const {
           while (dict_offset < data_size && is_whitespace_char(static_cast<char>(data[dict_offset]))) {
             dict_offset++;
           }
-          StreamReader sr(data, data_size, /*swap_endian=*/false);
+          StreamReader sr(data, data_size, swap_endian);
           Parser parser(sr);
           if (!sr.seek_set(dict_offset)) {
             return;
@@ -3442,7 +3944,9 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
 
   auto cache_it = object_stream_cache.find(stream_object_number);
   if (cache_it == object_stream_cache.end()) {
-    DecodedStream decoded = decode_stream(*this, stream_obj.value);
+    // Use overload with object number for proper decryption
+    DecodedStream decoded = decode_stream(*this, stream_obj.value,
+                                          stream_object_number, 0);
     if (!decoded.success) {
       return false;
     }
@@ -3534,7 +4038,7 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
   }
 
   StreamReader sr(data.data() + content_start, content_end - content_start,
-                  /*swap_endian=*/false);
+                  swap_endian);
   Parser parser(sr);
 
   Value parsed;
@@ -3588,6 +4092,11 @@ bool Pdf::load_document_structure() {
   ensure_field_from_trailer("Root", &root);
   ensure_field_from_trailer("Info", &info);
   ensure_field_from_trailer("Encrypt", &encrypt);
+
+  // Initialize security handler if document is encrypted
+  if (encrypt != 0) {
+    security = create_security_handler(*this);
+  }
 
   catalog.object_number = root;
   catalog.pages.clear();
@@ -3920,15 +4429,18 @@ PageContent Page::load_contents(const Pdf& pdf) const {
 
   std::vector<uint8_t> aggregate;
   std::vector<std::unique_ptr<Value>> owned_values;
-  std::vector<const Value*> stack;
+  // Stack holds (Value*, object_number, generation_number) for decryption
+  std::vector<std::tuple<const Value*, uint32_t, uint16_t>> stack;
 
   stack.reserve(contents.size());
   for (auto it = contents.rbegin(); it != contents.rend(); ++it) {
-    stack.push_back(&*it);
+    stack.push_back(std::make_tuple(&*it, 0u, static_cast<uint16_t>(0)));
   }
 
   while (!stack.empty()) {
-    const Value* node = stack.back();
+    const Value* node = std::get<0>(stack.back());
+    uint32_t obj_num = std::get<1>(stack.back());
+    uint16_t gen_num = std::get<2>(stack.back());
     stack.pop_back();
 
     switch (node->type) {
@@ -3942,19 +4454,22 @@ PageContent Page::load_contents(const Pdf& pdf) const {
           return content;
         }
         owned_values.push_back(std::unique_ptr<Value>(new Value(std::move(resolved.value))));
-        stack.push_back(owned_values.back().get());
+        // Track the object number for decryption
+        stack.push_back(std::make_tuple(owned_values.back().get(),
+                                        node->ref_object_number,
+                                        node->ref_generation_number));
         break;
       }
 
       case Value::ARRAY: {
         for (auto it = node->array.rbegin(); it != node->array.rend(); ++it) {
-          stack.push_back(&*it);
+          stack.push_back(std::make_tuple(&*it, obj_num, gen_num));
         }
         break;
       }
 
       case Value::STREAM: {
-        DecodedStream decoded = decode_stream(pdf, *node);
+        DecodedStream decoded = decode_stream(pdf, *node, obj_num, gen_num);
         if (!decoded.success) {
           content.error = decoded.error;
           content.success = false;
@@ -4232,7 +4747,8 @@ ColorSpace parse_color_space(const Pdf& pdf, const Value& cs_value) {
 }
 
 // Image XObject parsing
-ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value) {
+ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
+                                 uint32_t obj_num, uint16_t gen_num) {
   ImageXObject image;
 
   if (stream_value.type != Value::STREAM) {
@@ -4310,11 +4826,16 @@ ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value) {
     }
   }
 
-  // Decode the image data
-  DecodedStream decoded = decode_stream(pdf, stream_value);
+  // Decode the image data (use obj_num/gen_num for decryption if needed)
+  DecodedStream decoded = decode_stream(pdf, stream_value, obj_num, gen_num);
   if (decoded.success) {
     image.data = std::move(decoded.data);
   }
+
+  NANOPDF_LOG_DEBUG("parse_image", "Image %ux%u, bpc=%d, cs_type=%d, filter=%s, data=%zu bytes",
+                    static_cast<uint32_t>(image.width), static_cast<uint32_t>(image.height),
+                    image.bits_per_component, static_cast<int>(image.color_space.type),
+                    image.filter.c_str(), image.data.size());
 
   return image;
 }
@@ -4346,7 +4867,12 @@ std::map<std::string, ImageXObject> parse_xobject_resources(const Pdf& pdf, cons
         if (subtype_it != resolved_value.stream.dict.end() &&
             subtype_it->second.type == Value::NAME &&
             subtype_it->second.name == "Image") {
-          images[entry.first] = parse_image_xobject(pdf, resolved_value);
+          // Pass object numbers for proper decryption in encrypted PDFs
+          uint32_t obj_num = (xobj_value.type == Value::REFERENCE)
+                             ? xobj_value.ref_object_number : 0;
+          uint16_t gen_num = (xobj_value.type == Value::REFERENCE)
+                             ? xobj_value.ref_generation_number : 0;
+          images[entry.first] = parse_image_xobject(pdf, resolved_value, obj_num, gen_num);
         }
       }
     }

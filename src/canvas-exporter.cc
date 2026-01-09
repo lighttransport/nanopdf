@@ -520,7 +520,10 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
       graphics_state_stack_.pop_back();
     }
   } else if (op == "w" && operands.size() >= 1) {
-    add_canvas_command("lineWidth", {operands[0]});
+    try {
+      state_.stroke_width = std::stod(operands[0]);
+      update_canvas_line_width();
+    } catch (...) {}
   } else if (op == "gs" && !operands.empty()) {
     std::string name;
     for (auto it = operands.rbegin(); it != operands.rend(); ++it) {
@@ -541,6 +544,54 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
       operands[0], operands[1], operands[2],
       operands[3], operands[4], operands[5]
     });
+  } else if (op == "J" && operands.size() >= 1) {
+    try {
+      int cap = static_cast<int>(std::stod(operands[0]));
+      switch (cap) {
+        case 0:
+          state_.line_cap = "butt";
+          break;
+        case 1:
+          state_.line_cap = "round";
+          break;
+        case 2:
+          state_.line_cap = "square";
+          break;
+        default:
+          return;
+      }
+      update_canvas_line_cap();
+    } catch (...) {}
+  } else if (op == "j" && operands.size() >= 1) {
+    try {
+      int join = static_cast<int>(std::stod(operands[0]));
+      switch (join) {
+        case 0:
+          state_.line_join = "miter";
+          break;
+        case 1:
+          state_.line_join = "round";
+          break;
+        case 2:
+          state_.line_join = "bevel";
+          break;
+        default:
+          return;
+      }
+      update_canvas_line_join();
+    } catch (...) {}
+  } else if (op == "M" && operands.size() >= 1) {
+    try {
+      state_.miter_limit = std::stod(operands[0]);
+      update_canvas_miter_limit();
+    } catch (...) {}
+  } else if (op == "d" && operands.size() >= 2) {
+    std::vector<double> pattern;
+    double phase = 0.0;
+    parse_dash_pattern(operands, &pattern, &phase);
+    state_.dash_pattern = pattern;
+    state_.dash_phase = phase;
+    update_canvas_line_dash();
   }
 }
 
@@ -662,6 +713,48 @@ void CanvasExporter::update_canvas_stroke_style() {
   add_canvas_command("strokeStyle", {canvas_color_string(state_.stroke_color, state_.stroke_alpha)});
 }
 
+void CanvasExporter::update_canvas_line_width() {
+  if (!canvas_mode_) {
+    return;
+  }
+  add_canvas_command("lineWidth", {double_to_string(state_.stroke_width)});
+}
+
+void CanvasExporter::update_canvas_line_cap() {
+  if (!canvas_mode_) {
+    return;
+  }
+  if (state_.line_cap.empty()) {
+    return;
+  }
+  add_canvas_command("lineCap", {"\"" + state_.line_cap + "\""});
+}
+
+void CanvasExporter::update_canvas_line_join() {
+  if (!canvas_mode_) {
+    return;
+  }
+  if (state_.line_join.empty()) {
+    return;
+  }
+  add_canvas_command("lineJoin", {"\"" + state_.line_join + "\""});
+}
+
+void CanvasExporter::update_canvas_miter_limit() {
+  if (!canvas_mode_) {
+    return;
+  }
+  add_canvas_command("miterLimit", {double_to_string(state_.miter_limit)});
+}
+
+void CanvasExporter::update_canvas_line_dash() {
+  if (!canvas_mode_) {
+    return;
+  }
+  add_canvas_command("setLineDash", {dash_pattern_to_canvas_array(state_.dash_pattern)});
+  add_canvas_command("lineDashOffset", {double_to_string(state_.dash_phase)});
+}
+
 void CanvasExporter::update_canvas_blend_mode() {
   if (!canvas_mode_) {
     return;
@@ -745,6 +838,19 @@ std::string CanvasExporter::dash_pattern_to_string(const std::vector<double>& pa
     }
     ss << double_to_string(pattern[i]);
   }
+  return ss.str();
+}
+
+std::string CanvasExporter::dash_pattern_to_canvas_array(const std::vector<double>& pattern) const {
+  std::stringstream ss;
+  ss << '[';
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    if (i > 0) {
+      ss << ", ";
+    }
+    ss << double_to_string(pattern[i]);
+  }
+  ss << ']';
   return ss.str();
 }
 
@@ -1811,7 +1917,9 @@ std::string CanvasExporter::commands_to_javascript(const std::vector<CanvasComma
     } else if (cmd.command == "fillStyle" || cmd.command == "strokeStyle" || 
                cmd.command == "font") {
       js << "ctx." << cmd.command << " = " << cmd.args[0] << ";\n";
-    } else if (cmd.command == "lineWidth") {
+    } else if (cmd.command == "lineWidth" || cmd.command == "lineCap" ||
+               cmd.command == "lineJoin" || cmd.command == "miterLimit" ||
+               cmd.command == "lineDashOffset") {
       js << "ctx." << cmd.command << " = " << cmd.args[0] << ";\n";
     } else {
       js << "ctx." << cmd.command << "(";
@@ -2409,6 +2517,7 @@ void CanvasExporter::apply_extended_graphics_state(const std::string& name) {
 void CanvasExporter::apply_extended_graphics_state(const ExtendedGraphicsState& ext_state) {
   if (ext_state.line_width > 0.0) {
     state_.stroke_width = ext_state.line_width;
+    update_canvas_line_width();
   }
 
   switch (ext_state.line_cap) {
@@ -2424,6 +2533,7 @@ void CanvasExporter::apply_extended_graphics_state(const ExtendedGraphicsState& 
     default:
       break;
   }
+  update_canvas_line_cap();
 
   switch (ext_state.line_join) {
     case 0:
@@ -2438,13 +2548,16 @@ void CanvasExporter::apply_extended_graphics_state(const ExtendedGraphicsState& 
     default:
       break;
   }
+  update_canvas_line_join();
 
   if (ext_state.miter_limit > 0.0) {
     state_.miter_limit = ext_state.miter_limit;
+    update_canvas_miter_limit();
   }
 
   state_.dash_pattern = ext_state.dash_pattern;
   state_.dash_phase = ext_state.dash_phase;
+  update_canvas_line_dash();
 
   if (ext_state.soft_mask_type != SoftMaskType::None) {
     auto g_it = ext_state.soft_mask_dict.find("G");
