@@ -1586,6 +1586,47 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       return bit;
     }
 
+    // Poppler-style: Look ahead n bits, returning partial data if EOF reached
+    // Returns -1 if no bits available, otherwise returns available bits left-shifted
+    int look_bits_partial(int n, int* bits_available) {
+      if (byte_pos >= size) {
+        if (bits_available) *bits_available = 0;
+        return -1;
+      }
+
+      uint32_t result = 0;
+      int count = 0;
+      size_t saved_byte = byte_pos;
+      int saved_bit = bit_pos;
+
+      while (count < n) {
+        if (byte_pos >= size) {
+          // Near EOF - return whatever bits we have, left-shifted
+          byte_pos = saved_byte;
+          bit_pos = saved_bit;
+          if (bits_available) *bits_available = count;
+          if (count == 0) return -1;
+          // Left-shift to fill the requested bit width
+          return static_cast<int>(result << (n - count));
+        }
+        int bit = (data[byte_pos] >> bit_pos) & 1;
+        result = (result << 1) | static_cast<uint32_t>(bit);
+        count++;
+        if (bit_pos == 0) {
+          bit_pos = 7;
+          byte_pos++;
+        } else {
+          bit_pos--;
+        }
+      }
+
+      // Restore position (peek only)
+      byte_pos = saved_byte;
+      bit_pos = saved_bit;
+      if (bits_available) *bits_available = count;
+      return static_cast<int>(result);
+    }
+
     bool align_to_byte() {
       if (byte_pos >= size) {
         return false;
@@ -1739,10 +1780,29 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       for (int length = 1; length <= 13; ++length) {
         int bit = reader.get_bit();
         if (bit < 0) {
-          if (err) {
-            *err = "Unexpected EOF while decoding run";
+          // Poppler-style: Try to extract code from partial bits at EOF
+          reader.restore(state_before);
+          int bits_available = 0;
+          int partial_code = reader.look_bits_partial(length, &bits_available);
+          if (partial_code >= 0 && bits_available > 0) {
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF reached, using %d partial bits (code=0x%x) for run",
+                              bits_available, partial_code);
+            // Try to find a valid code with the partial bits
+            code = static_cast<uint32_t>(partial_code);
+            // Advance reader by the bits we have
+            for (int i = 0; i < bits_available; ++i) {
+              reader.get_bit();
+            }
+            // Check if this forms a valid code
+            if (const CodeEntry* entry = find_code(term_table, term_count, code >> (length - bits_available), bits_available)) {
+              *run_length = entry->run;
+              return true;
+            }
           }
-          return false;
+          // No valid partial code, return terminating code with 0 run
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF with no valid partial code, returning run=0");
+          *run_length = 0;
+          return true;
         }
         code = (code << 1) | static_cast<uint32_t>(bit);
 
@@ -1761,25 +1821,28 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         }
       }
 
-      reader.restore(state_before);
-      if (err) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "Invalid code word: 0x%x at byte %zu bit %d (white=%d)",
-                 code, state_before.byte_pos, state_before.bit_pos, white ? 1 : 0);
-        *err = buf;
-      }
-      NANOPDF_LOG_TRACE("CCITTFaxDecode", "decode_run failed: code=0x%x, byte=%zu, bit=%d, white=%d",
-                        code, state_before.byte_pos, state_before.bit_pos, white ? 1 : 0);
-      // Dump bytes around failure position
-      if (state_before.byte_pos < reader.size) {
-        char hex_buf[128];
-        int hex_len = 0;
-        for (size_t i = state_before.byte_pos; i < std::min(state_before.byte_pos + 5, reader.size); ++i) {
-          hex_len += snprintf(hex_buf + hex_len, sizeof(hex_buf) - hex_len, "%02x ", reader.data[i]);
+      {
+        // Poppler-style error recovery: eat 1 bit and return a small positive value
+        // This prevents infinite loops and allows decoding to continue
+        reader.restore(state_before);
+        int recovery_bit = reader.get_bit();
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Invalid code 0x%x at byte=%zu bit=%d (white=%d), eating 1 bit (%d) and returning run=1",
+                          code, state_before.byte_pos, state_before.bit_pos, white ? 1 : 0, recovery_bit);
+
+        // Dump bytes around failure position for debugging
+        if (state_before.byte_pos < reader.size) {
+          char hex_buf[128];
+          int hex_len = 0;
+          for (size_t i = state_before.byte_pos; i < std::min(state_before.byte_pos + 5, reader.size); ++i) {
+            hex_len += snprintf(hex_buf + hex_len, sizeof(hex_buf) - hex_len, "%02x ", reader.data[i]);
+          }
+          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Bytes at failure: %s", hex_buf);
         }
-        NANOPDF_LOG_TRACE("CCITTFaxDecode", "Bytes at failure: %s", hex_buf);
+
+        // Return 1 to allow caller to continue (poppler approach)
+        *run_length = 1;
+        return true;
       }
-      return false;
 
     decode_more:
       continue;
@@ -1810,11 +1873,23 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         return false;
       }
 
+      // Poppler-style bounds clamping: clamp invalid positions to valid range
       if (run < 0) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Negative run length %d at pos=%d, clamping to 0", run, pos);
         run = 0;
       }
       if (pos + run > width) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row overrun: pos=%d + run=%d > width=%d, clamping",
+                          pos, run, width);
         run = width - pos;
+      }
+      if (pos < 0) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Negative position %d, clamping to 0", pos);
+        pos = 0;
+      }
+      if (pos >= width) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Position %d >= width %d, breaking", pos, width);
+        break;
       }
       if (!is_white) {
         for (int i = 0; i < run; ++i) {
@@ -2174,9 +2249,20 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
           NANOPDF_LOG_TRACE("CCITTFaxDecode", "H-mode pass %d: %s run=%d, AFTER decode_run byte=%zu bit=%d",
                             pass, decoding_white ? "white" : "black", run,
                             after_state.byte_pos, after_state.bit_pos);
-          if (run < 0) run = 0;
+          // Poppler-style bounds clamping
+          if (run < 0) {
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode: negative run %d, clamping to 0", run);
+            run = 0;
+          }
           int new_a0 = a0 + run;
-          if (new_a0 > width) new_a0 = width;
+          if (new_a0 > width) {
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode: position %d > width %d, clamping", new_a0, width);
+            new_a0 = width;
+          }
+          if (new_a0 < a0) {
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode: new_a0=%d < a0=%d, clamping to a0", new_a0, a0);
+            new_a0 = a0;
+          }
           if (new_a0 > a0) {
             cur_transitions.push_back(new_a0);
           }
@@ -2271,8 +2357,16 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         std::pair<int, size_t> b1_result = find_b1();
         int b1 = b1_result.first;
         int new_a0 = b1 + delta;
-        if (new_a0 < 0) new_a0 = 0;
-        if (new_a0 > width) new_a0 = width;
+        // Poppler-style bounds clamping with error logging
+        if (new_a0 < 0) {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "V-mode: negative position %d (b1=%d delta=%d), clamping to 0",
+                            new_a0, b1, delta);
+          new_a0 = 0;
+        }
+        if (new_a0 > width) {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "V-mode: position %d > width %d, clamping", new_a0, width);
+          new_a0 = width;
+        }
         // Debug: log if b1 causes row to end early
         if (b1 >= width && a0 < width - 100) {
           NANOPDF_LOG_TRACE("CCITTFaxDecode", "V mode: b1=%d (width) at a0=%d, white=%d, ref_trans=%zu",
@@ -2359,15 +2453,60 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     if (!ok) {
       NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row %d failed: %s (row_is_1d=%d)",
                         decoded_rows, row_error.c_str(), row_is_1d);
-      if (params.damaged_rows_before_error > 0 &&
-          damaged_rows < params.damaged_rows_before_error) {
-        ++damaged_rows;
-        line = prev_line;
+
+      // Poppler-style EOL recovery: if we have EOL markers, scan for next one
+      if (params.end_of_line) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Attempting EOL resync at byte=%zu bit=%d",
+                          reader.byte_pos, reader.bit_pos);
+        bool found_eol = false;
+        size_t scan_start = reader.byte_pos;
+        // Scan bit-by-bit for next EOL marker (11 zeros followed by 1)
+        int zero_count = 0;
+        while (reader.byte_pos < size && reader.byte_pos < scan_start + 100) {
+          int bit = reader.get_bit();
+          if (bit < 0) break;
+          if (bit == 0) {
+            zero_count++;
+          } else {
+            if (zero_count >= 11) {
+              found_eol = true;
+              NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Found EOL after %zu bytes, resuming",
+                                reader.byte_pos - scan_start);
+              break;
+            }
+            zero_count = 0;
+          }
+        }
+        if (found_eol) {
+          // Successfully resynced - use previous line and continue
+          ++damaged_rows;
+          line = prev_line;
+          // Continue to next iteration
+        } else {
+          // EOL scan failed - treat as damaged row or fail
+          if (params.damaged_rows_before_error > 0 &&
+              damaged_rows < params.damaged_rows_before_error) {
+            ++damaged_rows;
+            line = prev_line;
+          } else {
+            result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+            NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
+                              decoded_rows, result.error.c_str());
+            return result;
+          }
+        }
       } else {
-        result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
-        NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
-                          decoded_rows, result.error.c_str());
-        return result;
+        // No EOL markers - use "just plow on" approach
+        if (params.damaged_rows_before_error > 0 &&
+            damaged_rows < params.damaged_rows_before_error) {
+          ++damaged_rows;
+          line = prev_line;
+        } else {
+          result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+          NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
+                            decoded_rows, result.error.c_str());
+          return result;
+        }
       }
     } else {
       damaged_rows = 0;
