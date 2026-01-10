@@ -2166,7 +2166,13 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     }
 
     // Convert reference line to transition array
+    // CRITICAL: Initialize refLine[0] = 0 to maintain invariant at start
+    // The invariant is: refLine[b1i-1] <= codingLine[a0i] < refLine[b1i]
+    // At the start, a0i=0, codingLine[0]=0, so we need refLine[-1] <= 0 < refLine[0]
+    // We accomplish this by setting refLine[0]=0, refLine[1]=first_real_transition
     int refIdx = 0;
+    refLine[refIdx++] = 0;  // Sentinel for the initial position
+
     bool refColor = false;
     for (int i = 0; i < width; ++i) {
       if (reference[i] != refColor) {
@@ -2182,7 +2188,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     // Initialize state
     codingLine[0] = 0;
     int a0i = 0;
-    int b1i = 0;
+    int b1i = 1;  // Start at 1 since refLine[0] is sentinel with value 0
     int blackPixels = 0;
 
     // Main decode loop using array-based approach
