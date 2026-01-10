@@ -1094,6 +1094,35 @@ std::unique_ptr<FormField> parse_form_field(const Pdf& pdf, const Dictionary& fi
 void parse_acro_form(const Pdf& pdf, DocumentCatalog& catalog);
 std::string generate_annotation_appearance(const Annotation& annot);
 
+// Phase 3: Form field value manipulation
+bool set_text_field_value(TextField* field, const std::string& value);
+bool set_button_field_checked(ButtonField* field, bool checked);
+bool set_choice_field_selection(ChoiceField* field, const std::vector<int>& indices);
+
+// Field validation
+bool validate_field_value(const FormField* field, const Value& value);
+std::string get_field_export_value(const FormField* field);
+
+// Find field by name
+FormField* find_field_by_name(DocumentCatalog& catalog, const std::string& field_name);
+
+// FDF (Forms Data Format) support
+struct FDFField {
+  std::string name;
+  Value value;
+};
+
+struct FDFData {
+  std::vector<FDFField> fields;
+  std::string pdf_file;  // F - Source PDF file
+  std::vector<std::string> field_names;  // Fields - List of field names
+};
+
+bool export_form_data_fdf(const Pdf& pdf, const std::string& output_path);
+std::string export_form_data_fdf_string(const Pdf& pdf);
+bool import_form_data_fdf(Pdf& pdf, const std::string& fdf_path);
+bool import_form_data_fdf_string(Pdf& pdf, const std::string& fdf_data);
+
 // Phase 4: Document Structure - Function declarations
 std::unique_ptr<OutlineItem> parse_outline_item(const Pdf& pdf, const Dictionary& outline_dict);
 void parse_document_outline(const Pdf& pdf, DocumentCatalog& catalog);

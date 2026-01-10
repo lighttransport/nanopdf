@@ -95,6 +95,9 @@ set(NANOPDF_SOURCES
   src/color-transform.cc
   src/tiff-decoder.cc
   src/text-layout.cc
+  src/table-extraction.cc
+  src/form-manipulation.cc
+  src/document-structure.cc
   src/stb_image_impl.cc
   src/stb_image_write_impl.cc
   src/stb_truetype_impl.cc
@@ -242,8 +245,11 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     "test_phase2_text|src/test-phase2-text-extraction.cc"
     "test_phase2_text_layout|test_phase2_text_layout.cc"
     "test_phase2_text_layout_integration|test_phase2_text_layout_integration.cc"
+    "test_phase2_table_extraction|test_phase2_table_extraction.cc"
     "test_phase3|src/test-phase3-features.cc"
+    "test_phase3_form_manipulation|test_phase3_form_manipulation.cc"
     "test_phase4|src/test-phase4-features.cc"
+    "test_phase4_document_structure|test_phase4_document_structure.cc"
     "test_phase5|src/test-phase5-features.cc"
     "test_phase6|src/test-phase6-features.cc"
   )
