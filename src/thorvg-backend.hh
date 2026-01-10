@@ -251,6 +251,10 @@ private:
   // Apply pattern fill to a shape
   bool apply_pattern_fill(tvg::Shape* shape, const std::string& pattern_name, bool is_stroke);
 
+  // Apply tiling pattern fill
+  bool apply_tiling_pattern(tvg::Shape* shape, const TilingPattern* tiling,
+                            const std::vector<double>& matrix, bool is_stroke);
+
   // Apply clipping path and push shape to scene
   bool push_with_clip(tvg::Shape* shape);
 
