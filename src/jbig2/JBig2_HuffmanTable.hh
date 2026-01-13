@@ -9,6 +9,7 @@
 #ifndef NANOPDF_JBIG2_HUFFMANTABLE_HH_
 #define NANOPDF_JBIG2_HUFFMANTABLE_HH_
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 

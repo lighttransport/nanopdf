@@ -18,6 +18,12 @@ extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
 
+// C++14 compatible clamp (std::clamp is C++17)
+template<typename T>
+constexpr T clamp14(const T& v, const T& lo, const T& hi) {
+  return (v < lo) ? lo : (hi < v) ? hi : v;
+}
+
 // WinAnsiEncoding to Unicode mapping table
 static const uint16_t kWinAnsiEncoding[256] = {
     0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007,
@@ -335,9 +341,9 @@ static void draw_gouraud_triangle(uint32_t* bitmap, int width, int height,
       float g = intersections[0].g + t * (intersections[1].g - intersections[0].g);
       float b = intersections[0].b + t * (intersections[1].b - intersections[0].b);
 
-      uint8_t ri = static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f));
-      uint8_t gi = static_cast<uint8_t>(std::clamp(g * 255.0f, 0.0f, 255.0f));
-      uint8_t bi = static_cast<uint8_t>(std::clamp(b * 255.0f, 0.0f, 255.0f));
+      uint8_t ri = static_cast<uint8_t>(clamp14(r * 255.0f, 0.0f, 255.0f));
+      uint8_t gi = static_cast<uint8_t>(clamp14(g * 255.0f, 0.0f, 255.0f));
+      uint8_t bi = static_cast<uint8_t>(clamp14(b * 255.0f, 0.0f, 255.0f));
 
       row[x] = 0xFF000000 | (bi << 16) | (gi << 8) | ri;  // BGRA format
     }
@@ -1990,7 +1996,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // For now, use a fallback gradient based on function endpoints
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2042,7 +2048,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid mesh data - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2053,7 +2059,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2154,7 +2160,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2172,13 +2178,13 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
     picture->translate(x, y);
     scene_->push(picture);
-    delete shape;  // Don't need shape wrapper
+    tvg::Paint::rel(shape);  // Don't need shape wrapper
     return true;
   }
   else if (shading->type == ShadingType::CoonsPatchMesh ||
@@ -2202,7 +2208,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid patch data - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2213,7 +2219,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2306,7 +2312,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2324,13 +2330,13 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
     picture->translate(x, y);
     scene_->push(picture);
-    delete shape;
+    tvg::Paint::rel(shape);
     return true;
   }
   else {
