@@ -374,6 +374,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     "test_phase4|src/test-phase4-features.cc"
     "test_phase5|src/test-phase5-features.cc"
     "test_phase6|src/test-phase6-features.cc"
+    "test_phase7|src/test-phase7-features.cc"
   )
 
   foreach(_spec ${_NANOPDF_PHASE_TEST_SPECS})
@@ -385,6 +386,9 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
 
   if(TARGET test_phase2_realpdf)
     target_compile_definitions(test_phase2_realpdf PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  endif()
+  if(TARGET test_phase7)
+    target_compile_definitions(test_phase7 PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
   endif()
 
   # ThorVG backend test
@@ -419,6 +423,11 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   if(NANOPDF_USE_BLEND2D)
     target_link_libraries(benchmark PRIVATE blend2d::blend2d)
   endif()
+
+  add_executable(ccitt_compare tools/ccitt_compare.cc)
+  target_include_directories(ccitt_compare PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(ccitt_compare PRIVATE ${BUILD_TARGET})
+  add_sanitizers(ccitt_compare)
 endif()
 
 # For WASM builds, create a JavaScript module

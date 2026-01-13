@@ -3,6 +3,7 @@
 #include "nanostring.h"
 #else
 #include <algorithm>
+#include <cstdlib>
 #include <cctype>
 #include <cstring>
 #include <deque>
@@ -1627,6 +1628,23 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       return static_cast<int>(result);
     }
 
+    int look_bits(int n) {
+      int bits_available = 0;
+      int value = look_bits_partial(n, &bits_available);
+      if (bits_available == 0) {
+        return -1;
+      }
+      return value;
+    }
+
+    void eat_bits(int n) {
+      for (int i = 0; i < n; ++i) {
+        if (get_bit() < 0) {
+          break;
+        }
+      }
+    }
+
     bool align_to_byte() {
       if (byte_pos >= size) {
         return false;
@@ -1658,195 +1676,401 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     }
   };
 
-  struct CodeEntry {
-    uint16_t code;
-    uint8_t length;
-    uint16_t run;
-    bool is_makeup;
+  struct CCITTCode {
+    int16_t bits;
+    int16_t run;
   };
 
-  // White terminating codes per ITU-T T.4 Table 1
-  static const CodeEntry kWhiteTerminating[] = {
-      {0x35, 8, 0, false},   {0x07, 6, 1, false},   {0x07, 4, 2, false},
-      {0x08, 4, 3, false},   {0x0B, 4, 4, false},   {0x0C, 4, 5, false},
-      {0x0E, 4, 6, false},   {0x0F, 4, 7, false},   {0x13, 5, 8, false},
-      {0x14, 5, 9, false},   {0x07, 5, 10, false},  {0x08, 5, 11, false},
-      {0x08, 6, 12, false},  {0x03, 6, 13, false},  {0x34, 6, 14, false},
-      {0x35, 6, 15, false},  {0x2A, 6, 16, false},  {0x2B, 6, 17, false},
-      {0x27, 7, 18, false},  {0x0C, 7, 19, false},  {0x08, 7, 20, false},
-      {0x17, 7, 21, false},  {0x03, 7, 22, false},  {0x04, 7, 23, false},
-      {0x28, 7, 24, false},  {0x2B, 7, 25, false},  {0x13, 7, 26, false},
-      {0x24, 7, 27, false},  {0x18, 7, 28, false},  {0x02, 8, 29, false},
-      {0x03, 8, 30, false},  {0x1A, 8, 31, false},  {0x1B, 8, 32, false},
-      {0x12, 8, 33, false},  {0x13, 8, 34, false},  {0x14, 8, 35, false},
-      {0x15, 8, 36, false},  {0x16, 8, 37, false},  {0x17, 8, 38, false},
-      {0x28, 8, 39, false},  {0x29, 8, 40, false},  {0x2A, 8, 41, false},
-      {0x2B, 8, 42, false},  {0x2C, 8, 43, false},  {0x2D, 8, 44, false},
-      {0x04, 8, 45, false},  {0x05, 8, 46, false},  {0x0A, 8, 47, false},
-      {0x0B, 8, 48, false},  {0x52, 8, 49, false},  {0x53, 8, 50, false},
-      {0x54, 8, 51, false},  {0x55, 8, 52, false},  {0x24, 8, 53, false},
-      {0x25, 8, 54, false},  {0x58, 8, 55, false},  {0x59, 8, 56, false},
-      {0x5A, 8, 57, false},  {0x5B, 8, 58, false},  {0x4A, 8, 59, false},
-      {0x4B, 8, 60, false},  {0x32, 8, 61, false},  {0x33, 8, 62, false},
-      {0x34, 8, 63, false},
+  static constexpr int kCcittEol = -2;
+
+  // Poppler CCITT tables (from ref/poppler/poppler/Stream-CCITT.h).
+  static const CCITTCode kWhiteTab1[32] = {
+      { -1, -1 }, // 00000
+      { 12, kCcittEol }, // 00001
+      { -1, -1 },       { -1, -1 }, // 0001x
+      { -1, -1 },       { -1, -1 },   { -1, -1 }, { -1, -1 }, // 001xx
+      { -1, -1 },       { -1, -1 },   { -1, -1 }, { -1, -1 }, // 010xx
+      { -1, -1 },       { -1, -1 },   { -1, -1 }, { -1, -1 }, // 011xx
+      { 11, 1792 },     { 11, 1792 }, // 1000x
+      { 12, 1984 }, // 10010
+      { 12, 2048 }, // 10011
+      { 12, 2112 }, // 10100
+      { 12, 2176 }, // 10101
+      { 12, 2240 }, // 10110
+      { 12, 2304 }, // 10111
+      { 11, 1856 },     { 11, 1856 }, // 1100x
+      { 11, 1920 },     { 11, 1920 }, // 1101x
+      { 12, 2368 }, // 11100
+      { 12, 2432 }, // 11101
+      { 12, 2496 }, // 11110
+      { 12, 2560 } // 11111
   };
 
-  // White makeup codes per ITU-T T.4 Table 1
-  static const CodeEntry kWhiteMakeup[] = {
-      {0x1B, 5, 64, true},   {0x12, 5, 128, true},  {0x17, 6, 192, true},
-      {0x37, 7, 256, true},  {0x36, 8, 320, true},  {0x37, 8, 384, true},
-      {0x64, 8, 448, true},  {0x65, 8, 512, true},  {0x68, 8, 576, true},
-      {0x67, 8, 640, true},  {0xCC, 8, 704, true},  {0xCD, 8, 768, true},
-      {0xD2, 8, 832, true},  {0xD3, 8, 896, true},  {0xD4, 8, 960, true},
-      {0xD5, 8, 1024, true}, {0xD6, 8, 1088, true}, {0xD7, 8, 1152, true},
-      {0xD8, 8, 1216, true}, {0xD9, 8, 1280, true}, {0xDA, 8, 1344, true},
-      {0xDB, 8, 1408, true}, {0x98, 9, 1472, true}, {0x99, 9, 1536, true},
-      {0x9A, 9, 1600, true}, {0x18, 9, 1664, true}, {0x9B, 9, 1728, true},
-      {0x08, 11, 1792, true}, {0x0C, 11, 1856, true}, {0x0D, 11, 1920, true},
-      {0x12, 12, 1984, true}, {0x13, 12, 2048, true}, {0x14, 12, 2112, true},
-      {0x15, 12, 2176, true}, {0x16, 12, 2240, true}, {0x17, 12, 2304, true},
-      {0x1C, 12, 2368, true}, {0x1D, 12, 2432, true}, {0x1E, 12, 2496, true},
-      {0x1F, 12, 2560, true},
+  static const CCITTCode kWhiteTab2[512] = {
+      { -1, -1 },  { -1, -1 },  { -1, -1 },  { -1, -1 }, // 0000000xx
+      { 8, 29 },   { 8, 29 }, // 00000010x
+      { 8, 30 },   { 8, 30 }, // 00000011x
+      { 8, 45 },   { 8, 45 }, // 00000100x
+      { 8, 46 },   { 8, 46 }, // 00000101x
+      { 7, 22 },   { 7, 22 },   { 7, 22 },   { 7, 22 }, // 0000011xx
+      { 7, 23 },   { 7, 23 },   { 7, 23 },   { 7, 23 }, // 0000100xx
+      { 8, 47 },   { 8, 47 }, // 00001010x
+      { 8, 48 },   { 8, 48 }, // 00001011x
+      { 6, 13 },   { 6, 13 },   { 6, 13 },   { 6, 13 }, // 000011xxx
+      { 6, 13 },   { 6, 13 },   { 6, 13 },   { 6, 13 },   { 7, 20 },   { 7, 20 },   { 7, 20 },   { 7, 20 }, // 0001000xx
+      { 8, 33 },   { 8, 33 }, // 00010010x
+      { 8, 34 },   { 8, 34 }, // 00010011x
+      { 8, 35 },   { 8, 35 }, // 00010100x
+      { 8, 36 },   { 8, 36 }, // 00010101x
+      { 8, 37 },   { 8, 37 }, // 00010110x
+      { 8, 38 },   { 8, 38 }, // 00010111x
+      { 7, 19 },   { 7, 19 },   { 7, 19 },   { 7, 19 }, // 0001100xx
+      { 8, 31 },   { 8, 31 }, // 00011010x
+      { 8, 32 },   { 8, 32 }, // 00011011x
+      { 6, 1 },    { 6, 1 },    { 6, 1 },    { 6, 1 }, // 000111xxx
+      { 6, 1 },    { 6, 1 },    { 6, 1 },    { 6, 1 },    { 6, 12 },   { 6, 12 },   { 6, 12 },   { 6, 12 }, // 001000xxx
+      { 6, 12 },   { 6, 12 },   { 6, 12 },   { 6, 12 },   { 8, 53 },   { 8, 53 }, // 00100100x
+      { 8, 54 },   { 8, 54 }, // 00100101x
+      { 7, 26 },   { 7, 26 },   { 7, 26 },   { 7, 26 }, // 0010011xx
+      { 8, 39 },   { 8, 39 }, // 00101000x
+      { 8, 40 },   { 8, 40 }, // 00101001x
+      { 8, 41 },   { 8, 41 }, // 00101010x
+      { 8, 42 },   { 8, 42 }, // 00101011x
+      { 8, 43 },   { 8, 43 }, // 00101100x
+      { 8, 44 },   { 8, 44 }, // 00101101x
+      { 7, 21 },   { 7, 21 },   { 7, 21 },   { 7, 21 }, // 0010111xx
+      { 7, 28 },   { 7, 28 },   { 7, 28 },   { 7, 28 }, // 0011000xx
+      { 8, 61 },   { 8, 61 }, // 00110010x
+      { 8, 62 },   { 8, 62 }, // 00110011x
+      { 8, 63 },   { 8, 63 }, // 00110100x
+      { 8, 0 },    { 8, 0 }, // 00110101x
+      { 8, 320 },  { 8, 320 }, // 00110110x
+      { 8, 384 },  { 8, 384 }, // 00110111x
+      { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 }, // 00111xxxx
+      { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },  { 5, 10 },  { 5, 10 },  { 5, 10 },  { 5, 11 },  { 5, 11 },  { 5, 11 },  { 5, 11 }, // 01000xxxx
+      { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },  { 5, 11 },  { 5, 11 },  { 5, 11 },  { 7, 27 },  { 7, 27 },  { 7, 27 },  { 7, 27 }, // 0100100xx
+      { 8, 59 },   { 8, 59 }, // 01001010x
+      { 8, 60 },   { 8, 60 }, // 01001011x
+      { 9, 1472 }, // 010011000
+      { 9, 1536 }, // 010011001
+      { 9, 1600 }, // 010011010
+      { 9, 1728 }, // 010011011
+      { 7, 18 },   { 7, 18 },   { 7, 18 },   { 7, 18 }, // 0100111xx
+      { 7, 24 },   { 7, 24 },   { 7, 24 },   { 7, 24 }, // 0101000xx
+      { 8, 49 },   { 8, 49 }, // 01010010x
+      { 8, 50 },   { 8, 50 }, // 01010011x
+      { 8, 51 },   { 8, 51 }, // 01010100x
+      { 8, 52 },   { 8, 52 }, // 01010101x
+      { 7, 25 },   { 7, 25 },   { 7, 25 },   { 7, 25 }, // 0101011xx
+      { 8, 55 },   { 8, 55 }, // 01011000x
+      { 8, 56 },   { 8, 56 }, // 01011001x
+      { 8, 57 },   { 8, 57 }, // 01011010x
+      { 8, 58 },   { 8, 58 }, // 01011011x
+      { 6, 192 },  { 6, 192 },  { 6, 192 },  { 6, 192 }, // 010111xxx
+      { 6, 192 },  { 6, 192 },  { 6, 192 },  { 6, 192 },  { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, // 011000xxx
+      { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, { 8, 448 },  { 8, 448 }, // 01100100x
+      { 8, 512 },  { 8, 512 }, // 01100101x
+      { 9, 704 }, // 011001100
+      { 9, 768 }, // 011001101
+      { 8, 640 },  { 8, 640 }, // 01100111x
+      { 8, 576 },  { 8, 576 }, // 01101000x
+      { 9, 832 }, // 011010010
+      { 9, 896 }, // 011010011
+      { 9, 960 }, // 011010100
+      { 9, 1024 }, // 011010101
+      { 9, 1088 }, // 011010110
+      { 9, 1152 }, // 011010111
+      { 9, 1216 }, // 011011000
+      { 9, 1280 }, // 011011001
+      { 9, 1344 }, // 011011010
+      { 9, 1408 }, // 011011011
+      { 7, 256 },  { 7, 256 },  { 7, 256 },  { 7, 256 }, // 0110111xx
+      { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 }, // 0111xxxxx
+      { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },
+      { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 }, // 1000xxxxx
+      { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },
+      { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 5, 128 }, { 5, 128 }, { 5, 128 }, { 5, 128 }, // 10010xxxx
+      { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 }, { 5, 128 }, { 5, 128 }, { 5, 128 }, { 5, 8 },   { 5, 8 },   { 5, 8 },   { 5, 8 }, // 10011xxxx
+      { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },   { 5, 8 },   { 5, 8 },   { 5, 8 },   { 5, 9 },   { 5, 9 },   { 5, 9 },   { 5, 9 }, // 10100xxxx
+      { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },   { 5, 9 },   { 5, 9 },   { 5, 9 },   { 6, 16 },  { 6, 16 },  { 6, 16 },  { 6, 16 }, // 101010xxx
+      { 6, 16 },   { 6, 16 },   { 6, 16 },   { 6, 16 },   { 6, 17 },   { 6, 17 },   { 6, 17 },   { 6, 17 }, // 101011xxx
+      { 6, 17 },   { 6, 17 },   { 6, 17 },   { 6, 17 },   { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 }, // 1011xxxxx
+      { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },
+      { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 }, // 1100xxxxx
+      { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },
+      { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 6, 14 },  { 6, 14 },  { 6, 14 },  { 6, 14 }, // 110100xxx
+      { 6, 14 },   { 6, 14 },   { 6, 14 },   { 6, 14 },   { 6, 15 },   { 6, 15 },   { 6, 15 },   { 6, 15 }, // 110101xxx
+      { 6, 15 },   { 6, 15 },   { 6, 15 },   { 6, 15 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 }, // 11011xxxx
+      { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },  { 5, 64 },  { 5, 64 },  { 5, 64 },  { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 }, // 1110xxxxx
+      { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },
+      { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 }, // 1111xxxxx
+      { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },
+      { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 }
   };
 
-  // Black terminating codes per ITU-T T.4 Table 2
-  static const CodeEntry kBlackTerminating[] = {
-      {0x037, 10, 0, false}, {0x02, 3, 1, false},   {0x03, 2, 2, false},
-      {0x02, 2, 3, false},   {0x03, 3, 4, false},   {0x03, 4, 5, false},
-      {0x02, 4, 6, false},   {0x03, 5, 7, false},   {0x05, 6, 8, false},
-      {0x04, 6, 9, false},   {0x04, 7, 10, false},  {0x05, 7, 11, false},
-      {0x07, 7, 12, false},  {0x04, 8, 13, false},  {0x07, 8, 14, false},
-      {0x18, 9, 15, false},  {0x17, 10, 16, false}, {0x18, 10, 17, false},
-      {0x08, 10, 18, false}, {0x67, 11, 19, false}, {0x68, 11, 20, false},
-      {0x6C, 11, 21, false}, {0x37, 11, 22, false}, {0x28, 11, 23, false},
-      {0x17, 11, 24, false}, {0x18, 11, 25, false}, {0xCA, 12, 26, false},
-      {0xCB, 12, 27, false}, {0xCC, 12, 28, false}, {0xCD, 12, 29, false},
-      {0x68, 12, 30, false}, {0x69, 12, 31, false}, {0x6A, 12, 32, false},
-      {0x6B, 12, 33, false}, {0xD2, 12, 34, false}, {0xD3, 12, 35, false},
-      {0xD4, 12, 36, false}, {0xD5, 12, 37, false}, {0xD6, 12, 38, false},
-      {0xD7, 12, 39, false}, {0x6C, 12, 40, false}, {0x6D, 12, 41, false},
-      {0xDA, 12, 42, false}, {0xDB, 12, 43, false}, {0x54, 12, 44, false},
-      {0x55, 12, 45, false}, {0x56, 12, 46, false}, {0x57, 12, 47, false},
-      {0x64, 12, 48, false}, {0x65, 12, 49, false}, {0x52, 12, 50, false},
-      {0x53, 12, 51, false}, {0x24, 12, 52, false}, {0x37, 12, 53, false},
-      {0x38, 12, 54, false}, {0x27, 12, 55, false}, {0x28, 12, 56, false},
-      {0x58, 12, 57, false}, {0x59, 12, 58, false}, {0x2B, 12, 59, false},
-      {0x2C, 12, 60, false}, {0x5A, 12, 61, false}, {0x66, 12, 62, false},
-      {0x67, 12, 63, false},
+  static const CCITTCode kBlackTab1[128] = { { -1, -1 },       { -1, -1 }, // 000000000000x
+                                          { 12, kCcittEol }, { 12, kCcittEol }, // 000000000001x
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000001xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000010xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000011xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000100xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000101xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000110xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000111xx
+                                          { 11, 1792 },     { 11, 1792 },     { 11, 1792 }, { 11, 1792 }, // 00000001000xx
+                                          { 12, 1984 },     { 12, 1984 }, // 000000010010x
+                                          { 12, 2048 },     { 12, 2048 }, // 000000010011x
+                                          { 12, 2112 },     { 12, 2112 }, // 000000010100x
+                                          { 12, 2176 },     { 12, 2176 }, // 000000010101x
+                                          { 12, 2240 },     { 12, 2240 }, // 000000010110x
+                                          { 12, 2304 },     { 12, 2304 }, // 000000010111x
+                                          { 11, 1856 },     { 11, 1856 },     { 11, 1856 }, { 11, 1856 }, // 00000001100xx
+                                          { 11, 1920 },     { 11, 1920 },     { 11, 1920 }, { 11, 1920 }, // 00000001101xx
+                                          { 12, 2368 },     { 12, 2368 }, // 000000011100x
+                                          { 12, 2432 },     { 12, 2432 }, // 000000011101x
+                                          { 12, 2496 },     { 12, 2496 }, // 000000011110x
+                                          { 12, 2560 },     { 12, 2560 }, // 000000011111x
+                                          { 10, 18 },       { 10, 18 },       { 10, 18 },   { 10, 18 }, // 0000001000xxx
+                                          { 10, 18 },       { 10, 18 },       { 10, 18 },   { 10, 18 },   { 12, 52 }, { 12, 52 }, // 000000100100x
+                                          { 13, 640 }, // 0000001001010
+                                          { 13, 704 }, // 0000001001011
+                                          { 13, 768 }, // 0000001001100
+                                          { 13, 832 }, // 0000001001101
+                                          { 12, 55 },       { 12, 55 }, // 000000100111x
+                                          { 12, 56 },       { 12, 56 }, // 000000101000x
+                                          { 13, 1280 }, // 0000001010010
+                                          { 13, 1344 }, // 0000001010011
+                                          { 13, 1408 }, // 0000001010100
+                                          { 13, 1472 }, // 0000001010101
+                                          { 12, 59 },       { 12, 59 }, // 000000101011x
+                                          { 12, 60 },       { 12, 60 }, // 000000101100x
+                                          { 13, 1536 }, // 0000001011010
+                                          { 13, 1600 }, // 0000001011011
+                                          { 11, 24 },       { 11, 24 },       { 11, 24 },   { 11, 24 }, // 00000010111xx
+                                          { 11, 25 },       { 11, 25 },       { 11, 25 },   { 11, 25 }, // 00000011000xx
+                                          { 13, 1664 }, // 0000001100100
+                                          { 13, 1728 }, // 0000001100101
+                                          { 12, 320 },      { 12, 320 }, // 000000110011x
+                                          { 12, 384 },      { 12, 384 }, // 000000110100x
+                                          { 12, 448 },      { 12, 448 }, // 000000110101x
+                                          { 13, 512 }, // 0000001101100
+                                          { 13, 576 }, // 0000001101101
+                                          { 12, 53 },       { 12, 53 }, // 000000110111x
+                                          { 12, 54 },       { 12, 54 }, // 000000111000x
+                                          { 13, 896 }, // 0000001110010
+                                          { 13, 960 }, // 0000001110011
+                                          { 13, 1024 }, // 0000001110100
+                                          { 13, 1088 }, // 0000001110101
+                                          { 13, 1152 }, // 0000001110110
+                                          { 13, 1216 }, // 0000001110111
+                                          { 10, 64 },       { 10, 64 },       { 10, 64 },   { 10, 64 }, // 0000001111xxx
+                                          { 10, 64 },       { 10, 64 },       { 10, 64 },   { 10, 64 } };
+
+  static const CCITTCode kBlackTab2[192] = {
+    { 8, 13 },   { 8, 13 },  { 8, 13 },  { 8, 13 }, // 00000100xxxx
+    { 8, 13 },   { 8, 13 },  { 8, 13 },  { 8, 13 },  { 8, 13 },   { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 11, 23 }, { 11, 23 }, // 00000101000x
+    { 12, 50 }, // 000001010010
+    { 12, 51 }, // 000001010011
+    { 12, 44 }, // 000001010100
+    { 12, 45 }, // 000001010101
+    { 12, 46 }, // 000001010110
+    { 12, 47 }, // 000001010111
+    { 12, 57 }, // 000001011000
+    { 12, 58 }, // 000001011001
+    { 12, 61 }, // 000001011010
+    { 12, 256 }, // 000001011011
+    { 10, 16 },  { 10, 16 }, { 10, 16 }, { 10, 16 }, // 0000010111xx
+    { 10, 17 },  { 10, 17 }, { 10, 17 }, { 10, 17 }, // 0000011000xx
+    { 12, 48 }, // 000001100100
+    { 12, 49 }, // 000001100101
+    { 12, 62 }, // 000001100110
+    { 12, 63 }, // 000001100111
+    { 12, 30 }, // 000001101000
+    { 12, 31 }, // 000001101001
+    { 12, 32 }, // 000001101010
+    { 12, 33 }, // 000001101011
+    { 12, 40 }, // 000001101100
+    { 12, 41 }, // 000001101101
+    { 11, 22 },  { 11, 22 }, // 00000110111x
+    { 8, 14 },   { 8, 14 },  { 8, 14 },  { 8, 14 }, // 00000111xxxx
+    { 8, 14 },   { 8, 14 },  { 8, 14 },  { 8, 14 },  { 8, 14 },   { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 7, 10 },  { 7, 10 },  { 7, 10 }, { 7, 10 }, // 0000100xxxxx
+    { 7, 10 },   { 7, 10 },  { 7, 10 },  { 7, 10 },  { 7, 10 },   { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 },  { 7, 10 },  { 7, 10 }, { 7, 10 },
+    { 7, 10 },   { 7, 10 },  { 7, 10 },  { 7, 10 },  { 7, 10 },   { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 11 },  { 7, 11 },  { 7, 11 }, { 7, 11 }, // 0000101xxxxx
+    { 7, 11 },   { 7, 11 },  { 7, 11 },  { 7, 11 },  { 7, 11 },   { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 },  { 7, 11 },  { 7, 11 }, { 7, 11 },
+    { 7, 11 },   { 7, 11 },  { 7, 11 },  { 7, 11 },  { 7, 11 },   { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 9, 15 },  { 9, 15 },  { 9, 15 }, { 9, 15 }, // 000011000xxx
+    { 9, 15 },   { 9, 15 },  { 9, 15 },  { 9, 15 },  { 12, 128 }, // 000011001000
+    { 12, 192 }, // 000011001001
+    { 12, 26 }, // 000011001010
+    { 12, 27 }, // 000011001011
+    { 12, 28 }, // 000011001100
+    { 12, 29 }, // 000011001101
+    { 11, 19 },  { 11, 19 }, // 00001100111x
+    { 11, 20 },  { 11, 20 }, // 00001101000x
+    { 12, 34 }, // 000011010010
+    { 12, 35 }, // 000011010011
+    { 12, 36 }, // 000011010100
+    { 12, 37 }, // 000011010101
+    { 12, 38 }, // 000011010110
+    { 12, 39 }, // 000011010111
+    { 11, 21 },  { 11, 21 }, // 00001101100x
+    { 12, 42 }, // 000011011010
+    { 12, 43 }, // 000011011011
+    { 10, 0 },   { 10, 0 },  { 10, 0 },  { 10, 0 }, // 0000110111xx
+    { 7, 12 },   { 7, 12 },  { 7, 12 },  { 7, 12 }, // 0000111xxxxx
+    { 7, 12 },   { 7, 12 },  { 7, 12 },  { 7, 12 },  { 7, 12 },   { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 },  { 7, 12 },  { 7, 12 }, { 7, 12 },
+    { 7, 12 },   { 7, 12 },  { 7, 12 },  { 7, 12 },  { 7, 12 },   { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }
   };
 
-  // Black makeup codes per ITU-T T.4 Table 2
-  static const CodeEntry kBlackMakeup[] = {
-      {0x0F, 10, 64, true},  {0xC8, 12, 128, true},  {0xC9, 12, 192, true},
-      {0x5B, 12, 256, true}, {0x33, 12, 320, true}, {0x34, 12, 384, true},
-      {0x35, 12, 448, true}, {0x6C, 13, 512, true}, {0x6D, 13, 576, true},
-      {0x4A, 13, 640, true}, {0x4B, 13, 704, true}, {0x4C, 13, 768, true},
-      {0x4D, 13, 832, true}, {0x72, 13, 896, true}, {0x73, 13, 960, true},
-      {0x74, 13, 1024, true}, {0x75, 13, 1088, true}, {0x76, 13, 1152, true},
-      {0x77, 13, 1216, true}, {0x52, 13, 1280, true}, {0x53, 13, 1344, true},
-      {0x54, 13, 1408, true}, {0x55, 13, 1472, true}, {0x5A, 13, 1536, true},
-      {0x5B, 13, 1600, true}, {0x64, 13, 1664, true}, {0x65, 13, 1728, true},
-      {0x08, 11, 1792, true}, {0x0C, 11, 1856, true}, {0x0D, 11, 1920, true},
-      {0x12, 12, 1984, true}, {0x13, 12, 2048, true}, {0x14, 12, 2112, true},
-      {0x15, 12, 2176, true}, {0x16, 12, 2240, true}, {0x17, 12, 2304, true},
-      {0x1C, 12, 2368, true}, {0x1D, 12, 2432, true}, {0x1E, 12, 2496, true},
-      {0x1F, 12, 2560, true},
-  };
+  static const CCITTCode kBlackTab3[64] = { { -1, -1 }, { -1, -1 }, { -1, -1 }, { -1, -1 }, // 0000xx
+                                         { 6, 9 }, // 000100
+                                         { 6, 8 }, // 000101
+                                         { 5, 7 },   { 5, 7 }, // 00011x
+                                         { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 }, // 0010xx
+                                         { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 }, // 0011xx
+                                         { 3, 1 },   { 3, 1 },   { 3, 1 },   { 3, 1 }, // 010xxx
+                                         { 3, 1 },   { 3, 1 },   { 3, 1 },   { 3, 1 },   { 3, 4 }, { 3, 4 }, { 3, 4 }, { 3, 4 }, // 011xxx
+                                         { 3, 4 },   { 3, 4 },   { 3, 4 },   { 3, 4 },   { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, // 10xxxx
+                                         { 2, 3 },   { 2, 3 },   { 2, 3 },   { 2, 3 },   { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, // 11xxxx
+                                         { 2, 2 },   { 2, 2 },   { 2, 2 },   { 2, 2 },   { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 } };
 
-  // Simple code lookup - tables now use correct MSB-first bit order
-  auto find_code = [](const CodeEntry* table, size_t count, uint32_t code,
-                      int length) -> const CodeEntry* {
-    for (size_t i = 0; i < count; ++i) {
-      if (table[i].length == length && table[i].code == code) {
-        return &table[i];
+  int decode_row_num = 0;
+
+  auto get_white_code = [&](BitReader& reader) -> int {
+    int code = 0;
+    if (params.end_of_block) {
+      code = reader.look_bits(12);
+      if (code < 0) {
+        return 1;
+      }
+      const CCITTCode* p = nullptr;
+      if ((code >> 5) == 0) {
+        p = &kWhiteTab1[code];
+      } else {
+        p = &kWhiteTab2[code >> 3];
+      }
+      if (p->bits > 0) {
+        reader.eat_bits(p->bits);
+        return p->run;
+      }
+    } else {
+      for (int n = 1; n <= 9; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 9) {
+          code <<= (9 - n);
+        }
+        const CCITTCode& p = kWhiteTab2[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
+      }
+      for (int n = 11; n <= 12; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 12) {
+          code <<= (12 - n);
+        }
+        const CCITTCode& p = kWhiteTab1[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
       }
     }
-    return nullptr;
+
+    NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Bad white code (0x%x)", code);
+    reader.eat_bits(1);
+    return 1;
+  };
+
+  auto get_black_code = [&](BitReader& reader) -> int {
+    int code = 0;
+    if (params.end_of_block) {
+      code = reader.look_bits(13);
+      if (code < 0) {
+        return 1;
+      }
+      const CCITTCode* p = nullptr;
+      if ((code >> 7) == 0) {
+        p = &kBlackTab1[code];
+      } else if ((code >> 9) == 0 && (code >> 7) != 0) {
+        p = &kBlackTab2[(code >> 1) - 64];
+      } else {
+        p = &kBlackTab3[code >> 7];
+      }
+      if (p->bits > 0) {
+        reader.eat_bits(p->bits);
+        return p->run;
+      }
+    } else {
+      for (int n = 2; n <= 6; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 6) {
+          code <<= (6 - n);
+        }
+        const CCITTCode& p = kBlackTab3[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
+      }
+      for (int n = 7; n <= 12; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 12) {
+          code <<= (12 - n);
+        }
+        if (code >= 64) {
+          const CCITTCode& p = kBlackTab2[code - 64];
+          if (p.bits == n) {
+            reader.eat_bits(n);
+            return p.run;
+          }
+        }
+      }
+      for (int n = 10; n <= 13; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 13) {
+          code <<= (13 - n);
+        }
+        const CCITTCode& p = kBlackTab1[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
+      }
+    }
+
+    NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Bad black code (0x%x)", code);
+    reader.eat_bits(1);
+    return 1;
   };
 
   auto decode_run = [&](BitReader& reader, bool white, int* run_length,
                         std::string* err) -> bool {
-    const CodeEntry* term_table = white ? kWhiteTerminating : kBlackTerminating;
-    const CodeEntry* makeup_table = white ? kWhiteMakeup : kBlackMakeup;
-    const size_t term_count = white ? sizeof(kWhiteTerminating) / sizeof(CodeEntry)
-                                    : sizeof(kBlackTerminating) / sizeof(CodeEntry);
-    const size_t makeup_count = white ? sizeof(kWhiteMakeup) / sizeof(CodeEntry)
-                                      : sizeof(kBlackMakeup) / sizeof(CodeEntry);
     int total = 0;
+    int code = 0;
+    do {
+      code = white ? get_white_code(reader) : get_black_code(reader);
+      total += code;
+    } while (code >= 64);
 
-    while (true) {
-      uint32_t code = 0;
-      BitReader::State state_before = reader.save();
-      for (int length = 1; length <= 13; ++length) {
-        int bit = reader.get_bit();
-        if (bit < 0) {
-          // Poppler-style: Try to extract code from partial bits at EOF
-          reader.restore(state_before);
-          int bits_available = 0;
-          int partial_code = reader.look_bits_partial(length, &bits_available);
-          if (partial_code >= 0 && bits_available > 0) {
-            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF reached, using %d partial bits (code=0x%x) for run",
-                              bits_available, partial_code);
-            // Try to find a valid code with the partial bits
-            code = static_cast<uint32_t>(partial_code);
-            // Advance reader by the bits we have
-            for (int i = 0; i < bits_available; ++i) {
-              reader.get_bit();
-            }
-            // Check if this forms a valid code
-            if (const CodeEntry* entry = find_code(term_table, term_count, code >> (length - bits_available), bits_available)) {
-              *run_length = entry->run;
-              return true;
-            }
-          }
-          // No valid partial code at EOF - return false to signal end of data
-          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF with no valid partial code, signaling end");
-          if (err) *err = "EOF while decoding run";
-          return false;
-        }
-        code = (code << 1) | static_cast<uint32_t>(bit);
-
-        if (const CodeEntry* entry = find_code(term_table, term_count, code, length)) {
-          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Found term code: len=%d code=0x%x run=%d white=%d",
-                            length, code, entry->run, white ? 1 : 0);
-          total += entry->run;
-          *run_length = total;
-          return true;
-        }
-        if (const CodeEntry* entry = find_code(makeup_table, makeup_count, code, length)) {
-          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Found makeup code: len=%d code=0x%x run=%d white=%d",
-                            length, code, entry->run, white ? 1 : 0);
-          total += entry->run;
-          goto decode_more;
-        }
-      }
-
-      {
-        // Poppler-style error recovery: eat 1 bit and return a small positive value
-        // This prevents infinite loops and allows decoding to continue
-        reader.restore(state_before);
-        int recovery_bit = reader.get_bit();
-        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Invalid code 0x%x at byte=%zu bit=%d (white=%d), eating 1 bit (%d) and returning run=total+1=%d+1=%d",
-                          code, state_before.byte_pos, state_before.bit_pos, white ? 1 : 0, recovery_bit, total, total+1);
-
-        // Dump bytes around failure position for debugging
-        if (state_before.byte_pos < reader.size) {
-          char hex_buf[128];
-          int hex_len = 0;
-          for (size_t i = state_before.byte_pos; i < std::min(state_before.byte_pos + 5, reader.size); ++i) {
-            hex_len += snprintf(hex_buf + hex_len, sizeof(hex_buf) - hex_len, "%02x ", reader.data[i]);
-          }
-          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Bytes at failure: %s", hex_buf);
-        }
-
-        // Return 1 to allow caller to continue (poppler approach)
-        *run_length = 1;
-        return true;
-      }
-
-    decode_more:
-      continue;
-    }
+    *run_length = total;
+    (void)err;
+    return true;
   };
 
   auto decode_row_1d = [&](BitReader& reader, std::vector<bool>& line,
@@ -1908,183 +2132,115 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     return true;
   };
 
-  auto compute_transitions = [&](const std::vector<bool>& line) {
-    std::vector<int> transitions;
-    bool current = false;
-    for (int i = 0; i < static_cast<int>(line.size()); ++i) {
-      bool black = line[i];
-      if (black != current) {
-        transitions.push_back(i);
-        current = black;
-      }
-    }
-    transitions.push_back(static_cast<int>(line.size()));
-    return transitions;
+
+  struct TwoDimCodeEntry {
+    int8_t bits;
+    int8_t code;
   };
 
-  auto apply_transitions = [&](const std::vector<int>& transitions,
-                               std::vector<bool>* line) {
-    if (!line) return;
-    std::fill(line->begin(), line->end(), false);
-    std::vector<int> sorted = transitions;
-    if (sorted.empty() || sorted.back() != static_cast<int>(line->size())) {
-      sorted.push_back(static_cast<int>(line->size()));
-    }
-    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+  static constexpr int kTwoDimPass = 0;
+  static constexpr int kTwoDimHoriz = 1;
+  static constexpr int kTwoDimVert0 = 2;
+  static constexpr int kTwoDimVertR1 = 3;
+  static constexpr int kTwoDimVertL1 = 4;
+  static constexpr int kTwoDimVertR2 = 5;
+  static constexpr int kTwoDimVertL2 = 6;
+  static constexpr int kTwoDimVertR3 = 7;
+  static constexpr int kTwoDimVertL3 = 8;
 
-    int start = 0;
-    bool black = false;
-    for (int pos : sorted) {
-      if (pos < start) {
-        continue;
+  static const TwoDimCodeEntry kTwoDimTab[128] = {
+      { -1, -1 },          { -1, -1 }, // 000000x
+      { 7, kTwoDimVertL3 }, { 7, kTwoDimVertR3 }, // 000001x
+      { 6, kTwoDimVertL2 }, { 6, kTwoDimVertL2 }, // 000010x
+      { 6, kTwoDimVertR2 }, { 6, kTwoDimVertR2 }, // 000011x
+      { 4, kTwoDimPass },   { 4, kTwoDimPass }, // 0001xxx
+      { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz }, // 001xxxx
+      { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },
+      { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, // 010xxxx
+      { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 },
+      { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, // 011xxxx
+      { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 },
+      { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 }, // 1xxxxxx
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+  };
+
+  // Return codes: 0=vertical, 1=horizontal, 2=pass, -1=error
+  auto read_2d_code = [&](BitReader& reader, int* delta) -> int {
+    int code = -1;
+    if (params.end_of_block) {
+      int bits = reader.look_bits(7);
+      if (bits < 0) {
+        return -1;
       }
-      if (pos > static_cast<int>(line->size())) {
-        pos = static_cast<int>(line->size());
+      const TwoDimCodeEntry& entry = kTwoDimTab[bits];
+      if (entry.bits > 0) {
+        reader.eat_bits(entry.bits);
+        code = entry.code;
       }
-      if (black) {
-        for (int i = start; i < pos; ++i) {
-          (*line)[i] = true;
+    } else {
+      for (int n = 1; n <= 7; ++n) {
+        int bits = reader.look_bits(n);
+        if (bits < 0) {
+          return -1;
+        }
+        if (n < 7) {
+          bits <<= (7 - n);
+        }
+        const TwoDimCodeEntry& entry = kTwoDimTab[bits & 0x7f];
+        if (entry.bits == n) {
+          reader.eat_bits(n);
+          code = entry.code;
+          break;
         }
       }
-      start = pos;
-      black = !black;
     }
-  };
 
-  // Return codes: 0=vertical, 1=horizontal, 2=pass, 3=EOFB/extension, -1=error
-  auto read_2d_code = [&](BitReader& reader, int* delta) -> int {
-    uint32_t code = 0;
-    auto saved_state = reader.save();
-    for (int length = 1; length <= 7; ++length) {
-      int bit = reader.get_bit();
-      if (bit < 0) {
-        NANOPDF_LOG_TRACE("CCITTFaxDecode", "read_2d_code: EOF at length %d", length);
-        return 3;  // Treat EOF as end of data
-      }
-      code = (code << 1) | static_cast<uint32_t>(bit);
-      if (code == 0b1 && length == 1) {
+    if (code < 0) {
+      return -1;
+    }
+
+    switch (code) {
+      case 0:  // pass
+        return 2;
+      case 1:  // horizontal
+        return 1;
+      case 2:  // vert0
         if (delta) *delta = 0;
         return 0;
-      } else if (code == 0b011 && length == 3) {
+      case 3:  // vertR1
         if (delta) *delta = 1;
         return 0;
-      } else if (code == 0b010 && length == 3) {
+      case 4:  // vertL1
         if (delta) *delta = -1;
         return 0;
-      } else if (code == 0b001 && length == 3) {
-        return 1;
-      } else if (code == 0b0001 && length == 4) {
-        return 2;
-      } else if (code == 0b000011 && length == 6) {
+      case 5:  // vertR2
         if (delta) *delta = 2;
         return 0;
-      } else if (code == 0b000010 && length == 6) {
+      case 6:  // vertL2
         if (delta) *delta = -2;
         return 0;
-      } else if (code == 0b0000011 && length == 7) {
+      case 7:  // vertR3
         if (delta) *delta = 3;
         return 0;
-      } else if (code == 0b0000010 && length == 7) {
+      case 8:  // vertL3
         if (delta) *delta = -3;
         return 0;
-      } else if (code == 0b0000001 && length == 7) {
-        // Extension code prefix (0000001xxx)
-        // Check next 3 bits to determine if it's uncompressed mode or extension
-        int b1 = reader.get_bit();
-        int b2 = reader.get_bit();
-        int b3 = reader.get_bit();
-        if (b1 < 0 || b2 < 0 || b3 < 0) {
-          return 3;  // EOF
-        }
-        int ext_code = (b1 << 2) | (b2 << 1) | b3;
-        // Extension codes: 0000001 xxx (10 bits total)
-        // According to ITU-T T.6:
-        //   xxx=111: Enter uncompressed mode (standard)
-        //   xxx=000-110: Reserved for future use
-        if (ext_code == 7) {
-          // Standard uncompressed mode entry (xxx=111)
-          NANOPDF_LOG_TRACE("CCITTFaxDecode", "Uncompressed mode entry (xxx=7) at byte=%zu bit=%d",
-                            saved_state.byte_pos, saved_state.bit_pos);
-          return 4;  // Signal uncompressed mode
-        } else {
-          // Reserved extension code (xxx=000-110)
-          // Some encoders use these as markers or no-ops
-          // Consume the 10 bits and continue with normal 2D decoding
-          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Reserved extension code 0000001%d%d%d at byte=%zu - skipping",
-                            b1, b2, b3, saved_state.byte_pos);
-          return -2;  // Signal "skip and continue"
-        }
-      } else if (code == 0b0000000 && length == 7) {
-        // 7 zeros - could be start of EOFB (000000000001 000000000001)
-        // Need to verify by checking for full EOFB pattern (24 bits total)
-        // Read 5 more bits to complete first potential EOL (12 bits)
-        uint32_t eol_check = code;
-        bool eof_reached = false;
-        for (int i = 0; i < 5; ++i) {
-          int bit = reader.get_bit();
-          if (bit < 0) {
-            eof_reached = true;
-            break;
-          }
-          eol_check = (eol_check << 1) | static_cast<uint32_t>(bit);
-        }
-        if (eof_reached) {
-          // Hit EOF while checking for EOFB - this is NOT a valid EOFB
-          // Return mode 6 to signal "fill rest of row" rather than treating as EOFB
-          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF while checking EOFB pattern, filling row");
-          return 6;  // Fill rest of row and continue
-        }
-        // First 12 bits should be 000000000001 for valid EOL
-        if (eol_check == 0b000000000001) {
-          // Check for second EOL
-          uint32_t eol2 = 0;
-          for (int i = 0; i < 12; ++i) {
-            int bit = reader.get_bit();
-            if (bit < 0) break;
-            eol2 = (eol2 << 1) | static_cast<uint32_t>(bit);
-          }
-          if (eol2 == 0b000000000001) {
-            NANOPDF_LOG_TRACE("CCITTFaxDecode", "Found valid EOFB at byte=%zu bit=%d",
-                              saved_state.byte_pos, saved_state.bit_pos);
-            return 3;  // Valid EOFB
-          }
-        }
-        // Not a valid EOFB - this could be padding zeros indicating end of row
-        // Signal "fill rest of row" - the caller will complete the row and move to next
-        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Non-EOFB 7-zeros at byte=%zu bit=%d (eol=0x%03x), fill row",
-                          saved_state.byte_pos, saved_state.bit_pos, eol_check);
-        // Leave reader at position after the 12 bits we read (for possible alignment)
-        return 6;  // Signal "fill rest of row and continue"
-      }
+      default:
+        return -1;
     }
-    // Show bytes around error position for debugging
-    size_t start_byte = saved_state.byte_pos > 2 ? saved_state.byte_pos - 2 : 0;
-    size_t end_byte = saved_state.byte_pos + 4 < size ? saved_state.byte_pos + 4 : size;
-    std::string hex_dump;
-    for (size_t i = start_byte; i < end_byte; ++i) {
-      char buf[8];
-      snprintf(buf, sizeof(buf), "%02x ", data[i]);
-      hex_dump += buf;
-    }
-    NANOPDF_LOG_TRACE("CCITTFaxDecode", "read_2d_code: Invalid code 0x%x at byte %zu bit %d, bytes: %s",
-                      code, saved_state.byte_pos, saved_state.bit_pos, hex_dump.c_str());
-    return -1;
   };
 
   bool hit_eofb = false;  // Flag to signal end of facsimile block
 
-  // Poppler-style helper functions for array-based CCITT decoding
-  // These implement the conditional transition logic that achieves 100% accuracy
-  // Declare log_this_row early so lambdas can capture it
-  static int decode_row_num = 0;
-  bool log_this_row = (decode_row_num == 9 || decode_row_num == 10);
-
-  auto addPixels = [&log_this_row](int a1, int blackPixels, int* codingLine, int& a0i,
-                     int columns) -> void {
-    if (log_this_row) {
-      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "    addPixels(a1=%d, blackPixels=%d, codingLine[%d]=%d)",
-                        a1, blackPixels, a0i, codingLine[a0i]);
-    }
+  // Poppler-style helper functions for array-based CCITT decoding.
+  auto addPixels = [](int a1, int blackPixels, int* codingLine, int& a0i,
+                      int columns) -> void {
     if (a1 > codingLine[a0i]) {
       if (a1 > columns) {
         NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row overrun: a1=%d > columns=%d, clamping", a1, columns);
@@ -2098,14 +2254,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         ++a0i;
       }
       codingLine[a0i] = a1;
-      if (log_this_row) {
-        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "    -> %s a0i, codingLine[%d]=%d",
-                          will_increment ? "incremented" : "did NOT increment", a0i, a1);
-      }
-    } else {
-      if (log_this_row) {
-        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "    -> SKIPPED (a1=%d not > codingLine[%d]=%d)", a1, a0i, codingLine[a0i]);
-      }
     }
   };
 
@@ -2127,11 +2275,8 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Invalid negative a1=%d, setting to columns=%d", a1, columns);
         a1 = columns;  // CRITICAL: Poppler sets to columns, not 0!
       }
-      // Scan backwards to find correct insertion point
-      if (a0i > 0) {
-        --a0i;
-      }
-      while (a0i > 0 && codingLine[a0i - 1] >= a1) {
+      // Scan backwards to find correct insertion point (match poppler)
+      while (a0i > 0 && a1 <= codingLine[a0i - 1]) {
         --a0i;
       }
       codingLine[a0i] = a1;
@@ -2139,15 +2284,34 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     // else: a1 == codingLine[a0i], no change
   };
 
+  std::vector<int> prev_coding_line;
+  bool prev_coding_line_valid = false;
+  std::vector<int> coding_line_cache;
+  bool coding_line_cache_valid = false;
+
+  auto build_coding_line_from_bits = [](const std::vector<bool>& bits, int width,
+                                        std::vector<int>& out) {
+    out.resize(width + 2);
+    int idx = 0;
+    if (width > 0 && bits[0]) {
+      out[idx++] = 0;
+    }
+    for (int i = 1; i < width; ++i) {
+      if (bits[i] != bits[i - 1]) {
+        out[idx++] = i;
+      }
+    }
+    for (int i = idx; i < width + 2; ++i) {
+      out[i] = width;
+    }
+  };
+
   auto decode_row_2d = [&](BitReader& reader, const std::vector<bool>& reference,
                            std::vector<bool>& line, int width,
                            std::string* err) -> bool {
-    // Update logging flag for current row
-    log_this_row = (decode_row_num >= 9 && decode_row_num <= 11);
-
     // Array-based CCITT decoding (poppler style) for 100% accuracy
     // Use fixed arrays for typical widths, heap for large images
-    static constexpr int MAX_STATIC_WIDTH = 2400;
+    static constexpr int MAX_STATIC_WIDTH = 2402;
     int codingLine_static[MAX_STATIC_WIDTH];
     int refLine_static[MAX_STATIC_WIDTH];
     std::vector<int> codingLine_dynamic, refLine_dynamic;
@@ -2155,7 +2319,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     int* codingLine;
     int* refLine;
 
-    if (width <= MAX_STATIC_WIDTH) {
+    if (width + 2 <= MAX_STATIC_WIDTH) {
       codingLine = codingLine_static;
       refLine = refLine_static;
     } else {
@@ -2165,55 +2329,53 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       refLine = refLine_dynamic.data();
     }
 
-    // Convert reference line to transition array
-    // CRITICAL: Initialize refLine[0] = 0 to maintain invariant at start
-    // The invariant is: refLine[b1i-1] <= codingLine[a0i] < refLine[b1i]
-    // At the start, a0i=0, codingLine[0]=0, so we need refLine[-1] <= 0 < refLine[0]
-    // We accomplish this by setting refLine[0]=0, refLine[1]=first_real_transition
-    int refIdx = 0;
-    refLine[refIdx++] = 0;  // Sentinel for the initial position
-
-    bool refColor = false;
-    for (int i = 0; i < width; ++i) {
-      if (reference[i] != refColor) {
-        refLine[refIdx++] = i;
-        refColor = !refColor;
+    // Convert reference line to transition array (match poppler codingLine)
+    if (prev_coding_line_valid && static_cast<int>(prev_coding_line.size()) >= width + 2) {
+      for (int i = 0; i < width + 2; ++i) {
+        refLine[i] = prev_coding_line[i];
       }
-    }
-    // Poppler fills ALL remaining positions with columns (width)
-    for (int i = refIdx; i < width + 2; ++i) {
-      refLine[i] = width;
+    } else {
+      int refIdx = 0;
+      if (!reference.empty() && reference[0]) {
+        refLine[refIdx++] = 0;
+      }
+      for (int i = 1; i < width; ++i) {
+        if (reference[i] != reference[i - 1]) {
+          refLine[refIdx++] = i;
+        }
+      }
+      // Poppler fills ALL remaining positions with columns (width)
+      for (int i = refIdx; i < width + 2; ++i) {
+        refLine[i] = width;
+      }
     }
 
     // Initialize state
     codingLine[0] = 0;
     int a0i = 0;
-    int b1i = 1;  // Start at 1 since refLine[0] is sentinel with value 0
+    int b1i = 0;
     int blackPixels = 0;
 
     // Main decode loop using array-based approach
-    // (log_this_row declared above with addPixels)
 
     while (codingLine[a0i] < width) {
       BitReader::State mode_state = reader.save();
       int delta = 0;
       int mode = read_2d_code(reader, &delta);
+      bool row_done = false;
 
-      if (log_this_row) {
-        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row %d: mode=%d delta=%d at pos=%d a0i=%d blackPixels=%d",
-                          decode_row_num, mode, delta, codingLine[a0i], a0i, blackPixels);
-      }
       NANOPDF_LOG_TRACE("CCITTFaxDecode", "2D mode=%d delta=%d at byte=%zu bit=%d a0i=%d pos=%d",
                         mode, delta, mode_state.byte_pos, mode_state.bit_pos, a0i, codingLine[a0i]);
       // Error handling
       if (mode == -1) {
         if (reader.byte_pos >= reader.size) {
           NANOPDF_LOG_DEBUG("CCITTFaxDecode", "2D mode: out of data at pos=%d", codingLine[a0i]);
-          break;
+        } else {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "2D mode: invalid code at pos=%d", codingLine[a0i]);
         }
-        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "2D mode: invalid code at pos=%d", codingLine[a0i]);
         if (err) *err = "Invalid 2D code";
-        return false;
+        addPixels(width, 0, codingLine, a0i, width);
+        break;
       }
 
       if (mode == -2) {
@@ -2244,7 +2406,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         // refLine is filled up to width+2, so we only need to check against that
         if (b1i + 1 < width + 2) {
           addPixels(refLine[b1i + 1], blackPixels, codingLine, a0i, width);
-
           if (refLine[b1i + 1] < width) {
             b1i += 2;
           }
@@ -2259,82 +2420,29 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         // Decode two runs: first in current color, then opposite
         // CRITICAL: Poppler checks codingLine[a0i] < columns before second run!
         for (int pass = 0; pass < 2; ++pass) {
-          // Check if we should skip second run (poppler line 2022)
-          if (pass == 1 && codingLine[a0i] >= width) {
-            if (log_this_row) {
-              NANOPDF_LOG_DEBUG("CCITTFaxDecode", "  H-mode: skipping pass 1 (codingLine[%d]=%d >= width=%d)",
-                                a0i, codingLine[a0i], width);
-            }
-            break;
-          }
-
           bool decoding_white = (blackPixels == 0);
           if (pass == 1) decoding_white = !decoding_white;
-
-          int run = 0;
-          BitReader::State run_state = reader.save();
-
-          if (log_this_row) {
-            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "  H-mode pass=%d: about to decode %s run at byte=%zu bit=%d",
-                              pass, decoding_white ? "white" : "black", run_state.byte_pos, run_state.bit_pos);
-          }
-
-          if (!decode_run(reader, decoding_white, &run, err)) {
-            // Error recovery
-            if (pass == 1) {
-              reader.restore(run_state);
-              if (reader.get_bit() >= 0 && decode_run(reader, decoding_white, &run, nullptr)) {
-                goto h_success;
-              }
-              reader.restore(run_state);
-            }
-
-            // Check for mode code patterns
-            reader.restore(run_state);
-            uint32_t peek = 0;
-            for (int i = 0; i < 7 && reader.byte_pos < reader.size; ++i) {
-              int b = reader.get_bit();
-              if (b < 0) break;
-              peek = (peek << 1) | static_cast<uint32_t>(b);
-            }
-            reader.restore(run_state);
-
-            if (peek == 0b0000001 || peek == 0b0000000) {
-              break;
-            }
-
-            // Fill rest of row and break
-            for (int i = 0; i < 7 && reader.byte_pos < reader.size; ++i) {
-              reader.get_bit();
-            }
-            codingLine[a0i] = width;
-            break;
-          }
-        h_success:
-          if (log_this_row) {
-            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "  H-mode pass=%d: decoded run=%d (before clamping)", pass, run);
-          }
-
-          if (run < 0) run = 0;
-
-          // CRITICAL: addPixels uses current codingLine[a0i] which may be updated by first call
-          int target = codingLine[a0i] + run;
-          if (target > width) target = width;
-
-          // Pass correct color: blackPixels for first run, blackPixels^1 for second
           int color = (pass == 0) ? blackPixels : (blackPixels ^ 1);
 
-          if (log_this_row) {
-            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "  H-mode pass=%d: run=%d, base=%d, target=%d, color=%d, a0i_before=%d",
-                              pass, run, codingLine[a0i], target, color, a0i);
+          int run = 0;
+          if (!decode_run(reader, decoding_white, &run, err)) {
+            addPixels(width, color, codingLine, a0i, width);
+            row_done = true;
+            break;
           }
+          if (run < 0) run = 0;
 
-          addPixels(target, color, codingLine, a0i, width);
+          bool do_add = !(pass == 1 && codingLine[a0i] >= width);
+          if (do_add) {
+            // CRITICAL: addPixels uses current codingLine[a0i] which may be updated by first call
+            int target = codingLine[a0i] + run;
+            if (target > width) target = width;
 
-          if (log_this_row) {
-            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "  H-mode pass=%d: a0i_after=%d, pos_after=%d",
-                              pass, a0i, codingLine[a0i]);
+            addPixels(target, color, codingLine, a0i, width);
           }
+        }
+        if (row_done) {
+          break;
         }
 
         // Update b1i to skip past coded region (match poppler exactly)
@@ -2406,7 +2514,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         }
 
         // Poppler maintains invariant: refLine[b1i-1] <= codingLine[a0i] < refLine[b1i]
-        // So we use refLine[b1i] directly without searching!
+        // (left-edge exception: b1i can be 0), so use refLine[b1i] directly.
         int target = refLine[b1i] + delta;
 
         // Use addPixels for positive/zero delta, addPixelsNeg for negative delta
@@ -2443,6 +2551,17 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     }
 
     // Convert codingLine array back to output line vector
+    // Cache codingLine transitions for reuse as next refLine
+    coding_line_cache.resize(width + 2);
+    int cache_limit = std::min(a0i + 1, width + 2);
+    for (int i = 0; i < cache_limit; ++i) {
+      coding_line_cache[i] = codingLine[i];
+    }
+    for (int i = cache_limit; i < width + 2; ++i) {
+      coding_line_cache[i] = width;
+    }
+    coding_line_cache_valid = true;
+
     std::fill(line.begin(), line.end(), false);
 
     // CRITICAL: Determine starting color (match poppler's logic at lines 2327-2330)
@@ -2462,28 +2581,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       start_idx = 0;
       isBlack = false;
       prevPos = 0;
-    }
-
-    // Debug: log first few rows' transitions and validate
-    static int debug_row_count = 0;
-    if (debug_row_count < 15) {
-      std::string trans_str = "";
-      bool has_duplicate = false;
-      bool not_increasing = false;
-      for (int i = 0; i <= a0i && i < 20 && codingLine[i] <= width; ++i) {
-        trans_str += std::to_string(codingLine[i]) + ",";
-        if (i > 0 && codingLine[i] == codingLine[i-1]) {
-          has_duplicate = true;
-        }
-        if (i > 0 && codingLine[i] < codingLine[i-1]) {
-          not_increasing = true;
-        }
-      }
-      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row %d: codingLine[0]=%d, start_idx=%d, isBlack=%d, transitions: %s%s%s",
-                        debug_row_count, codingLine[0], start_idx, isBlack, trans_str.c_str(),
-                        has_duplicate ? " [DUP]" : "",
-                        not_increasing ? " [NOT_INC]" : "");
-      debug_row_count++;
     }
 
     for (int i = start_idx; i <= a0i && codingLine[i] <= width; ++i) {
@@ -2526,9 +2623,8 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
         result.error = "CCITTFaxDecode: Missing EOL";
         return result;
       }
-      if (params.encoded_byte_align) {
-        reader.align_to_byte();
-      }
+    } else if (params.encoded_byte_align) {
+      reader.align_to_byte();
     }
 
     bool allow_indicator_skip = (params.k == 0);
@@ -2637,6 +2733,30 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       }
     } else {
       damaged_rows = 0;
+    }
+
+    if (ok) {
+      if (!row_is_1d && coding_line_cache_valid &&
+          static_cast<int>(coding_line_cache.size()) >= width + 2) {
+        prev_coding_line = coding_line_cache;
+      } else {
+        build_coding_line_from_bits(line, width, prev_coding_line);
+      }
+      prev_coding_line_valid = true;
+    }
+
+    // Poppler-style: skip post-row zero padding when no EOL and no byte alignment.
+    if (!params.end_of_line && !params.encoded_byte_align) {
+      int code = reader.look_bits(12);
+      while (code == 0) {
+        if (reader.get_bit() < 0) {
+          break;
+        }
+        code = reader.look_bits(12);
+        if (code < 0) {
+          break;
+        }
+      }
     }
 
     std::fill(row_bytes.begin(), row_bytes.end(), 0);
