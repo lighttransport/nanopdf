@@ -19,7 +19,11 @@
 - **Stream Decoding**
   - FlateDecode (zlib/deflate compression)
   - ASCII85Decode (Base85 encoding)
+  - ASCIIHexDecode (Hexadecimal encoding)
   - LZWDecode (Lempel-Ziv-Welch compression)
+  - RunLengthDecode (RLE compression)
+  - DCTDecode (JPEG via stb_image)
+  - CCITTFaxDecode (Group 3/4 fax, 1D and 2D modes)
   - JBIG2Decode (monochrome bitmap - partial)
 
 - **Font Support**
@@ -49,9 +53,9 @@
   - Implementation: Add decode_runlength() function
   - Actual effort: 1 day
 
-- [ ] **CCITTFaxDecode** - Fax compression for monochrome images
-  - Implementation: Integrate CCITT Group 3/4 decoder
-  - Estimated effort: 1 week
+- [x] **CCITTFaxDecode** - Fax compression for monochrome images ✅ COMPLETED
+  - Implementation: Group 3/4 decoder with 1D and 2D modes
+  - Actual effort: 1 week
 
 - [x] **DCTDecode** (JPEG) - JPEG image support ✅ COMPLETED
   - Implementation: Using stb_image.h for JPEG decoding
@@ -180,26 +184,31 @@
   - PKCS#7 padding
   - Actual effort: < 1 day
 
-### Phase 6: Advanced Features (Priority: Low)
+### Phase 6: Advanced Features (Priority: Low) ✅ PARTIALLY COMPLETED
 
-#### 6.1 Multimedia
+#### 6.1 Stream Filters ✅ COMPLETED
+- [x] **CCITTFaxDecode** - Group 3/4 fax (1D and 2D modes)
+- [x] **ASCIIHexDecode** - Hexadecimal encoding
+
+#### 6.2 Multimedia
 - [ ] **Sound objects**
 - [ ] **Movie objects**
 - [ ] **3D content**
   - Estimated effort: 3 weeks total
 
-#### 6.2 Advanced Graphics
-- [ ] **Transparency/Blending modes**
-  - Soft masks
-  - Blend modes
-  - Estimated effort: 2 weeks
+#### 6.3 Advanced Graphics
+- [x] **Transparency/Blending modes** (parsing only) ✅ PARTIALLY COMPLETED
+  - Extended graphics state parsing
+  - Blend mode parsing
+  - [ ] Full rendering support
+  - Estimated effort: 2 weeks for full rendering
 
-- [ ] **Patterns and Shadings**
-  - Tiling patterns
-  - Shading patterns (gradients)
-  - Estimated effort: 2 weeks
+- [x] **Patterns and Shadings** (parsing only) ✅ PARTIALLY COMPLETED
+  - Tiling and shading pattern parsing
+  - [ ] Full pattern painting
+  - Estimated effort: 2 weeks for full rendering
 
-#### 6.3 Tagged PDF
+#### 6.4 Tagged PDF
 - [ ] **Logical structure**
   - Structure tree parsing
   - Accessibility support

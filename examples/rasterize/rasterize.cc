@@ -153,7 +153,7 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
                 const RasterizeOptions& options, const std::string& output_file) {
 #ifdef NANOPDF_USE_THORVG
   // Get page dimensions from media_box [left, bottom, right, top]
-  double page_width = 612.0;   // Default letter size
+  double page_width = 612.0;  // Default US Letter
   double page_height = 792.0;
   if (page.media_box.size() >= 4) {
     page_width = page.media_box[2] - page.media_box[0];

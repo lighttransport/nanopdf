@@ -21,6 +21,7 @@
 #include <zlib.h>
 
 #include "common-macros.inc"
+#include "ccitt-decoder.hh"
 #include "crypto.hh"
 #include "jpx-decoder.hh"
 #include "nanopdf-log.hh"
@@ -1510,6 +1511,11 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                     params.encoded_byte_align, params.black_is_1,
                     params.damaged_rows_before_error, size);
 
+  if (!data || size == 0) {
+    result.error = "CCITTFaxDecode: Empty stream";
+    return result;
+  }
+
 #ifdef NANOPDF_USE_POPPLER_CCITT
   // Use Poppler's CCITT decoder if available (highest priority - most accurate)
   {
@@ -1534,6 +1540,27 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     NANOPDF_LOG_INFO("CCITTFaxDecode", "Poppler decoded %zu bytes", result.data.size());
     return result;
   }
+#elif defined(NANOPDF_USE_PDFIUM_CCITT)
+  NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using PDFium decoder");
+  int width = params.columns > 0 ? params.columns : 1728;
+  int height = params.rows;
+  if (height <= 0) {
+    height = static_cast<int>((size * 8 * 20) / width);
+    if (height > 10000) height = 10000;
+    if (height < 1) height = 1;
+  }
+
+  std::string error;
+  if (!ccitt::decode_ccitt_fax(data, size, width, height, params.k,
+                               params.end_of_line != 0,
+                               params.encoded_byte_align != 0,
+                               params.black_is_1 != 0,
+                               result.data, &error)) {
+    result.error = error.empty() ? "CCITTFaxDecode: Decode failed" : error;
+    return result;
+  }
+  result.success = true;
+  return result;
 #elif defined(NANOPDF_USE_LIBTIFF)
   // Use libtiff for CCITT decoding if available
   NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using libtiff decoder");
@@ -1543,11 +1570,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   if (size >= 8) {
     NANOPDF_LOG_TRACE("CCITTFaxDecode", "First bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
                       data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
-  }
-
-  if (!data || size == 0) {
-    result.error = "CCITTFaxDecode: Empty stream";
-    return result;
   }
 
   struct BitReader {
@@ -2773,7 +2795,6 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     ++decoded_rows;
   }
 
-  result.data = std::move(output);
   result.success = true;
   return result;
 }

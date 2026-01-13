@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 
 project(nanopdf_rasterize_example)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find nanopdf library (assumes it's built in the parent build directory)
@@ -44,7 +44,7 @@ if(USE_THORVG)
   if(NOT THORVG_FOUND)
     find_package(PkgConfig)
     if(PkgConfig_FOUND)
-      pkg_check_modules(THORVG thorvg)
+      pkg_check_modules(THORVG IMPORTED_TARGET thorvg)
     endif()
   endif()
 
@@ -70,7 +70,9 @@ if(USE_THORVG)
 
   if(THORVG_FOUND)
     add_compile_definitions(NANOPDF_USE_THORVG)
-    include_directories(${THORVG_INCLUDE_DIRS})
+    if(NOT TARGET PkgConfig::THORVG)
+      include_directories(${THORVG_INCLUDE_DIRS})
+    endif()
   endif()
 endif()
 
@@ -86,12 +88,16 @@ endif()
 
 # Link with ThorVG if found
 if(THORVG_FOUND)
-  target_link_libraries(rasterize ${THORVG_LIBRARIES})
-  # Set RPATH so the executable can find ThorVG at runtime
-  if(THORVG_LIBRARY_DIRS)
-    set_target_properties(rasterize PROPERTIES
-      BUILD_RPATH "${THORVG_LIBRARY_DIRS}"
-      INSTALL_RPATH "${THORVG_LIBRARY_DIRS}")
+  if(TARGET PkgConfig::THORVG)
+    target_link_libraries(rasterize PkgConfig::THORVG)
+  else()
+    target_link_libraries(rasterize ${THORVG_LIBRARIES})
+    # Set RPATH so the executable can find ThorVG at runtime
+    if(THORVG_LIBRARY_DIRS)
+      set_target_properties(rasterize PROPERTIES
+        BUILD_RPATH "${THORVG_LIBRARY_DIRS}"
+        INSTALL_RPATH "${THORVG_LIBRARY_DIRS}")
+    endif()
   endif()
 endif()
 
