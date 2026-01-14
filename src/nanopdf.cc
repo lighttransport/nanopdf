@@ -1517,7 +1517,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   }
 
 #ifdef NANOPDF_USE_POPPLER_CCITT
-  // Use Poppler's CCITT decoder if available (highest priority - most accurate)
+  // Use Poppler's CCITT decoder if available (highest priority - GPL licensed)
   {
     NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using Poppler decoder");
     extern std::vector<uint8_t> decode_ccitt_poppler_wrapper(
@@ -1540,33 +1540,12 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     NANOPDF_LOG_INFO("CCITTFaxDecode", "Poppler decoded %zu bytes", result.data.size());
     return result;
   }
-#elif defined(NANOPDF_USE_PDFIUM_CCITT)
-  NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using PDFium decoder");
-  int width = params.columns > 0 ? params.columns : 1728;
-  int height = params.rows;
-  if (height <= 0) {
-    height = static_cast<int>((size * 8 * 20) / width);
-    if (height > 10000) height = 10000;
-    if (height < 1) height = 1;
-  }
-
-  std::string error;
-  if (!ccitt::decode_ccitt_fax(data, size, width, height, params.k,
-                               params.end_of_line != 0,
-                               params.encoded_byte_align != 0,
-                               params.black_is_1 != 0,
-                               result.data, &error)) {
-    result.error = error.empty() ? "CCITTFaxDecode: Decode failed" : error;
-    return result;
-  }
-  result.success = true;
-  return result;
 #elif defined(NANOPDF_USE_LIBTIFF)
   // Use libtiff for CCITT decoding if available
   NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using libtiff decoder");
   return decode_ccittfax_libtiff(data, size, params);
-#else
-  // Built-in fallback decoder (when no external decoder is enabled)
+#elif defined(NANOPDF_USE_BUILTIN_CCITT)
+  // Built-in fallback decoder (less accurate, for compatibility)
   if (size >= 8) {
     NANOPDF_LOG_TRACE("CCITTFaxDecode", "First bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
                       data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
@@ -2797,7 +2776,29 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 
   result.success = true;
   return result;
-#endif  // NANOPDF_USE_POPPLER_CCITT || NANOPDF_USE_PDFIUM_CCITT || NANOPDF_USE_LIBTIFF
+#else
+  // Default: PDFium-based CCITT decoder (header-only, BSD licensed)
+  NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using PDFium decoder");
+  int width = params.columns > 0 ? params.columns : 1728;
+  int height = params.rows;
+  if (height <= 0) {
+    height = static_cast<int>((size * 8 * 20) / width);
+    if (height > 10000) height = 10000;
+    if (height < 1) height = 1;
+  }
+
+  std::string error;
+  if (!ccitt::decode_ccitt_fax(data, size, width, height, params.k,
+                               params.end_of_line != 0,
+                               params.encoded_byte_align != 0,
+                               params.black_is_1 != 0,
+                               result.data, &error)) {
+    result.error = error.empty() ? "CCITTFaxDecode: Decode failed" : error;
+    return result;
+  }
+  result.success = true;
+  return result;
+#endif  // NANOPDF_USE_POPPLER_CCITT || NANOPDF_USE_LIBTIFF || NANOPDF_USE_BUILTIN_CCITT
 }
 
 }  // namespace filters

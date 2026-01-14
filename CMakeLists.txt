@@ -16,7 +16,7 @@ option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
 option(NANOPDF_USE_POPPLER_CCITT "Use Poppler for CCITT/Fax decoding (GPL)" OFF)
-option(NANOPDF_USE_PDFIUM_CCITT "Use PDFium-based CCITT/Fax decoding" OFF)
+option(NANOPDF_USE_BUILTIN_CCITT "Use built-in CCITT decoder instead of PDFium-based" OFF)
 
 # Log level: 0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
 set(NANOPDF_LOG_LEVEL "3" CACHE STRING "Log level (0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace)")
@@ -294,10 +294,10 @@ if (NANOPDF_USE_LIBTIFF)
   endif()
 endif ()
 
-# PDFium CCITT decoder support (header-only)
-if (NANOPDF_USE_PDFIUM_CCITT)
-  target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_PDFIUM_CCITT")
-  message(STATUS "PDFium CCITT decoder enabled")
+# Built-in CCITT decoder support (fallback, less accurate)
+if (NANOPDF_USE_BUILTIN_CCITT)
+  target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_BUILTIN_CCITT")
+  message(STATUS "Built-in CCITT decoder enabled (fallback)")
 endif ()
 
 # Poppler CCITT decoder support (GPL-licensed)
