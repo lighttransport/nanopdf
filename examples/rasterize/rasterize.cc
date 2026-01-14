@@ -11,6 +11,8 @@
 //   -h, --height <n>   Output height in pixels (default: 600)
 //   -s, --scale <f>    Scale factor (overrides width/height)
 //   --dpi <n>          DPI for rendering (default: 72)
+//   -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)
+//   -g, --grayscale    Convert output to grayscale
 //   --all              Render all pages (creates multiple PNG files)
 //   --verbose          Verbose output
 //   --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace
@@ -31,6 +33,12 @@
 #include "../../src/nanopdf.hh"
 #include "../../src/nanopdf-log.hh"
 
+// For saving processed images
+extern "C" {
+  int stbi_write_png(const char* filename, int w, int h, int comp,
+                     const void* data, int stride_in_bytes);
+}
+
 struct RasterizeOptions {
   std::string input_file;
   std::string output_file;
@@ -39,6 +47,8 @@ struct RasterizeOptions {
   int height = 600;
   float scale = 0.0f;  // 0 means auto-calculate
   float dpi = 72.0f;
+  int rotation = 0;    // 0, 90, 180, 270 degrees
+  bool grayscale = false;
   bool render_all_pages = false;
   bool verbose = false;
   int log_level = 3;  // Default: Info
@@ -55,6 +65,8 @@ void print_usage(const char* program_name) {
   std::cout << "  -h, --height <n>   Output height in pixels (default: 600)\n";
   std::cout << "  -s, --scale <f>    Scale factor (overrides width/height)\n";
   std::cout << "  --dpi <n>          DPI for rendering (default: 72)\n";
+  std::cout << "  -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)\n";
+  std::cout << "  -g, --grayscale    Convert output to grayscale\n";
   std::cout << "  --all              Render all pages (creates multiple PNG files)\n";
   std::cout << "  --verbose          Verbose output\n";
   std::cout << "  --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace\n";
@@ -65,6 +77,7 @@ void print_usage(const char* program_name) {
   std::cout << "  " << program_name << " document.pdf output.png -p 2 -w 1024 -h 768\n";
   std::cout << "  " << program_name << " document.pdf output.png --all --dpi 150\n";
   std::cout << "  " << program_name << " document.pdf output.png -s 2.0\n";
+  std::cout << "  " << program_name << " document.pdf output.png -r 90 --grayscale\n";
 }
 
 bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
@@ -109,6 +122,15 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
         std::cerr << "Error: DPI must be > 0\n";
         return false;
       }
+    } else if ((arg == "-r" || arg == "--rotate") && i + 1 < argc) {
+      options.rotation = std::atoi(argv[++i]);
+      if (options.rotation != 0 && options.rotation != 90 &&
+          options.rotation != 180 && options.rotation != 270) {
+        std::cerr << "Error: Rotation must be 0, 90, 180, or 270\n";
+        return false;
+      }
+    } else if (arg == "-g" || arg == "--grayscale") {
+      options.grayscale = true;
     } else if (arg == "--all") {
       options.render_all_pages = true;
     } else if (arg == "--verbose") {
@@ -147,6 +169,75 @@ std::string generate_output_filename(const std::string& base_output, int page_nu
     }
   }
   return base_output;
+}
+
+// Convert RGBA pixels to grayscale (in-place, keeps alpha)
+void convert_to_grayscale(std::vector<uint8_t>& pixels) {
+  for (size_t i = 0; i < pixels.size(); i += 4) {
+    // Use luminosity formula: 0.299*R + 0.587*G + 0.114*B
+    uint8_t r = pixels[i];
+    uint8_t g = pixels[i + 1];
+    uint8_t b = pixels[i + 2];
+    uint8_t gray = static_cast<uint8_t>(0.299f * r + 0.587f * g + 0.114f * b);
+    pixels[i] = gray;
+    pixels[i + 1] = gray;
+    pixels[i + 2] = gray;
+    // Keep alpha unchanged
+  }
+}
+
+// Rotate RGBA pixels by 90, 180, or 270 degrees
+std::vector<uint8_t> rotate_pixels(const std::vector<uint8_t>& src,
+                                   int src_width, int src_height,
+                                   int rotation,
+                                   int& dst_width, int& dst_height) {
+  if (rotation == 0) {
+    dst_width = src_width;
+    dst_height = src_height;
+    return src;
+  }
+
+  if (rotation == 180) {
+    dst_width = src_width;
+    dst_height = src_height;
+    std::vector<uint8_t> dst(src.size());
+    for (int y = 0; y < src_height; ++y) {
+      for (int x = 0; x < src_width; ++x) {
+        int src_idx = (y * src_width + x) * 4;
+        int dst_idx = ((src_height - 1 - y) * src_width + (src_width - 1 - x)) * 4;
+        dst[dst_idx] = src[src_idx];
+        dst[dst_idx + 1] = src[src_idx + 1];
+        dst[dst_idx + 2] = src[src_idx + 2];
+        dst[dst_idx + 3] = src[src_idx + 3];
+      }
+    }
+    return dst;
+  }
+
+  // 90 or 270 degrees - swap dimensions
+  dst_width = src_height;
+  dst_height = src_width;
+  std::vector<uint8_t> dst(src.size());
+
+  for (int y = 0; y < src_height; ++y) {
+    for (int x = 0; x < src_width; ++x) {
+      int src_idx = (y * src_width + x) * 4;
+      int dst_x, dst_y;
+      if (rotation == 90) {
+        dst_x = src_height - 1 - y;
+        dst_y = x;
+      } else {  // 270
+        dst_x = y;
+        dst_y = src_width - 1 - x;
+      }
+      int dst_idx = (dst_y * dst_width + dst_x) * 4;
+      dst[dst_idx] = src[src_idx];
+      dst[dst_idx + 1] = src[src_idx + 1];
+      dst[dst_idx + 2] = src[src_idx + 2];
+      dst[dst_idx + 3] = src[src_idx + 3];
+    }
+  }
+  return dst;
 }
 
 bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_num,
@@ -210,7 +301,49 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     return false;
   }
 
-  // Save to PNG
+  // Apply post-processing (rotation and/or grayscale) if needed
+  if (options.rotation != 0 || options.grayscale) {
+    auto buffer = backend.get_buffer();
+    if (buffer.pixels.empty()) {
+      std::cerr << "Error: Failed to get render buffer\n";
+      return false;
+    }
+
+    std::vector<uint8_t> pixels = std::move(buffer.pixels);
+    int final_width = buffer.width;
+    int final_height = buffer.height;
+
+    // Apply grayscale conversion first (before rotation to work on smaller data if rotated)
+    if (options.grayscale) {
+      if (options.verbose) {
+        std::cout << "  Converting to grayscale...\n";
+      }
+      convert_to_grayscale(pixels);
+    }
+
+    // Apply rotation
+    if (options.rotation != 0) {
+      if (options.verbose) {
+        std::cout << "  Rotating " << options.rotation << " degrees...\n";
+      }
+      pixels = rotate_pixels(pixels, final_width, final_height,
+                            options.rotation, final_width, final_height);
+    }
+
+    // Save processed image using stb_image_write
+    if (stbi_write_png(output_file.c_str(), final_width, final_height, 4,
+                       pixels.data(), final_width * 4)) {
+      if (options.verbose) {
+        std::cout << "  Saved to: " << output_file << "\n";
+      }
+      return true;
+    } else {
+      std::cerr << "Error: Failed to save PNG file: " << output_file << "\n";
+      return false;
+    }
+  }
+
+  // No post-processing needed, save directly
   if (backend.save_to_png(output_file)) {
     if (options.verbose) {
       std::cout << "  Saved to: " << output_file << "\n";
