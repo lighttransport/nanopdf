@@ -1565,8 +1565,8 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   // Use libtiff for CCITT decoding if available
   NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using libtiff decoder");
   return decode_ccittfax_libtiff(data, size, params);
-#endif
-
+#else
+  // Built-in fallback decoder (when no external decoder is enabled)
   if (size >= 8) {
     NANOPDF_LOG_TRACE("CCITTFaxDecode", "First bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
                       data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
@@ -2797,6 +2797,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 
   result.success = true;
   return result;
+#endif  // NANOPDF_USE_POPPLER_CCITT || NANOPDF_USE_PDFIUM_CCITT || NANOPDF_USE_LIBTIFF
 }
 
 }  // namespace filters
