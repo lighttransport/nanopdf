@@ -54,7 +54,7 @@ if(NANOPDF_BUILD_WASM)
   # Set Emscripten-specific linker flags (all -s flags go here)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s WASM=1 -s ALLOW_MEMORY_GROWTH=1")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s MODULARIZE=1 -s EXPORT_ES6=1")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS'] -s EXPORTED_FUNCTIONS=['_malloc','_free']")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','allocateUTF8','UTF8ToString'] -s EXPORTED_FUNCTIONS=['_malloc','_free']")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s USE_ZLIB=1")
 endif()
 
@@ -105,6 +105,7 @@ set(NANOPDF_SOURCES
   src/table-extraction.cc
   src/form-manipulation.cc
   src/document-structure.cc
+  src/pdf-writer.cc
   src/stb_image_impl.cc
   src/stb_image_write_impl.cc
   src/stb_truetype_impl.cc
