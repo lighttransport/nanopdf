@@ -2511,8 +2511,47 @@ bool Blend2DBackend::parse_inline_image(const std::string& content, size_t& pos)
       decoded_data.push_back(static_cast<uint8_t>(strtol(hex, nullptr, 16)));
     }
   } else if (filter == "A85" || filter == "ASCII85Decode") {
-    // ASCII85 decode - simplified, just use raw data for now
-    decoded_data = raw_data;
+    // ASCII85 decode
+    decoded_data.reserve(raw_data.size() * 4 / 5);
+    uint32_t value = 0;
+    int count = 0;
+    for (size_t i = 0; i < raw_data.size(); ++i) {
+      uint8_t c = raw_data[i];
+      // Skip whitespace
+      if (c <= ' ') continue;
+      // Handle 'z' (represents four zero bytes)
+      if (c == 'z' && count == 0) {
+        decoded_data.push_back(0);
+        decoded_data.push_back(0);
+        decoded_data.push_back(0);
+        decoded_data.push_back(0);
+        continue;
+      }
+      // Check for end marker ~>
+      if (c == '~') break;
+      // Validate character range
+      if (c < '!' || c > 'u') continue;
+      // Accumulate value
+      value = value * 85 + (c - '!');
+      count++;
+      if (count == 5) {
+        decoded_data.push_back((value >> 24) & 0xFF);
+        decoded_data.push_back((value >> 16) & 0xFF);
+        decoded_data.push_back((value >> 8) & 0xFF);
+        decoded_data.push_back(value & 0xFF);
+        value = 0;
+        count = 0;
+      }
+    }
+    // Handle remaining bytes (partial group)
+    if (count > 0) {
+      for (int j = count; j < 5; j++) {
+        value = value * 85 + 84;  // Pad with 'u'
+      }
+      if (count > 1) decoded_data.push_back((value >> 24) & 0xFF);
+      if (count > 2) decoded_data.push_back((value >> 16) & 0xFF);
+      if (count > 3) decoded_data.push_back((value >> 8) & 0xFF);
+    }
   } else if (filter == "Fl" || filter == "FlateDecode" || filter == "LZW" || filter == "LZWDecode") {
     // Need to decompress - use nanopdf's decode functions
     if (current_pdf_) {
@@ -2913,6 +2952,12 @@ bool Blend2DBackend::render_soft_mask_group(const Value& group_xobject, int mask
   if (mask_width == 0) mask_width = width_;
   if (mask_height == 0) mask_height = height_;
 
+  // Decode the XObject stream content
+  auto decoded = decode_stream(*current_pdf_, xobject_value);
+  if (!decoded.success) {
+    return false;
+  }
+
   // Create a temporary image for rendering the soft mask
   BLImage mask_image(mask_width, mask_height, BL_FORMAT_PRGB32);
   BLContext mask_ctx(mask_image);
@@ -2925,25 +2970,37 @@ bool Blend2DBackend::render_soft_mask_group(const Value& group_xobject, int mask
   }
   mask_ctx.fill_all();
 
-  // Decode the XObject stream content
-  auto decoded = decode_stream(*current_pdf_, xobject_value);
-  if (!decoded.success) {
-    return false;
-  }
+  // Save current rendering context state
+  BLImage saved_image = std::move(image_);
+  BLContext saved_ctx = std::move(ctx_);
+  uint32_t saved_width = width_;
+  uint32_t saved_height = height_;
+  GraphicsState saved_state = state_;
 
-  // TODO: Full implementation would parse and render the XObject content
-  // to the mask_ctx. For now, we store basic mask info.
+  // Switch to mask rendering context
+  image_ = std::move(mask_image);
+  ctx_ = std::move(mask_ctx);
+  width_ = mask_width;
+  height_ = mask_height;
 
-  // Store mask data
-  state_.soft_mask_width = mask_width;
-  state_.soft_mask_height = mask_height;
+  // Reset graphics state for mask rendering
+  state_ = GraphicsState();
+  state_.page_width = std::abs(bbox[2] - bbox[0]);
+  state_.page_height = std::abs(bbox[3] - bbox[1]);
+  state_.scale = static_cast<float>(mask_width) / state_.page_width;
 
-  // Get the rendered pixels
+  // Parse and render the XObject content to the mask context
+  parse_pdf_content(decoded.data);
+
+  // Flush rendering
+  ctx_.flush(BL_CONTEXT_FLUSH_SYNC);
+
+  // Get the rendered pixels from mask image
   BLImageData data;
-  mask_image.get_data(&data);
+  image_.get_data(&data);
 
   // Convert to grayscale mask values
-  state_.soft_mask_data.resize(mask_width * mask_height);
+  std::vector<uint8_t> mask_data(mask_width * mask_height);
   const uint8_t* pixels = static_cast<const uint8_t*>(data.pixel_data);
 
   for (uint32_t y = 0; y < mask_height; ++y) {
@@ -2957,14 +3014,28 @@ bool Blend2DBackend::render_soft_mask_group(const Value& group_xobject, int mask
         float g = pixels[src_idx + 1] / 255.0f;
         float b = pixels[src_idx + 0] / 255.0f;
         float luminance = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-        state_.soft_mask_data[dst_idx] = static_cast<uint8_t>(luminance * 255.0f);
+        mask_data[dst_idx] = static_cast<uint8_t>(luminance * 255.0f);
       } else {  // Alpha mask
-        state_.soft_mask_data[dst_idx] = pixels[src_idx + 3];  // Alpha channel
+        mask_data[dst_idx] = pixels[src_idx + 3];  // Alpha channel
       }
     }
   }
 
-  mask_ctx.end();
+  // End mask context before restoring
+  ctx_.end();
+
+  // Restore original rendering context
+  image_ = std::move(saved_image);
+  ctx_ = std::move(saved_ctx);
+  width_ = saved_width;
+  height_ = saved_height;
+
+  // Restore graphics state but keep extracted mask data
+  state_ = saved_state;
+  state_.soft_mask_width = mask_width;
+  state_.soft_mask_height = mask_height;
+  state_.soft_mask_data = std::move(mask_data);
+
   return true;
 }
 

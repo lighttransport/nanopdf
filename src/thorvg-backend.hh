@@ -174,6 +174,11 @@ private:
     int text_rise{0};                // Ts - text rise (baseline shift)
     int text_render_mode{0};         // Tr - text rendering mode (0-7)
 
+    // Text clipping path (accumulated during text block for modes 4-7)
+    bool text_clip_active{false};    // True when accumulating text for clipping
+    std::vector<tvg::PathCommand> text_clip_commands;
+    std::vector<tvg::Point> text_clip_points;
+
     // Transformation matrix [a b c d e f]
     // Maps (x, y) -> (ax + cy + e, bx + dy + f)
     struct Matrix {
@@ -229,6 +234,11 @@ private:
   // Draw a single glyph using stb_truetype outlines (by glyph index - for CID fonts)
   bool draw_glyph_by_index(int glyph_index, float x, float y, float size,
                            uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+
+  // Render a Type 3 font glyph by executing its CharProc content stream
+  bool render_type3_glyph(const Type3Font* type3_font, const std::string& glyph_name,
+                          float x, float y, float size,
+                          uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
   // Load font from PDF FontDescriptor
   bool load_font(const Pdf& pdf, const std::string& font_name, const BaseFont* font);
