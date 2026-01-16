@@ -52,7 +52,71 @@ inline uint32_t read_be_u32(const uint8_t* data) {
          static_cast<uint32_t>(data[3]);
 }
 
+// Read big-endian uint16
+inline uint16_t read_be_u16(const uint8_t* data) {
+  return (static_cast<uint16_t>(data[0]) << 8) |
+         static_cast<uint16_t>(data[1]);
+}
+
+// Read s15Fixed16Number (signed 15.16 fixed point)
+inline float read_s15Fixed16(const uint8_t* data) {
+  int32_t raw = static_cast<int32_t>(read_be_u32(data));
+  return static_cast<float>(raw) / 65536.0f;
+}
+
+// Read u8Fixed8Number (unsigned 8.8 fixed point)
+inline float read_u8Fixed8(const uint8_t* data) {
+  uint16_t raw = read_be_u16(data);
+  return static_cast<float>(raw) / 256.0f;
+}
+
 }  // namespace
+
+// IccTRC implementation
+float IccTRC::apply(float v) const {
+  if (!valid) return v;
+
+  v = clamp01(v);
+
+  if (is_gamma) {
+    // Simple gamma
+    return std::pow(v, gamma);
+  } else if (!curve.empty()) {
+    // Curve table lookup with linear interpolation
+    float idx = v * static_cast<float>(curve.size() - 1);
+    size_t i0 = static_cast<size_t>(idx);
+    size_t i1 = std::min(i0 + 1, curve.size() - 1);
+    float frac = idx - static_cast<float>(i0);
+    return curve[i0] * (1.0f - frac) + curve[i1] * frac;
+  }
+
+  return v;
+}
+
+float IccTRC::apply_inverse(float v) const {
+  if (!valid) return v;
+
+  v = clamp01(v);
+
+  if (is_gamma && gamma > 0.0f) {
+    // Simple inverse gamma
+    return std::pow(v, 1.0f / gamma);
+  } else if (!curve.empty()) {
+    // Binary search in curve table
+    size_t lo = 0, hi = curve.size() - 1;
+    while (lo < hi) {
+      size_t mid = (lo + hi) / 2;
+      if (curve[mid] < v) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return static_cast<float>(lo) / static_cast<float>(curve.size() - 1);
+  }
+
+  return v;
+}
 
 IccProfileInfo parse_icc_profile_header(const uint8_t* data, size_t size) {
   IccProfileInfo info;
@@ -104,6 +168,295 @@ IccProfileInfo parse_icc_profile_header(const uint8_t* data, size_t size) {
 
   info.valid = true;
   return info;
+}
+
+namespace {
+
+// Helper to find and parse a tag in the ICC profile
+struct IccTag {
+  uint32_t signature;
+  uint32_t offset;
+  uint32_t size;
+};
+
+// Parse TRC (Tone Reproduction Curve) tag
+IccTRC parse_trc_tag(const uint8_t* data, size_t data_size,
+                     uint32_t offset, uint32_t size) {
+  IccTRC trc;
+
+  if (offset + size > data_size || size < 12) {
+    return trc;
+  }
+
+  const uint8_t* tag_data = data + offset;
+
+  // Tag type signature at offset 0-3
+  uint32_t type_sig = read_be_u32(tag_data);
+
+  // 'curv' type (0x63757276)
+  if (type_sig == 0x63757276) {
+    // Bytes 8-11: Number of entries
+    uint32_t count = read_be_u32(tag_data + 8);
+
+    if (count == 0) {
+      // Identity curve (gamma = 1.0)
+      trc.valid = true;
+      trc.is_gamma = true;
+      trc.gamma = 1.0f;
+    } else if (count == 1) {
+      // Single value = gamma encoded as u8Fixed8
+      if (size >= 14) {
+        trc.valid = true;
+        trc.is_gamma = true;
+        trc.gamma = read_u8Fixed8(tag_data + 12);
+      }
+    } else {
+      // Curve table (16-bit values)
+      if (size >= 12 + count * 2) {
+        trc.valid = true;
+        trc.is_gamma = false;
+        trc.curve.resize(count);
+        for (uint32_t i = 0; i < count; ++i) {
+          uint16_t val = read_be_u16(tag_data + 12 + i * 2);
+          trc.curve[i] = static_cast<float>(val) / 65535.0f;
+        }
+      }
+    }
+  }
+  // 'para' type (parametric curve) - 0x70617261
+  else if (type_sig == 0x70617261) {
+    if (size >= 16) {
+      uint16_t func_type = read_be_u16(tag_data + 8);
+
+      if (func_type == 0) {
+        // Type 0: Y = X^g
+        trc.valid = true;
+        trc.is_gamma = true;
+        trc.gamma = read_s15Fixed16(tag_data + 12);
+      } else if (func_type == 1 && size >= 24) {
+        // Type 1: Y = (aX+b)^g for X >= -b/a, else Y = 0
+        // Approximate as simple gamma
+        trc.valid = true;
+        trc.is_gamma = true;
+        trc.gamma = read_s15Fixed16(tag_data + 12);
+      } else if (func_type == 2 && size >= 28) {
+        // Type 2: sRGB-like
+        trc.valid = true;
+        trc.is_gamma = true;
+        trc.gamma = read_s15Fixed16(tag_data + 12);
+      } else if (func_type == 3 && size >= 32) {
+        // Type 3: Y = (aX+b)^g + c for X >= d, else Y = cX
+        trc.valid = true;
+        trc.is_gamma = true;
+        trc.gamma = read_s15Fixed16(tag_data + 12);
+      } else if (func_type == 4 && size >= 36) {
+        // Type 4: Y = (aX+b)^g + e for X >= d, else Y = cX + f
+        trc.valid = true;
+        trc.is_gamma = true;
+        trc.gamma = read_s15Fixed16(tag_data + 12);
+      }
+    }
+  }
+
+  return trc;
+}
+
+// Parse XYZ tag (returns XYZ values)
+bool parse_xyz_tag(const uint8_t* data, size_t data_size,
+                   uint32_t offset, uint32_t size,
+                   float* x, float* y, float* z) {
+  if (offset + size > data_size || size < 20) {
+    return false;
+  }
+
+  const uint8_t* tag_data = data + offset;
+
+  // Tag type signature at offset 0-3 should be 'XYZ ' (0x58595A20)
+  uint32_t type_sig = read_be_u32(tag_data);
+  if (type_sig != 0x58595A20) {
+    return false;
+  }
+
+  // XYZ values at offsets 8, 12, 16 (s15Fixed16)
+  *x = read_s15Fixed16(tag_data + 8);
+  *y = read_s15Fixed16(tag_data + 12);
+  *z = read_s15Fixed16(tag_data + 16);
+
+  return true;
+}
+
+}  // namespace
+
+IccProfileInfo parse_icc_profile(const uint8_t* data, size_t size) {
+  // First parse the header
+  IccProfileInfo info = parse_icc_profile_header(data, size);
+  if (!info.valid) {
+    return info;
+  }
+
+  // Need at least header + tag table
+  if (size < 132) {
+    return info;  // Return basic info without tag data
+  }
+
+  // Tag count at offset 128
+  uint32_t tag_count = read_be_u32(data + 128);
+
+  if (tag_count > 100 || size < 132 + tag_count * 12) {
+    return info;  // Invalid or truncated tag table
+  }
+
+  // Build tag directory
+  std::vector<IccTag> tags(tag_count);
+  for (uint32_t i = 0; i < tag_count; ++i) {
+    const uint8_t* entry = data + 132 + i * 12;
+    tags[i].signature = read_be_u32(entry);
+    tags[i].offset = read_be_u32(entry + 4);
+    tags[i].size = read_be_u32(entry + 8);
+  }
+
+  // Helper to find a tag
+  auto find_tag = [&](uint32_t sig) -> const IccTag* {
+    for (const auto& tag : tags) {
+      if (tag.signature == sig) {
+        return &tag;
+      }
+    }
+    return nullptr;
+  };
+
+  // Parse based on color space type
+  if (info.color_space == ICC_SIG_RGB) {
+    // Try to parse as matrix/TRC profile
+    const IccTag* rXYZ = find_tag(ICC_TAG_rXYZ);
+    const IccTag* gXYZ = find_tag(ICC_TAG_gXYZ);
+    const IccTag* bXYZ = find_tag(ICC_TAG_bXYZ);
+    const IccTag* rTRC = find_tag(ICC_TAG_rTRC);
+    const IccTag* gTRC = find_tag(ICC_TAG_gTRC);
+    const IccTag* bTRC = find_tag(ICC_TAG_bTRC);
+
+    if (rXYZ && gXYZ && bXYZ && rTRC && gTRC && bTRC) {
+      // Parse colorant matrix
+      float rx, ry, rz, gx, gy, gz, bx, by, bz;
+      bool have_matrix =
+          parse_xyz_tag(data, size, rXYZ->offset, rXYZ->size, &rx, &ry, &rz) &&
+          parse_xyz_tag(data, size, gXYZ->offset, gXYZ->size, &gx, &gy, &gz) &&
+          parse_xyz_tag(data, size, bXYZ->offset, bXYZ->size, &bx, &by, &bz);
+
+      if (have_matrix) {
+        // Store as row-major matrix (XYZ rows, RGB columns)
+        info.colorant_matrix[0] = rx;
+        info.colorant_matrix[1] = gx;
+        info.colorant_matrix[2] = bx;
+        info.colorant_matrix[3] = ry;
+        info.colorant_matrix[4] = gy;
+        info.colorant_matrix[5] = by;
+        info.colorant_matrix[6] = rz;
+        info.colorant_matrix[7] = gz;
+        info.colorant_matrix[8] = bz;
+      }
+
+      // Parse TRC curves
+      info.trc_r = parse_trc_tag(data, size, rTRC->offset, rTRC->size);
+      info.trc_g = parse_trc_tag(data, size, gTRC->offset, gTRC->size);
+      info.trc_b = parse_trc_tag(data, size, bTRC->offset, bTRC->size);
+
+      if (have_matrix && info.trc_r.valid && info.trc_g.valid && info.trc_b.valid) {
+        info.is_matrix_profile = true;
+      }
+    }
+  } else if (info.color_space == ICC_SIG_GRAY) {
+    // Gray profile - just need kTRC
+    const IccTag* kTRC = find_tag(ICC_TAG_kTRC);
+    if (kTRC) {
+      info.trc_gray = parse_trc_tag(data, size, kTRC->offset, kTRC->size);
+      if (info.trc_gray.valid) {
+        info.is_matrix_profile = true;  // Simple TRC profile
+      }
+    }
+  }
+
+  // Parse white point if available
+  const IccTag* wtpt = find_tag(ICC_TAG_wtpt);
+  if (wtpt) {
+    parse_xyz_tag(data, size, wtpt->offset, wtpt->size,
+                  &info.white_point[0], &info.white_point[1], &info.white_point[2]);
+  }
+
+  return info;
+}
+
+RGB iccbased_to_rgb(const float* components, int num_components,
+                    const IccProfileInfo& profile) {
+  if (!profile.valid) {
+    return iccbased_to_rgb_simple(components, num_components);
+  }
+
+  // Handle based on profile color space
+  if (profile.color_space == ICC_SIG_GRAY && num_components >= 1) {
+    float gray = clamp01(components[0]);
+
+    // Apply gray TRC if available
+    if (profile.trc_gray.valid) {
+      gray = profile.trc_gray.apply(gray);
+    }
+
+    return RGB(gray, gray, gray);
+  }
+
+  if (profile.color_space == ICC_SIG_RGB && num_components >= 3) {
+    float r = clamp01(components[0]);
+    float g = clamp01(components[1]);
+    float b = clamp01(components[2]);
+
+    if (profile.is_matrix_profile) {
+      // Apply TRC curves (linearize)
+      if (profile.trc_r.valid) r = profile.trc_r.apply(r);
+      if (profile.trc_g.valid) g = profile.trc_g.apply(g);
+      if (profile.trc_b.valid) b = profile.trc_b.apply(b);
+
+      // Apply colorant matrix to get XYZ
+      float x = profile.colorant_matrix[0] * r +
+                profile.colorant_matrix[1] * g +
+                profile.colorant_matrix[2] * b;
+      float y = profile.colorant_matrix[3] * r +
+                profile.colorant_matrix[4] * g +
+                profile.colorant_matrix[5] * b;
+      float z = profile.colorant_matrix[6] * r +
+                profile.colorant_matrix[7] * g +
+                profile.colorant_matrix[8] * b;
+
+      // Convert XYZ to sRGB
+      return xyz_to_rgb(XYZ(x, y, z));
+    }
+
+    // Non-matrix profile - return as-is (assuming sRGB)
+    return RGB(r, g, b);
+  }
+
+  if (profile.color_space == ICC_SIG_CMYK && num_components >= 4) {
+    // CMYK profiles require CLUT - fall back to simple conversion
+    return cmyk_to_rgb(components[0], components[1],
+                       components[2], components[3]);
+  }
+
+  if (profile.color_space == ICC_SIG_LAB && num_components >= 3) {
+    // Lab profile
+    Lab lab;
+    lab.L = components[0] * 100.0f;
+    lab.a = components[1] * 255.0f - 128.0f;
+    lab.b = components[2] * 255.0f - 128.0f;
+
+    std::vector<double> wp = {
+        static_cast<double>(profile.white_point[0]),
+        static_cast<double>(profile.white_point[1]),
+        static_cast<double>(profile.white_point[2])};
+
+    return lab_to_rgb(lab, wp);
+  }
+
+  // Fallback to simple conversion
+  return iccbased_to_rgb_simple(components, num_components);
 }
 
 RGB gray_to_rgb(float gray) {
@@ -361,9 +714,104 @@ TransformResult transform_to_rgb(const ColorSpace& color_space,
           rgb = RGB(0.5f, 0.5f, 0.5f);
           break;
       }
+    } else if (bits_per_component == 16) {
+      // 16-bit components (big-endian)
+      const uint8_t* src_pixel = src_data + i * src_components * 2;
+      float components[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+      for (int c = 0; c < src_components && c < 4; ++c) {
+        uint16_t val = (static_cast<uint16_t>(src_pixel[c * 2]) << 8) |
+                       static_cast<uint16_t>(src_pixel[c * 2 + 1]);
+        components[c] = static_cast<float>(val) / 65535.0f;
+      }
+
+      // Convert based on color space type (same as 8-bit)
+      switch (color_space.type) {
+        case ColorSpaceType::DeviceGray:
+          rgb = gray_to_rgb(components[0]);
+          break;
+        case ColorSpaceType::DeviceRGB:
+          rgb = RGB(components[0], components[1], components[2]);
+          break;
+        case ColorSpaceType::DeviceCMYK:
+          rgb = cmyk_to_rgb(components[0], components[1],
+                           components[2], components[3]);
+          break;
+        case ColorSpaceType::CalGray:
+          rgb = calgray_to_rgb(components[0], color_space.white_point,
+                              color_space.black_point, color_space.gamma);
+          break;
+        case ColorSpaceType::CalRGB:
+          rgb = calrgb_to_rgb(components[0], components[1], components[2],
+                             color_space.white_point, color_space.black_point,
+                             color_space.gamma, color_space.matrix);
+          break;
+        case ColorSpaceType::Lab: {
+          Lab lab;
+          lab.L = components[0] * 100.0f;
+          lab.a = components[1] * 255.0f - 128.0f;
+          lab.b = components[2] * 255.0f - 128.0f;
+          rgb = lab_to_rgb(lab, color_space.white_point);
+          break;
+        }
+        case ColorSpaceType::ICCBased:
+          rgb = iccbased_to_rgb_simple(components, src_components);
+          break;
+        default:
+          rgb = RGB(0.5f, 0.5f, 0.5f);
+          break;
+      }
+    } else if (bits_per_component == 1 || bits_per_component == 2 ||
+               bits_per_component == 4) {
+      // Sub-byte components (packed pixels)
+      // For simplicity, we need to handle row-by-row with padding
+      // This path handles single-component (gray) images primarily
+
+      int mask = (1 << bits_per_component) - 1;
+      float max_val = static_cast<float>(mask);
+
+      // Calculate position in packed data
+      int row = i / width;
+      int col = i % width;
+      int bytes_per_row = (width * src_components * bits_per_component + 7) / 8;
+      int bit_offset = (col * src_components * bits_per_component) % 8;
+      int byte_idx = row * bytes_per_row + (col * src_components * bits_per_component) / 8;
+
+      if (byte_idx >= static_cast<int>(src_size)) {
+        rgb = RGB(0.5f, 0.5f, 0.5f);
+      } else {
+        float components[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int c = 0; c < src_components && c < 4; ++c) {
+          int c_bit_offset = bit_offset + c * bits_per_component;
+          int c_byte_idx = byte_idx + c_bit_offset / 8;
+          int c_shift = 8 - bits_per_component - (c_bit_offset % 8);
+
+          if (c_byte_idx < static_cast<int>(src_size) && c_shift >= 0) {
+            uint8_t val = (src_data[c_byte_idx] >> c_shift) & mask;
+            components[c] = static_cast<float>(val) / max_val;
+          }
+        }
+
+        // Convert based on color space type
+        switch (color_space.type) {
+          case ColorSpaceType::DeviceGray:
+            rgb = gray_to_rgb(components[0]);
+            break;
+          case ColorSpaceType::DeviceRGB:
+            rgb = RGB(components[0], components[1], components[2]);
+            break;
+          case ColorSpaceType::DeviceCMYK:
+            rgb = cmyk_to_rgb(components[0], components[1],
+                             components[2], components[3]);
+            break;
+          default:
+            rgb = gray_to_rgb(components[0]);
+            break;
+        }
+      }
     } else {
-      // TODO: Handle other bit depths (1, 2, 4, 16 bits)
-      result.error = "Only 8-bit color components supported currently";
+      result.error = "Unsupported bit depth";
       return result;
     }
 
