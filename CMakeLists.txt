@@ -95,6 +95,8 @@ set(NANOPDF_SOURCES
   src/nanopdf.cc
   src/jbig2-decoder.cc
   src/jpx-decoder.cc
+  src/type1-parser.cc
+  src/cff-parser.cc
   src/canvas-exporter.cc
   src/crypto.cc
   src/pdf-security.cc
@@ -121,6 +123,10 @@ set(NANOPDF_SOURCES
   src/jbig2/JBig2_ArithIntDecoder.cc
   src/jbig2/JBig2_GrdProc.cc
   src/jbig2/JBig2_GrrdProc.cc
+  # JBIG2 decoder main components (completing Phase 1.4)
+  src/jbig2/JBig2_Context.cc
+  src/jbig2/JBig2_SddProc.cc
+  src/jbig2/JBig2_TrdProc.cc
 )
 
 if(NANOPDF_USE_THORVG)

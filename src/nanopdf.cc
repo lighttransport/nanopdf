@@ -23,11 +23,15 @@
 #include "common-macros.inc"
 #include "ccitt-decoder.hh"
 #include "crypto.hh"
+#include "jbig2/JBig2_Context.hh"
+#include "jbig2/JBig2_Image.hh"
 #include "jpx-decoder.hh"
 #include "nanopdf-log.hh"
 #include "nanopdf.hh"
+#include "cff-parser.hh"
 #include "stb_image.h"
 #include "stream-reader.hh"
+#include "type1-parser.hh"
 
 namespace nanopdf {
 
@@ -709,11 +713,63 @@ std::string validate_params(const DecodeParams &params) {
   return "";  // No error
 }
 
+// Apply TIFF predictor (horizontal differencing)
+bool apply_tiff_predictor(std::vector<uint8_t> &data, const DecodeParams &params,
+                          std::string &error) {
+  int bytes_per_pixel = (params.bits_per_component * params.colors + 7) / 8;
+  int bytes_per_row =
+      (params.bits_per_component * params.colors * params.columns + 7) / 8;
+
+  if (data.empty() || bytes_per_row <= 0) {
+    return true;  // Nothing to do
+  }
+
+  int row_count = static_cast<int>(data.size()) / bytes_per_row;
+  if (row_count <= 0) {
+    return true;
+  }
+
+  // For 8-bit components, apply horizontal differencing
+  if (params.bits_per_component == 8) {
+    for (int row = 0; row < row_count; row++) {
+      size_t row_start = static_cast<size_t>(row) * bytes_per_row;
+      // Start from the second pixel and accumulate differences
+      for (int col = bytes_per_pixel; col < bytes_per_row; col++) {
+        data[row_start + col] += data[row_start + col - bytes_per_pixel];
+      }
+    }
+  }
+  // For 16-bit components
+  else if (params.bits_per_component == 16) {
+    int samples_per_row = params.columns * params.colors;
+    for (int row = 0; row < row_count; row++) {
+      size_t row_start = static_cast<size_t>(row) * bytes_per_row;
+      for (int sample = params.colors; sample < samples_per_row; sample++) {
+        size_t offset = row_start + sample * 2;
+        size_t prev_offset = row_start + (sample - params.colors) * 2;
+        // Big-endian 16-bit
+        uint16_t prev = (data[prev_offset] << 8) | data[prev_offset + 1];
+        uint16_t curr = (data[offset] << 8) | data[offset + 1];
+        uint16_t result = curr + prev;
+        data[offset] = (result >> 8) & 0xFF;
+        data[offset + 1] = result & 0xFF;
+      }
+    }
+  }
+
+  return true;
+}
+
 // Apply PNG predictor row filter
 bool apply_predictor(std::vector<uint8_t> &data, const DecodeParams &params,
                      std::string &error) {
+  // TIFF predictor (horizontal differencing)
+  if (params.predictor == 2) {
+    return apply_tiff_predictor(data, params, error);
+  }
+
   if (params.predictor < 10 || params.predictor > 15) {
-    return true;  // No predictor or unsupported
+    return true;  // No predictor or unsupported (predictor 1 = no prediction)
   }
 
   // Validate parameters first
@@ -1230,11 +1286,54 @@ DecodedStream decode_lzw(const uint8_t *data, size_t size,
 }
 
 
-DecodedStream decode_jbig2(const uint8_t * /*data*/, size_t /*size*/,
-                           const DecodeParams & /*params*/) {
+DecodedStream decode_jbig2(const uint8_t *data, size_t size,
+                           const DecodeParams &params) {
   DecodedStream result;
-  result.success = false;
-  result.error = "JBIG2Decode filter is not implemented.";
+
+  // Get globals data if present
+  const uint8_t* globalsData = nullptr;
+  size_t globalsSize = 0;
+  if (!params.jbig2_globals.empty()) {
+    globalsData = params.jbig2_globals.data();
+    globalsSize = params.jbig2_globals.size();
+  }
+
+  // Create JBIG2 decoding context
+  jbig2::CJBig2_Context context(globalsData, globalsSize, data, size, false);
+
+  // Decode the JBIG2 stream
+  auto decodeResult = context.Decode();
+
+  if (!decodeResult.success) {
+    result.success = false;
+    result.error = "JBIG2Decode: " + decodeResult.error;
+    return result;
+  }
+
+  if (!decodeResult.image || !decodeResult.image->has_data()) {
+    result.success = false;
+    result.error = "JBIG2Decode: No image data decoded";
+    return result;
+  }
+
+  // Convert 1-bit packed bitmap to byte array
+  // JBIG2 images are 1-bit per pixel, packed into bytes
+  uint32_t width = decodeResult.width;
+  uint32_t height = decodeResult.height;
+  int32_t stride = decodeResult.image->stride();
+  const uint8_t* imgData = decodeResult.image->data();
+
+  // Output as raw 1-bit packed data (same format as the image)
+  size_t dataSize = static_cast<size_t>(stride) * height;
+  result.data.resize(dataSize);
+  std::memcpy(result.data.data(), imgData, dataSize);
+
+  // Store image dimensions in result for later use
+  result.width = static_cast<int>(width);
+  result.height = static_cast<int>(height);
+  result.bits_per_component = 1;
+  result.success = true;
+
   return result;
 }
 
@@ -2838,6 +2937,20 @@ static DecodedStream apply_single_filter(const std::string &filter_name,
   return result;
 }
 
+// Helper to generate cache key for decoded streams
+static uint64_t make_decoded_stream_cache_key(uint32_t obj_num, uint16_t gen_num,
+                                               int image_width = 0, int image_height = 0) {
+  // Encode obj_num, gen_num, and optionally hash image dimensions
+  uint64_t key = (static_cast<uint64_t>(obj_num) << 32) |
+                 (static_cast<uint64_t>(gen_num) << 16);
+  // Include image dimensions in key for image-specific decoding
+  if (image_width > 0 || image_height > 0) {
+    // Use simple hash for dimensions (lower 16 bits)
+    key |= static_cast<uint16_t>((image_width * 31 + image_height) & 0xFFFF);
+  }
+  return key;
+}
+
 DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
                            uint32_t obj_num, uint16_t gen_num) {
   DecodedStream result;
@@ -2845,6 +2958,32 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
     return result;
+  }
+
+  // Check cache first (only if we have a valid object number)
+  uint64_t cache_key = 0;
+  if (obj_num > 0) {
+    cache_key = make_decoded_stream_cache_key(obj_num, gen_num);
+    auto cache_it = pdf.decoded_stream_cache.find(cache_key);
+    if (cache_it != pdf.decoded_stream_cache.end()) {
+      // Cache hit - return cached result
+      const auto& entry = cache_it->second;
+      result.data = entry.data;
+      result.success = entry.success;
+      result.error = entry.error;
+      result.width = entry.width;
+      result.height = entry.height;
+      result.bits_per_component = entry.bits_per_component;
+
+      // Move to back of LRU order
+      auto& order = pdf.decoded_stream_cache_order;
+      auto it = std::find(order.begin(), order.end(), cache_key);
+      if (it != order.end()) {
+        order.erase(it);
+        order.push_back(cache_key);
+      }
+      return result;
+    }
   }
 
   // Start with raw stream data
@@ -2962,6 +3101,28 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   result.data = std::move(current_data);
   result.success = true;
+
+  // Store in cache (only if we have a valid object number)
+  if (obj_num > 0 && cache_key != 0) {
+    // Evict oldest entries if at capacity
+    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
+      uint64_t evict = pdf.decoded_stream_cache_order.front();
+      pdf.decoded_stream_cache_order.pop_front();
+      pdf.decoded_stream_cache.erase(evict);
+    }
+
+    // Store in cache
+    Pdf::DecodedStreamCacheEntry entry;
+    entry.data = result.data;  // Copy for cache
+    entry.success = result.success;
+    entry.error = result.error;
+    entry.width = result.width;
+    entry.height = result.height;
+    entry.bits_per_component = result.bits_per_component;
+    pdf.decoded_stream_cache[cache_key] = std::move(entry);
+    pdf.decoded_stream_cache_order.push_back(cache_key);
+  }
+
   return result;
 }
 
@@ -2974,6 +3135,32 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
     return result;
+  }
+
+  // Check cache first (only if we have a valid object number)
+  uint64_t cache_key = 0;
+  if (obj_num > 0) {
+    cache_key = make_decoded_stream_cache_key(obj_num, gen_num, image_width, image_height);
+    auto cache_it = pdf.decoded_stream_cache.find(cache_key);
+    if (cache_it != pdf.decoded_stream_cache.end()) {
+      // Cache hit - return cached result
+      const auto& entry = cache_it->second;
+      result.data = entry.data;
+      result.success = entry.success;
+      result.error = entry.error;
+      result.width = entry.width;
+      result.height = entry.height;
+      result.bits_per_component = entry.bits_per_component;
+
+      // Move to back of LRU order
+      auto& order = pdf.decoded_stream_cache_order;
+      auto it = std::find(order.begin(), order.end(), cache_key);
+      if (it != order.end()) {
+        order.erase(it);
+        order.push_back(cache_key);
+      }
+      return result;
+    }
   }
 
   // Start with raw stream data
@@ -3114,6 +3301,28 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   result.data = std::move(current_data);
   result.success = true;
+
+  // Store in cache (only if we have a valid object number)
+  if (obj_num > 0 && cache_key != 0) {
+    // Evict oldest entries if at capacity
+    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
+      uint64_t evict = pdf.decoded_stream_cache_order.front();
+      pdf.decoded_stream_cache_order.pop_front();
+      pdf.decoded_stream_cache.erase(evict);
+    }
+
+    // Store in cache
+    Pdf::DecodedStreamCacheEntry entry;
+    entry.data = result.data;  // Copy for cache
+    entry.success = result.success;
+    entry.error = result.error;
+    entry.width = result.width;
+    entry.height = result.height;
+    entry.bits_per_component = result.bits_per_component;
+    pdf.decoded_stream_cache[cache_key] = std::move(entry);
+    pdf.decoded_stream_cache_order.push_back(cache_key);
+  }
+
   return result;
 }
 
@@ -4846,6 +5055,24 @@ void Pdf::set_object_stream_cache_capacity(size_t capacity) const {
     object_stream_cache_order.pop_front();
     object_stream_cache.erase(evict);
   }
+}
+
+void Pdf::set_decoded_stream_cache_capacity(size_t capacity) const {
+  if (capacity == 0) {
+    capacity = 1;
+  }
+  decoded_stream_cache_capacity = capacity;
+
+  while (decoded_stream_cache_order.size() > decoded_stream_cache_capacity) {
+    uint64_t evict = decoded_stream_cache_order.front();
+    decoded_stream_cache_order.pop_front();
+    decoded_stream_cache.erase(evict);
+  }
+}
+
+void Pdf::clear_decoded_stream_cache() const {
+  decoded_stream_cache.clear();
+  decoded_stream_cache_order.clear();
 }
 
 bool Pdf::load_document_structure() {
@@ -6754,6 +6981,147 @@ void parse_simple_font_encoding(const Pdf& pdf, const Value& encoding_value, Bas
   }
 }
 
+// Parse Type1 font program from FontFile stream and extract encoding
+// This is called when no explicit encoding is provided in the PDF
+void parse_type1_font_encoding(const Pdf& pdf, BaseFont* font) {
+  if (!font || !font->descriptor) {
+    return;
+  }
+
+  // Check if FontFile is present (Type1 font program)
+  const Value& font_file = font->descriptor->font_file;
+  if (font_file.type != Value::REFERENCE && font_file.type != Value::STREAM) {
+    return;
+  }
+
+  // Resolve the font file stream
+  Value resolved;
+  if (font_file.type == Value::REFERENCE) {
+    ResolvedObject res = resolve_reference(pdf, font_file.ref_object_number,
+                                           font_file.ref_generation_number);
+    if (!res.success || res.value.type != Value::STREAM) {
+      return;
+    }
+    resolved = res.value;
+  } else {
+    resolved = font_file;
+  }
+
+  if (resolved.type != Value::STREAM) {
+    return;
+  }
+
+  // Decode the stream
+  DecodedStream decoded = decode_stream(const_cast<Pdf&>(pdf), resolved);
+  if (!decoded.success || decoded.data.empty()) {
+    return;
+  }
+
+  // Parse the Type1 font program
+  Type1Parser parser;
+  Type1FontData fontData;
+  if (!parser.Parse(decoded.data.data(), decoded.data.size(), fontData, false)) {
+    NANOPDF_LOG_DEBUG("Type1Parser failed: %s", parser.GetError().c_str());
+    return;
+  }
+
+  // If font uses standard encoding and no explicit encoding was provided,
+  // populate encoding differences from the Type1 program
+  if (!fontData.uses_standard_encoding) {
+    // Apply encoding from Type1 font program
+    for (int i = 0; i < 256; ++i) {
+      if (!fontData.encoding[i].empty() && fontData.encoding[i] != ".notdef") {
+        font->encoding_differences[static_cast<uint32_t>(i)] = fontData.encoding[i];
+      }
+    }
+  }
+
+  // Update font metrics if not already set
+  if (font->descriptor && font->descriptor->font_bbox.empty() &&
+      (fontData.font_bbox[2] != 0 || fontData.font_bbox[3] != 0)) {
+    font->descriptor->font_bbox.push_back(fontData.font_bbox[0]);
+    font->descriptor->font_bbox.push_back(fontData.font_bbox[1]);
+    font->descriptor->font_bbox.push_back(fontData.font_bbox[2]);
+    font->descriptor->font_bbox.push_back(fontData.font_bbox[3]);
+  }
+}
+
+// Parse CFF font program from FontFile3 stream and extract encoding/charset
+// This is called when no explicit encoding is provided in the PDF for CFF fonts
+void parse_cff_font_encoding(const Pdf& pdf, BaseFont* font) {
+  if (!font || !font->descriptor) {
+    return;
+  }
+
+  // Check if FontFile3 is present (CFF font program)
+  if (font->descriptor->font_file_type != FontFileType::FontFile3) {
+    return;
+  }
+
+  const Value& font_file = font->descriptor->font_file;
+  if (font_file.type != Value::REFERENCE && font_file.type != Value::STREAM) {
+    return;
+  }
+
+  // Resolve the font file stream
+  Value resolved;
+  if (font_file.type == Value::REFERENCE) {
+    ResolvedObject res = resolve_reference(pdf, font_file.ref_object_number,
+                                           font_file.ref_generation_number);
+    if (!res.success || res.value.type != Value::STREAM) {
+      return;
+    }
+    resolved = res.value;
+  } else {
+    resolved = font_file;
+  }
+
+  if (resolved.type != Value::STREAM) {
+    return;
+  }
+
+  // Decode the stream
+  DecodedStream decoded = decode_stream(const_cast<Pdf&>(pdf), resolved);
+  if (!decoded.success || decoded.data.empty()) {
+    return;
+  }
+
+  // Parse the CFF font program
+  cff::CFFParser parser;
+  cff::CFFData cffData;
+  if (!parser.parse(decoded.data.data(), decoded.data.size(), cffData)) {
+    NANOPDF_LOG_DEBUG("CFFParser failed for font %s", font->base_font.c_str());
+    return;
+  }
+
+  NANOPDF_LOG_DEBUG("Parsed CFF font: %s, %zu glyphs, %zu charset entries",
+                    cffData.font_name.c_str(), static_cast<size_t>(cffData.num_glyphs),
+                    cffData.charset.size());
+
+  // Build encoding mapping from CFF data
+  // The CFF charset maps glyph index to glyph name
+  // The CFF encoding maps code to glyph index
+  if (!cffData.encoding.empty() && !cffData.charset.empty()) {
+    for (int code = 0; code < 256 && code < static_cast<int>(cffData.encoding.size()); ++code) {
+      int gid = cffData.encoding[code];
+      if (gid > 0 && gid < static_cast<int>(cffData.charset.size())) {
+        const std::string& glyph_name = cffData.charset[gid];
+        if (!glyph_name.empty() && glyph_name != ".notdef") {
+          font->encoding_differences[static_cast<uint32_t>(code)] = glyph_name;
+        }
+      }
+    }
+  }
+
+  // Update font metrics if not already set
+  if (font->descriptor && font->descriptor->font_bbox.empty() &&
+      cffData.font_bbox.size() >= 4) {
+    for (size_t i = 0; i < 4; ++i) {
+      font->descriptor->font_bbox.push_back(cffData.font_bbox[i]);
+    }
+  }
+}
+
 void extract_cid_system_info(const Dictionary& dict, std::string* registry,
                              std::string* ordering, int* supplement) {
   auto registry_it = dict.find("Registry");
@@ -6840,6 +7208,68 @@ void parse_cid_width_array(const std::vector<Value>& array, Type0Font* font) {
     } else {
       i++;
     }
+  }
+}
+
+// Parse W2 (vertical metrics) array for CIDFonts
+// Format: [CID [w1_y v_x v_y ...]] or [CID_first CID_last w1_y v_x v_y]
+void parse_cid_vertical_width_array(const std::vector<Value>& array, Type0Font* font) {
+  if (!font) {
+    return;
+  }
+  size_t i = 0;
+  while (i < array.size()) {
+    if (array[i].type != Value::NUMBER) {
+      i++;
+      continue;
+    }
+    uint32_t cid = static_cast<uint32_t>(array[i].number);
+    i++;
+    if (i >= array.size()) {
+      break;
+    }
+    const Value& next = array[i];
+    if (next.type == Value::ARRAY) {
+      // Format: CID [w1_y v_x v_y w1_y v_x v_y ...]
+      // Groups of 3 values for each CID starting from cid
+      const auto& metrics_array = next.array;
+      for (size_t j = 0; j + 2 < metrics_array.size(); j += 3) {
+        if (metrics_array[j].type == Value::NUMBER &&
+            metrics_array[j + 1].type == Value::NUMBER &&
+            metrics_array[j + 2].type == Value::NUMBER) {
+          Type0Font::VerticalMetrics vm;
+          vm.w1_y = metrics_array[j].number;
+          vm.v_x = metrics_array[j + 1].number;
+          vm.v_y = metrics_array[j + 2].number;
+          font->cid_vertical_metrics[cid + static_cast<uint32_t>(j / 3)] = vm;
+        }
+      }
+      i++;
+    } else if (next.type == Value::NUMBER) {
+      // Format: CID_first CID_last w1_y v_x v_y
+      uint32_t end_cid = static_cast<uint32_t>(next.number);
+      i++;
+      if (i + 2 >= array.size()) {
+        break;
+      }
+      if (array[i].type == Value::NUMBER &&
+          array[i + 1].type == Value::NUMBER &&
+          array[i + 2].type == Value::NUMBER) {
+        Type0Font::VerticalMetrics vm;
+        vm.w1_y = array[i].number;
+        vm.v_x = array[i + 1].number;
+        vm.v_y = array[i + 2].number;
+        for (uint32_t current = cid; current <= end_cid; ++current) {
+          font->cid_vertical_metrics[current] = vm;
+        }
+      }
+      i += 3;
+    } else {
+      i++;
+    }
+  }
+  if (!font->cid_vertical_metrics.empty()) {
+    font->has_vertical_metrics = true;
   }
 }
 
@@ -7248,6 +7678,26 @@ std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& fon
         parse_cid_width_array(w_it->second.array, font.get());
       }
 
+      // Parse DW2 (default vertical metrics): [v_y w1_y]
+      auto dw2_it = cid_font_dict.find("DW2");
+      if (dw2_it != cid_font_dict.end() && dw2_it->second.type == Value::ARRAY) {
+        const auto& dw2_array = dw2_it->second.array;
+        if (dw2_array.size() >= 2 &&
+            dw2_array[0].type == Value::NUMBER &&
+            dw2_array[1].type == Value::NUMBER) {
+          font->default_v_y = dw2_array[0].number;
+          font->default_w1_y = dw2_array[1].number;
+          font->has_vertical_metrics = true;
+        }
+      }
+
+      // Parse W2 (vertical metrics per CID)
+      auto w2_it = cid_font_dict.find("W2");
+      if (w2_it != cid_font_dict.end() && w2_it->second.type == Value::ARRAY) {
+        font->cid_vertical_metrics.clear();
+        parse_cid_vertical_width_array(w2_it->second.array, font.get());
+      }
+
       auto cid_to_gid_it = cid_font_dict.find("CIDToGIDMap");
       if (cid_to_gid_it != cid_font_dict.end()) {
         parse_cid_to_gid_map(pdf, cid_to_gid_it->second, font.get());
@@ -7469,15 +7919,21 @@ std::unique_ptr<FontDescriptor> Pdf::parse_font_descriptor(const Pdf& pdf, const
   // FontFile2 = TrueType font program
   // FontFile3 = CFF font program (Type1C, CIDFontType0C, OpenType)
   auto fontfile_it = dict.find("FontFile2");  // TrueType
-  if (fontfile_it == dict.end()) {
-    fontfile_it = dict.find("FontFile3");  // CFF/OpenType
-  }
-  if (fontfile_it == dict.end()) {
-    fontfile_it = dict.find("FontFile");  // Type1
-  }
   if (fontfile_it != dict.end()) {
-    // Store the reference/stream for later decoding
     descriptor->font_file = fontfile_it->second;
+    descriptor->font_file_type = FontFileType::FontFile2;
+  } else {
+    fontfile_it = dict.find("FontFile3");  // CFF/OpenType
+    if (fontfile_it != dict.end()) {
+      descriptor->font_file = fontfile_it->second;
+      descriptor->font_file_type = FontFileType::FontFile3;
+    } else {
+      fontfile_it = dict.find("FontFile");  // Type1
+      if (fontfile_it != dict.end()) {
+        descriptor->font_file = fontfile_it->second;
+        descriptor->font_file_type = FontFileType::FontFile;
+      }
+    }
   }
 
   return descriptor;
@@ -7524,6 +7980,18 @@ std::unique_ptr<BaseFont> Pdf::parse_font(const Pdf& pdf, const Value& font_val)
     auto desc_it = font_dict.find("FontDescriptor");
     if (desc_it != font_dict.end()) {
       font->descriptor = parse_font_descriptor(pdf, desc_it->second).release();
+    }
+
+    // For Type1 fonts with embedded font program, try to extract encoding
+    // if no explicit encoding was provided in the PDF
+    if (subtype == "Type1" && font->descriptor &&
+        font->encoding_differences.empty()) {
+      // Try CFF (FontFile3) first, then Type1 (FontFile)
+      if (font->descriptor->font_file_type == FontFileType::FontFile3) {
+        parse_cff_font_encoding(pdf, font.get());
+      } else if (font->descriptor->font_file_type == FontFileType::FontFile) {
+        parse_type1_font_encoding(pdf, font.get());
+      }
     }
 
     auto tounicode_it = font_dict.find("ToUnicode");
@@ -8581,6 +9049,249 @@ void parse_xmp_metadata(const Pdf& pdf, DocumentCatalog& catalog) {
         }
       }
     }
+  }
+}
+
+// Optional Content Properties helper methods
+bool OptionalContentProperties::is_ocg_visible(uint32_t obj_num) const {
+  // Check if explicitly in off_list
+  for (uint32_t off_ref : off_list) {
+    if (off_ref == obj_num) return false;
+  }
+
+  // Check if explicitly in on_list
+  for (uint32_t on_ref : on_list) {
+    if (on_ref == obj_num) return true;
+  }
+
+  // Check base_state
+  if (base_state == "OFF") return false;
+
+  // Default to visible if not explicitly off and base_state is "ON" or empty
+  return true;
+}
+
+const OptionalContentGroup* OptionalContentProperties::find_ocg(uint32_t obj_num) const {
+  for (const auto& ocg : ocgs) {
+    if (ocg.object_number == obj_num) {
+      return &ocg;
+    }
+  }
+  return nullptr;
+}
+
+void OptionalContentProperties::set_ocg_visibility(uint32_t obj_num, bool visible) {
+  // Find and update the OCG
+  for (auto& ocg : ocgs) {
+    if (ocg.object_number == obj_num) {
+      ocg.visible = visible;
+      break;
+    }
+  }
+
+  // Update on/off lists
+  if (visible) {
+    // Remove from off_list if present
+    off_list.erase(
+        std::remove(off_list.begin(), off_list.end(), obj_num),
+        off_list.end());
+    // Add to on_list if not present
+    if (std::find(on_list.begin(), on_list.end(), obj_num) == on_list.end()) {
+      on_list.push_back(obj_num);
+    }
+  } else {
+    // Remove from on_list if present
+    on_list.erase(
+        std::remove(on_list.begin(), on_list.end(), obj_num),
+        on_list.end());
+    // Add to off_list if not present
+    if (std::find(off_list.begin(), off_list.end(), obj_num) == off_list.end()) {
+      off_list.push_back(obj_num);
+    }
+  }
+}
+
+// Parse Optional Content properties from document catalog
+void parse_optional_content(const Pdf& pdf, DocumentCatalog& catalog) {
+  // Look for OCProperties entry in document catalog
+  auto catalog_obj = resolve_reference(pdf, pdf.root, 0);
+  if (!catalog_obj.success || catalog_obj.value.type != Value::DICTIONARY) {
+    return;
+  }
+
+  const auto& catalog_dict = catalog_obj.value.dict;
+  auto ocprops_it = catalog_dict.find("OCProperties");
+  if (ocprops_it == catalog_dict.end()) {
+    return;  // No optional content in this document
+  }
+
+  Value ocprops_val = ocprops_it->second;
+  if (ocprops_val.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, ocprops_val.ref_object_number,
+                                       ocprops_val.ref_generation_number);
+    if (!resolved.success) return;
+    ocprops_val = resolved.value;
+  }
+
+  if (ocprops_val.type != Value::DICTIONARY) return;
+  const auto& ocprops_dict = ocprops_val.dict;
+
+  // Parse OCGs array - list of all OCG dictionaries
+  auto ocgs_it = ocprops_dict.find("OCGs");
+  if (ocgs_it != ocprops_dict.end()) {
+    Value ocgs_val = ocgs_it->second;
+    if (ocgs_val.type == Value::REFERENCE) {
+      auto resolved = resolve_reference(pdf, ocgs_val.ref_object_number,
+                                         ocgs_val.ref_generation_number);
+      if (resolved.success) ocgs_val = resolved.value;
+    }
+
+    if (ocgs_val.type == Value::ARRAY) {
+      for (const auto& ocg_ref : ocgs_val.array) {
+        if (ocg_ref.type == Value::REFERENCE) {
+          auto ocg_obj = resolve_reference(pdf, ocg_ref.ref_object_number,
+                                            ocg_ref.ref_generation_number);
+          if (ocg_obj.success && ocg_obj.value.type == Value::DICTIONARY) {
+            OptionalContentGroup ocg;
+            ocg.object_number = ocg_ref.ref_object_number;
+            ocg.generation_number = ocg_ref.ref_generation_number;
+
+            const auto& ocg_dict = ocg_obj.value.dict;
+
+            // Get OCG name
+            auto name_it = ocg_dict.find("Name");
+            if (name_it != ocg_dict.end() && name_it->second.type == Value::STRING) {
+              ocg.name = name_it->second.str;
+            }
+
+            // Get intent
+            auto intent_it = ocg_dict.find("Intent");
+            if (intent_it != ocg_dict.end()) {
+              if (intent_it->second.type == Value::NAME) {
+                ocg.intent = intent_it->second.name;
+              } else if (intent_it->second.type == Value::ARRAY && !intent_it->second.array.empty()) {
+                if (intent_it->second.array[0].type == Value::NAME) {
+                  ocg.intent = intent_it->second.array[0].name;
+                }
+              }
+            }
+
+            // Parse Usage dictionary if present
+            auto usage_it = ocg_dict.find("Usage");
+            if (usage_it != ocg_dict.end() && usage_it->second.type == Value::DICTIONARY) {
+              const auto& usage_dict = usage_it->second.dict;
+
+              // Print usage
+              auto print_it = usage_dict.find("Print");
+              if (print_it != usage_dict.end() && print_it->second.type == Value::DICTIONARY) {
+                auto state_it = print_it->second.dict.find("PrintState");
+                if (state_it != print_it->second.dict.end() &&
+                    state_it->second.type == Value::NAME &&
+                    state_it->second.name == "OFF") {
+                  ocg.print_never = true;
+                }
+              }
+
+              // View usage
+              auto view_it = usage_dict.find("View");
+              if (view_it != usage_dict.end() && view_it->second.type == Value::DICTIONARY) {
+                auto state_it = view_it->second.dict.find("ViewState");
+                if (state_it != view_it->second.dict.end() &&
+                    state_it->second.type == Value::NAME &&
+                    state_it->second.name == "OFF") {
+                  ocg.view_never = true;
+                }
+              }
+            }
+
+            catalog.ocg_properties.ocgs.push_back(ocg);
+          }
+        }
+      }
+    }
+  }
+
+  // Parse D (default configuration)
+  auto d_it = ocprops_dict.find("D");
+  if (d_it != ocprops_dict.end()) {
+    Value d_val = d_it->second;
+    if (d_val.type == Value::REFERENCE) {
+      auto resolved = resolve_reference(pdf, d_val.ref_object_number,
+                                         d_val.ref_generation_number);
+      if (resolved.success) d_val = resolved.value;
+    }
+
+    if (d_val.type == Value::DICTIONARY) {
+      const auto& d_dict = d_val.dict;
+
+      // BaseState
+      auto basestate_it = d_dict.find("BaseState");
+      if (basestate_it != d_dict.end() && basestate_it->second.type == Value::NAME) {
+        catalog.ocg_properties.base_state = basestate_it->second.name;
+      } else {
+        catalog.ocg_properties.base_state = "ON";  // Default
+      }
+
+      // ON array
+      auto on_it = d_dict.find("ON");
+      if (on_it != d_dict.end() && on_it->second.type == Value::ARRAY) {
+        for (const auto& ref : on_it->second.array) {
+          if (ref.type == Value::REFERENCE) {
+            catalog.ocg_properties.on_list.push_back(ref.ref_object_number);
+          }
+        }
+      }
+
+      // OFF array
+      auto off_it = d_dict.find("OFF");
+      if (off_it != d_dict.end() && off_it->second.type == Value::ARRAY) {
+        for (const auto& ref : off_it->second.array) {
+          if (ref.type == Value::REFERENCE) {
+            catalog.ocg_properties.off_list.push_back(ref.ref_object_number);
+          }
+        }
+      }
+
+      // Locked array
+      auto locked_it = d_dict.find("Locked");
+      if (locked_it != d_dict.end() && locked_it->second.type == Value::ARRAY) {
+        for (const auto& ref : locked_it->second.array) {
+          if (ref.type == Value::REFERENCE) {
+            catalog.ocg_properties.locked.push_back(ref.ref_object_number);
+            // Mark OCG as locked
+            for (auto& ocg : catalog.ocg_properties.ocgs) {
+              if (ocg.object_number == ref.ref_object_number) {
+                ocg.locked = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Order array (simplified - just extract OCG references)
+      auto order_it = d_dict.find("Order");
+      if (order_it != d_dict.end() && order_it->second.type == Value::ARRAY) {
+        int creator_order = 0;
+        for (const auto& item : order_it->second.array) {
+          if (item.type == Value::REFERENCE) {
+            catalog.ocg_properties.order.push_back(item.ref_object_number);
+            // Set creator order for the OCG
+            for (auto& ocg : catalog.ocg_properties.ocgs) {
+              if (ocg.object_number == item.ref_object_number) {
+                ocg.creator_order = creator_order++;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Set initial visibility based on default configuration
+  for (auto& ocg : catalog.ocg_properties.ocgs) {
+    ocg.visible = catalog.ocg_properties.is_ocg_visible(ocg.object_number);
   }
 }
 

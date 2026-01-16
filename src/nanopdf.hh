@@ -127,6 +127,14 @@ enum class FontType {
   CIDFontType2
 };
 
+// Embedded font file types in FontDescriptor
+enum class FontFileType {
+  None,        // No embedded font file
+  FontFile,    // Type1 font program (PFA/PFB)
+  FontFile2,   // TrueType font program
+  FontFile3    // CFF font program (Type1C, CIDFontType0C, OpenType)
+};
+
 // Color space types
 enum class ColorSpaceType {
   DeviceGray,
@@ -656,6 +664,7 @@ struct FontDescriptor {
 
   // Embedded font file data
   Value font_file;  // Can be FontFile, FontFile2, or FontFile3
+  FontFileType font_file_type{FontFileType::None};  // Which type of embedded font
   uint32_t font_file_length{0};
 
   ~FontDescriptor() = default;
@@ -695,6 +704,25 @@ struct Type0Font : public BaseFont {
   int default_width{1000};
   std::map<uint32_t, int> cid_widths;
 
+  // Vertical metrics (for vertical writing mode)
+  // DW2: [v_y, w1_y] - default vertical origin Y and advance width
+  //   v_y: vertical origin Y relative to horizontal origin (default 880)
+  //   w1_y: vertical advance width (default -1000)
+  double default_v_y{880.0};
+  double default_w1_y{-1000.0};
+
+  // W2: vertical metrics per CID
+  // Key: CID, Value: [w1_y, v_x, v_y] (vertical advance, origin x, origin y)
+  struct VerticalMetrics {
+    double w1_y{-1000.0};  // Vertical advance width
+    double v_x{0.0};       // Vertical origin X (relative to horizontal origin)
+    double v_y{880.0};     // Vertical origin Y (relative to horizontal origin)
+  };
+  std::map<uint32_t, VerticalMetrics> cid_vertical_metrics;
+
+  // Whether the font has vertical metrics defined
+  bool has_vertical_metrics{false};
+
   // CIDToGIDMap for glyph mapping
   std::vector<uint16_t> cid_to_gid_map;
 
@@ -727,6 +755,11 @@ struct DecodedStream {
   std::vector<uint8_t> data;
   bool success{false};
   std::string error;
+
+  // Image metadata (for image decoders like JBIG2, JPX)
+  int width{0};
+  int height{0};
+  int bits_per_component{0};
 };
 
 struct ResolvedObject {
@@ -960,6 +993,57 @@ std::vector<uint8_t> compute_user_key(const std::string& user_password, const st
 bool verify_user_password(const std::string& password, const EncryptionDictionary& encrypt_dict, const std::string& file_id);
 bool verify_owner_password(const std::string& password, const EncryptionDictionary& encrypt_dict, const std::string& file_id);
 
+// Optional Content Groups (Layers) support
+struct OptionalContentGroup {
+  uint32_t object_number{0};
+  uint32_t generation_number{0};
+  std::string name;           // Layer name displayed to users
+  std::string intent;         // "View" or "Design"
+  bool visible{true};         // Current visibility state
+  bool locked{false};         // Whether user can change visibility
+  int creator_order{-1};      // Order in creator-defined list
+
+  // Usage dictionary fields
+  bool print_never{false};    // Don't print this layer
+  bool view_never{false};     // Don't view this layer
+  std::string language;       // Language preference
+};
+
+// Optional Content Membership Dictionary (combines OCGs)
+struct OptionalContentMembership {
+  enum class VisibilityPolicy {
+    AllOn,    // All listed OCGs must be ON
+    AnyOn,    // Any listed OCG must be ON
+    AllOff,   // All listed OCGs must be OFF
+    AnyOff    // Any listed OCG must be OFF
+  };
+
+  std::vector<uint32_t> ocg_refs;  // Object numbers of referenced OCGs
+  VisibilityPolicy policy{VisibilityPolicy::AnyOn};
+  std::vector<uint32_t> ve_ocgs;   // Visibility expression OCGs (advanced)
+};
+
+// Optional Content Properties (document-level OCG configuration)
+struct OptionalContentProperties {
+  std::vector<OptionalContentGroup> ocgs;  // All OCGs in the document
+  std::vector<uint32_t> on_list;           // OCGs that are ON by default
+  std::vector<uint32_t> off_list;          // OCGs that are OFF by default
+  std::string base_state;                  // "ON", "OFF", or "Unchanged"
+  std::vector<std::string> intent;         // Active intents
+
+  // Order array - defines how layers appear in UI (can be hierarchical)
+  // Simplified as flat list of OCG references for now
+  std::vector<uint32_t> order;
+
+  // Locked layers that user cannot toggle
+  std::vector<uint32_t> locked;
+
+  // Helper methods
+  bool is_ocg_visible(uint32_t obj_num) const;
+  const OptionalContentGroup* find_ocg(uint32_t obj_num) const;
+  void set_ocg_visibility(uint32_t obj_num, bool visible);
+};
+
 struct DocumentCatalog {
   uint32_t object_number{0};
   uint32_t pages_count{0};
@@ -981,6 +1065,9 @@ struct DocumentCatalog {
   // Phase 6.3: Tagged PDF
   Dictionary mark_info;                       // MarkInfo dictionary for tagged PDFs
   std::unique_ptr<StructureTreeRoot> structure_tree;  // Structure tree for tagged PDFs
+
+  // Optional Content Groups (Layers)
+  OptionalContentProperties ocg_properties;
 };
 
 // Now we can define Pdf after its dependencies
@@ -1013,6 +1100,25 @@ struct Pdf {
   mutable std::deque<uint32_t> object_stream_cache_order;
   static const size_t kDefaultObjectStreamCacheCapacity = 32;
   mutable size_t object_stream_cache_capacity{kDefaultObjectStreamCacheCapacity};
+
+  // Decoded stream cache (LRU) - caches decoded stream data
+  // Key format: (obj_num << 32) | (gen_num << 16) | flags
+  // where flags encode image dimensions if applicable
+  struct DecodedStreamCacheEntry {
+    std::vector<uint8_t> data;
+    int width{0};
+    int height{0};
+    int bits_per_component{0};
+    bool success{false};
+    std::string error;
+  };
+  mutable std::unordered_map<uint64_t, DecodedStreamCacheEntry> decoded_stream_cache;
+  mutable std::deque<uint64_t> decoded_stream_cache_order;
+  static const size_t kDefaultDecodedStreamCacheCapacity = 64;
+  mutable size_t decoded_stream_cache_capacity{kDefaultDecodedStreamCacheCapacity};
+
+  void set_decoded_stream_cache_capacity(size_t capacity) const;
+  void clear_decoded_stream_cache() const;
 
   // Lazy loading state flags
   mutable bool pages_loaded{false};
@@ -1133,6 +1239,7 @@ void parse_page_labels(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_named_destinations(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_document_info(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_xmp_metadata(const Pdf& pdf, DocumentCatalog& catalog);
+void parse_optional_content(const Pdf& pdf, DocumentCatalog& catalog);
 
 // Phase 6.2: Advanced Graphics - Transparency and Blending
 
@@ -1491,6 +1598,9 @@ struct DecodeParams {
   bool black_is_1{false};     // Black pixels are 1 (default: white is 1)
   int rows{0};                 // Number of rows (0 = determine from data)
   int damaged_rows_before_error{0}; // Continue decoding past errors
+
+  // JBIG2Decode parameters
+  std::vector<uint8_t> jbig2_globals;  // JBIG2Globals stream data
 };
 
 DecodedStream decode_flate(const uint8_t* data, size_t size,
