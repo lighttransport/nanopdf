@@ -47,6 +47,36 @@ struct Lab {
   Lab(float L_, float a_, float b_) : L(L_), a(a_), b(b_) {}
 };
 
+// ICC color space signatures
+constexpr uint32_t ICC_SIG_GRAY = 0x47524159;  // 'GRAY'
+constexpr uint32_t ICC_SIG_RGB = 0x52474220;   // 'RGB '
+constexpr uint32_t ICC_SIG_CMYK = 0x434D594B;  // 'CMYK'
+constexpr uint32_t ICC_SIG_LAB = 0x4C616220;   // 'Lab '
+constexpr uint32_t ICC_SIG_XYZ = 0x58595A20;   // 'XYZ '
+
+// ICC tag signatures
+constexpr uint32_t ICC_TAG_rXYZ = 0x7258595A;  // Red colorant XYZ
+constexpr uint32_t ICC_TAG_gXYZ = 0x6758595A;  // Green colorant XYZ
+constexpr uint32_t ICC_TAG_bXYZ = 0x6258595A;  // Blue colorant XYZ
+constexpr uint32_t ICC_TAG_rTRC = 0x72545243;  // Red TRC (gamma)
+constexpr uint32_t ICC_TAG_gTRC = 0x67545243;  // Green TRC (gamma)
+constexpr uint32_t ICC_TAG_bTRC = 0x62545243;  // Blue TRC (gamma)
+constexpr uint32_t ICC_TAG_kTRC = 0x6B545243;  // Gray TRC
+constexpr uint32_t ICC_TAG_wtpt = 0x77747074;  // White point
+
+// TRC (Tone Reproduction Curve) representation
+struct IccTRC {
+  bool valid{false};
+  bool is_gamma{false};    // True if simple gamma, false if curve table
+  float gamma{1.0f};       // Simple gamma value
+  std::vector<float> curve;  // Curve table (normalized 0-1)
+
+  // Apply TRC to a value
+  float apply(float v) const;
+  // Apply inverse TRC
+  float apply_inverse(float v) const;
+};
+
 // Simple ICC profile header parsing (minimal)
 struct IccProfileInfo {
   bool valid{false};
@@ -62,10 +92,31 @@ struct IccProfileInfo {
 
   // Number of color components (1=Gray, 3=RGB, 4=CMYK)
   int num_components{0};
+
+  // Parsed profile data (for matrix/TRC profiles)
+  bool is_matrix_profile{false};  // True if matrix/TRC based
+
+  // Colorant matrix (3x3) - converts profile RGB to XYZ
+  // Row-major: [rX, gX, bX, rY, gY, bY, rZ, gZ, bZ]
+  float colorant_matrix[9]{0};
+
+  // TRC curves for each channel
+  IccTRC trc_r, trc_g, trc_b;  // For RGB profiles
+  IccTRC trc_gray;              // For Gray profiles
+
+  // White point
+  float white_point[3]{0.9505f, 1.0f, 1.0889f};  // Default D65
 };
 
 // Parse ICC profile header (first 128 bytes)
 IccProfileInfo parse_icc_profile_header(const uint8_t* data, size_t size);
+
+// Parse full ICC profile including tags (TRC curves, colorant matrix)
+IccProfileInfo parse_icc_profile(const uint8_t* data, size_t size);
+
+// Convert color using parsed ICC profile
+RGB iccbased_to_rgb(const float* components, int num_components,
+                    const IccProfileInfo& profile);
 
 // Basic color space conversions (no ICC profile needed)
 

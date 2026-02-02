@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-nanopdf is a lightweight, minimal PDF parsing library written in C++11. It focuses on parsing PDF document structure, extracting text content, and decoding various stream filters. The library is designed to be embedded in other applications with minimal dependencies.
+nanopdf is a lightweight, minimal PDF parsing library written in C++14. It focuses on parsing PDF document structure, extracting text content, and decoding various stream filters. The library is designed to be embedded in other applications with minimal dependencies.
 
 ## Build System
 
-This project uses CMake as its build system with C++11 standard requirement.
+This project uses CMake as its build system with C++14 standard requirement.
 
 ### Build Commands
 
@@ -42,6 +42,7 @@ make test_nanopdf     # Build test executable
 - `NANOPDF_BUILD_TESTS`: Build test executables (default: ON)
 - `NANOPDF_BUILD_WASM`: Build for WebAssembly with Emscripten (default: OFF)
 - `NANOPDF_USE_THORVG`: Use ThorVG for rendering backend (default: OFF)
+- `NANOPDF_USE_LIBTIFF`: Use libtiff for CCITT/Fax decoding (default: OFF, experimental)
 - `SANITIZE_ADDRESS`: Enable address sanitizer for debugging
 
 ### Testing

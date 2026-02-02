@@ -18,6 +18,14 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
+# Check for ThorVG in dist/ directory
+NANOPDF_ROOT="$SCRIPT_DIR/../.."
+THORVG_DIST_PKGCONFIG="$NANOPDF_ROOT/dist/lib/x86_64-linux-gnu/pkgconfig"
+if [ -d "$THORVG_DIST_PKGCONFIG" ]; then
+    export PKG_CONFIG_PATH="$THORVG_DIST_PKGCONFIG:$PKG_CONFIG_PATH"
+    echo "Using ThorVG from dist/ directory"
+fi
+
 # Check if nanopdf is built
 NANOPDF_BUILD_DIR="../../build"
 if [ ! -f "$NANOPDF_BUILD_DIR/libnanopdf.a" ]; then
@@ -30,8 +38,8 @@ if [ ! -f "$NANOPDF_BUILD_DIR/libnanopdf.a" ]; then
     fi
     cd build
 
-    # Build with ThorVG support if available
-    if pkg-config --exists thorvg 2>/dev/null; then
+    # Build with ThorVG support if available (check dist/ or system)
+    if [ -f "$NANOPDF_ROOT/dist/include/thorvg-1/thorvg.h" ] || pkg-config --exists thorvg 2>/dev/null; then
         echo "ThorVG found, building with ThorVG support..."
         cmake .. -DNANOPDF_USE_THORVG=ON
     else
@@ -71,7 +79,8 @@ if [ -f "rasterize" ]; then
     else
         echo -e "${YELLOW}⚠ ThorVG support is not enabled${NC}"
         echo "  To enable ThorVG rendering:"
-        echo "  1. Install ThorVG: ../../scripts/install-thorvg.sh"
+        echo "  1. Install ThorVG to dist/: ../../scripts/install-thorvg.sh"
+        echo "     (or install system-wide)"
         echo "  2. Rebuild nanopdf with -DNANOPDF_USE_THORVG=ON"
         echo "  3. Run this script again"
     fi

@@ -56,6 +56,35 @@ struct SvgExportResult {
   double height{0.0};
 };
 
+// SVG gradient definition
+struct SvgGradient {
+  std::string id;
+  bool is_radial{false};
+  // Linear: x1, y1, x2, y2
+  // Radial: cx, cy, r, fx, fy
+  double x1{0.0}, y1{0.0}, x2{1.0}, y2{0.0};
+  double cx{0.5}, cy{0.5}, r{0.5}, fx{0.5}, fy{0.5};
+  struct Stop {
+    double offset;  // 0.0-1.0
+    std::string color;
+    double opacity{1.0};
+  };
+  std::vector<Stop> stops;
+  std::string transform;  // Optional transform attribute
+  std::string units{"objectBoundingBox"};  // or "userSpaceOnUse"
+};
+
+// SVG pattern definition
+struct SvgPattern {
+  std::string id;
+  double x{0.0}, y{0.0};
+  double width{0.0}, height{0.0};
+  std::string units{"userSpaceOnUse"};
+  std::string content_units{"userSpaceOnUse"};
+  std::string transform;
+  std::vector<SvgElement> content;
+};
+
 class CanvasExporter {
 public:
   CanvasExporter() = default;
@@ -221,6 +250,20 @@ private:
   std::vector<GraphicsState> graphics_state_stack_;
   bool canvas_mode_{false};
   bool svg_mode_{false};
+
+  // SVG gradient and pattern definitions
+  std::vector<SvgGradient> svg_gradients_;
+  std::vector<SvgPattern> svg_patterns_;
+  int svg_gradient_counter_{0};
+  int svg_pattern_counter_{0};
+
+  // Methods for gradient/pattern handling
+  std::string create_svg_gradient(const Value& shading, const Matrix2D& ctm);
+  std::string create_svg_pattern(const Value& pattern, const Matrix2D& ctm);
+  void parse_shading_resources(const Pdf& pdf, const Dictionary& resources);
+  void parse_pattern_resources(const Pdf& pdf, const Dictionary& resources);
+  std::map<std::string, Value> shading_resources_;
+  std::map<std::string, Value> pattern_resources_;
 };
 
 }  // namespace nanopdf

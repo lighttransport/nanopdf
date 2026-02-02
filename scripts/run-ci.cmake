@@ -23,6 +23,23 @@ if(NOT CTEST_COMMAND)
   message(FATAL_ERROR "ctest executable not found in PATH")
 endif()
 
+set(PHASE_EXECUTABLES
+  test_phase1
+  test_phase1_simple
+  test_phase2
+  test_phase2_standardencoding
+  test_phase2_rendering
+  test_phase2_realpdf
+  test_phase2_text
+  test_phase3
+  test_phase4
+  test_phase5
+  test_phase6
+)
+
+file(GLOB_RECURSE SAMPLE_PDFS LIST_DIRECTORIES false "${PROJECT_ROOT}/data/*.pdf")
+list(SORT SAMPLE_PDFS)
+
 foreach(CONFIG IN LISTS DEFAULT_CONFIGS)
   string(TOLOWER "${CONFIG}" CONFIG_LOWER)
   set(BINARY_DIR "${BUILD_ROOT}/ci-${CONFIG_LOWER}")
@@ -63,6 +80,42 @@ foreach(CONFIG IN LISTS DEFAULT_CONFIGS)
     message("${TEST_OUT}")
     message(FATAL_ERROR "Tests failed for ${CONFIG}: ${TEST_ERR}")
   endif()
+
+  set(EXEC_SUFFIX "")
+  if(WIN32)
+    set(EXEC_SUFFIX ".exe")
+  endif()
+
+  foreach(PHASE_EXE IN LISTS PHASE_EXECUTABLES)
+    set(EXEC_PATH "${BINARY_DIR}/${PHASE_EXE}${EXEC_SUFFIX}")
+    if(NOT EXISTS "${EXEC_PATH}")
+      message(FATAL_ERROR "Expected phase executable ${EXEC_PATH} was not generated")
+    endif()
+
+    set(PHASE_ARGS)
+    set(PHASE_DISPLAY "")
+    if(SAMPLE_PDFS)
+      list(GET SAMPLE_PDFS 0 SAMPLE_PDF)
+      list(APPEND PHASE_ARGS "${SAMPLE_PDF}")
+      file(RELATIVE_PATH PHASE_DISPLAY "${PROJECT_ROOT}" "${SAMPLE_PDF}")
+    endif()
+
+    if(PHASE_DISPLAY)
+      message(STATUS "[nanopdf-ci] Run ${PHASE_EXE} (${PHASE_DISPLAY})")
+    else()
+      message(STATUS "[nanopdf-ci] Run ${PHASE_EXE}")
+    endif()
+
+    execute_process(
+      COMMAND "${EXEC_PATH}" ${PHASE_ARGS}
+      WORKING_DIRECTORY "${BINARY_DIR}"
+      RESULT_VARIABLE PHASE_RESULT
+      COMMAND_ECHO STDOUT
+    )
+    if(PHASE_RESULT)
+      message(FATAL_ERROR "Phase executable ${PHASE_EXE} failed with exit code ${PHASE_RESULT}")
+    endif()
+  endforeach()
 endforeach()
 
 message(STATUS "[nanopdf-ci] All configurations passed")

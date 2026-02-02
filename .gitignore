@@ -1,0 +1,54 @@
+# Build directories
+build/
+build_*/
+**/build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+
+# Temporary files
+tmp/
+.tmp/
+*.tmp
+*~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+*.png
+*.jpg
+*.jpeg
+*.pgm
+*.ppm
+*.pbm
+!data/*.png
+!data/*.jpg
+!data/*.jpeg
+
+# Test/temp data
+*.pdf
+!data/*.pdf
+canvas_output.*
+svg_output.*
+data/ccitt/
+
+# Emscripten
+*.wasm
+*.js.map

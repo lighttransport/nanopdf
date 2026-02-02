@@ -11,6 +11,9 @@
 #include "JBig2_ArithDecoder.hh"
 #include "JBig2_BitStream.hh"
 #include "JBig2_Image.hh"
+#include "../ccitt-decoder.hh"
+
+#include <cstring>
 
 namespace nanopdf {
 namespace jbig2 {
@@ -423,9 +426,67 @@ std::unique_ptr<CJBig2_Image> CJBig2_GRDProc::DecodeArithTemplate3Unopt(
 
 std::unique_ptr<CJBig2_Image> CJBig2_GRDProc::DecodeMMR(
     CJBig2_BitStream* pStream) {
-  // MMR decoding requires FAX G4 decoder which is not yet ported
-  // Return empty image for now
-  return std::unique_ptr<CJBig2_Image>(new CJBig2_Image(GBW, GBH));
+  // Validate dimensions
+  if (GBW == 0 || GBH == 0 || GBW > 65535 || GBH > 65535) {
+    return std::unique_ptr<CJBig2_Image>(new CJBig2_Image(GBW, GBH));
+  }
+
+  // Align to byte boundary before MMR data
+  pStream->alignByte();
+
+  // Get remaining data from stream
+  const uint8_t* src_data = pStream->getPointer();
+  size_t src_size = pStream->getByteLeft();
+
+  if (!src_data || src_size == 0) {
+    return std::unique_ptr<CJBig2_Image>(new CJBig2_Image(GBW, GBH));
+  }
+
+  // Decode using CCITT Group 4 (MMR) algorithm
+  // K = -1 means Group 4, no EOL markers, no byte alignment, black_is_1 = true
+  std::vector<uint8_t> decoded_data;
+  bool success = ccitt::decode_ccitt_fax(
+      src_data, src_size,
+      static_cast<int>(GBW), static_cast<int>(GBH),
+      -1,      // K < 0 = Group 4 (T.6) - pure 2D
+      false,   // end_of_line - no EOL markers in JBIG2 MMR
+      false,   // encoded_byte_align - no byte alignment between rows
+      true,    // black_is_1 - JBIG2 uses 1 for black pixels
+      decoded_data);
+
+  if (!success || decoded_data.empty()) {
+    // Fallback to empty image
+    return std::unique_ptr<CJBig2_Image>(new CJBig2_Image(GBW, GBH));
+  }
+
+  // Create output image
+  auto pImage = std::unique_ptr<CJBig2_Image>(new CJBig2_Image(GBW, GBH));
+
+  // Copy decoded data to image
+  // CJBig2_Image uses pitch = (width + 31) / 32 * 4 (32-bit aligned rows)
+  // CCITT decoder uses pitch = (width + 7) / 8 (byte aligned)
+  int ccitt_pitch = (static_cast<int>(GBW) + 7) / 8;
+  int jbig2_pitch = pImage->stride();
+
+  for (uint32_t y = 0; y < GBH; ++y) {
+    const uint8_t* src_row = decoded_data.data() + y * ccitt_pitch;
+    uint8_t* dst_row = pImage->data() + y * jbig2_pitch;
+
+    // Copy the bytes that contain image data
+    std::memcpy(dst_row, src_row, ccitt_pitch);
+
+    // Clear any padding bytes in the wider stride
+    if (jbig2_pitch > ccitt_pitch) {
+      std::memset(dst_row + ccitt_pitch, 0, jbig2_pitch - ccitt_pitch);
+    }
+  }
+
+  // Advance stream position past the MMR data
+  // MMR data ends with EOFB (000000000001 repeated twice) or when all rows decoded
+  // For simplicity, consume all remaining bytes
+  pStream->setOffset(static_cast<uint32_t>(pStream->getBufSize()));
+
+  return pImage;
 }
 
 }  // namespace jbig2

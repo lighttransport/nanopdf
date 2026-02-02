@@ -5,7 +5,9 @@
 
 #include "nanopdf.hh"
 
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 namespace nanopdf {
@@ -328,6 +330,121 @@ void parse_page_labels(const Pdf& pdf, DocumentCatalog& catalog) {
   }
 }
 
+// Helper: Parse a single destination value into NamedDestination
+static void parse_destination_value(const Pdf& pdf, const std::string& name,
+                                    const Value& dest_value,
+                                    DocumentCatalog& catalog) {
+  NamedDestination dest;
+  dest.name = name;
+
+  Value dest_array = dest_value;
+  if (dest_array.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, dest_array.ref_object_number,
+                                      dest_array.ref_generation_number);
+    if (resolved.success) {
+      dest_array = resolved.value;
+    }
+  }
+
+  // Handle dictionary with D entry (destination dictionary)
+  if (dest_array.type == Value::DICTIONARY) {
+    auto d_it = dest_array.dict.find("D");
+    if (d_it != dest_array.dict.end()) {
+      dest_array = d_it->second;
+      if (dest_array.type == Value::REFERENCE) {
+        auto resolved = resolve_reference(pdf, dest_array.ref_object_number,
+                                          dest_array.ref_generation_number);
+        if (resolved.success) {
+          dest_array = resolved.value;
+        }
+      }
+    }
+  }
+
+  if (dest_array.type == Value::ARRAY && !dest_array.array.empty()) {
+    // Parse destination array [page /Type params...]
+    if (dest_array.array[0].type == Value::REFERENCE) {
+      uint32_t page_obj = dest_array.array[0].ref_object_number;
+      for (size_t i = 0; i < pdf.catalog.pages.size(); ++i) {
+        if (pdf.catalog.pages[i].object_number == page_obj) {
+          dest.page_number = static_cast<uint32_t>(i);
+          break;
+        }
+      }
+    } else if (dest_array.array[0].type == Value::NUMBER) {
+      // Page number directly (rare but valid)
+      dest.page_number = static_cast<uint32_t>(dest_array.array[0].number);
+    }
+
+    // Fit type
+    if (dest_array.array.size() >= 2 && dest_array.array[1].type == Value::NAME) {
+      dest.fit_type = dest_array.array[1].str;
+    }
+
+    // Position parameters
+    for (size_t i = 2; i < dest_array.array.size(); ++i) {
+      if (dest_array.array[i].type == Value::NUMBER) {
+        dest.position.push_back(dest_array.array[i].number);
+      } else if (dest_array.array[i].type == Value::NULL_OBJ) {
+        // null represents "unchanged" - use NaN as placeholder
+        dest.position.push_back(std::numeric_limits<double>::quiet_NaN());
+      }
+    }
+  }
+
+  catalog.named_destinations[dest.name] = dest;
+}
+
+// Helper: Recursively parse a name tree node
+// Name trees have either:
+// - Kids: array of child node references (intermediate node)
+// - Names: array of key-value pairs (leaf node)
+static void parse_name_tree_node(const Pdf& pdf, const Value& node_value,
+                                 DocumentCatalog& catalog) {
+  Value node = node_value;
+  if (node.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, node.ref_object_number,
+                                      node.ref_generation_number);
+    if (!resolved.success) {
+      return;
+    }
+    node = resolved.value;
+  }
+
+  if (node.type != Value::DICTIONARY) {
+    return;
+  }
+
+  const auto& node_dict = node.dict;
+
+  // Check for Names array (leaf node)
+  auto names_it = node_dict.find("Names");
+  if (names_it != node_dict.end() && names_it->second.type == Value::ARRAY) {
+    const auto& names_array = names_it->second.array;
+    // Names array: [key1 value1 key2 value2 ...]
+    for (size_t i = 0; i + 1 < names_array.size(); i += 2) {
+      std::string key;
+      if (names_array[i].type == Value::STRING) {
+        key = names_array[i].str;
+      } else if (names_array[i].type == Value::NAME) {
+        key = names_array[i].str;
+      } else {
+        continue;  // Invalid key type
+      }
+
+      parse_destination_value(pdf, key, names_array[i + 1], catalog);
+    }
+  }
+
+  // Check for Kids array (intermediate node)
+  auto kids_it = node_dict.find("Kids");
+  if (kids_it != node_dict.end() && kids_it->second.type == Value::ARRAY) {
+    for (const auto& kid : kids_it->second.array) {
+      parse_name_tree_node(pdf, kid, catalog);
+    }
+  }
+}
+
 // Parse named destinations
 void parse_named_destinations(const Pdf& pdf, DocumentCatalog& catalog) {
   // Resolve catalog object to get dictionary
@@ -410,8 +527,8 @@ void parse_named_destinations(const Pdf& pdf, DocumentCatalog& catalog) {
     if (names_value.type == Value::DICTIONARY) {
       auto dests_tree_it = names_value.dict.find("Dests");
       if (dests_tree_it != names_value.dict.end()) {
-        // TODO: Parse name tree structure (Names array in leaf nodes)
-        // For now, simplified implementation
+        // Parse name tree structure recursively
+        parse_name_tree_node(pdf, dests_tree_it->second, catalog);
       }
     }
   }

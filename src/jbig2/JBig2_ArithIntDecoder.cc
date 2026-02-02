@@ -8,6 +8,7 @@
 
 #include "JBig2_ArithIntDecoder.hh"
 
+#include <cstddef>
 #include <limits>
 
 namespace nanopdf {

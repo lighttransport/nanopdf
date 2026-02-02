@@ -84,3 +84,8 @@ echo '    import Module from "./nanopdf.js";'
 echo '    const module = await Module();'
 echo '    // Use module functions here'
 echo '  </script>'
+echo ""
+echo -e "${GREEN}To run the nanopdfjs demo:${NC}"
+echo "  cd $PROJECT_ROOT/examples/nanopdfjs"
+echo "  python3 -m http.server 8000"
+echo "  # Then open http://localhost:8000 in your browser"

@@ -5,9 +5,11 @@
 
 #include "thorvg-backend.hh"
 #include <cmath>
-#include <iostream>
 #include <fstream>
 #include <sstream>
+
+#include "nanopdf-log.hh"
+#include "color-transform.hh"
 
 // For PNG saving - implementation in stb_image_write_impl.cc
 #include "stb_image_write.h"
@@ -16,6 +18,12 @@
 extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
+
+// C++14 compatible clamp (std::clamp is C++17)
+template<typename T>
+constexpr T clamp14(const T& v, const T& lo, const T& hi) {
+  return (v < lo) ? lo : (hi < v) ? hi : v;
+}
 
 // WinAnsiEncoding to Unicode mapping table
 static const uint16_t kWinAnsiEncoding[256] = {
@@ -334,9 +342,9 @@ static void draw_gouraud_triangle(uint32_t* bitmap, int width, int height,
       float g = intersections[0].g + t * (intersections[1].g - intersections[0].g);
       float b = intersections[0].b + t * (intersections[1].b - intersections[0].b);
 
-      uint8_t ri = static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f));
-      uint8_t gi = static_cast<uint8_t>(std::clamp(g * 255.0f, 0.0f, 255.0f));
-      uint8_t bi = static_cast<uint8_t>(std::clamp(b * 255.0f, 0.0f, 255.0f));
+      uint8_t ri = static_cast<uint8_t>(clamp14(r * 255.0f, 0.0f, 255.0f));
+      uint8_t gi = static_cast<uint8_t>(clamp14(g * 255.0f, 0.0f, 255.0f));
+      uint8_t bi = static_cast<uint8_t>(clamp14(b * 255.0f, 0.0f, 255.0f));
 
       row[x] = 0xFF000000 | (bi << 16) | (gi << 8) | ri;  // BGRA format
     }
@@ -657,13 +665,39 @@ static void convert_icc_to_srgb(
         }
       }
     } else {
-      // Unknown RGB profile - assume sRGB-like, direct copy
-      for (int i = 0; i < width * height; i++) {
-        int src_idx = i * 3;
-        if (src_idx + 2 < static_cast<int>(src_data.size())) {
-          dst_data[i * 3] = src_data[src_idx];
-          dst_data[i * 3 + 1] = src_data[src_idx + 1];
-          dst_data[i * 3 + 2] = src_data[src_idx + 2];
+      // Unknown RGB profile - try to use full ICC profile parsing
+      color::IccProfileInfo full_profile;
+      if (!color_space.icc_profile_data.empty()) {
+        full_profile = color::parse_icc_profile(
+            color_space.icc_profile_data.data(),
+            color_space.icc_profile_data.size());
+      }
+
+      if (full_profile.valid && full_profile.is_matrix_profile) {
+        // Use TRC curves and colorant matrix for accurate conversion
+        for (int i = 0; i < width * height; i++) {
+          int src_idx = i * 3;
+          if (src_idx + 2 < static_cast<int>(src_data.size())) {
+            float components[3] = {
+                src_data[src_idx] / 255.0f,
+                src_data[src_idx + 1] / 255.0f,
+                src_data[src_idx + 2] / 255.0f
+            };
+            color::RGB rgb = color::iccbased_to_rgb(components, 3, full_profile);
+            dst_data[i * 3] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, rgb.r)) * 255);
+            dst_data[i * 3 + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, rgb.g)) * 255);
+            dst_data[i * 3 + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, rgb.b)) * 255);
+          }
+        }
+      } else {
+        // Fallback - direct copy assuming sRGB-like
+        for (int i = 0; i < width * height; i++) {
+          int src_idx = i * 3;
+          if (src_idx + 2 < static_cast<int>(src_data.size())) {
+            dst_data[i * 3] = src_data[src_idx];
+            dst_data[i * 3 + 1] = src_data[src_idx + 1];
+            dst_data[i * 3 + 2] = src_data[src_idx + 2];
+          }
         }
       }
     }
@@ -725,7 +759,7 @@ static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
 ThorVGBackend::ThorVGBackend() {
   // Initialize ThorVG engine (v1.0+ API - no canvas engine param)
   if (tvg::Initializer::init(0) != tvg::Result::Success) {
-    std::cerr << "Failed to initialize ThorVG" << std::endl;
+    NANOPDF_LOG_ERROR("ThorVG", "Failed to initialize ThorVG engine");
   }
 }
 
@@ -876,10 +910,146 @@ bool ThorVGBackend::draw_path(const std::vector<tvg::PathCommand>& cmds,
   return push_with_clip(shape);
 }
 
+// Render a Type 3 font glyph by executing its CharProc content stream
+bool ThorVGBackend::render_type3_glyph(const Type3Font* type3_font, const std::string& glyph_name,
+                                        float x, float y, float size,
+                                        uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  if (!type3_font || !current_pdf_ || glyph_name.empty()) {
+    return false;
+  }
+
+  // Look up the glyph procedure in CharProcs
+  auto proc_it = type3_font->char_procs.find(glyph_name);
+  if (proc_it == type3_font->char_procs.end()) {
+    // Glyph not found - draw placeholder rectangle
+    auto shape = tvg::Shape::gen();
+    if (shape) {
+      float glyph_width = size * 0.5f;
+      shape->appendRect(x, y - size, glyph_width, size, 0, 0);
+      shape->fill(r, g, b, static_cast<uint8_t>(a * 0.3f));  // Semi-transparent
+      push_with_clip(shape);
+    }
+    return true;
+  }
+
+  // Resolve the glyph procedure (it's usually a stream)
+  Value proc_value = proc_it->second;
+  if (proc_value.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_, proc_value.ref_object_number,
+                                       proc_value.ref_generation_number);
+    if (!resolved.success) {
+      return false;
+    }
+    proc_value = resolved.value;
+  }
+
+  if (proc_value.type != Value::STREAM) {
+    return false;
+  }
+
+  // Decode the glyph content stream
+  auto decoded = decode_stream(*current_pdf_, proc_value);
+  if (!decoded.success || decoded.data.empty()) {
+    return false;
+  }
+
+  // Calculate transformation based on font matrix and size
+  // Type 3 fonts use font_matrix to scale glyph space to text space
+  // Default is [0.001, 0, 0, 0.001, 0, 0] which scales 1000 units to 1 point
+  double fm_a = type3_font->font_matrix.size() >= 1 ? type3_font->font_matrix[0] : 0.001;
+  double fm_b = type3_font->font_matrix.size() >= 2 ? type3_font->font_matrix[1] : 0;
+  double fm_c = type3_font->font_matrix.size() >= 3 ? type3_font->font_matrix[2] : 0;
+  double fm_d = type3_font->font_matrix.size() >= 4 ? type3_font->font_matrix[3] : 0.001;
+
+  // Save current state
+  GraphicsState saved_state = state_;
+
+  // Set up graphics state for glyph rendering
+  // Apply font matrix and size scaling
+  float glyph_scale = size * static_cast<float>(fm_a) * state_.scale;
+
+  // Offset to glyph position
+  state_.transform.e = x;
+  state_.transform.f = y;
+
+  // Apply font matrix scaling
+  state_.transform.a = glyph_scale;
+  state_.transform.d = -glyph_scale;  // Flip Y for glyph space
+
+  // Set fill color
+  state_.fill_r = r;
+  state_.fill_g = g;
+  state_.fill_b = b;
+  state_.fill_a = a;
+
+  // Push Type 3 font resources
+  if (!type3_font->resources.empty()) {
+    form_resources_stack_.push_back(type3_font->resources);
+  }
+
+  // Parse and render the glyph content stream
+  // Type 3 glyphs use d0/d1 operators for metrics, then standard path operators
+  parse_pdf_content(decoded.data);
+
+  // Pop resources
+  if (!type3_font->resources.empty() && !form_resources_stack_.empty()) {
+    form_resources_stack_.pop_back();
+  }
+
+  // Restore state
+  state_ = saved_state;
+
+  return true;
+}
+
 bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float size,
                              uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   if (!scene_) {
     return false;
+  }
+
+  // Check for Type 3 font (user-defined glyphs)
+  auto* type3_font = dynamic_cast<const Type3Font*>(current_font_);
+  if (type3_font) {
+    // Type 3 fonts: render each glyph using its CharProc content stream
+    float cursor_x = x;
+
+    for (size_t i = 0; i < text.length(); ++i) {
+      uint8_t char_code = static_cast<uint8_t>(text[i]);
+
+      // Get glyph name from encoding
+      std::string glyph_name;
+      if (char_code < type3_font->encoding.size()) {
+        glyph_name = type3_font->encoding[char_code];
+      }
+
+      if (glyph_name.empty() || glyph_name == ".notdef") {
+        // No glyph - draw placeholder and advance
+        auto shape = tvg::Shape::gen();
+        if (shape) {
+          float glyph_width = size * 0.5f;
+          shape->appendRect(cursor_x, y - size, glyph_width, size, 0, 0);
+          shape->fill(r, g, b, static_cast<uint8_t>(a * 0.2f));
+          push_with_clip(shape);
+        }
+        cursor_x += size * 0.6f;
+        continue;
+      }
+
+      // Render the Type 3 glyph
+      render_type3_glyph(type3_font, glyph_name, cursor_x, y, size, r, g, b, a);
+
+      // Get advance width from Widths array if available
+      float advance = size * 0.6f;  // Default advance
+      if (char_code < type3_font->widths.size()) {
+        // Type 3 widths are in glyph space, apply font matrix
+        double fm_a = type3_font->font_matrix.size() >= 1 ? type3_font->font_matrix[0] : 0.001;
+        advance = static_cast<float>(type3_font->widths[char_code] * fm_a * size);
+      }
+
+      cursor_x += advance;
+    }
+    return true;
   }
 
   // Check if we have a loaded font with glyph data
@@ -1145,9 +1315,7 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
       if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
         cache.initialized = true;
         font_cache_[font_name] = std::move(cache);
-#if NANOPDF_DEBUG_PRINT
-        std::cerr << "[ThorVG] Using fallback font: " << *path << " for '" << font_name << "'" << std::endl;
-#endif
+        NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s'", *path, font_name.c_str());
         return true;
       }
     }
@@ -1162,18 +1330,14 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
-#if NANOPDF_DEBUG_PRINT
-          std::cerr << "[ThorVG] Using fallback font: " << *path << " for '" << font_name << "'" << std::endl;
-#endif
+          NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s'", *path, font_name.c_str());
           return true;
         }
       }
     }
   }
 
-#if NANOPDF_DEBUG_PRINT
-  std::cerr << "[ThorVG] Font '" << font_name << "' - no fallback font found" << std::endl;
-#endif
+  NANOPDF_LOG_WARN("ThorVG", "Font '%s' - no fallback font found", font_name.c_str());
   return false;
 }
 
@@ -1225,7 +1389,7 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
 
   cache.initialized = true;
   font_cache_[font_name] = std::move(cache);
-  std::cerr << "[ThorVG] Successfully loaded font '" << font_name << "' (" << decoded.data.size() << " bytes)" << std::endl;
+  NANOPDF_LOG_INFO("ThorVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), decoded.data.size());
   return true;
 }
 
@@ -1387,8 +1551,8 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
 
     // Apply clip to the shape (clip() takes ownership of clipper)
     if (shape->clip(clipper) != tvg::Result::Success) {
-      // Clipping failed, delete clipper and push shape without clip
-      delete clipper;
+      // Clipping failed, release clipper and push shape without clip
+      tvg::Paint::rel(clipper);
       scene_->push(shape);
       return true;
     }
@@ -1399,7 +1563,12 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
 }
 
 bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height) {
+  NANOPDF_LOG_DEBUG("ThorVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
+                    image.width, image.height, x, y, width, height, image.data.size());
+
   if (!scene_ || image.data.empty()) {
+    NANOPDF_LOG_WARN("ThorVG", "draw_image: skipped (scene=%p, data.empty=%d)",
+                     (void*)scene_, image.data.empty() ? 1 : 0);
     return false;
   }
 
@@ -1494,11 +1663,154 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
       }
     }
   }
+  // Handle Separation color space (single spot color)
+  else if (cs_type == ColorSpaceType::Separation) {
+    // Separation has a single tint value that maps to alternate color space
+    const auto& colorant = image.color_space.colorant_names;
+    const auto& tint_func = image.color_space.tint_function;
+
+    // Determine alternate color space components
+    int alt_components = 4;  // Default CMYK
+    if (image.color_space.alternate_color_space) {
+      ColorSpaceType alt_type = image.color_space.alternate_color_space->type;
+      if (alt_type == ColorSpaceType::DeviceGray || alt_type == ColorSpaceType::CalGray) {
+        alt_components = 1;
+      } else if (alt_type == ColorSpaceType::DeviceRGB || alt_type == ColorSpaceType::CalRGB) {
+        alt_components = 3;
+      }
+    }
+
+    for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
+      // Get tint value (0-1 range from 8-bit data)
+      double tint = image.data[i] / 255.0;
+
+      // Evaluate tint function if present
+      std::vector<double> outputs;
+      uint8_t r = 0, g = 0, b = 0;
+
+      if (tint_func.type != Value::NONE && current_pdf_ &&
+          evaluate_pdf_function(*current_pdf_, tint_func, {tint}, outputs) &&
+          !outputs.empty()) {
+        // Convert alternate color to RGB
+        if (alt_components == 1) {
+          // Gray
+          uint8_t gray = static_cast<uint8_t>(outputs[0] * 255);
+          r = g = b = gray;
+        } else if (alt_components == 3 && outputs.size() >= 3) {
+          // RGB
+          r = static_cast<uint8_t>(outputs[0] * 255);
+          g = static_cast<uint8_t>(outputs[1] * 255);
+          b = static_cast<uint8_t>(outputs[2] * 255);
+        } else if (alt_components == 4 && outputs.size() >= 4) {
+          // CMYK to RGB
+          float c = static_cast<float>(outputs[0]);
+          float m = static_cast<float>(outputs[1]);
+          float y = static_cast<float>(outputs[2]);
+          float k = static_cast<float>(outputs[3]);
+          r = static_cast<uint8_t>(255 * (1.0f - c) * (1.0f - k));
+          g = static_cast<uint8_t>(255 * (1.0f - m) * (1.0f - k));
+          b = static_cast<uint8_t>(255 * (1.0f - y) * (1.0f - k));
+        }
+      } else {
+        // Fallback: treat as grayscale tint
+        uint8_t gray = static_cast<uint8_t>((1.0 - tint) * 255);
+        r = g = b = gray;
+      }
+
+      argb_data[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+    }
+  }
+  // Handle DeviceN color space (multiple spot colors)
+  else if (cs_type == ColorSpaceType::DeviceN) {
+    int n_colorants = static_cast<int>(image.color_space.colorant_names.size());
+    if (n_colorants == 0) n_colorants = num_components;
+    const auto& tint_func = image.color_space.tint_function;
+
+    // Determine alternate color space components
+    int alt_components = 4;  // Default CMYK
+    if (image.color_space.alternate_color_space) {
+      ColorSpaceType alt_type = image.color_space.alternate_color_space->type;
+      if (alt_type == ColorSpaceType::DeviceGray || alt_type == ColorSpaceType::CalGray) {
+        alt_components = 1;
+      } else if (alt_type == ColorSpaceType::DeviceRGB || alt_type == ColorSpaceType::CalRGB) {
+        alt_components = 3;
+      }
+    }
+
+    for (int i = 0; i < img_width * img_height; i++) {
+      int src_idx = i * n_colorants;
+
+      // Collect tint values
+      std::vector<double> inputs;
+      for (int j = 0; j < n_colorants; j++) {
+        if (src_idx + j < static_cast<int>(image.data.size())) {
+          inputs.push_back(image.data[src_idx + j] / 255.0);
+        } else {
+          inputs.push_back(0.0);
+        }
+      }
+
+      // Evaluate tint function
+      std::vector<double> outputs;
+      uint8_t r = 0, g = 0, b = 0;
+
+      if (tint_func.type != Value::NONE && current_pdf_ &&
+          evaluate_pdf_function(*current_pdf_, tint_func, inputs, outputs) &&
+          !outputs.empty()) {
+        // Convert alternate color to RGB
+        if (alt_components == 1) {
+          uint8_t gray = static_cast<uint8_t>(outputs[0] * 255);
+          r = g = b = gray;
+        } else if (alt_components == 3 && outputs.size() >= 3) {
+          r = static_cast<uint8_t>(outputs[0] * 255);
+          g = static_cast<uint8_t>(outputs[1] * 255);
+          b = static_cast<uint8_t>(outputs[2] * 255);
+        } else if (alt_components == 4 && outputs.size() >= 4) {
+          float c = static_cast<float>(outputs[0]);
+          float m = static_cast<float>(outputs[1]);
+          float y = static_cast<float>(outputs[2]);
+          float k = static_cast<float>(outputs[3]);
+          r = static_cast<uint8_t>(255 * (1.0f - c) * (1.0f - k));
+          g = static_cast<uint8_t>(255 * (1.0f - m) * (1.0f - k));
+          b = static_cast<uint8_t>(255 * (1.0f - y) * (1.0f - k));
+        }
+      } else {
+        // Fallback: average tints as gray
+        double avg = 0;
+        for (double t : inputs) avg += t;
+        avg /= (inputs.empty() ? 1.0 : inputs.size());
+        uint8_t gray = static_cast<uint8_t>((1.0 - avg) * 255);
+        r = g = b = gray;
+      }
+
+      argb_data[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+    }
+  }
   // Handle grayscale
   else if (num_components == 1) {
-    for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
-      uint8_t gray = image.data[i];
-      argb_data[i] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
+    // Check if this is 1-bit per pixel (packed bits)
+    if (image.bits_per_component == 1) {
+      // Unpack 1-bit data: 8 pixels per byte
+      int stride = (img_width + 7) / 8;  // Bytes per row
+      for (int row = 0; row < img_height; row++) {
+        for (int col = 0; col < img_width; col++) {
+          int byte_idx = row * stride + col / 8;
+          int bit_idx = 7 - (col % 8);  // MSB first
+
+          if (byte_idx < static_cast<int>(image.data.size())) {
+            bool bit_set = (image.data[byte_idx] >> bit_idx) & 1;
+            // CCITT decoder outputs: 1=white, 0=black (when BlackIs1=false, which is typical)
+            uint8_t gray = bit_set ? 0xFF : 0x00;
+            argb_data[row * img_width + col] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
+          }
+        }
+      }
+    } else {
+      // 8-bit grayscale
+      for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
+        uint8_t gray = image.data[i];
+        argb_data[i] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
+      }
     }
   }
   // Handle RGB
@@ -1559,6 +1871,9 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   float canvas_x = x * state_.scale;
   float canvas_y = (state_.page_height - y - height) * state_.scale;
 
+  NANOPDF_LOG_DEBUG("ThorVG", "draw_image transform: page_h=%.1f, scale=%.3f, canvas=(%.1f,%.1f)",
+                    state_.page_height, state_.scale, canvas_x, canvas_y);
+
   // Apply transformation using matrix for non-uniform scaling
   tvg::Matrix m;
   m.e11 = scale_x * state_.scale;
@@ -1573,7 +1888,8 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   picture->transform(m);
 
   // Push to scene
-  scene_->push(std::move(picture));
+  auto push_result = scene_->push(std::move(picture));
+  NANOPDF_LOG_DEBUG("ThorVG", "draw_image: pushed to scene, result=%d", static_cast<int>(push_result));
 
   return true;
 }
@@ -1737,6 +2053,714 @@ static std::vector<tvg::Fill::ColorStop> extract_color_stops_from_function(
   return stops;
 }
 
+// ============================================================
+// PostScript Type 4 Calculator Function Evaluator
+// ============================================================
+
+// PostScript calculator stack
+class PSStack {
+public:
+  void push(double v) { stack_.push_back(v); }
+
+  double pop() {
+    if (stack_.empty()) return 0.0;
+    double v = stack_.back();
+    stack_.pop_back();
+    return v;
+  }
+
+  double top() const {
+    return stack_.empty() ? 0.0 : stack_.back();
+  }
+
+  size_t size() const { return stack_.size(); }
+
+  bool empty() const { return stack_.empty(); }
+
+  double at(size_t idx) const {
+    if (idx >= stack_.size()) return 0.0;
+    return stack_[stack_.size() - 1 - idx];
+  }
+
+  void dup() {
+    if (!stack_.empty()) push(top());
+  }
+
+  void exch() {
+    if (stack_.size() >= 2) {
+      double a = pop();
+      double b = pop();
+      push(a);
+      push(b);
+    }
+  }
+
+  void roll(int n, int j) {
+    if (n <= 0 || static_cast<size_t>(n) > stack_.size()) return;
+    j = ((j % n) + n) % n;  // Normalize j
+    if (j == 0) return;
+
+    std::vector<double> temp;
+    for (int i = 0; i < n; ++i) {
+      temp.push_back(pop());
+    }
+    // Rotate and push back
+    for (int i = 0; i < n; ++i) {
+      push(temp[(i + j) % n]);
+    }
+  }
+
+  void index(int i) {
+    if (i >= 0 && static_cast<size_t>(i) < stack_.size()) {
+      push(stack_[stack_.size() - 1 - i]);
+    }
+  }
+
+  void copy(int n) {
+    if (n <= 0 || static_cast<size_t>(n) > stack_.size()) return;
+    size_t start = stack_.size() - n;
+    for (int i = 0; i < n; ++i) {
+      push(stack_[start + i]);
+    }
+  }
+
+  void clear() { stack_.clear(); }
+
+  const std::vector<double>& data() const { return stack_; }
+
+private:
+  std::vector<double> stack_;
+};
+
+// Tokenize PostScript code
+static std::vector<std::string> tokenize_postscript(const std::string& code) {
+  std::vector<std::string> tokens;
+  size_t i = 0;
+  while (i < code.size()) {
+    // Skip whitespace
+    while (i < code.size() && (code[i] == ' ' || code[i] == '\t' ||
+                                code[i] == '\n' || code[i] == '\r')) {
+      ++i;
+    }
+    if (i >= code.size()) break;
+
+    // Comments
+    if (code[i] == '%') {
+      while (i < code.size() && code[i] != '\n' && code[i] != '\r') ++i;
+      continue;
+    }
+
+    // Braces are separate tokens
+    if (code[i] == '{' || code[i] == '}') {
+      tokens.push_back(std::string(1, code[i]));
+      ++i;
+      continue;
+    }
+
+    // Collect token
+    std::string token;
+    while (i < code.size() && code[i] != ' ' && code[i] != '\t' &&
+           code[i] != '\n' && code[i] != '\r' &&
+           code[i] != '{' && code[i] != '}' && code[i] != '%') {
+      token += code[i];
+      ++i;
+    }
+    if (!token.empty()) {
+      tokens.push_back(token);
+    }
+  }
+  return tokens;
+}
+
+// Check if token is a number
+static bool is_ps_number(const std::string& token, double& value) {
+  if (token.empty()) return false;
+  char* end = nullptr;
+  value = std::strtod(token.c_str(), &end);
+  return end != token.c_str() && *end == '\0';
+}
+
+// Execute PostScript tokens
+static bool execute_postscript(const std::vector<std::string>& tokens,
+                                size_t& pos, PSStack& stack,
+                                int depth = 0) {
+  const int MAX_DEPTH = 100;  // Prevent infinite recursion
+  if (depth > MAX_DEPTH) return false;
+
+  while (pos < tokens.size()) {
+    const std::string& tok = tokens[pos];
+    ++pos;
+
+    // End of procedure
+    if (tok == "}") {
+      return true;
+    }
+
+    // Start of procedure - find matching end and skip
+    if (tok == "{") {
+      // Find the matching closing brace and collect procedure tokens
+      int brace_count = 1;
+      size_t proc_start = pos;
+      while (pos < tokens.size() && brace_count > 0) {
+        if (tokens[pos] == "{") ++brace_count;
+        else if (tokens[pos] == "}") --brace_count;
+        ++pos;
+      }
+      // Push procedure marker (we'll handle this specially in if/ifelse)
+      continue;
+    }
+
+    // Check if it's a number
+    double num_val;
+    if (is_ps_number(tok, num_val)) {
+      stack.push(num_val);
+      continue;
+    }
+
+    // Boolean literals
+    if (tok == "true") { stack.push(1.0); continue; }
+    if (tok == "false") { stack.push(0.0); continue; }
+
+    // Arithmetic operators
+    if (tok == "add") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a + b);
+    } else if (tok == "sub") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a - b);
+    } else if (tok == "mul") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a * b);
+    } else if (tok == "div") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(b != 0 ? a / b : 0.0);
+    } else if (tok == "idiv") {
+      int b = static_cast<int>(stack.pop());
+      int a = static_cast<int>(stack.pop());
+      stack.push(b != 0 ? static_cast<double>(a / b) : 0.0);
+    } else if (tok == "mod") {
+      int b = static_cast<int>(stack.pop());
+      int a = static_cast<int>(stack.pop());
+      stack.push(b != 0 ? static_cast<double>(a % b) : 0.0);
+    } else if (tok == "neg") {
+      stack.push(-stack.pop());
+    } else if (tok == "abs") {
+      stack.push(std::fabs(stack.pop()));
+    } else if (tok == "ceiling") {
+      stack.push(std::ceil(stack.pop()));
+    } else if (tok == "floor") {
+      stack.push(std::floor(stack.pop()));
+    } else if (tok == "round") {
+      stack.push(std::round(stack.pop()));
+    } else if (tok == "truncate") {
+      stack.push(std::trunc(stack.pop()));
+    } else if (tok == "sqrt") {
+      double v = stack.pop();
+      stack.push(v >= 0 ? std::sqrt(v) : 0.0);
+    } else if (tok == "sin") {
+      stack.push(std::sin(stack.pop() * M_PI / 180.0));  // Degrees
+    } else if (tok == "cos") {
+      stack.push(std::cos(stack.pop() * M_PI / 180.0));  // Degrees
+    } else if (tok == "atan") {
+      double x = stack.pop(), y = stack.pop();
+      stack.push(std::atan2(y, x) * 180.0 / M_PI);  // Degrees
+    } else if (tok == "exp") {
+      double e = stack.pop(), b = stack.pop();
+      stack.push(std::pow(b, e));
+    } else if (tok == "ln") {
+      double v = stack.pop();
+      stack.push(v > 0 ? std::log(v) : 0.0);
+    } else if (tok == "log") {
+      double v = stack.pop();
+      stack.push(v > 0 ? std::log10(v) : 0.0);
+    }
+    // Relational operators
+    else if (tok == "eq") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a == b ? 1.0 : 0.0);
+    } else if (tok == "ne") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a != b ? 1.0 : 0.0);
+    } else if (tok == "gt") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a > b ? 1.0 : 0.0);
+    } else if (tok == "ge") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a >= b ? 1.0 : 0.0);
+    } else if (tok == "lt") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a < b ? 1.0 : 0.0);
+    } else if (tok == "le") {
+      double b = stack.pop(), a = stack.pop();
+      stack.push(a <= b ? 1.0 : 0.0);
+    }
+    // Boolean operators
+    else if (tok == "and") {
+      int b = static_cast<int>(stack.pop());
+      int a = static_cast<int>(stack.pop());
+      stack.push(static_cast<double>(a & b));
+    } else if (tok == "or") {
+      int b = static_cast<int>(stack.pop());
+      int a = static_cast<int>(stack.pop());
+      stack.push(static_cast<double>(a | b));
+    } else if (tok == "xor") {
+      int b = static_cast<int>(stack.pop());
+      int a = static_cast<int>(stack.pop());
+      stack.push(static_cast<double>(a ^ b));
+    } else if (tok == "not") {
+      int a = static_cast<int>(stack.pop());
+      stack.push(a == 0 ? 1.0 : 0.0);
+    } else if (tok == "bitshift") {
+      int shift = static_cast<int>(stack.pop());
+      int val = static_cast<int>(stack.pop());
+      stack.push(static_cast<double>(shift >= 0 ? (val << shift) : (val >> (-shift))));
+    }
+    // Stack operators
+    else if (tok == "dup") {
+      stack.dup();
+    } else if (tok == "exch") {
+      stack.exch();
+    } else if (tok == "pop") {
+      stack.pop();
+    } else if (tok == "copy") {
+      int n = static_cast<int>(stack.pop());
+      stack.copy(n);
+    } else if (tok == "index") {
+      int i = static_cast<int>(stack.pop());
+      stack.index(i);
+    } else if (tok == "roll") {
+      int j = static_cast<int>(stack.pop());
+      int n = static_cast<int>(stack.pop());
+      stack.roll(n, j);
+    }
+    // Conditional operators - these need special handling
+    else if (tok == "if") {
+      // Find the procedure before this 'if'
+      // Format: { proc } bool if
+      // We need to backtrack to find the procedure
+      // For simplicity, we'll handle this by looking at prior tokens
+      // This is a simplified implementation
+      bool cond = stack.pop() != 0.0;
+      if (cond) {
+        // Execute the procedure (already executed inline)
+      }
+      // Note: Full implementation would need procedure objects
+    } else if (tok == "ifelse") {
+      // { proc1 } { proc2 } bool ifelse
+      bool cond = stack.pop() != 0.0;
+      // Simplified - full implementation needs procedure handling
+    }
+    // Value clamping (common in PDF functions)
+    else if (tok == "cvr") {
+      // Convert to real - already real
+    } else if (tok == "cvi") {
+      stack.push(static_cast<double>(static_cast<int>(stack.pop())));
+    }
+    // Unknown operator - ignore
+  }
+  return true;
+}
+
+// Evaluate a PostScript Type 4 function
+static bool evaluate_postscript_function(const std::string& code,
+                                          const std::vector<double>& inputs,
+                                          const std::vector<double>& domain,
+                                          const std::vector<double>& range,
+                                          std::vector<double>& outputs) {
+  // Tokenize the code (strip leading '{' and trailing '}')
+  std::string stripped = code;
+  size_t start = stripped.find('{');
+  size_t end = stripped.rfind('}');
+  if (start != std::string::npos && end != std::string::npos && end > start) {
+    stripped = stripped.substr(start + 1, end - start - 1);
+  }
+
+  std::vector<std::string> tokens = tokenize_postscript(stripped);
+
+  // Initialize stack with inputs (clamped to domain)
+  PSStack stack;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    double v = inputs[i];
+    if (domain.size() >= (i + 1) * 2) {
+      v = clamp14(v, domain[i * 2], domain[i * 2 + 1]);
+    }
+    stack.push(v);
+  }
+
+  // Execute the PostScript code
+  size_t pos = 0;
+  if (!execute_postscript(tokens, pos, stack)) {
+    return false;
+  }
+
+  // Get outputs from stack (in reverse order)
+  int n_outputs = static_cast<int>(range.size() / 2);
+  if (n_outputs <= 0) n_outputs = static_cast<int>(stack.size());
+
+  outputs.clear();
+  const auto& stack_data = stack.data();
+
+  // Stack top is last output
+  for (int i = n_outputs - 1; i >= 0 && !stack_data.empty(); --i) {
+    size_t idx = stack_data.size() - 1 - i;
+    if (idx < stack_data.size()) {
+      double v = stack_data[idx];
+      // Clamp to range
+      if (range.size() >= static_cast<size_t>((n_outputs - 1 - i + 1) * 2)) {
+        size_t ri = (n_outputs - 1 - i) * 2;
+        v = clamp14(v, range[ri], range[ri + 1]);
+      }
+      outputs.push_back(v);
+    }
+  }
+
+  // Reverse to get correct order
+  std::reverse(outputs.begin(), outputs.end());
+
+  return !outputs.empty();
+}
+
+// PDF function evaluator - evaluates a PDF function at given input values
+// Returns output color values (typically RGB, each in range 0-1)
+static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
+                                   const std::vector<double>& inputs,
+                                   std::vector<double>& outputs) {
+  if (function.type != Value::DICTIONARY) {
+    return false;
+  }
+
+  auto func_type_it = function.dict.find("FunctionType");
+  if (func_type_it == function.dict.end() || func_type_it->second.type != Value::NUMBER) {
+    return false;
+  }
+
+  int func_type = static_cast<int>(func_type_it->second.number);
+
+  // Get function domain
+  std::vector<double> domain;
+  auto domain_it = function.dict.find("Domain");
+  if (domain_it != function.dict.end() && domain_it->second.type == Value::ARRAY) {
+    for (const auto& v : domain_it->second.array) {
+      if (v.type == Value::NUMBER) {
+        domain.push_back(v.number);
+      }
+    }
+  }
+
+  // Get function range (optional)
+  std::vector<double> range;
+  auto range_it = function.dict.find("Range");
+  if (range_it != function.dict.end() && range_it->second.type == Value::ARRAY) {
+    for (const auto& v : range_it->second.array) {
+      if (v.type == Value::NUMBER) {
+        range.push_back(v.number);
+      }
+    }
+  }
+
+  if (func_type == 0) {
+    // Type 0: Sampled function
+    // Lookup and interpolate from a sample table
+    auto size_it = function.dict.find("Size");
+    auto bps_it = function.dict.find("BitsPerSample");
+
+    if (size_it == function.dict.end() || bps_it == function.dict.end()) {
+      return false;
+    }
+
+    std::vector<int> sizes;
+    if (size_it->second.type == Value::ARRAY) {
+      for (const auto& v : size_it->second.array) {
+        if (v.type == Value::NUMBER) {
+          sizes.push_back(static_cast<int>(v.number));
+        }
+      }
+    }
+
+    int bps = static_cast<int>(bps_it->second.number);
+    int n_outputs = static_cast<int>(range.size() / 2);
+    if (n_outputs <= 0) n_outputs = 3;  // Default to RGB
+
+    // Get decode array
+    std::vector<double> decode;
+    auto decode_it = function.dict.find("Decode");
+    if (decode_it != function.dict.end() && decode_it->second.type == Value::ARRAY) {
+      for (const auto& v : decode_it->second.array) {
+        if (v.type == Value::NUMBER) {
+          decode.push_back(v.number);
+        }
+      }
+    }
+
+    // For sampled functions in a stream, decode the stream data
+    if (function.type == Value::STREAM && !sizes.empty() && !inputs.empty()) {
+      auto decoded = decode_stream(pdf, function);
+      if (decoded.success && !decoded.data.empty()) {
+        // Simple 1D or 2D interpolation
+        int n_inputs = static_cast<int>(sizes.size());
+        if (n_inputs == 1 && domain.size() >= 2) {
+          // 1D sampled function
+          double t = (inputs[0] - domain[0]) / (domain[1] - domain[0]);
+          t = clamp14(t, 0.0, 1.0);
+          int idx = static_cast<int>(t * (sizes[0] - 1));
+          idx = clamp14(idx, 0, sizes[0] - 1);
+
+          outputs.resize(n_outputs);
+          int bytes_per_sample = (bps + 7) / 8;
+          int sample_offset = idx * n_outputs * bytes_per_sample;
+
+          for (int i = 0; i < n_outputs && sample_offset + i * bytes_per_sample < static_cast<int>(decoded.data.size()); ++i) {
+            double val = 0;
+            if (bps == 8) {
+              val = decoded.data[sample_offset + i] / 255.0;
+            } else if (bps == 16) {
+              val = ((decoded.data[sample_offset + i * 2] << 8) |
+                     decoded.data[sample_offset + i * 2 + 1]) / 65535.0;
+            }
+            // Apply decode mapping if present
+            if (decode.size() >= static_cast<size_t>((i + 1) * 2)) {
+              val = decode[i * 2] + val * (decode[i * 2 + 1] - decode[i * 2]);
+            }
+            outputs[i] = val;
+          }
+          return true;
+        }
+      }
+    }
+
+    // Fallback: return mid-gray
+    outputs.resize(n_outputs, 0.5);
+    return true;
+
+  } else if (func_type == 2) {
+    // Type 2: Exponential interpolation
+    // y = C0 + x^N * (C1 - C0)
+    auto c0_it = function.dict.find("C0");
+    auto c1_it = function.dict.find("C1");
+    auto n_it = function.dict.find("N");
+
+    std::vector<double> c0, c1;
+    double n_exp = 1.0;
+
+    if (c0_it != function.dict.end() && c0_it->second.type == Value::ARRAY) {
+      for (const auto& v : c0_it->second.array) {
+        if (v.type == Value::NUMBER) {
+          c0.push_back(v.number);
+        }
+      }
+    }
+    if (c1_it != function.dict.end() && c1_it->second.type == Value::ARRAY) {
+      for (const auto& v : c1_it->second.array) {
+        if (v.type == Value::NUMBER) {
+          c1.push_back(v.number);
+        }
+      }
+    }
+    if (n_it != function.dict.end() && n_it->second.type == Value::NUMBER) {
+      n_exp = n_it->second.number;
+    }
+
+    // Default C0 = [0] and C1 = [1] if not specified
+    if (c0.empty()) c0 = {0.0};
+    if (c1.empty()) c1 = {1.0};
+
+    // Get input (clamp to domain)
+    double x = inputs.empty() ? 0.0 : inputs[0];
+    if (domain.size() >= 2) {
+      x = clamp14(x, domain[0], domain[1]);
+      x = (x - domain[0]) / (domain[1] - domain[0]);  // Normalize to 0-1
+    }
+
+    double x_pow = std::pow(x, n_exp);
+    outputs.resize(c0.size());
+    for (size_t i = 0; i < c0.size(); ++i) {
+      double c1_val = (i < c1.size()) ? c1[i] : 1.0;
+      outputs[i] = c0[i] + x_pow * (c1_val - c0[i]);
+    }
+
+    return true;
+
+  } else if (func_type == 3) {
+    // Type 3: Stitching function
+    auto functions_it = function.dict.find("Functions");
+    auto bounds_it = function.dict.find("Bounds");
+    auto encode_it = function.dict.find("Encode");
+
+    if (functions_it == function.dict.end() || functions_it->second.type != Value::ARRAY) {
+      return false;
+    }
+
+    const auto& functions = functions_it->second.array;
+
+    std::vector<double> bounds;
+    if (bounds_it != function.dict.end() && bounds_it->second.type == Value::ARRAY) {
+      for (const auto& v : bounds_it->second.array) {
+        if (v.type == Value::NUMBER) {
+          bounds.push_back(v.number);
+        }
+      }
+    }
+
+    std::vector<double> encode;
+    if (encode_it != function.dict.end() && encode_it->second.type == Value::ARRAY) {
+      for (const auto& v : encode_it->second.array) {
+        if (v.type == Value::NUMBER) {
+          encode.push_back(v.number);
+        }
+      }
+    }
+
+    // Get input value
+    double x = inputs.empty() ? 0.0 : inputs[0];
+    if (domain.size() >= 2) {
+      x = clamp14(x, domain[0], domain[1]);
+    }
+
+    // Find which sub-function to use
+    size_t func_idx = 0;
+    double subdomain_min = domain.empty() ? 0.0 : domain[0];
+    double subdomain_max = bounds.empty() ? (domain.size() >= 2 ? domain[1] : 1.0) : bounds[0];
+
+    for (size_t i = 0; i < bounds.size(); ++i) {
+      if (x < bounds[i]) {
+        func_idx = i;
+        subdomain_max = bounds[i];
+        break;
+      }
+      subdomain_min = bounds[i];
+      func_idx = i + 1;
+      subdomain_max = (i + 1 < bounds.size()) ? bounds[i + 1] : (domain.size() >= 2 ? domain[1] : 1.0);
+    }
+
+    if (func_idx >= functions.size()) {
+      func_idx = functions.size() - 1;
+    }
+
+    // Map x to sub-function domain using encode array
+    double encode_min = (func_idx * 2 < encode.size()) ? encode[func_idx * 2] : 0.0;
+    double encode_max = (func_idx * 2 + 1 < encode.size()) ? encode[func_idx * 2 + 1] : 1.0;
+
+    double sub_x = encode_min;
+    if (subdomain_max != subdomain_min) {
+      sub_x = encode_min + (x - subdomain_min) / (subdomain_max - subdomain_min) * (encode_max - encode_min);
+    }
+
+    // Resolve and evaluate sub-function
+    Value sub_func = functions[func_idx];
+    if (sub_func.type == Value::REFERENCE) {
+      auto resolved = resolve_reference(pdf, sub_func.ref_object_number, sub_func.ref_generation_number);
+      if (resolved.success) {
+        sub_func = resolved.value;
+      }
+    }
+
+    return evaluate_pdf_function(pdf, sub_func, {sub_x}, outputs);
+
+  } else if (func_type == 4) {
+    // Type 4: PostScript calculator function
+    // The function code is stored in the stream data
+    if (function.type != Value::STREAM) {
+      return false;
+    }
+
+    auto decoded = decode_stream(pdf, function);
+    if (!decoded.success || decoded.data.empty()) {
+      return false;
+    }
+
+    // Convert stream data to string
+    std::string ps_code(decoded.data.begin(), decoded.data.end());
+
+    // Evaluate the PostScript function
+    return evaluate_postscript_function(ps_code, inputs, domain, range, outputs);
+  }
+
+  return false;
+}
+
+// Rasterize function-based shading to a bitmap
+static bool rasterize_function_shading(const Pdf& pdf, const Shading& shading,
+                                        int width, int height, float scale,
+                                        float page_height,
+                                        std::vector<uint32_t>& pixels) {
+  pixels.resize(width * height);
+
+  // Get domain bounds
+  double x_min = shading.domain.size() >= 1 ? shading.domain[0] : 0.0;
+  double x_max = shading.domain.size() >= 2 ? shading.domain[1] : 1.0;
+  double y_min = shading.domain.size() >= 3 ? shading.domain[2] : 0.0;
+  double y_max = shading.domain.size() >= 4 ? shading.domain[3] : 1.0;
+
+  // Get transformation matrix
+  double a = shading.matrix.size() >= 1 ? shading.matrix[0] : 1.0;
+  double b = shading.matrix.size() >= 2 ? shading.matrix[1] : 0.0;
+  double c = shading.matrix.size() >= 3 ? shading.matrix[2] : 0.0;
+  double d = shading.matrix.size() >= 4 ? shading.matrix[3] : 1.0;
+  double e = shading.matrix.size() >= 5 ? shading.matrix[4] : 0.0;
+  double f = shading.matrix.size() >= 6 ? shading.matrix[5] : 0.0;
+
+  // Compute inverse matrix for device-to-domain transform
+  double det = a * d - b * c;
+  if (std::abs(det) < 1e-10) {
+    // Degenerate matrix, fill with background or gray
+    std::fill(pixels.begin(), pixels.end(), 0xFF808080);
+    return true;
+  }
+
+  double inv_a = d / det;
+  double inv_b = -b / det;
+  double inv_c = -c / det;
+  double inv_d = a / det;
+  double inv_e = (c * f - d * e) / det;
+  double inv_f = (b * e - a * f) / det;
+
+  // Rasterize each pixel
+  for (int py = 0; py < height; ++py) {
+    for (int px = 0; px < width; ++px) {
+      // Convert pixel coords to user space (flip Y)
+      double ux = px / scale;
+      double uy = (height - 1 - py) / scale;
+
+      // Apply inverse matrix to get domain coordinates
+      double dx = inv_a * ux + inv_c * uy + inv_e;
+      double dy = inv_b * ux + inv_d * uy + inv_f;
+
+      // Check if in domain
+      uint8_t r = 128, g = 128, b = 128, alpha = 255;
+
+      if (dx >= x_min && dx <= x_max && dy >= y_min && dy <= y_max) {
+        // Evaluate function at (dx, dy)
+        std::vector<double> outputs;
+        if (evaluate_pdf_function(pdf, shading.function, {dx, dy}, outputs)) {
+          if (outputs.size() >= 3) {
+            r = static_cast<uint8_t>(clamp14(outputs[0], 0.0, 1.0) * 255);
+            g = static_cast<uint8_t>(clamp14(outputs[1], 0.0, 1.0) * 255);
+            b = static_cast<uint8_t>(clamp14(outputs[2], 0.0, 1.0) * 255);
+          } else if (outputs.size() == 1) {
+            // Grayscale
+            uint8_t gray = static_cast<uint8_t>(clamp14(outputs[0], 0.0, 1.0) * 255);
+            r = g = b = gray;
+          }
+        }
+      } else if (!shading.background.empty()) {
+        // Use background color outside domain
+        if (shading.background.size() >= 3) {
+          r = static_cast<uint8_t>(clamp14(shading.background[0], 0.0, 1.0) * 255);
+          g = static_cast<uint8_t>(clamp14(shading.background[1], 0.0, 1.0) * 255);
+          b = static_cast<uint8_t>(clamp14(shading.background[2], 0.0, 1.0) * 255);
+        }
+      } else {
+        // Transparent outside domain
+        alpha = 0;
+      }
+
+      pixels[py * width + px] = (alpha << 24) | (r << 16) | (g << 8) | b;
+    }
+  }
+
+  return true;
+}
+
 // Helper to lookup a resource, checking Form XObject resources first, then page resources
 const Value* ThorVGBackend::lookup_resource(const std::string& resource_type, const std::string& name) const {
   // Check Form XObject resources stack (from top to bottom)
@@ -1872,7 +2896,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Linear gradient
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -1899,7 +2923,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Radial gradient
     auto gradient = tvg::RadialGradient::gen();
     if (!gradient) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -1943,59 +2967,65 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
            shading->matrix.size() >= 6 ? shading->matrix[3] : 1,
            shading->matrix.size() >= 6 ? shading->matrix[4] : 0,
            shading->matrix.size() >= 6 ? shading->matrix[5] : 0);
-    printf("DEBUG: Function-based shading not fully implemented - using placeholder gradient\n");
 #endif
 
-    // TODO: Full implementation requires:
-    // 1. Creating a function evaluator for 2D input (x, y) -> color output
-    // 2. Rasterizing the domain at appropriate resolution
-    // 3. For each pixel:
-    //    - Transform from device space to user space
-    //    - Apply inverse matrix to get parametric coordinates
-    //    - Evaluate function at (x, y) to get color
-    // 4. Create bitmap from evaluated colors
-    // 5. Load bitmap as ThorVG Picture and add to scene
-    //
-    // Challenges:
-    // - Function evaluation for Type 0 (sampled), Type 2 (exponential),
-    //   Type 3 (stitching), Type 4 (postscript calculator) functions
-    // - Efficient rasterization (resolution vs performance tradeoff)
-    // - Proper coordinate transformations (domain -> user space)
-    // - Color space conversion if needed
-    //
-    // For now, use a fallback gradient based on function endpoints
+    // Rasterize the function-based shading to a bitmap
+    int raster_w = static_cast<int>(w);
+    int raster_h = static_cast<int>(h);
+    if (raster_w <= 0) raster_w = 256;
+    if (raster_h <= 0) raster_h = 256;
+
+    std::vector<uint32_t> pixels;
+    if (rasterize_function_shading(*current_pdf_, *shading, raster_w, raster_h,
+                                    state_.scale, state_.page_height, pixels)) {
+      // Create ThorVG Picture from rasterized bitmap
+      auto picture = tvg::Picture::gen();
+      if (picture) {
+        auto* data_copy = new uint32_t[pixels.size()];
+        std::copy(pixels.begin(), pixels.end(), data_copy);
+
+        auto result = picture->load(data_copy, raster_w, raster_h,
+                                     tvg::ColorSpace::ARGB8888, true);
+        if (result == tvg::Result::Success) {
+          // Position the picture at the shape location
+          tvg::Matrix m;
+          m.e11 = 1.0f; m.e12 = 0.0f; m.e13 = x;
+          m.e21 = 0.0f; m.e22 = 1.0f; m.e23 = y;
+          m.e31 = 0.0f; m.e32 = 0.0f; m.e33 = 1.0f;
+          picture->transform(m);
+
+          scene_->push(picture);
+          tvg::Paint::rel(shape);  // Don't need the shape anymore
+          return true;
+        } else {
+          delete[] data_copy;
+        }
+      }
+    }
+
+    // Fallback: use gradient approximation
+#if NANOPDF_DEBUG_PRINT
+    printf("DEBUG: Function rasterization failed, using gradient fallback\n");
+#endif
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
-    // Use domain bounds for gradient direction
     float x0 = 0, y0 = 0, x1 = w, y1 = 0;
     if (shading->domain.size() >= 4 && shading->matrix.size() >= 6) {
-      // Simple approximation: map domain x-axis to gradient
       float xmin = static_cast<float>(shading->domain[0]);
       float xmax = static_cast<float>(shading->domain[1]);
       float a = static_cast<float>(shading->matrix[0]);
-      float b = static_cast<float>(shading->matrix[1]);
-      float c = static_cast<float>(shading->matrix[2]);
-      float d = static_cast<float>(shading->matrix[3]);
       float e = static_cast<float>(shading->matrix[4]);
-      float f = static_cast<float>(shading->matrix[5]);
-
-      // Transform domain corners through matrix
       x0 = (a * xmin + e) * state_.scale;
-      y0 = (state_.page_height - (b * xmin + f)) * state_.scale;
       x1 = (a * xmax + e) * state_.scale;
-      y1 = (state_.page_height - (b * xmax + f)) * state_.scale;
     }
 
     gradient->linear(x0, y0, x1, y1);
-
-    // Extract approximate color stops from function
     auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function);
     gradient->colorStops(colorStops.data(), colorStops.size());
-
     shape->fill(gradient);
   }
   else if (shading->type == ShadingType::FreeFormTriangleMesh ||
@@ -2018,7 +3048,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid mesh data - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2029,7 +3059,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2130,7 +3160,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2148,13 +3178,13 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
     picture->translate(x, y);
     scene_->push(picture);
-    delete shape;  // Don't need shape wrapper
+    tvg::Paint::rel(shape);  // Don't need shape wrapper
     return true;
   }
   else if (shading->type == ShadingType::CoonsPatchMesh ||
@@ -2178,7 +3208,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid patch data - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2189,7 +3219,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2282,7 +3312,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
@@ -2300,13 +3330,13 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      delete shape;
+      tvg::Paint::rel(shape);
       return false;
     }
 
     picture->translate(x, y);
     scene_->push(picture);
-    delete shape;
+    tvg::Paint::rel(shape);
     return true;
   }
   else {
@@ -2480,8 +3510,47 @@ bool ThorVGBackend::parse_inline_image(const std::string& content, size_t& pos) 
       decoded_data.push_back(static_cast<uint8_t>(strtol(hex, nullptr, 16)));
     }
   } else if (filter == "A85" || filter == "ASCII85Decode") {
-    // ASCII85 decode - simplified, just use raw data for now
-    decoded_data = raw_data;
+    // ASCII85 decode
+    decoded_data.reserve(raw_data.size() * 4 / 5);
+    uint32_t value = 0;
+    int count = 0;
+    for (size_t i = 0; i < raw_data.size(); ++i) {
+      uint8_t c = raw_data[i];
+      // Skip whitespace
+      if (c <= ' ') continue;
+      // Handle 'z' (represents four zero bytes)
+      if (c == 'z' && count == 0) {
+        decoded_data.push_back(0);
+        decoded_data.push_back(0);
+        decoded_data.push_back(0);
+        decoded_data.push_back(0);
+        continue;
+      }
+      // Check for end marker ~>
+      if (c == '~') break;
+      // Validate character range
+      if (c < '!' || c > 'u') continue;
+      // Accumulate value
+      value = value * 85 + (c - '!');
+      count++;
+      if (count == 5) {
+        decoded_data.push_back((value >> 24) & 0xFF);
+        decoded_data.push_back((value >> 16) & 0xFF);
+        decoded_data.push_back((value >> 8) & 0xFF);
+        decoded_data.push_back(value & 0xFF);
+        value = 0;
+        count = 0;
+      }
+    }
+    // Handle remaining bytes (partial group)
+    if (count > 0) {
+      for (int j = count; j < 5; j++) {
+        value = value * 85 + 84;  // Pad with 'u'
+      }
+      if (count > 1) decoded_data.push_back((value >> 24) & 0xFF);
+      if (count > 2) decoded_data.push_back((value >> 16) & 0xFF);
+      if (count > 3) decoded_data.push_back((value >> 8) & 0xFF);
+    }
   } else if (filter == "Fl" || filter == "FlateDecode" || filter == "LZW" || filter == "LZWDecode") {
     // Need to decompress - use nanopdf's decode functions
     if (current_pdf_) {
@@ -2552,9 +3621,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
   // Look up pattern from page resources
   auto pattern_dict_it = current_page_->resources.find("Pattern");
   if (pattern_dict_it == current_page_->resources.end()) {
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: No Pattern resources in page\n");
-#endif
+    NANOPDF_LOG_TRACE("ThorVG", "No Pattern resources in page");
     return false;
   }
 
@@ -2577,9 +3644,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
   // Look up the specific pattern
   auto pattern_it = pattern_resources.find(pattern_name);
   if (pattern_it == pattern_resources.end()) {
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: Pattern '%s' not found\n", pattern_name.c_str());
-#endif
+    NANOPDF_LOG_DEBUG("ThorVG", "Pattern '%s' not found", pattern_name.c_str());
     return false;
   }
 
@@ -2602,16 +3667,12 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
   // Parse the pattern
   auto pattern = parse_pattern(*current_pdf_, pattern_dict);
   if (!pattern) {
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: Failed to parse pattern '%s'\n", pattern_name.c_str());
-#endif
+    NANOPDF_LOG_DEBUG("ThorVG", "Failed to parse pattern '%s'", pattern_name.c_str());
     return false;
   }
 
-#if NANOPDF_DEBUG_PRINT
-  printf("DEBUG: Applying pattern '%s', type=%d\n", pattern_name.c_str(),
-         static_cast<int>(pattern->type));
-#endif
+  NANOPDF_LOG_TRACE("ThorVG", "Applying pattern '%s', type=%d", pattern_name.c_str(),
+                    static_cast<int>(pattern->type));
 
   if (pattern->type == PatternType::Shading && pattern->shading) {
     // Shading pattern - apply as gradient fill
@@ -2739,7 +3800,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
 
 bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern* tiling,
                                           const std::vector<double>& matrix, bool is_stroke) {
-  if (!shape || !tiling) {
+  if (!shape || !tiling || !current_pdf_) {
     return false;
   }
 
@@ -2751,34 +3812,220 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
          tiling->bbox.size() >= 4 ? tiling->bbox[2] : 0,
          tiling->bbox.size() >= 4 ? tiling->bbox[3] : 0,
          tiling->x_step, tiling->y_step);
-  printf("DEBUG: Tiling patterns not fully implemented - using placeholder fill\n");
 #endif
 
-  // TODO: Full tiling pattern implementation requires:
-  // 1. Rendering pattern content_stream to a temporary canvas
-  // 2. Extracting the rendered tile as pixels
-  // 3. Creating multiple instances or using custom fill to tile across shape
-  // 4. Handling colored vs uncolored patterns (paint_type)
-  // 5. Applying pattern matrix transformation
-  // 6. Respecting tiling_type (constant spacing, no distortion, etc.)
-  //
-  // Challenges:
-  // - ThorVG doesn't have native tiling/repeat pattern support
-  // - Would need to either:
-  //   a) Create multiple Picture instances positioned in a grid
-  //   b) Pre-render a larger tiled bitmap
-  //   c) Use custom rendering approach
-  // - Need to handle pattern resources and nested content streams
-  // - State management during pattern rendering is complex
+  // Get tile dimensions from BBox
+  if (tiling->bbox.size() < 4 || tiling->content_stream.empty()) {
+    // No content to render - use fallback color
+    goto fallback;
+  }
 
-  // For now, use placeholder colors based on paint_type
-  // Uncolored patterns (paint_type=2) should use current fill/stroke color
-  // Colored patterns (paint_type=1) have their own colors
+  {
+    float tile_width = static_cast<float>(tiling->bbox[2] - tiling->bbox[0]);
+    float tile_height = static_cast<float>(tiling->bbox[3] - tiling->bbox[1]);
 
+    if (tile_width <= 0 || tile_height <= 0) {
+      goto fallback;
+    }
+
+    // Calculate tile size in pixels (with some reasonable scaling)
+    float pattern_scale = state_.scale;
+    int tile_px_w = static_cast<int>(std::ceil(tile_width * pattern_scale));
+    int tile_px_h = static_cast<int>(std::ceil(tile_height * pattern_scale));
+
+    // Limit tile size to avoid excessive memory usage
+    tile_px_w = clamp14(tile_px_w, 1, 512);
+    tile_px_h = clamp14(tile_px_h, 1, 512);
+
+    // Create temporary canvas for rendering the tile
+    std::vector<uint8_t> tile_buffer(tile_px_w * tile_px_h * 4, 0);
+
+    // Initialize with transparent (for colored) or white (for uncolored)
+    if (tiling->paint_type == TilingPaintType::ColoredTiles) {
+      // Transparent background for colored patterns
+      std::fill(tile_buffer.begin(), tile_buffer.end(), 0);
+    } else {
+      // For uncolored, we'll apply color after rendering
+      for (size_t i = 0; i < tile_buffer.size(); i += 4) {
+        tile_buffer[i + 0] = 255;  // B
+        tile_buffer[i + 1] = 255;  // G
+        tile_buffer[i + 2] = 255;  // R
+        tile_buffer[i + 3] = 255;  // A
+      }
+    }
+
+    tvg::SwCanvas* tile_canvas = tvg::SwCanvas::gen();
+    if (!tile_canvas) {
+      goto fallback;
+    }
+
+    if (tile_canvas->target(reinterpret_cast<uint32_t*>(tile_buffer.data()),
+                            tile_px_w, tile_px_w, tile_px_h,
+                            tvg::ColorSpace::ABGR8888) != tvg::Result::Success) {
+      delete tile_canvas;
+      goto fallback;
+    }
+
+    tvg::Scene* tile_scene = tvg::Scene::gen();
+    if (!tile_scene) {
+      delete tile_canvas;
+      goto fallback;
+    }
+
+    // Save current state
+    tvg::SwCanvas* saved_canvas = canvas_;
+    tvg::Scene* saved_scene = scene_;
+    std::vector<uint8_t> saved_buffer = std::move(buffer_);
+    uint32_t saved_width = width_;
+    uint32_t saved_height = height_;
+    GraphicsState saved_state = state_;
+
+    // Switch to tile canvas
+    canvas_ = tile_canvas;
+    scene_ = tile_scene;
+    buffer_ = std::move(tile_buffer);
+    width_ = tile_px_w;
+    height_ = tile_px_h;
+
+    // Reset graphics state for tile rendering
+    state_ = GraphicsState();
+    state_.page_width = tile_width;
+    state_.page_height = tile_height;
+    state_.scale = pattern_scale;
+
+    // Push pattern resources if available
+    if (!tiling->resources.empty()) {
+      form_resources_stack_.push_back(tiling->resources);
+    }
+
+    // Parse and render the tile content
+    parse_pdf_content(tiling->content_stream);
+
+    // Pop pattern resources
+    if (!tiling->resources.empty() && !form_resources_stack_.empty()) {
+      form_resources_stack_.pop_back();
+    }
+
+    // Finalize tile rendering
+    if (tile_canvas->push(tile_scene) == tvg::Result::Success) {
+      tile_canvas->draw(true);
+      tile_canvas->sync();
+    }
+
+    // Get the rendered tile pixels
+    std::vector<uint8_t> rendered_tile = std::move(buffer_);
+
+    // Clean up tile canvas
+    delete tile_canvas;
+
+    // Restore original state
+    canvas_ = saved_canvas;
+    scene_ = saved_scene;
+    buffer_ = std::move(saved_buffer);
+    width_ = saved_width;
+    height_ = saved_height;
+    state_ = saved_state;
+
+    // Now create a tiled bitmap covering the target area
+    // Get shape bounds
+    float shape_x, shape_y, shape_w, shape_h;
+    shape->bounds(&shape_x, &shape_y, &shape_w, &shape_h);
+
+    // Calculate how many tiles we need
+    float step_x = static_cast<float>(tiling->x_step) * state_.scale;
+    float step_y = static_cast<float>(tiling->y_step) * state_.scale;
+    if (step_x <= 0) step_x = tile_px_w;
+    if (step_y <= 0) step_y = tile_px_h;
+
+    int tiles_x = static_cast<int>(std::ceil(shape_w / step_x)) + 2;
+    int tiles_y = static_cast<int>(std::ceil(shape_h / step_y)) + 2;
+
+    // Limit total tiles
+    tiles_x = clamp14(tiles_x, 1, 50);
+    tiles_y = clamp14(tiles_y, 1, 50);
+
+    int tiled_w = static_cast<int>(tiles_x * step_x);
+    int tiled_h = static_cast<int>(tiles_y * step_y);
+
+    // Create the tiled bitmap
+    std::vector<uint32_t> tiled_pixels(tiled_w * tiled_h);
+
+    // Get color for uncolored patterns
+    uint8_t pattern_r = state_.fill_r;
+    uint8_t pattern_g = state_.fill_g;
+    uint8_t pattern_b = state_.fill_b;
+    uint8_t pattern_a = static_cast<uint8_t>(state_.fill_opacity * 255);
+    if (is_stroke) {
+      pattern_r = state_.stroke_r;
+      pattern_g = state_.stroke_g;
+      pattern_b = state_.stroke_b;
+      pattern_a = static_cast<uint8_t>(state_.stroke_opacity * 255);
+    }
+
+    // Tile the pattern
+    for (int ty = 0; ty < tiles_y; ++ty) {
+      for (int tx = 0; tx < tiles_x; ++tx) {
+        int offset_x = static_cast<int>(tx * step_x);
+        int offset_y = static_cast<int>(ty * step_y);
+
+        for (int py = 0; py < tile_px_h && offset_y + py < tiled_h; ++py) {
+          for (int px = 0; px < tile_px_w && offset_x + px < tiled_w; ++px) {
+            size_t src_idx = (py * tile_px_w + px) * 4;
+            size_t dst_idx = (offset_y + py) * tiled_w + (offset_x + px);
+
+            uint8_t b_val = rendered_tile[src_idx + 0];
+            uint8_t g_val = rendered_tile[src_idx + 1];
+            uint8_t r_val = rendered_tile[src_idx + 2];
+            uint8_t a_val = rendered_tile[src_idx + 3];
+
+            if (tiling->paint_type == TilingPaintType::UncoloredTiles) {
+              // For uncolored patterns, use the alpha as a mask and apply current color
+              // Invert: white background with black pattern content
+              uint8_t intensity = static_cast<uint8_t>((255 - ((r_val + g_val + b_val) / 3)));
+              a_val = static_cast<uint8_t>((intensity * pattern_a) / 255);
+              r_val = pattern_r;
+              g_val = pattern_g;
+              b_val = pattern_b;
+            }
+
+            tiled_pixels[dst_idx] = (a_val << 24) | (r_val << 16) | (g_val << 8) | b_val;
+          }
+        }
+      }
+    }
+
+    // Create ThorVG Picture from tiled bitmap
+    auto picture = tvg::Picture::gen();
+    if (picture) {
+      auto* data_copy = new uint32_t[tiled_pixels.size()];
+      std::copy(tiled_pixels.begin(), tiled_pixels.end(), data_copy);
+
+      auto result = picture->load(data_copy, tiled_w, tiled_h,
+                                   tvg::ColorSpace::ARGB8888, true);
+      if (result == tvg::Result::Success) {
+        // Position at shape origin
+        tvg::Matrix m;
+        m.e11 = 1.0f; m.e12 = 0.0f; m.e13 = shape_x;
+        m.e21 = 0.0f; m.e22 = 1.0f; m.e23 = shape_y;
+        m.e31 = 0.0f; m.e32 = 0.0f; m.e33 = 1.0f;
+        picture->transform(m);
+
+        // Clip to shape
+        picture->composite(shape, tvg::CompositeMethod::ClipPath);
+
+        scene_->push(picture);
+        return true;
+      } else {
+        delete[] data_copy;
+      }
+    }
+  }
+
+fallback:
+  // Fallback: use solid color based on paint_type
   uint8_t r, g, b, a;
 
   if (tiling->paint_type == TilingPaintType::UncoloredTiles) {
-    // Uncolored pattern - use current graphics state color
     if (is_stroke) {
       r = state_.stroke_r;
       g = state_.stroke_g;
@@ -2790,19 +4037,12 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
       b = state_.fill_b;
       a = static_cast<uint8_t>(state_.fill_opacity * 255);
     }
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: Uncolored pattern - using graphics state color (%d,%d,%d,%d)\n", r, g, b, a);
-#endif
   } else {
-    // Colored pattern - use distinctive purple placeholder
-    // (full implementation would render the pattern content_stream)
+    // Colored pattern placeholder
     r = 200;
     g = 150;
     b = 220;
     a = 255;
-#if NANOPDF_DEBUG_PRINT
-    printf("DEBUG: Colored pattern - using purple placeholder\n");
-#endif
   }
 
   if (is_stroke) {
@@ -2920,10 +4160,67 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
-  bool invisible = (render_mode == 3 || render_mode == 7);
+  bool invisible = (render_mode == 3);  // Only mode 3 is truly invisible
+  bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
 
-  if (invisible) {
-    // Invisible - don't render, just cleanup
+  // If adding to clip, accumulate glyph path in text_clip arrays
+  if (add_to_clip) {
+    state_.text_clip_active = true;
+    // Re-trace the glyph path to accumulate clip commands
+    float curr_x_clip = x, curr_y_clip = y;
+    for (int i = 0; i < num_verts; i++) {
+      stbtt_vertex* v = &vertices[i];
+      float vx = x + v->x * scale;
+      float vy = y - v->y * scale;
+
+      switch (v->type) {
+        case STBTT_vmove:
+          state_.text_clip_commands.push_back(tvg::PathCommand::MoveTo);
+          state_.text_clip_points.push_back({vx, vy});
+          curr_x_clip = vx;
+          curr_y_clip = vy;
+          break;
+        case STBTT_vline:
+          state_.text_clip_commands.push_back(tvg::PathCommand::LineTo);
+          state_.text_clip_points.push_back({vx, vy});
+          curr_x_clip = vx;
+          curr_y_clip = vy;
+          break;
+        case STBTT_vcurve: {
+          float cx = x + v->cx * scale;
+          float cy = y - v->cy * scale;
+          float cp1x = curr_x_clip + (2.0f / 3.0f) * (cx - curr_x_clip);
+          float cp1y = curr_y_clip + (2.0f / 3.0f) * (cy - curr_y_clip);
+          float cp2x = vx + (2.0f / 3.0f) * (cx - vx);
+          float cp2y = vy + (2.0f / 3.0f) * (cy - vy);
+          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
+          state_.text_clip_points.push_back({cp1x, cp1y});
+          state_.text_clip_points.push_back({cp2x, cp2y});
+          state_.text_clip_points.push_back({vx, vy});
+          curr_x_clip = vx;
+          curr_y_clip = vy;
+          break;
+        }
+        case STBTT_vcubic: {
+          float cx1 = x + v->cx * scale;
+          float cy1 = y - v->cy * scale;
+          float cx2 = x + v->cx1 * scale;
+          float cy2 = y - v->cy1 * scale;
+          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
+          state_.text_clip_points.push_back({cx1, cy1});
+          state_.text_clip_points.push_back({cx2, cy2});
+          state_.text_clip_points.push_back({vx, vy});
+          curr_x_clip = vx;
+          curr_y_clip = vy;
+          break;
+        }
+      }
+    }
+    state_.text_clip_commands.push_back(tvg::PathCommand::Close);
+  }
+
+  // Mode 7: clip only - don't render visible shape
+  if (render_mode == 7 || invisible) {
     stbtt_FreeShape(&font->font_info, vertices);
     return true;
   }
@@ -3062,10 +4359,67 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
-  bool invisible = (render_mode == 3 || render_mode == 7);
+  bool invisible = (render_mode == 3);  // Only mode 3 is truly invisible
+  bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
 
-  if (invisible) {
-    // Invisible - don't render, just cleanup
+  // If adding to clip, accumulate glyph path in text_clip arrays
+  if (add_to_clip) {
+    state_.text_clip_active = true;
+    // Re-trace the glyph path to accumulate clip commands
+    float curr_x_clip = x, curr_y_clip = y;
+    for (int i = 0; i < num_verts; i++) {
+      stbtt_vertex* v = &vertices[i];
+      float vx_c = x + v->x * scale;
+      float vy_c = y - v->y * scale;
+
+      switch (v->type) {
+        case STBTT_vmove:
+          state_.text_clip_commands.push_back(tvg::PathCommand::MoveTo);
+          state_.text_clip_points.push_back({vx_c, vy_c});
+          curr_x_clip = vx_c;
+          curr_y_clip = vy_c;
+          break;
+        case STBTT_vline:
+          state_.text_clip_commands.push_back(tvg::PathCommand::LineTo);
+          state_.text_clip_points.push_back({vx_c, vy_c});
+          curr_x_clip = vx_c;
+          curr_y_clip = vy_c;
+          break;
+        case STBTT_vcurve: {
+          float cx_c = x + v->cx * scale;
+          float cy_c = y - v->cy * scale;
+          float cp1x = curr_x_clip + (2.0f / 3.0f) * (cx_c - curr_x_clip);
+          float cp1y = curr_y_clip + (2.0f / 3.0f) * (cy_c - curr_y_clip);
+          float cp2x = vx_c + (2.0f / 3.0f) * (cx_c - vx_c);
+          float cp2y = vy_c + (2.0f / 3.0f) * (cy_c - vy_c);
+          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
+          state_.text_clip_points.push_back({cp1x, cp1y});
+          state_.text_clip_points.push_back({cp2x, cp2y});
+          state_.text_clip_points.push_back({vx_c, vy_c});
+          curr_x_clip = vx_c;
+          curr_y_clip = vy_c;
+          break;
+        }
+        case STBTT_vcubic: {
+          float cx1 = x + v->cx * scale;
+          float cy1 = y - v->cy * scale;
+          float cx2 = x + v->cx1 * scale;
+          float cy2 = y - v->cy1 * scale;
+          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
+          state_.text_clip_points.push_back({cx1, cy1});
+          state_.text_clip_points.push_back({cx2, cy2});
+          state_.text_clip_points.push_back({vx_c, vy_c});
+          curr_x_clip = vx_c;
+          curr_y_clip = vy_c;
+          break;
+        }
+      }
+    }
+    state_.text_clip_commands.push_back(tvg::PathCommand::Close);
+  }
+
+  // Mode 7: clip only - don't render visible shape
+  if (render_mode == 7 || invisible) {
     stbtt_FreeShape(&font->font_info, vertices);
     return true;
   }
@@ -3230,9 +4584,13 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
 
+    uint32_t obj_num = 0;
+    uint16_t gen_num = 0;
+
     if (content_obj.type == Value::REFERENCE) {
-      auto resolved = resolve_reference(pdf, content_obj.ref_object_number,
-                                        content_obj.ref_generation_number);
+      obj_num = content_obj.ref_object_number;
+      gen_num = content_obj.ref_generation_number;
+      auto resolved = resolve_reference(pdf, obj_num, gen_num);
       if (resolved.success) {
         resolved_obj = resolved.value;
       } else {
@@ -3241,7 +4599,7 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
     }
 
     if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj);
+      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
       if (decoded_result.success) {
         state_ = GraphicsState();
         state_.page_width = page_width;
@@ -3302,11 +4660,14 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
   // Parse and render page content
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
+    uint32_t obj_num = 0;
+    uint16_t gen_num = 0;
 
     // Resolve reference if needed
     if (content_obj.type == Value::REFERENCE) {
-      auto resolved = resolve_reference(pdf, content_obj.ref_object_number,
-                                        content_obj.ref_generation_number);
+      obj_num = content_obj.ref_object_number;
+      gen_num = content_obj.ref_generation_number;
+      auto resolved = resolve_reference(pdf, obj_num, gen_num);
       if (resolved.success) {
         resolved_obj = resolved.value;
       } else {
@@ -3315,7 +4676,8 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
     }
 
     if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj);
+      // Pass object numbers for proper decryption
+      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
       if (decoded_result.success) {
         state_ = GraphicsState();  // Reset state
         // Set page coordinate info
@@ -3325,6 +4687,112 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
         parse_pdf_content(decoded_result.data);
       }
     }
+  }
+
+  // Render page annotations (including form widgets)
+  for (const auto& annot : page.annotations) {
+    if (!annot) continue;
+
+    // Get annotation rect
+    if (annot->rect.size() < 4) continue;
+    float ax1 = static_cast<float>(annot->rect[0]) * scale;
+    float ay1 = (page_height - static_cast<float>(annot->rect[3])) * scale;
+    float ax2 = static_cast<float>(annot->rect[2]) * scale;
+    float ay2 = (page_height - static_cast<float>(annot->rect[1])) * scale;
+    float aw = ax2 - ax1;
+    float ah = ay2 - ay1;
+
+    if (aw <= 0 || ah <= 0) continue;
+
+    // Check for appearance stream
+    auto n_it = annot->appearance_streams.find("N");
+    if (n_it != annot->appearance_streams.end()) {
+      // Has normal appearance - render it as a Form XObject
+      Value ap_stream = n_it->second;
+      if (ap_stream.type == Value::REFERENCE) {
+        auto resolved = resolve_reference(pdf, ap_stream.ref_object_number,
+                                           ap_stream.ref_generation_number);
+        if (resolved.success) {
+          ap_stream = resolved.value;
+        }
+      }
+
+      if (ap_stream.type == Value::STREAM) {
+        auto decoded = decode_stream(pdf, ap_stream);
+        if (decoded.success) {
+          // Save state and set up for appearance stream
+          GraphicsState saved_state = state_;
+          state_ = GraphicsState();
+          state_.page_width = page_width;
+          state_.page_height = page_height;
+          state_.scale = scale;
+
+          // Set up transformation for annotation rect
+          state_.transform.a = scale;
+          state_.transform.d = scale;
+          state_.transform.e = ax1;
+          state_.transform.f = ay1;
+
+          parse_pdf_content(decoded.data);
+
+          state_ = saved_state;
+        }
+      }
+      continue;
+    }
+
+    // No appearance stream - render default appearance based on type
+    if (annot->type == AnnotationType::Widget) {
+      auto* widget = static_cast<WidgetAnnotation*>(annot.get());
+
+      // Draw widget border
+      auto shape = tvg::Shape::gen();
+      if (shape) {
+        shape->appendRect(ax1, ay1, aw, ah, 0, 0);
+
+        // Light gray background for form fields
+        shape->fill(245, 245, 245, 255);
+        shape->strokeWidth(1.0f);
+        shape->strokeFill(128, 128, 128, 255);
+
+        scene_->push(std::move(shape));
+      }
+
+      // Render field value for text fields
+      if (widget->field_type == FieldType::Text && !widget->field_value.empty()) {
+        // Draw text value (simple implementation)
+        float text_size = std::min(ah * 0.7f, 12.0f * scale);
+        float text_x = ax1 + 2 * scale;
+        float text_y = ay1 + ah * 0.7f;
+        draw_text(text_x, text_y, widget->field_value, text_size, 0, 0, 0, 255);
+      }
+      // Render checkmark for button fields (checkboxes)
+      else if (widget->field_type == FieldType::Button) {
+        // Check if the field is checked (value is not "Off")
+        if (widget->field_value != "Off" && !widget->field_value.empty()) {
+          // Draw checkmark
+          auto check = tvg::Shape::gen();
+          if (check) {
+            float cx = ax1 + aw * 0.5f;
+            float cy = ay1 + ah * 0.5f;
+            float s = std::min(aw, ah) * 0.35f;
+
+            // Simple checkmark path
+            check->moveTo(cx - s, cy);
+            check->lineTo(cx - s * 0.3f, cy + s * 0.6f);
+            check->lineTo(cx + s, cy - s * 0.5f);
+
+            check->strokeWidth(2.0f * scale);
+            check->strokeFill(0, 0, 0, 255);
+            check->strokeCap(tvg::StrokeCap::Round);
+            check->strokeJoin(tvg::StrokeJoin::Round);
+
+            scene_->push(std::move(check));
+          }
+        }
+      }
+    }
+    // Other annotation types could be rendered here (links, highlights, etc.)
   }
 
   if (!end_scene()) {
@@ -3816,9 +5284,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           }
           state_.fill_color_space = cs_name;
           state_.fill_pattern.clear();  // Clear any previous pattern
-#if NANOPDF_DEBUG_PRINT
-          printf("DEBUG: cs set fill color space to: %s\n", cs_name.c_str());
-#endif
+          NANOPDF_LOG_TRACE("ThorVG", "cs: set fill color space to '%s'", cs_name.c_str());
         }
       } else if (token == "CS") {  // Set stroking color space
         if (operands.size() >= 1) {
@@ -3828,9 +5294,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           }
           state_.stroke_color_space = cs_name;
           state_.stroke_pattern.clear();  // Clear any previous pattern
-#if NANOPDF_DEBUG_PRINT
-          printf("DEBUG: CS set stroke color space to: %s\n", cs_name.c_str());
-#endif
+          NANOPDF_LOG_TRACE("ThorVG", "CS: set stroke color space to '%s'", cs_name.c_str());
         }
       } else if (token == "sc" || token == "scn") {  // Set non-stroking color
         // Check if last operand is a pattern name (starts with /)
@@ -3842,9 +5306,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             std::string pattern_name = last.substr(1);
             state_.fill_pattern = pattern_name;
             is_pattern = true;
-#if NANOPDF_DEBUG_PRINT
-            printf("DEBUG: scn set fill pattern to: %s\n", pattern_name.c_str());
-#endif
+            NANOPDF_LOG_TRACE("ThorVG", "scn: set fill pattern to '%s'", pattern_name.c_str());
           }
         }
 
@@ -3871,9 +5333,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             std::string pattern_name = last.substr(1);
             state_.stroke_pattern = pattern_name;
             is_pattern = true;
-#if NANOPDF_DEBUG_PRINT
-            printf("DEBUG: SCN set stroke pattern to: %s\n", pattern_name.c_str());
-#endif
+            NANOPDF_LOG_TRACE("ThorVG", "SCN: set stroke pattern to '%s'", pattern_name.c_str());
           }
         }
 
@@ -4030,6 +5490,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                   state_.blend_mode = 5;  // Difference
                 } else if (bm_name == "Exclusion") {
                   state_.blend_mode = 6;  // Exclusion
+                } else if (bm_name == "Hue" || bm_name == "Saturation" ||
+                           bm_name == "Color" || bm_name == "Luminosity") {
+                  // Non-separable blend modes - ThorVG doesn't support these natively
+                  // Fall back to Normal. For proper support, would need custom blending.
+                  state_.blend_mode = 0;  // Normal (fallback)
                 } else {
                   state_.blend_mode = 0;  // Default to Normal
                 }
@@ -4154,6 +5619,23 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         state_.text_line_matrix.reset();
       } else if (token == "ET") {  // End text
         state_.in_text_block = false;
+
+        // If text clipping was active, apply accumulated text path to clipping
+        if (state_.text_clip_active && !state_.text_clip_commands.empty()) {
+          // Merge text clip path into main clip path
+          state_.clip_commands.insert(state_.clip_commands.end(),
+                                       state_.text_clip_commands.begin(),
+                                       state_.text_clip_commands.end());
+          state_.clip_points.insert(state_.clip_points.end(),
+                                     state_.text_clip_points.begin(),
+                                     state_.text_clip_points.end());
+          state_.has_clip = true;
+
+          // Clear text clip state
+          state_.text_clip_commands.clear();
+          state_.text_clip_points.clear();
+          state_.text_clip_active = false;
+        }
       } else if (token == "Td") {  // Move text position
         if (operands.size() >= 2 && state_.in_text_block) {
           float tx = std::stof(operands[0]);
@@ -4222,9 +5704,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         // 4 = Fill+Clip, 5 = Stroke+Clip, 6 = Fill+Stroke+Clip, 7 = Clip only
         if (operands.size() >= 1) {
           state_.text_render_mode = std::stoi(operands[0]);
-#if NANOPDF_DEBUG_PRINT
-          printf("DEBUG: Tr set text rendering mode to: %d\n", state_.text_render_mode);
-#endif
+          NANOPDF_LOG_TRACE("ThorVG", "Tr: set text rendering mode to %d", state_.text_render_mode);
         }
       } else if (token == "Tf") {  // Set font and size
         if (operands.size() >= 2) {
@@ -4470,10 +5950,13 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             xobj_name = xobj_name.substr(1);
           }
 
+          NANOPDF_LOG_DEBUG("ThorVG", "Do operator: looking up XObject '%s'", xobj_name.c_str());
+
           // Look up XObject in page resources
           auto xobj_it = current_page_->resources.find("XObject");
           if (xobj_it == current_page_->resources.end()) {
             // No XObject dictionary
+            NANOPDF_LOG_DEBUG("ThorVG", "Do: no XObject dictionary in resources");
           } else if (xobj_it->second.type == Value::REFERENCE) {
             // XObject dict may be a reference, resolve it
             ResolvedObject resolved = resolve_reference(*current_pdf_,
@@ -4483,10 +5966,12 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
               auto entry_it = resolved.value.dict.find(xobj_name);
               if (entry_it != resolved.value.dict.end()) {
                 Value xobj_value;
+                uint32_t xobj_num = 0;
+                uint16_t xobj_gen = 0;
                 if (entry_it->second.type == Value::REFERENCE) {
-                  ResolvedObject xobj_resolved = resolve_reference(*current_pdf_,
-                      entry_it->second.ref_object_number,
-                      entry_it->second.ref_generation_number);
+                  xobj_num = entry_it->second.ref_object_number;
+                  xobj_gen = entry_it->second.ref_generation_number;
+                  ResolvedObject xobj_resolved = resolve_reference(*current_pdf_, xobj_num, xobj_gen);
                   if (xobj_resolved.success) {
                     xobj_value = std::move(xobj_resolved.value);
                   }
@@ -4499,7 +5984,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                   if (subtype_it != xobj_value.stream.dict.end() &&
                       subtype_it->second.type == Value::NAME) {
                     if (subtype_it->second.name == "Image") {
-                      ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value);
+                      ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                       float img_x = state_.transform.e;
                       float img_y = state_.transform.f;
                       float img_width = state_.transform.a;
@@ -4511,7 +5996,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                       draw_image(image, img_x, img_y, img_width, img_height);
                     } else if (subtype_it->second.name == "Form") {
                       // Form XObject - decode and parse its content stream
-                      auto decoded = decode_stream(*current_pdf_, xobj_value);
+                      auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                       if (decoded.success && !decoded.data.empty()) {
                         // Save current state and apply Form's matrix if present
                         GraphicsState saved_state = state_;
@@ -4574,10 +6059,12 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             if (entry_it != xobj_it->second.dict.end()) {
               // Resolve reference if needed
               Value xobj_value;
+              uint32_t xobj_num = 0;
+              uint16_t xobj_gen = 0;
               if (entry_it->second.type == Value::REFERENCE) {
-                ResolvedObject resolved = resolve_reference(*current_pdf_,
-                    entry_it->second.ref_object_number,
-                    entry_it->second.ref_generation_number);
+                xobj_num = entry_it->second.ref_object_number;
+                xobj_gen = entry_it->second.ref_generation_number;
+                ResolvedObject resolved = resolve_reference(*current_pdf_, xobj_num, xobj_gen);
                 if (resolved.success) {
                   xobj_value = std::move(resolved.value);
                 }
@@ -4591,8 +6078,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                 if (subtype_it != xobj_value.stream.dict.end() &&
                     subtype_it->second.type == Value::NAME) {
                   if (subtype_it->second.name == "Image") {
-                    // Parse and render the image
-                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value);
+                    // Parse and render the image (pass object numbers for decryption)
+                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
 
                     // Get image dimensions from CTM (current transformation matrix)
                     float img_x = state_.transform.e;
@@ -4609,7 +6096,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                     draw_image(image, img_x, img_y, img_width, img_height);
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream
-                    auto decoded = decode_stream(*current_pdf_, xobj_value);
+                    auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                     if (decoded.success && !decoded.data.empty()) {
                       // Save current state and apply Form's matrix if present
                       GraphicsState saved_state = state_;
@@ -4736,14 +6223,120 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
     return false;
   }
 
-  // TODO: Full implementation would create a separate ThorVG canvas,
-  // render the XObject content to it, then extract mask values.
-  // For now, we just store basic mask info as a placeholder.
+  // Create temporary canvas and scene for rendering the soft mask
+  std::vector<uint8_t> mask_buffer(mask_width * mask_height * 4, 0);
 
-  // Store mask data (fill with white/opaque as default)
+  // Initialize mask buffer based on mask type
+  if (mask_type == 2) {  // Luminosity - start with white
+    for (size_t i = 0; i < mask_buffer.size(); i += 4) {
+      mask_buffer[i + 0] = 255;  // B
+      mask_buffer[i + 1] = 255;  // G
+      mask_buffer[i + 2] = 255;  // R
+      mask_buffer[i + 3] = 255;  // A
+    }
+  }
+  // For alpha mask (type 1), buffer is already zeroed (transparent)
+
+  tvg::SwCanvas* mask_canvas = tvg::SwCanvas::gen();
+  if (!mask_canvas) {
+    // Fallback to opaque mask
+    state_.soft_mask_width = mask_width;
+    state_.soft_mask_height = mask_height;
+    state_.soft_mask_data.resize(mask_width * mask_height, 255);
+    return true;
+  }
+
+  if (mask_canvas->target(reinterpret_cast<uint32_t*>(mask_buffer.data()),
+                          mask_width, mask_width, mask_height,
+                          tvg::ColorSpace::ABGR8888) != tvg::Result::Success) {
+    delete mask_canvas;
+    state_.soft_mask_width = mask_width;
+    state_.soft_mask_height = mask_height;
+    state_.soft_mask_data.resize(mask_width * mask_height, 255);
+    return true;
+  }
+
+  // Create temporary scene
+  tvg::Scene* mask_scene = tvg::Scene::gen();
+  if (!mask_scene) {
+    delete mask_canvas;
+    state_.soft_mask_width = mask_width;
+    state_.soft_mask_height = mask_height;
+    state_.soft_mask_data.resize(mask_width * mask_height, 255);
+    return true;
+  }
+
+  // Save current state
+  tvg::SwCanvas* saved_canvas = canvas_;
+  tvg::Scene* saved_scene = scene_;
+  std::vector<uint8_t> saved_buffer = std::move(buffer_);
+  uint32_t saved_width = width_;
+  uint32_t saved_height = height_;
+  GraphicsState saved_state = state_;
+
+  // Switch to mask canvas
+  canvas_ = mask_canvas;
+  scene_ = mask_scene;
+  buffer_ = std::move(mask_buffer);
+  width_ = mask_width;
+  height_ = mask_height;
+
+  // Reset graphics state for mask rendering
+  state_ = GraphicsState();
+  state_.page_width = std::abs(bbox[2] - bbox[0]);
+  state_.page_height = std::abs(bbox[3] - bbox[1]);
+  state_.scale = static_cast<float>(mask_width) / state_.page_width;
+
+  // Parse and render the XObject content to the mask canvas
+  parse_pdf_content(decoded.data);
+
+  // Finalize rendering
+  if (mask_canvas->push(mask_scene) == tvg::Result::Success) {
+    mask_canvas->draw(true);
+    mask_canvas->sync();
+  }
+
+  // Extract mask values from rendered buffer
   state_.soft_mask_width = mask_width;
   state_.soft_mask_height = mask_height;
-  state_.soft_mask_data.resize(mask_width * mask_height, 255);
+  state_.soft_mask_data.resize(mask_width * mask_height);
+
+  for (uint32_t y = 0; y < mask_height; ++y) {
+    for (uint32_t x = 0; x < mask_width; ++x) {
+      size_t src_idx = (y * mask_width + x) * 4;
+      size_t dst_idx = y * mask_width + x;
+
+      if (mask_type == 2) {  // Luminosity mask
+        // Convert RGB to luminance using standard coefficients
+        float b = buffer_[src_idx + 0] / 255.0f;
+        float g = buffer_[src_idx + 1] / 255.0f;
+        float r = buffer_[src_idx + 2] / 255.0f;
+        float luminance = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        state_.soft_mask_data[dst_idx] = static_cast<uint8_t>(luminance * 255.0f);
+      } else {  // Alpha mask
+        state_.soft_mask_data[dst_idx] = buffer_[src_idx + 3];  // Alpha channel
+      }
+    }
+  }
+
+  // Clean up mask canvas (scene was pushed to canvas, so canvas owns it)
+  delete mask_canvas;
+
+  // Restore original state
+  canvas_ = saved_canvas;
+  scene_ = saved_scene;
+  buffer_ = std::move(saved_buffer);
+  width_ = saved_width;
+  height_ = saved_height;
+
+  // Restore graphics state but keep the extracted soft mask data
+  auto soft_mask_data = std::move(state_.soft_mask_data);
+  auto soft_mask_width = state_.soft_mask_width;
+  auto soft_mask_height = state_.soft_mask_height;
+  state_ = saved_state;
+  state_.soft_mask_data = std::move(soft_mask_data);
+  state_.soft_mask_width = soft_mask_width;
+  state_.soft_mask_height = soft_mask_height;
 
   return true;
 }

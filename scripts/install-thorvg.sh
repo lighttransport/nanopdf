@@ -5,7 +5,12 @@
 
 set -e
 
-echo "Installing ThorVG..."
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+INSTALL_DIR="$PROJECT_ROOT/dist"
+
+echo "Installing ThorVG to $INSTALL_DIR..."
 
 # Check if we're on Linux
 if [[ "$OSTYPE" != "linux-gnu"* ]]; then
@@ -13,6 +18,9 @@ if [[ "$OSTYPE" != "linux-gnu"* ]]; then
     echo "Visit: https://github.com/thorvg/thorvg"
     exit 1
 fi
+
+# Create install directory
+mkdir -p "$INSTALL_DIR"
 
 # Create a temporary directory
 TEMP_DIR=$(mktemp -d)
@@ -25,20 +33,18 @@ cd thorvg
 
 # Build ThorVG using Meson
 echo "Building ThorVG..."
-meson setup build --prefix=/usr/local
+meson setup build --prefix="$INSTALL_DIR"
 ninja -C build
 
-# Install (requires sudo)
-echo "Installing ThorVG (requires sudo)..."
-sudo ninja -C build install
-
-# Update library cache
-sudo ldconfig
+# Install to local dist directory (no sudo required)
+echo "Installing ThorVG to $INSTALL_DIR..."
+ninja -C build install
 
 # Clean up
 cd /
 rm -rf "$TEMP_DIR"
 
-echo "ThorVG has been installed successfully!"
+echo "ThorVG has been installed successfully to $INSTALL_DIR!"
 echo "You can now build nanopdf with ThorVG support using:"
-echo "  cmake .. -DNANOPDF_USE_THORVG=ON"
+echo "  cmake .. -DNANOPDF_USE_THORVG=ON \\"
+echo "    -DCMAKE_PREFIX_PATH=$INSTALL_DIR"

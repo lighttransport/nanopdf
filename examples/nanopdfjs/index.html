@@ -1,0 +1,1428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nanopdf - PDF Editor</title>
+  <style>
+    :root {
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --bg: #f3f4f6;
+      --sidebar-bg: #ffffff;
+      --border: #e5e7eb;
+      --text: #1f2937;
+      --text-light: #6b7280;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --error: #ef4444;
+      --thumbnail-size: 120px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Layout */
+    .app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    .header {
+      background: var(--sidebar-bg);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--primary);
+    }
+
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Sidebar - Thumbnails */
+    .sidebar {
+      width: 180px;
+      background: var(--sidebar-bg);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .sidebar-header {
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 500;
+      font-size: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .sidebar-header span {
+      color: var(--text-light);
+      font-size: 12px;
+    }
+
+    .thumbnail-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+
+    .thumbnail-item {
+      margin-bottom: 8px;
+      cursor: pointer;
+      border: 2px solid transparent;
+      border-radius: 4px;
+      padding: 4px;
+      transition: border-color 0.2s;
+    }
+
+    .thumbnail-item:hover {
+      border-color: var(--border);
+    }
+
+    .thumbnail-item.selected {
+      border-color: var(--primary);
+      background: rgba(37, 99, 235, 0.05);
+    }
+
+    .thumbnail-item canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      background: white;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    .thumbnail-info {
+      font-size: 11px;
+      color: var(--text-light);
+      text-align: center;
+      margin-top: 4px;
+    }
+
+    .thumbnail-actions {
+      display: flex;
+      justify-content: center;
+      gap: 4px;
+      margin-top: 4px;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+
+    .thumbnail-item:hover .thumbnail-actions {
+      opacity: 1;
+    }
+
+    .thumbnail-actions button {
+      padding: 2px 6px;
+      font-size: 10px;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .thumbnail-actions button:hover {
+      background: var(--primary);
+      color: white;
+    }
+
+    .thumbnail-actions button.delete:hover {
+      background: var(--error);
+    }
+
+    /* Content area */
+    .content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Toolbar */
+    .toolbar {
+      background: var(--sidebar-bg);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 12px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .toolbar-group {
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      padding-right: 12px;
+      border-right: 1px solid var(--border);
+    }
+
+    .toolbar-group:last-child {
+      border-right: none;
+    }
+
+    .toolbar-label {
+      font-size: 11px;
+      color: var(--text-light);
+      margin-right: 4px;
+    }
+
+    .btn {
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: white;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.2s;
+    }
+
+    .btn:hover {
+      background: var(--bg);
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+    }
+
+    .btn-primary:hover {
+      background: var(--primary-dark);
+    }
+
+    .btn-icon {
+      padding: 6px 8px;
+      min-width: 32px;
+      justify-content: center;
+    }
+
+    .btn.active {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+    }
+
+    /* Annotation Toolbar */
+    .annot-toolbar {
+      background: #fef3c7;
+      border-bottom: 1px solid #fcd34d;
+      padding: 8px 12px;
+      display: none;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .annot-toolbar.visible {
+      display: flex;
+    }
+
+    .color-picker {
+      width: 32px;
+      height: 24px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      padding: 0;
+    }
+
+    .size-input {
+      width: 50px;
+      padding: 4px 6px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    /* Viewer */
+    .viewer {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 20px;
+      background: #e5e7eb;
+    }
+
+    .page-container {
+      position: relative;
+      background: white;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+
+    #pageCanvas {
+      display: block;
+    }
+
+    .annotation-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .annotation-layer.drawing {
+      pointer-events: auto;
+      cursor: crosshair;
+    }
+
+    /* Status bar */
+    .status-bar {
+      background: var(--sidebar-bg);
+      border-top: 1px solid var(--border);
+      padding: 6px 12px;
+      font-size: 12px;
+      color: var(--text-light);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    /* Upload area */
+    .upload-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 40px;
+      text-align: center;
+    }
+
+    .upload-area.hidden {
+      display: none;
+    }
+
+    .upload-dropzone {
+      width: 100%;
+      max-width: 500px;
+      padding: 60px 40px;
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      background: white;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .upload-dropzone:hover,
+    .upload-dropzone.dragover {
+      border-color: var(--primary);
+      background: rgba(37, 99, 235, 0.05);
+    }
+
+    .upload-dropzone h2 {
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+
+    .upload-dropzone p {
+      color: var(--text-light);
+      margin-bottom: 16px;
+    }
+
+    .file-input {
+      display: none;
+    }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.5);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      z-index: 1000;
+    }
+
+    .modal-overlay.visible {
+      display: flex;
+    }
+
+    .modal {
+      background: white;
+      border-radius: 8px;
+      padding: 24px;
+      min-width: 400px;
+      max-width: 90%;
+      max-height: 90%;
+      overflow: auto;
+    }
+
+    .modal h3 {
+      margin-bottom: 16px;
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    /* Crop overlay */
+    .crop-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: none;
+    }
+
+    .crop-overlay.visible {
+      display: block;
+    }
+
+    .crop-box {
+      position: absolute;
+      border: 2px dashed var(--primary);
+      background: rgba(37, 99, 235, 0.1);
+    }
+
+    /* Loaded docs list */
+    .doc-list {
+      margin-bottom: 12px;
+    }
+
+    .doc-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      background: var(--bg);
+      border-radius: 4px;
+      margin-bottom: 4px;
+    }
+
+    .doc-item-name {
+      font-size: 13px;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .doc-item-pages {
+      font-size: 11px;
+      color: var(--text-light);
+      margin: 0 12px;
+    }
+
+    /* Loading spinner */
+    .loading {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(255,255,255,0.8);
+      justify-content: center;
+      align-items: center;
+      z-index: 2000;
+    }
+
+    .loading.visible {
+      display: flex;
+    }
+
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid var(--border);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Icons (simple SVG) */
+    .icon {
+      width: 16px;
+      height: 16px;
+      fill: currentColor;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1>nanopdf Editor</h1>
+      <input type="file" id="fileInput" class="file-input" accept=".pdf" multiple>
+      <button class="btn" onclick="document.getElementById('fileInput').click()">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+        Add PDF
+      </button>
+      <button class="btn btn-primary" id="exportBtn" onclick="exportPDF()" disabled>
+        <svg class="icon" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        Export PDF
+      </button>
+      <span id="status" style="margin-left: auto; font-size: 12px; color: var(--text-light);">Loading WASM...</span>
+    </header>
+
+    <main class="main">
+      <!-- Sidebar - Page Thumbnails -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          Pages <span id="pageCount">0</span>
+        </div>
+        <div class="thumbnail-list" id="thumbnailList"></div>
+      </aside>
+
+      <!-- Main Content -->
+      <div class="content">
+        <!-- Toolbar -->
+        <div class="toolbar" id="toolbar">
+          <div class="toolbar-group">
+            <span class="toolbar-label">Page:</span>
+            <button class="btn btn-icon" onclick="prevPage()" title="Previous Page">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+            </button>
+            <span id="pageInfo">-</span>
+            <button class="btn btn-icon" onclick="nextPage()" title="Next Page">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+            </button>
+          </div>
+
+          <div class="toolbar-group">
+            <span class="toolbar-label">Zoom:</span>
+            <button class="btn btn-icon" onclick="zoomOut()" title="Zoom Out">-</button>
+            <span id="zoomLevel">100%</span>
+            <button class="btn btn-icon" onclick="zoomIn()" title="Zoom In">+</button>
+            <button class="btn" onclick="fitPage()" title="Fit to Window">Fit</button>
+          </div>
+
+          <div class="toolbar-group">
+            <span class="toolbar-label">Rotate:</span>
+            <button class="btn btn-icon" onclick="rotatePage(-90)" title="Rotate Left">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M7.11 8.53L5.7 7.11C4.8 8.27 4.24 9.61 4.07 11h2.02c.14-.87.49-1.72 1.02-2.47zM6.09 13H4.07c.17 1.39.72 2.73 1.62 3.89l1.41-1.42c-.52-.75-.87-1.59-1.01-2.47zm1.01 5.32c1.16.9 2.51 1.44 3.9 1.61V17.9c-.87-.15-1.71-.49-2.46-1.03L7.1 18.32zM13 4.07V1L8.45 5.55 13 10V6.09c2.84.48 5 2.94 5 5.91s-2.16 5.43-5 5.91v2.02c3.95-.49 7-3.85 7-7.93s-3.05-7.44-7-7.93z"/></svg>
+            </button>
+            <button class="btn btn-icon" onclick="rotatePage(90)" title="Rotate Right">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M15.55 5.55L11 1v3.07C7.06 4.56 4 7.92 4 12s3.05 7.44 7 7.93v-2.02c-2.84-.48-5-2.94-5-5.91s2.16-5.43 5-5.91V10l4.55-4.45zM19.93 11c-.17-1.39-.72-2.73-1.62-3.89l-1.42 1.42c.54.75.88 1.6 1.02 2.47h2.02zM13 17.9v2.02c1.39-.17 2.74-.71 3.9-1.61l-1.44-1.44c-.75.54-1.59.89-2.46 1.03zm3.89-2.42l1.42 1.41c.9-1.16 1.45-2.5 1.62-3.89h-2.02c-.14.87-.48 1.72-1.02 2.48z"/></svg>
+            </button>
+          </div>
+
+          <div class="toolbar-group">
+            <button class="btn" onclick="toggleCropMode()" id="cropBtn" title="Crop Page">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M17 15h2V7c0-1.1-.9-2-2-2H9v2h8v8zM7 17V1H5v4H1v2h4v10c0 1.1.9 2 2 2h10v4h2v-4h4v-2H7z"/></svg>
+              Crop
+            </button>
+            <button class="btn" onclick="deletePage()" title="Delete Page">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+              Delete
+            </button>
+          </div>
+        </div>
+
+        <!-- Annotation Toolbar -->
+        <div class="annot-toolbar" id="annotToolbar">
+          <span class="toolbar-label">Annotate:</span>
+          <button class="btn btn-icon" onclick="setAnnotTool('select')" id="toolSelect" title="Select">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/></svg>
+          </button>
+          <button class="btn btn-icon" onclick="setAnnotTool('text')" id="toolText" title="Text">T</button>
+          <button class="btn btn-icon" onclick="setAnnotTool('line')" id="toolLine" title="Line">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M19 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V5a2 2 0 00-2-2zM5 19V5h14v14H5z"/><line x1="5" y1="19" x2="19" y2="5" stroke="currentColor" stroke-width="2"/></svg>
+          </button>
+          <button class="btn btn-icon" onclick="setAnnotTool('rect')" id="toolRect" title="Rectangle">
+            <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+          </button>
+          <button class="btn btn-icon" onclick="setAnnotTool('oval')" id="toolOval" title="Oval">
+            <svg class="icon" viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="9" ry="6" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+          </button>
+          <button class="btn btn-icon" onclick="setAnnotTool('highlight')" id="toolHighlight" title="Highlight">
+            <svg class="icon" viewBox="0 0 24 24"><rect x="2" y="8" width="20" height="8" fill="currentColor" opacity="0.3"/></svg>
+          </button>
+          <span style="margin-left: 12px;"></span>
+          <span class="toolbar-label">Color:</span>
+          <input type="color" class="color-picker" id="annotColor" value="#ff0000">
+          <span class="toolbar-label" style="margin-left: 8px;">Size:</span>
+          <input type="number" class="size-input" id="annotSize" value="2" min="1" max="20">
+          <span class="toolbar-label" style="margin-left: 8px;">Fill:</span>
+          <input type="checkbox" id="annotFill">
+          <button class="btn" onclick="toggleAnnotMode()" style="margin-left: auto;">Done</button>
+        </div>
+
+        <!-- Upload Area (shown when no docs) -->
+        <div class="upload-area" id="uploadArea">
+          <div class="upload-dropzone" id="dropzone">
+            <h2>Drop PDF files here</h2>
+            <p>or click to browse</p>
+            <button class="btn btn-primary">Select Files</button>
+          </div>
+          <p style="margin-top: 16px; color: var(--text-light);">
+            You can select multiple PDF files to combine them.
+          </p>
+        </div>
+
+        <!-- Page Viewer -->
+        <div class="viewer" id="viewer" style="display: none;">
+          <div class="page-container" id="pageContainer">
+            <canvas id="pageCanvas"></canvas>
+            <canvas class="annotation-layer" id="annotLayer"></canvas>
+            <div class="crop-overlay" id="cropOverlay">
+              <div class="crop-box" id="cropBox"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <div class="status-bar">
+      <span id="statusLeft">Ready</span>
+      <span id="statusRight"></span>
+    </div>
+  </div>
+
+  <!-- Concat Modal -->
+  <div class="modal-overlay" id="concatModal">
+    <div class="modal">
+      <h3>Manage Documents</h3>
+      <div class="doc-list" id="docList"></div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn" onclick="document.getElementById('fileInput').click()">Add More PDFs</button>
+        <button class="btn btn-primary" onclick="addAllToWorking()">Add All Pages to Document</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeConcatModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Text Input Modal -->
+  <div class="modal-overlay" id="textModal">
+    <div class="modal">
+      <h3>Add Text Annotation</h3>
+      <div style="margin-bottom: 12px;">
+        <label style="display: block; margin-bottom: 4px; font-size: 13px;">Text:</label>
+        <textarea id="textInput" rows="3" style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 4px;"></textarea>
+      </div>
+      <div style="margin-bottom: 12px;">
+        <label style="display: block; margin-bottom: 4px; font-size: 13px;">Font Size:</label>
+        <input type="number" id="textFontSize" value="14" min="6" max="72" style="width: 60px; padding: 4px;">
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeTextModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="confirmText()">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Loading Overlay -->
+  <div class="loading" id="loading">
+    <div class="spinner"></div>
+  </div>
+
+  <script type="module">
+    // Import nanopdf wrapper
+    import { NanoPDF, createNanoPDF } from './src/nanopdf.js';
+
+    // Global state
+    let nanopdf = null;
+    let loadedDocs = new Map(); // docId -> { name, pageCount }
+    let currentPage = 0;
+    let zoom = 1.0;
+    let annotMode = false;
+    let currentTool = 'select';
+    let cropMode = false;
+
+    // Drawing state
+    let isDrawing = false;
+    let drawStart = { x: 0, y: 0 };
+    let tempAnnotations = []; // Annotations drawn on canvas (before export)
+
+    // Pending text annotation
+    let pendingTextPos = null;
+
+    // Initialize
+    window.addEventListener('DOMContentLoaded', async () => {
+      try {
+        // Try to load WASM module
+        const moduleUrl = '../../build_wasm/nanopdf.js';
+
+        // Check if WASM build exists
+        try {
+          const response = await fetch(moduleUrl, { method: 'HEAD' });
+          if (!response.ok) throw new Error('WASM not found');
+        } catch {
+          document.getElementById('status').textContent = 'WASM not built - see README';
+          document.getElementById('status').style.color = 'var(--error)';
+          console.error('WASM module not found. Build with: ./scripts/bootstrap-emscripten.sh && cd build_wasm && emmake make');
+          return;
+        }
+
+        const NanoPDFModule = (await import(moduleUrl)).default;
+        const module = await NanoPDFModule();
+        nanopdf = createNanoPDF(module);
+        nanopdf.init();
+
+        document.getElementById('status').textContent = 'Ready';
+        document.getElementById('status').style.color = 'var(--success)';
+
+        if (!nanopdf.hasRendering()) {
+          document.getElementById('status').textContent = 'No rendering backend';
+          document.getElementById('status').style.color = 'var(--warning)';
+        }
+
+        setupEventListeners();
+      } catch (err) {
+        console.error('Failed to load WASM:', err);
+        document.getElementById('status').textContent = 'Failed to load WASM';
+        document.getElementById('status').style.color = 'var(--error)';
+      }
+    });
+
+    function setupEventListeners() {
+      const fileInput = document.getElementById('fileInput');
+      const dropzone = document.getElementById('dropzone');
+
+      fileInput.addEventListener('change', handleFileSelect);
+
+      dropzone.addEventListener('click', () => fileInput.click());
+      dropzone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropzone.classList.add('dragover');
+      });
+      dropzone.addEventListener('dragleave', () => {
+        dropzone.classList.remove('dragover');
+      });
+      dropzone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('dragover');
+        handleFiles(e.dataTransfer.files);
+      });
+
+      // Annotation canvas events
+      const annotLayer = document.getElementById('annotLayer');
+      annotLayer.addEventListener('mousedown', handleAnnotMouseDown);
+      annotLayer.addEventListener('mousemove', handleAnnotMouseMove);
+      annotLayer.addEventListener('mouseup', handleAnnotMouseUp);
+      annotLayer.addEventListener('mouseleave', handleAnnotMouseUp);
+
+      // Crop events
+      const cropOverlay = document.getElementById('cropOverlay');
+      cropOverlay.addEventListener('mousedown', handleCropStart);
+      cropOverlay.addEventListener('mousemove', handleCropMove);
+      cropOverlay.addEventListener('mouseup', handleCropEnd);
+    }
+
+    async function handleFileSelect(e) {
+      handleFiles(e.target.files);
+      e.target.value = ''; // Reset for next selection
+    }
+
+    async function handleFiles(files) {
+      if (!nanopdf) return;
+
+      showLoading(true);
+
+      for (const file of files) {
+        if (!file.name.toLowerCase().endsWith('.pdf')) continue;
+
+        try {
+          const data = await file.arrayBuffer();
+          const docId = nanopdf.docLoad(data);
+
+          if (docId < 0) {
+            alert(`Failed to load ${file.name}: ${nanopdf.getLastError()}`);
+            continue;
+          }
+
+          const pageCount = nanopdf.docGetPageCount(docId);
+          loadedDocs.set(docId, { name: file.name, pageCount });
+
+          // Add all pages to working document
+          nanopdf.workAddAllPages(docId);
+
+          updateStatus(`Loaded ${file.name} (${pageCount} pages)`);
+        } catch (err) {
+          console.error(`Error loading ${file.name}:`, err);
+          alert(`Error loading ${file.name}`);
+        }
+      }
+
+      updateUI();
+      showLoading(false);
+    }
+
+    function updateUI() {
+      const pageCount = nanopdf.workGetPageCount();
+      document.getElementById('pageCount').textContent = pageCount;
+      document.getElementById('exportBtn').disabled = pageCount === 0;
+
+      if (pageCount > 0) {
+        document.getElementById('uploadArea').style.display = 'none';
+        document.getElementById('viewer').style.display = 'flex';
+        document.getElementById('toolbar').style.display = 'flex';
+
+        if (currentPage >= pageCount) {
+          currentPage = pageCount - 1;
+        }
+
+        renderThumbnails();
+        renderCurrentPage();
+      } else {
+        document.getElementById('uploadArea').style.display = 'flex';
+        document.getElementById('viewer').style.display = 'none';
+      }
+    }
+
+    function renderThumbnails() {
+      const list = document.getElementById('thumbnailList');
+      list.innerHTML = '';
+
+      const pageCount = nanopdf.workGetPageCount();
+      for (let i = 0; i < pageCount; i++) {
+        const item = document.createElement('div');
+        item.className = 'thumbnail-item' + (i === currentPage ? ' selected' : '');
+        item.onclick = () => goToPage(i);
+
+        const canvas = document.createElement('canvas');
+        const size = nanopdf.workGetPageSize(i);
+        const scale = 150 / Math.max(size.width, size.height);
+        canvas.width = size.width * scale;
+        canvas.height = size.height * scale;
+
+        // Draw placeholder (gray)
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#f0f0f0';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#999';
+        ctx.font = '12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`Page ${i + 1}`, canvas.width / 2, canvas.height / 2);
+
+        const info = document.createElement('div');
+        info.className = 'thumbnail-info';
+        const rotation = nanopdf.workGetRotation(i);
+        info.textContent = `${i + 1}${rotation ? ` (${rotation}°)` : ''}`;
+
+        const actions = document.createElement('div');
+        actions.className = 'thumbnail-actions';
+        actions.innerHTML = `
+          <button onclick="event.stopPropagation(); movePageUp(${i})">↑</button>
+          <button onclick="event.stopPropagation(); movePageDown(${i})">↓</button>
+          <button class="delete" onclick="event.stopPropagation(); deletePageAt(${i})">×</button>
+        `;
+
+        item.appendChild(canvas);
+        item.appendChild(info);
+        item.appendChild(actions);
+        list.appendChild(item);
+      }
+    }
+
+    function renderCurrentPage() {
+      const canvas = document.getElementById('pageCanvas');
+      const ctx = canvas.getContext('2d');
+      const pageCount = nanopdf.workGetPageCount();
+
+      if (pageCount === 0) return;
+
+      const size = nanopdf.workGetPageSize(currentPage);
+      const width = Math.floor(size.width * zoom);
+      const height = Math.floor(size.height * zoom);
+
+      canvas.width = width;
+      canvas.height = height;
+
+      // Draw white background
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, width, height);
+
+      // Draw page border
+      ctx.strokeStyle = '#ccc';
+      ctx.strokeRect(0, 0, width, height);
+
+      // Draw placeholder
+      ctx.fillStyle = '#666';
+      ctx.font = '14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`Page ${currentPage + 1}`, width / 2, height / 2 - 10);
+      ctx.fillText(`${Math.round(size.width)} × ${Math.round(size.height)} pt`, width / 2, height / 2 + 10);
+
+      // Update annotation layer size
+      const annotLayer = document.getElementById('annotLayer');
+      annotLayer.width = width;
+      annotLayer.height = height;
+
+      // Redraw annotations
+      redrawAnnotations();
+
+      // Update UI
+      document.getElementById('pageInfo').textContent = `${currentPage + 1} / ${pageCount}`;
+      document.getElementById('zoomLevel').textContent = `${Math.round(zoom * 100)}%`;
+
+      // Update thumbnail selection
+      document.querySelectorAll('.thumbnail-item').forEach((item, i) => {
+        item.classList.toggle('selected', i === currentPage);
+      });
+    }
+
+    function redrawAnnotations() {
+      const canvas = document.getElementById('annotLayer');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw temp annotations for current page
+      for (const annot of tempAnnotations) {
+        if (annot.pageIndex !== currentPage) continue;
+        drawAnnotation(ctx, annot, zoom);
+      }
+    }
+
+    function drawAnnotation(ctx, annot, scale) {
+      ctx.save();
+
+      const color = annot.color || '#ff0000';
+      const alpha = annot.alpha || 1;
+      ctx.globalAlpha = alpha;
+
+      switch (annot.type) {
+        case 'line':
+          ctx.strokeStyle = color;
+          ctx.lineWidth = (annot.lineWidth || 2) * scale;
+          ctx.beginPath();
+          ctx.moveTo(annot.x1 * scale, annot.y1 * scale);
+          ctx.lineTo(annot.x2 * scale, annot.y2 * scale);
+          ctx.stroke();
+          break;
+
+        case 'rect':
+          ctx.lineWidth = (annot.lineWidth || 2) * scale;
+          if (annot.filled) {
+            ctx.fillStyle = color;
+            ctx.fillRect(annot.x * scale, annot.y * scale, annot.w * scale, annot.h * scale);
+          } else {
+            ctx.strokeStyle = color;
+            ctx.strokeRect(annot.x * scale, annot.y * scale, annot.w * scale, annot.h * scale);
+          }
+          break;
+
+        case 'oval':
+          ctx.lineWidth = (annot.lineWidth || 2) * scale;
+          ctx.beginPath();
+          ctx.ellipse(
+            annot.cx * scale, annot.cy * scale,
+            annot.rx * scale, annot.ry * scale,
+            0, 0, Math.PI * 2
+          );
+          if (annot.filled) {
+            ctx.fillStyle = color;
+            ctx.fill();
+          } else {
+            ctx.strokeStyle = color;
+            ctx.stroke();
+          }
+          break;
+
+        case 'highlight':
+          ctx.fillStyle = color;
+          ctx.globalAlpha = 0.3;
+          ctx.fillRect(annot.x * scale, annot.y * scale, annot.w * scale, annot.h * scale);
+          break;
+
+        case 'text':
+          ctx.fillStyle = color;
+          ctx.font = `${(annot.fontSize || 14) * scale}px sans-serif`;
+          ctx.fillText(annot.text, annot.x * scale, annot.y * scale);
+          break;
+      }
+
+      ctx.restore();
+    }
+
+    // Navigation
+    window.goToPage = function(index) {
+      const pageCount = nanopdf.workGetPageCount();
+      if (index >= 0 && index < pageCount) {
+        currentPage = index;
+        renderCurrentPage();
+      }
+    };
+
+    window.prevPage = function() {
+      goToPage(currentPage - 1);
+    };
+
+    window.nextPage = function() {
+      goToPage(currentPage + 1);
+    };
+
+    // Zoom
+    window.zoomIn = function() {
+      zoom = Math.min(zoom * 1.25, 4);
+      renderCurrentPage();
+    };
+
+    window.zoomOut = function() {
+      zoom = Math.max(zoom / 1.25, 0.25);
+      renderCurrentPage();
+    };
+
+    window.fitPage = function() {
+      const viewer = document.getElementById('viewer');
+      const size = nanopdf.workGetPageSize(currentPage);
+      const viewW = viewer.clientWidth - 40;
+      const viewH = viewer.clientHeight - 40;
+      zoom = Math.min(viewW / size.width, viewH / size.height, 2);
+      renderCurrentPage();
+    };
+
+    // Rotation
+    window.rotatePage = function(angle) {
+      if (nanopdf.workGetPageCount() === 0) return;
+      const current = nanopdf.workGetRotation(currentPage);
+      const newAngle = (current + angle + 360) % 360;
+      nanopdf.workRotatePage(currentPage, newAngle);
+      renderThumbnails();
+      renderCurrentPage();
+    };
+
+    // Page management
+    window.deletePage = function() {
+      deletePageAt(currentPage);
+    };
+
+    window.deletePageAt = function(index) {
+      if (nanopdf.workGetPageCount() <= 1) {
+        alert('Cannot delete the last page');
+        return;
+      }
+      nanopdf.workRemovePage(index);
+      tempAnnotations = tempAnnotations.filter(a => a.pageIndex !== index)
+        .map(a => {
+          if (a.pageIndex > index) a.pageIndex--;
+          return a;
+        });
+      updateUI();
+    };
+
+    window.movePageUp = function(index) {
+      if (index > 0) {
+        nanopdf.workMovePage(index, index - 1);
+        if (currentPage === index) currentPage--;
+        updateUI();
+      }
+    };
+
+    window.movePageDown = function(index) {
+      const pageCount = nanopdf.workGetPageCount();
+      if (index < pageCount - 1) {
+        nanopdf.workMovePage(index, index + 1);
+        if (currentPage === index) currentPage++;
+        updateUI();
+      }
+    };
+
+    // Annotation mode
+    window.toggleAnnotMode = function() {
+      annotMode = !annotMode;
+      const toolbar = document.getElementById('annotToolbar');
+      const annotLayer = document.getElementById('annotLayer');
+
+      if (annotMode) {
+        toolbar.classList.add('visible');
+        annotLayer.classList.add('drawing');
+        setAnnotTool('select');
+      } else {
+        toolbar.classList.remove('visible');
+        annotLayer.classList.remove('drawing');
+      }
+    };
+
+    window.setAnnotTool = function(tool) {
+      currentTool = tool;
+      ['select', 'text', 'line', 'rect', 'oval', 'highlight'].forEach(t => {
+        const btn = document.getElementById('tool' + t.charAt(0).toUpperCase() + t.slice(1));
+        if (btn) btn.classList.toggle('active', t === tool);
+      });
+    };
+
+    // Annotation drawing
+    function handleAnnotMouseDown(e) {
+      if (!annotMode || currentTool === 'select') return;
+
+      const rect = e.target.getBoundingClientRect();
+      drawStart = {
+        x: (e.clientX - rect.left) / zoom,
+        y: (e.clientY - rect.top) / zoom
+      };
+
+      if (currentTool === 'text') {
+        pendingTextPos = { ...drawStart };
+        document.getElementById('textModal').classList.add('visible');
+        document.getElementById('textInput').focus();
+        return;
+      }
+
+      isDrawing = true;
+    }
+
+    function handleAnnotMouseMove(e) {
+      if (!isDrawing) return;
+
+      const rect = e.target.getBoundingClientRect();
+      const current = {
+        x: (e.clientX - rect.left) / zoom,
+        y: (e.clientY - rect.top) / zoom
+      };
+
+      // Preview the annotation
+      const canvas = document.getElementById('annotLayer');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Redraw existing annotations
+      redrawAnnotations();
+
+      // Draw preview
+      const color = document.getElementById('annotColor').value;
+      const lineWidth = parseInt(document.getElementById('annotSize').value) || 2;
+      const filled = document.getElementById('annotFill').checked;
+
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = lineWidth * zoom;
+
+      switch (currentTool) {
+        case 'line':
+          ctx.beginPath();
+          ctx.moveTo(drawStart.x * zoom, drawStart.y * zoom);
+          ctx.lineTo(current.x * zoom, current.y * zoom);
+          ctx.stroke();
+          break;
+
+        case 'rect':
+          const rx = Math.min(drawStart.x, current.x) * zoom;
+          const ry = Math.min(drawStart.y, current.y) * zoom;
+          const rw = Math.abs(current.x - drawStart.x) * zoom;
+          const rh = Math.abs(current.y - drawStart.y) * zoom;
+          if (filled) {
+            ctx.fillRect(rx, ry, rw, rh);
+          } else {
+            ctx.strokeRect(rx, ry, rw, rh);
+          }
+          break;
+
+        case 'oval':
+          const cx = (drawStart.x + current.x) / 2 * zoom;
+          const cy = (drawStart.y + current.y) / 2 * zoom;
+          const orx = Math.abs(current.x - drawStart.x) / 2 * zoom;
+          const ory = Math.abs(current.y - drawStart.y) / 2 * zoom;
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, orx, ory, 0, 0, Math.PI * 2);
+          if (filled) ctx.fill();
+          else ctx.stroke();
+          break;
+
+        case 'highlight':
+          ctx.globalAlpha = 0.3;
+          const hx = Math.min(drawStart.x, current.x) * zoom;
+          const hy = Math.min(drawStart.y, current.y) * zoom;
+          const hw = Math.abs(current.x - drawStart.x) * zoom;
+          const hh = Math.abs(current.y - drawStart.y) * zoom;
+          ctx.fillRect(hx, hy, hw, hh);
+          break;
+      }
+
+      ctx.restore();
+    }
+
+    function handleAnnotMouseUp(e) {
+      if (!isDrawing) return;
+      isDrawing = false;
+
+      const rect = e.target.getBoundingClientRect();
+      const end = {
+        x: (e.clientX - rect.left) / zoom,
+        y: (e.clientY - rect.top) / zoom
+      };
+
+      const color = document.getElementById('annotColor').value;
+      const lineWidth = parseInt(document.getElementById('annotSize').value) || 2;
+      const filled = document.getElementById('annotFill').checked;
+
+      // Create annotation
+      const annot = {
+        pageIndex: currentPage,
+        color,
+        lineWidth,
+        filled,
+        alpha: currentTool === 'highlight' ? 0.3 : 1
+      };
+
+      switch (currentTool) {
+        case 'line':
+          annot.type = 'line';
+          annot.x1 = drawStart.x;
+          annot.y1 = drawStart.y;
+          annot.x2 = end.x;
+          annot.y2 = end.y;
+          break;
+
+        case 'rect':
+          annot.type = 'rect';
+          annot.x = Math.min(drawStart.x, end.x);
+          annot.y = Math.min(drawStart.y, end.y);
+          annot.w = Math.abs(end.x - drawStart.x);
+          annot.h = Math.abs(end.y - drawStart.y);
+          break;
+
+        case 'oval':
+          annot.type = 'oval';
+          annot.cx = (drawStart.x + end.x) / 2;
+          annot.cy = (drawStart.y + end.y) / 2;
+          annot.rx = Math.abs(end.x - drawStart.x) / 2;
+          annot.ry = Math.abs(end.y - drawStart.y) / 2;
+          break;
+
+        case 'highlight':
+          annot.type = 'highlight';
+          annot.x = Math.min(drawStart.x, end.x);
+          annot.y = Math.min(drawStart.y, end.y);
+          annot.w = Math.abs(end.x - drawStart.x);
+          annot.h = Math.abs(end.y - drawStart.y);
+          break;
+      }
+
+      if (annot.type) {
+        tempAnnotations.push(annot);
+        redrawAnnotations();
+      }
+    }
+
+    // Text modal
+    window.closeTextModal = function() {
+      document.getElementById('textModal').classList.remove('visible');
+      pendingTextPos = null;
+    };
+
+    window.confirmText = function() {
+      const text = document.getElementById('textInput').value.trim();
+      const fontSize = parseInt(document.getElementById('textFontSize').value) || 14;
+
+      if (text && pendingTextPos) {
+        const color = document.getElementById('annotColor').value;
+        tempAnnotations.push({
+          type: 'text',
+          pageIndex: currentPage,
+          x: pendingTextPos.x,
+          y: pendingTextPos.y,
+          text,
+          fontSize,
+          color
+        });
+        redrawAnnotations();
+      }
+
+      document.getElementById('textInput').value = '';
+      closeTextModal();
+    };
+
+    // Crop mode
+    let cropStart = null;
+
+    window.toggleCropMode = function() {
+      cropMode = !cropMode;
+      const overlay = document.getElementById('cropOverlay');
+      const btn = document.getElementById('cropBtn');
+
+      if (cropMode) {
+        overlay.classList.add('visible');
+        btn.classList.add('active');
+      } else {
+        overlay.classList.remove('visible');
+        btn.classList.remove('active');
+        document.getElementById('cropBox').style.display = 'none';
+      }
+    };
+
+    function handleCropStart(e) {
+      if (!cropMode) return;
+      const rect = e.target.getBoundingClientRect();
+      cropStart = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top
+      };
+    }
+
+    function handleCropMove(e) {
+      if (!cropMode || !cropStart) return;
+      const rect = e.target.getBoundingClientRect();
+      const current = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top
+      };
+
+      const box = document.getElementById('cropBox');
+      box.style.display = 'block';
+      box.style.left = Math.min(cropStart.x, current.x) + 'px';
+      box.style.top = Math.min(cropStart.y, current.y) + 'px';
+      box.style.width = Math.abs(current.x - cropStart.x) + 'px';
+      box.style.height = Math.abs(current.y - cropStart.y) + 'px';
+    }
+
+    function handleCropEnd(e) {
+      if (!cropMode || !cropStart) return;
+
+      const rect = e.target.getBoundingClientRect();
+      const end = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top
+      };
+
+      // Convert to page coordinates
+      const x = Math.min(cropStart.x, end.x) / zoom;
+      const y = Math.min(cropStart.y, end.y) / zoom;
+      const w = Math.abs(end.x - cropStart.x) / zoom;
+      const h = Math.abs(end.y - cropStart.y) / zoom;
+
+      if (w > 10 && h > 10) {
+        // PDF coordinates are bottom-up, canvas is top-down
+        const pageSize = nanopdf.workGetPageSize(currentPage);
+        const pdfY = pageSize.height - y - h;
+
+        if (confirm(`Crop page to ${Math.round(w)} × ${Math.round(h)} pt?`)) {
+          nanopdf.workCropPage(currentPage, x, pdfY, w, h);
+          toggleCropMode();
+          updateUI();
+        }
+      }
+
+      cropStart = null;
+      document.getElementById('cropBox').style.display = 'none';
+    }
+
+    // Export
+    window.exportPDF = function() {
+      if (!nanopdf) return;
+
+      showLoading(true);
+
+      // First, add all canvas annotations to WASM
+      for (const annot of tempAnnotations) {
+        const hexColor = annot.color || '#000000';
+        const r = parseInt(hexColor.slice(1, 3), 16) / 255;
+        const g = parseInt(hexColor.slice(3, 5), 16) / 255;
+        const b = parseInt(hexColor.slice(5, 7), 16) / 255;
+        const a = annot.alpha || 1;
+
+        // PDF coordinates are bottom-up
+        const pageSize = nanopdf.workGetPageSize(annot.pageIndex);
+        const flipY = (y) => pageSize.height - y;
+
+        switch (annot.type) {
+          case 'text':
+            nanopdf.addTextAnnotation(annot.pageIndex, annot.x, flipY(annot.y), annot.text, {
+              fontSize: annot.fontSize, r, g, b, a
+            });
+            break;
+
+          case 'line':
+            nanopdf.addLineAnnotation(annot.pageIndex,
+              annot.x1, flipY(annot.y1),
+              annot.x2, flipY(annot.y2),
+              { lineWidth: annot.lineWidth, r, g, b, a }
+            );
+            break;
+
+          case 'rect':
+            nanopdf.addRectAnnotation(annot.pageIndex,
+              annot.x, flipY(annot.y + annot.h),
+              annot.w, annot.h,
+              { lineWidth: annot.lineWidth, r, g, b, a, filled: annot.filled }
+            );
+            break;
+
+          case 'oval':
+            nanopdf.addOvalAnnotation(annot.pageIndex,
+              annot.cx, flipY(annot.cy),
+              annot.rx, annot.ry,
+              { lineWidth: annot.lineWidth, r, g, b, a, filled: annot.filled }
+            );
+            break;
+
+          case 'highlight':
+            nanopdf.addHighlightAnnotation(annot.pageIndex,
+              annot.x, flipY(annot.y + annot.h),
+              annot.w, annot.h,
+              { r, g, b, a: 0.3 }
+            );
+            break;
+        }
+      }
+
+      // Export
+      setTimeout(() => {
+        const success = nanopdf.exportAndDownload('nanopdf-output.pdf');
+        showLoading(false);
+
+        if (!success) {
+          alert('Export failed: ' + nanopdf.getLastError());
+        } else {
+          updateStatus('PDF exported successfully');
+        }
+      }, 100);
+    };
+
+    // Helpers
+    function showLoading(show) {
+      document.getElementById('loading').classList.toggle('visible', show);
+    }
+
+    function updateStatus(text) {
+      document.getElementById('statusLeft').textContent = text;
+    }
+
+    // Expose to global
+    window.nanopdf = () => nanopdf;
+  </script>
+</body>
+</html>

@@ -281,6 +281,14 @@ void CanvasExporter::reset_state() {
   state_ = GraphicsState{};
   canvas_mode_ = false;
   svg_mode_ = false;
+
+  // Clear gradient and pattern definitions
+  svg_gradients_.clear();
+  svg_patterns_.clear();
+  svg_gradient_counter_ = 0;
+  svg_pattern_counter_ = 0;
+  shading_resources_.clear();
+  pattern_resources_.clear();
 }
 
 CanvasExportResult CanvasExporter::export_page(const Pdf& pdf, const Page& page) {
@@ -2818,6 +2826,86 @@ std::string CanvasExporter::svg_to_markup(const std::vector<SvgElement>& element
       << "\" viewBox=\"0 0 " << double_to_string(page_width_) << " "
       << double_to_string(page_height_) << "\">\n";
 
+  // Add defs section for gradients and patterns
+  if (!svg_gradients_.empty() || !svg_patterns_.empty()) {
+    svg << "  <defs>\n";
+
+    // Output gradients
+    for (const auto& grad : svg_gradients_) {
+      if (grad.is_radial) {
+        svg << "    <radialGradient id=\"" << grad.id << "\"";
+        svg << " cx=\"" << double_to_string(grad.cx) << "\"";
+        svg << " cy=\"" << double_to_string(grad.cy) << "\"";
+        svg << " r=\"" << double_to_string(grad.r) << "\"";
+        svg << " fx=\"" << double_to_string(grad.fx) << "\"";
+        svg << " fy=\"" << double_to_string(grad.fy) << "\"";
+        svg << " gradientUnits=\"" << grad.units << "\"";
+        if (!grad.transform.empty()) {
+          svg << " gradientTransform=\"" << grad.transform << "\"";
+        }
+        svg << ">\n";
+      } else {
+        svg << "    <linearGradient id=\"" << grad.id << "\"";
+        svg << " x1=\"" << double_to_string(grad.x1) << "\"";
+        svg << " y1=\"" << double_to_string(grad.y1) << "\"";
+        svg << " x2=\"" << double_to_string(grad.x2) << "\"";
+        svg << " y2=\"" << double_to_string(grad.y2) << "\"";
+        svg << " gradientUnits=\"" << grad.units << "\"";
+        if (!grad.transform.empty()) {
+          svg << " gradientTransform=\"" << grad.transform << "\"";
+        }
+        svg << ">\n";
+      }
+
+      for (const auto& stop : grad.stops) {
+        svg << "      <stop offset=\"" << double_to_string(stop.offset * 100) << "%\"";
+        svg << " stop-color=\"" << stop.color << "\"";
+        if (std::abs(stop.opacity - 1.0) > 1e-6) {
+          svg << " stop-opacity=\"" << double_to_string(stop.opacity) << "\"";
+        }
+        svg << "/>\n";
+      }
+
+      if (grad.is_radial) {
+        svg << "    </radialGradient>\n";
+      } else {
+        svg << "    </linearGradient>\n";
+      }
+    }
+
+    // Output patterns
+    for (const auto& pat : svg_patterns_) {
+      svg << "    <pattern id=\"" << pat.id << "\"";
+      svg << " x=\"" << double_to_string(pat.x) << "\"";
+      svg << " y=\"" << double_to_string(pat.y) << "\"";
+      svg << " width=\"" << double_to_string(pat.width) << "\"";
+      svg << " height=\"" << double_to_string(pat.height) << "\"";
+      svg << " patternUnits=\"" << pat.units << "\"";
+      svg << " patternContentUnits=\"" << pat.content_units << "\"";
+      if (!pat.transform.empty()) {
+        svg << " patternTransform=\"" << pat.transform << "\"";
+      }
+      svg << ">\n";
+
+      for (const auto& elem : pat.content) {
+        svg << "      <" << elem.element_type;
+        for (const auto& attr : elem.attributes) {
+          svg << " " << attr.first << "=\"" << escape_xml_string(attr.second) << "\"";
+        }
+        if (elem.text_content.empty()) {
+          svg << " />\n";
+        } else {
+          svg << ">" << escape_xml_string(elem.text_content)
+              << "</" << elem.element_type << ">\n";
+        }
+      }
+
+      svg << "    </pattern>\n";
+    }
+
+    svg << "  </defs>\n";
+  }
+
   for (const SvgElement& elem : elements) {
     svg << "  <" << elem.element_type;
     for (const auto& attr : elem.attributes) {
@@ -2848,6 +2936,310 @@ void CanvasExporter::queue_canvas_image(double a, double b, double c, double d,
   cmd.args.push_back(double_to_string(e));
   cmd.args.push_back(double_to_string(f));
   canvas_commands_.push_back(std::move(cmd));
+}
+
+// Parse shading resources from page resources
+void CanvasExporter::parse_shading_resources(const Pdf& pdf, const Dictionary& resources) {
+  auto shading_it = resources.find("Shading");
+  if (shading_it == resources.end()) return;
+
+  const Value& shading_dict_val = shading_it->second;
+  if (shading_dict_val.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, shading_dict_val.ref_object_number,
+                                       shading_dict_val.ref_generation_number);
+    if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+      for (const auto& entry : resolved.value.dict) {
+        shading_resources_[entry.first] = entry.second;
+      }
+    }
+  } else if (shading_dict_val.type == Value::DICTIONARY) {
+    for (const auto& entry : shading_dict_val.dict) {
+      shading_resources_[entry.first] = entry.second;
+    }
+  }
+}
+
+// Parse pattern resources from page resources
+void CanvasExporter::parse_pattern_resources(const Pdf& pdf, const Dictionary& resources) {
+  auto pattern_it = resources.find("Pattern");
+  if (pattern_it == resources.end()) return;
+
+  const Value& pattern_dict_val = pattern_it->second;
+  if (pattern_dict_val.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, pattern_dict_val.ref_object_number,
+                                       pattern_dict_val.ref_generation_number);
+    if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+      for (const auto& entry : resolved.value.dict) {
+        pattern_resources_[entry.first] = entry.second;
+      }
+    }
+  } else if (pattern_dict_val.type == Value::DICTIONARY) {
+    for (const auto& entry : pattern_dict_val.dict) {
+      pattern_resources_[entry.first] = entry.second;
+    }
+  }
+}
+
+// Create SVG gradient from PDF shading dictionary
+std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const Matrix2D& ctm) {
+  (void)ctm;  // TODO: Apply CTM transform to gradient coordinates
+  if (!current_pdf_) return "";
+
+  Value shading = shading_val;
+  if (shading.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_, shading.ref_object_number,
+                                       shading.ref_generation_number);
+    if (!resolved.success) return "";
+    shading = resolved.value;
+  }
+
+  if (shading.type != Value::DICTIONARY && shading.type != Value::STREAM) {
+    return "";
+  }
+
+  const Dictionary& dict = (shading.type == Value::STREAM)
+                               ? shading.stream.dict
+                               : shading.dict;
+
+  // Get shading type
+  auto type_it = dict.find("ShadingType");
+  if (type_it == dict.end() || type_it->second.type != Value::NUMBER) {
+    return "";
+  }
+  int shading_type = static_cast<int>(type_it->second.number);
+
+  // Only support Type 2 (linear) and Type 3 (radial)
+  if (shading_type != 2 && shading_type != 3) {
+    return "";
+  }
+
+  SvgGradient gradient;
+  gradient.id = "grad_" + std::to_string(++svg_gradient_counter_);
+  gradient.is_radial = (shading_type == 3);
+  gradient.units = "userSpaceOnUse";
+
+  // Get coords
+  auto coords_it = dict.find("Coords");
+  if (coords_it == dict.end() || coords_it->second.type != Value::ARRAY) {
+    return "";
+  }
+
+  const auto& coords = coords_it->second.array;
+  if (shading_type == 2 && coords.size() >= 4) {
+    // Linear gradient: x0, y0, x1, y1
+    if (coords[0].type == Value::NUMBER) gradient.x1 = coords[0].number;
+    if (coords[1].type == Value::NUMBER) gradient.y1 = page_height_ - coords[1].number;
+    if (coords[2].type == Value::NUMBER) gradient.x2 = coords[2].number;
+    if (coords[3].type == Value::NUMBER) gradient.y2 = page_height_ - coords[3].number;
+  } else if (shading_type == 3 && coords.size() >= 6) {
+    // Radial gradient: x0, y0, r0, x1, y1, r1
+    double x0 = 0, y0 = 0, r0 = 0, x1 = 0, y1 = 0, r1 = 0;
+    if (coords[0].type == Value::NUMBER) x0 = coords[0].number;
+    if (coords[1].type == Value::NUMBER) y0 = coords[1].number;
+    if (coords[2].type == Value::NUMBER) r0 = coords[2].number;
+    if (coords[3].type == Value::NUMBER) x1 = coords[3].number;
+    if (coords[4].type == Value::NUMBER) y1 = coords[4].number;
+    if (coords[5].type == Value::NUMBER) r1 = coords[5].number;
+
+    // SVG radial gradient uses outer circle (cx, cy, r) and focal point (fx, fy)
+    gradient.cx = x1;
+    gradient.cy = page_height_ - y1;
+    gradient.r = r1;
+    gradient.fx = x0;
+    gradient.fy = page_height_ - y0;
+    (void)r0;  // Inner radius not directly supported in SVG
+  }
+
+  // Determine color space components
+  auto color_space_it = dict.find("ColorSpace");
+  int num_components = 3;  // Default RGB
+  if (color_space_it != dict.end()) {
+    if (color_space_it->second.type == Value::NAME) {
+      const std::string& cs_name = color_space_it->second.name;
+      if (cs_name == "DeviceGray") num_components = 1;
+      else if (cs_name == "DeviceCMYK") num_components = 4;
+    }
+  }
+
+  // Get color function and try to extract C0/C1 for Type 2 exponential interpolation
+  auto function_it = dict.find("Function");
+  if (function_it != dict.end()) {
+    Value func = function_it->second;
+    if (func.type == Value::REFERENCE) {
+      auto resolved = resolve_reference(*current_pdf_, func.ref_object_number,
+                                         func.ref_generation_number);
+      if (resolved.success) func = resolved.value;
+    }
+
+    if (func.type == Value::DICTIONARY) {
+      auto func_type_it = func.dict.find("FunctionType");
+      if (func_type_it != func.dict.end() &&
+          func_type_it->second.type == Value::NUMBER &&
+          static_cast<int>(func_type_it->second.number) == 2) {
+        // Type 2: Exponential interpolation - extract C0 and C1
+        std::vector<double> c0, c1;
+
+        auto c0_it = func.dict.find("C0");
+        if (c0_it != func.dict.end() && c0_it->second.type == Value::ARRAY) {
+          for (const auto& v : c0_it->second.array) {
+            if (v.type == Value::NUMBER) c0.push_back(v.number);
+          }
+        }
+
+        auto c1_it = func.dict.find("C1");
+        if (c1_it != func.dict.end() && c1_it->second.type == Value::ARRAY) {
+          for (const auto& v : c1_it->second.array) {
+            if (v.type == Value::NUMBER) c1.push_back(v.number);
+          }
+        }
+
+        // Default C0 is black, C1 is white
+        if (c0.empty()) c0 = std::vector<double>(num_components, 0.0);
+        if (c1.empty()) c1 = std::vector<double>(num_components, 1.0);
+
+        // Create gradient stops
+        SvgGradient::Stop start_stop, end_stop;
+        start_stop.offset = 0.0;
+        end_stop.offset = 1.0;
+
+        if (num_components == 1 && c0.size() >= 1 && c1.size() >= 1) {
+          start_stop.color = rgb_to_hex(c0[0], c0[0], c0[0]);
+          end_stop.color = rgb_to_hex(c1[0], c1[0], c1[0]);
+        } else if (num_components == 4 && c0.size() >= 4 && c1.size() >= 4) {
+          // CMYK to RGB
+          double r0 = (1.0 - c0[0]) * (1.0 - c0[3]);
+          double g0 = (1.0 - c0[1]) * (1.0 - c0[3]);
+          double b0 = (1.0 - c0[2]) * (1.0 - c0[3]);
+          start_stop.color = rgb_to_hex(r0, g0, b0);
+
+          double r1 = (1.0 - c1[0]) * (1.0 - c1[3]);
+          double g1 = (1.0 - c1[1]) * (1.0 - c1[3]);
+          double b1 = (1.0 - c1[2]) * (1.0 - c1[3]);
+          end_stop.color = rgb_to_hex(r1, g1, b1);
+        } else if (c0.size() >= 3 && c1.size() >= 3) {
+          start_stop.color = rgb_to_hex(c0[0], c0[1], c0[2]);
+          end_stop.color = rgb_to_hex(c1[0], c1[1], c1[2]);
+        }
+
+        gradient.stops.push_back(start_stop);
+        gradient.stops.push_back(end_stop);
+      }
+    }
+  }
+
+  if (gradient.stops.empty()) {
+    // Add default black-white gradient
+    gradient.stops.push_back({0.0, "#000000", 1.0});
+    gradient.stops.push_back({1.0, "#ffffff", 1.0});
+  }
+
+  svg_gradients_.push_back(gradient);
+  return "url(#" + gradient.id + ")";
+}
+
+// Create SVG pattern from PDF pattern dictionary
+std::string CanvasExporter::create_svg_pattern(const Value& pattern_val, const Matrix2D& ctm) {
+  (void)ctm;  // TODO: Apply CTM transform to pattern
+  if (!current_pdf_) return "";
+
+  Value pattern = pattern_val;
+  if (pattern.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_, pattern.ref_object_number,
+                                       pattern.ref_generation_number);
+    if (!resolved.success) return "";
+    pattern = resolved.value;
+  }
+
+  if (pattern.type != Value::DICTIONARY && pattern.type != Value::STREAM) {
+    return "";
+  }
+
+  const Dictionary& dict = (pattern.type == Value::STREAM)
+                               ? pattern.stream.dict
+                               : pattern.dict;
+
+  // Get pattern type
+  auto type_it = dict.find("PatternType");
+  if (type_it == dict.end() || type_it->second.type != Value::NUMBER) {
+    return "";
+  }
+  int pattern_type = static_cast<int>(type_it->second.number);
+
+  if (pattern_type == 2) {
+    // Shading pattern - create gradient instead
+    auto shading_it = dict.find("Shading");
+    if (shading_it != dict.end()) {
+      return create_svg_gradient(shading_it->second, ctm);
+    }
+    return "";
+  }
+
+  if (pattern_type != 1) {
+    return "";  // Only support Type 1 (tiling) patterns
+  }
+
+  SvgPattern svg_pattern;
+  svg_pattern.id = "pat_" + std::to_string(++svg_pattern_counter_);
+
+  // Get BBox
+  auto bbox_it = dict.find("BBox");
+  if (bbox_it != dict.end() && bbox_it->second.type == Value::ARRAY &&
+      bbox_it->second.array.size() >= 4) {
+    const auto& bbox = bbox_it->second.array;
+    double llx = 0, lly = 0, urx = 0, ury = 0;
+    if (bbox[0].type == Value::NUMBER) llx = bbox[0].number;
+    if (bbox[1].type == Value::NUMBER) lly = bbox[1].number;
+    if (bbox[2].type == Value::NUMBER) urx = bbox[2].number;
+    if (bbox[3].type == Value::NUMBER) ury = bbox[3].number;
+
+    svg_pattern.x = llx;
+    svg_pattern.y = lly;
+    svg_pattern.width = urx - llx;
+    svg_pattern.height = ury - lly;
+  }
+
+  // Get XStep and YStep
+  auto xstep_it = dict.find("XStep");
+  auto ystep_it = dict.find("YStep");
+  if (xstep_it != dict.end() && xstep_it->second.type == Value::NUMBER) {
+    svg_pattern.width = std::abs(xstep_it->second.number);
+  }
+  if (ystep_it != dict.end() && ystep_it->second.type == Value::NUMBER) {
+    svg_pattern.height = std::abs(ystep_it->second.number);
+  }
+
+  // Get pattern matrix
+  auto matrix_it = dict.find("Matrix");
+  if (matrix_it != dict.end() && matrix_it->second.type == Value::ARRAY &&
+      matrix_it->second.array.size() >= 6) {
+    const auto& m = matrix_it->second.array;
+    std::stringstream transform;
+    transform << "matrix(";
+    for (size_t i = 0; i < 6; i++) {
+      if (i > 0) transform << " ";
+      if (m[i].type == Value::NUMBER) {
+        transform << double_to_string(m[i].number);
+      } else {
+        transform << "1";
+      }
+    }
+    transform << ")";
+    svg_pattern.transform = transform.str();
+  }
+
+  // For tiling patterns, add a simple rectangle as placeholder
+  // A full implementation would parse the pattern's content stream
+  SvgElement rect("rect");
+  rect.attributes["x"] = "0";
+  rect.attributes["y"] = "0";
+  rect.attributes["width"] = double_to_string(svg_pattern.width);
+  rect.attributes["height"] = double_to_string(svg_pattern.height);
+  rect.attributes["fill"] = "#808080";
+  rect.attributes["fill-opacity"] = "0.5";
+  svg_pattern.content.push_back(rect);
+
+  svg_patterns_.push_back(svg_pattern);
+  return "url(#" + svg_pattern.id + ")";
 }
 
 }  // namespace nanopdf

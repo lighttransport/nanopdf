@@ -132,23 +132,25 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    std::cout << "PDF Info:" << std::endl;
-    std::cout << "  Version: " << pdf.version_major << "." << pdf.version_minor << std::endl;
-
-    // Load document structure (includes catalog and pages)
     if (!pdf.load_document_structure()) {
       std::cerr << "Failed to load document structure" << std::endl;
       return 1;
     }
 
-    std::cout << "  Pages: " << pdf.catalog.pages.size() << std::endl;
+    std::cout << "PDF Info:" << std::endl;
+    std::cout << "  Version: " << pdf.version_major << "." << pdf.version_minor << std::endl;
+
+    // Get document catalog
+    const nanopdf::DocumentCatalog& catalog = pdf.catalog;
+
+    std::cout << "  Pages: " << catalog.pages.size() << std::endl;
 
     // Render first page if available
     if (!pdf.catalog.pages.empty()) {
       const auto& page = pdf.catalog.pages[0];
 
       // Get page dimensions from media_box [left, bottom, right, top]
-      double page_width = 612.0;  // Default US Letter
+      double page_width = 612.0;   // Default letter size
       double page_height = 792.0;
       if (page.media_box.size() >= 4) {
         page_width = page.media_box[2] - page.media_box[0];
