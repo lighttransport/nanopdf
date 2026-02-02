@@ -106,6 +106,11 @@ public:
 
   // Render page with options (handles DPI scaling)
   Blend2DRenderResult render_page(const Pdf& pdf, const Page& page, const RenderOptions& options);
+  
+  // Calculate text width using font metrics (returns width in text space units)
+  float calculate_text_width(const std::string& text, float font_size);
+
+  void set_current_font(const std::string& font_name, const BaseFont* font);
 
 private:
   // Parse PDF content stream and convert to Blend2D shapes
@@ -236,9 +241,6 @@ private:
 
   // Get font cache entry
   FontCache* get_font(const std::string& font_name);
-
-  // Calculate text width using font metrics (returns width in text space units)
-  float calculate_text_width(const std::string& text, float font_size);
 
   // Draw an image XObject
   bool draw_image(const ImageXObject& image, float x, float y, float width, float height);

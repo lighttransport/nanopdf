@@ -267,6 +267,12 @@ Blend2DBackend::Blend2DBackend() {}
 
 Blend2DBackend::~Blend2DBackend() {}
 
+void Blend2DBackend::set_current_font(const std::string& font_name, const BaseFont* font) {
+    current_font_name_ = font_name;
+    current_font_ = font;
+    load_font(*current_pdf_, font_name, current_font_);
+}
+
 bool Blend2DBackend::initialize(uint32_t width, uint32_t height) {
   width_ = width;
   height_ = height;
@@ -464,7 +470,7 @@ bool Blend2DBackend::save_to_file(const std::string& filename, const RenderOptio
   return ret != 0;
 }
 
-Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page,
+Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page, 
                                                  const RenderOptions& options) {
   Blend2DRenderResult result;
 
@@ -941,6 +947,12 @@ float Blend2DBackend::calculate_text_width(const std::string& text, float font_s
     int advance, lsb;
     stbtt_GetCodepointHMetrics(&font->font_info, codepoint, &advance, &lsb);
     width += advance * scale;
+
+    if (i + 1 < text.length()) {
+      int next_codepoint = static_cast<unsigned char>(text[i + 1]);
+      int kern = stbtt_GetCodepointKernAdvance(&font->font_info, codepoint, next_codepoint);
+      width += kern * scale;
+    }
   }
 
   return width;
@@ -2382,7 +2394,11 @@ bool Blend2DBackend::parse_inline_image(const std::string& content, size_t& pos)
     if (content[pos] == '/') {
       pos++;  // Skip /
       while (pos < content.length() && !std::isspace(static_cast<unsigned char>(content[pos])) &&
-             content[pos] != '/') {
+             content[pos] != '/' && content[pos] != '[' &&
+             content[pos] != ']' && content[pos] != '(' &&
+             content[pos] != ')' && content[pos] != '<' &&
+             content[pos] != '>' && content[pos] != '{' &&
+             content[pos] != '}') {
         key += content[pos++];
       }
     } else {
@@ -2404,7 +2420,11 @@ bool Blend2DBackend::parse_inline_image(const std::string& content, size_t& pos)
       if (content[pos] == '/') {
         pos++;  // Skip /
         while (pos < content.length() && !std::isspace(static_cast<unsigned char>(content[pos])) &&
-               content[pos] != '/') {
+               content[pos] != '/' && content[pos] != '[' &&
+               content[pos] != ']' && content[pos] != '(' &&
+               content[pos] != ')' && content[pos] != '<' &&
+               content[pos] != '>' && content[pos] != '{' &&
+               content[pos] != '}') {
           value += content[pos++];
         }
       } else if (content[pos] == '[') {
@@ -2417,7 +2437,11 @@ bool Blend2DBackend::parse_inline_image(const std::string& content, size_t& pos)
       } else {
         // Numeric or other value
         while (pos < content.length() && !std::isspace(static_cast<unsigned char>(content[pos])) &&
-               content[pos] != '/') {
+               content[pos] != '/' && content[pos] != '[' &&
+               content[pos] != ']' && content[pos] != '(' &&
+               content[pos] != ')' && content[pos] != '<' &&
+               content[pos] != '>' && content[pos] != '{' &&
+               content[pos] != '}') {
           value += content[pos++];
         }
       }
