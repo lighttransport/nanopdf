@@ -1899,8 +1899,8 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
 
     // Apply clip to the shape (clip() takes ownership of clipper)
     if (shape->clip(clipper) != tvg::Result::Success) {
-      // Clipping failed, release clipper and push shape without clip
-      tvg::Paint::rel(clipper);
+      // Clipping failed, delete clipper and push shape without clip
+      delete clipper;
       scene_->push(shape);
       return true;
     }
@@ -1909,6 +1909,11 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
   scene_->push(shape);
   return true;
 }
+
+// Forward declaration for PDF function evaluator
+static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
+                                   const std::vector<double>& inputs,
+                                   std::vector<double>& outputs);
 
 bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height) {
   NANOPDF_LOG_DEBUG("ThorVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
@@ -2019,8 +2024,8 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
 
     // Determine alternate color space components
     int alt_components = 4;  // Default CMYK
-    if (image.color_space.alternate_color_space) {
-      ColorSpaceType alt_type = image.color_space.alternate_color_space->type;
+    if (image.color_space.base_color_space) {
+      ColorSpaceType alt_type = image.color_space.base_color_space->type;
       if (alt_type == ColorSpaceType::DeviceGray || alt_type == ColorSpaceType::CalGray) {
         alt_components = 1;
       } else if (alt_type == ColorSpaceType::DeviceRGB || alt_type == ColorSpaceType::CalRGB) {
@@ -2036,7 +2041,7 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
       std::vector<double> outputs;
       uint8_t r = 0, g = 0, b = 0;
 
-      if (tint_func.type != Value::NONE && current_pdf_ &&
+      if (tint_func.type != Value::UNDEFINED && current_pdf_ &&
           evaluate_pdf_function(*current_pdf_, tint_func, {tint}, outputs) &&
           !outputs.empty()) {
         // Convert alternate color to RGB
@@ -2076,8 +2081,8 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
 
     // Determine alternate color space components
     int alt_components = 4;  // Default CMYK
-    if (image.color_space.alternate_color_space) {
-      ColorSpaceType alt_type = image.color_space.alternate_color_space->type;
+    if (image.color_space.base_color_space) {
+      ColorSpaceType alt_type = image.color_space.base_color_space->type;
       if (alt_type == ColorSpaceType::DeviceGray || alt_type == ColorSpaceType::CalGray) {
         alt_components = 1;
       } else if (alt_type == ColorSpaceType::DeviceRGB || alt_type == ColorSpaceType::CalRGB) {
@@ -2102,7 +2107,7 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
       std::vector<double> outputs;
       uint8_t r = 0, g = 0, b = 0;
 
-      if (tint_func.type != Value::NONE && current_pdf_ &&
+      if (tint_func.type != Value::UNDEFINED && current_pdf_ &&
           evaluate_pdf_function(*current_pdf_, tint_func, inputs, outputs) &&
           !outputs.empty()) {
         // Convert alternate color to RGB
@@ -3244,7 +3249,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Linear gradient
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3271,7 +3276,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Radial gradient
     auto gradient = tvg::RadialGradient::gen();
     if (!gradient) {
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3343,7 +3348,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
           picture->transform(m);
 
           scene_->push(picture);
-          tvg::Paint::rel(shape);  // Don't need the shape anymore
+          delete (shape);  // Don't need the shape anymore
           return true;
         } else {
           delete[] data_copy;
@@ -3357,7 +3362,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #endif
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3396,7 +3401,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid mesh data - skipping\n");
 #endif
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3407,7 +3412,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3508,7 +3513,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3526,13 +3531,13 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
     picture->translate(x, y);
     scene_->push(picture);
-    tvg::Paint::rel(shape);  // Don't need shape wrapper
+    delete (shape);  // Don't need shape wrapper
     return true;
   }
   else if (shading->type == ShadingType::CoonsPatchMesh ||
@@ -3556,7 +3561,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid patch data - skipping\n");
 #endif
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3567,7 +3572,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3660,7 +3665,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
@@ -3678,13 +3683,13 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      tvg::Paint::rel(shape);
+      delete (shape);
       return false;
     }
 
     picture->translate(x, y);
     scene_->push(picture);
-    tvg::Paint::rel(shape);
+    delete (shape);
     return true;
   }
   else {
@@ -4186,20 +4191,15 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     tile_px_h = clamp14(tile_px_h, 1, 512);
 
     // Create temporary canvas for rendering the tile
-    std::vector<uint8_t> tile_buffer(tile_px_w * tile_px_h * 4, 0);
+    std::vector<uint32_t> tile_buffer(tile_px_w * tile_px_h, 0);
 
     // Initialize with transparent (for colored) or white (for uncolored)
     if (tiling->paint_type == TilingPaintType::ColoredTiles) {
-      // Transparent background for colored patterns
+      // Transparent background for colored patterns (ARGB = 0x00000000)
       std::fill(tile_buffer.begin(), tile_buffer.end(), 0);
     } else {
-      // For uncolored, we'll apply color after rendering
-      for (size_t i = 0; i < tile_buffer.size(); i += 4) {
-        tile_buffer[i + 0] = 255;  // B
-        tile_buffer[i + 1] = 255;  // G
-        tile_buffer[i + 2] = 255;  // R
-        tile_buffer[i + 3] = 255;  // A
-      }
+      // For uncolored, we'll apply color after rendering (ARGB = 0xFFFFFFFF = white)
+      std::fill(tile_buffer.begin(), tile_buffer.end(), 0xFFFFFFFF);
     }
 
     tvg::SwCanvas* tile_canvas = tvg::SwCanvas::gen();
@@ -4207,7 +4207,7 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
       goto fallback;
     }
 
-    if (tile_canvas->target(reinterpret_cast<uint32_t*>(tile_buffer.data()),
+    if (tile_canvas->target(tile_buffer.data(),
                             tile_px_w, tile_px_w, tile_px_h,
                             tvg::ColorSpace::ABGR8888) != tvg::Result::Success) {
       delete tile_canvas;
@@ -4223,7 +4223,7 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     // Save current state
     tvg::SwCanvas* saved_canvas = canvas_;
     tvg::Scene* saved_scene = scene_;
-    std::vector<uint8_t> saved_buffer = std::move(buffer_);
+    std::vector<uint32_t> saved_buffer = std::move(buffer_);
     uint32_t saved_width = width_;
     uint32_t saved_height = height_;
     GraphicsState saved_state = state_;
@@ -4261,7 +4261,7 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     }
 
     // Get the rendered tile pixels
-    std::vector<uint8_t> rendered_tile = std::move(buffer_);
+    std::vector<uint32_t> rendered_tile = std::move(buffer_);
 
     // Clean up tile canvas
     delete tile_canvas;
@@ -4318,13 +4318,15 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
 
         for (int py = 0; py < tile_px_h && offset_y + py < tiled_h; ++py) {
           for (int px = 0; px < tile_px_w && offset_x + px < tiled_w; ++px) {
-            size_t src_idx = (py * tile_px_w + px) * 4;
+            size_t src_idx = py * tile_px_w + px;
             size_t dst_idx = (offset_y + py) * tiled_w + (offset_x + px);
 
-            uint8_t b_val = rendered_tile[src_idx + 0];
-            uint8_t g_val = rendered_tile[src_idx + 1];
-            uint8_t r_val = rendered_tile[src_idx + 2];
-            uint8_t a_val = rendered_tile[src_idx + 3];
+            // Extract BGRA components from ABGR8888 format pixel
+            uint32_t pixel = rendered_tile[src_idx];
+            uint8_t b_val = static_cast<uint8_t>(pixel & 0xFF);
+            uint8_t g_val = static_cast<uint8_t>((pixel >> 8) & 0xFF);
+            uint8_t r_val = static_cast<uint8_t>((pixel >> 16) & 0xFF);
+            uint8_t a_val = static_cast<uint8_t>((pixel >> 24) & 0xFF);
 
             if (tiling->paint_type == TilingPaintType::UncoloredTiles) {
               // For uncolored patterns, use the alpha as a mask and apply current color
@@ -4358,8 +4360,16 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
         m.e31 = 0.0f; m.e32 = 0.0f; m.e33 = 1.0f;
         picture->transform(m);
 
-        // Clip to shape
-        picture->composite(shape, tvg::CompositeMethod::ClipPath);
+        // Clip to shape using the clip() method
+        // Note: In newer ThorVG, clip() takes ownership of the shape
+        tvg::Shape* clip_shape = tvg::Shape::gen();
+        if (clip_shape) {
+          // Copy path from original shape
+          float sx, sy, sw, sh;
+          shape->bounds(&sx, &sy, &sw, &sh);
+          clip_shape->appendRect(sx, sy, sw, sh, 0, 0);
+          picture->clip(clip_shape);
+        }
 
         scene_->push(picture);
         return true;
@@ -6572,16 +6582,11 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
   }
 
   // Create temporary canvas and scene for rendering the soft mask
-  std::vector<uint8_t> mask_buffer(mask_width * mask_height * 4, 0);
+  std::vector<uint32_t> mask_buffer(mask_width * mask_height, 0);
 
   // Initialize mask buffer based on mask type
-  if (mask_type == 2) {  // Luminosity - start with white
-    for (size_t i = 0; i < mask_buffer.size(); i += 4) {
-      mask_buffer[i + 0] = 255;  // B
-      mask_buffer[i + 1] = 255;  // G
-      mask_buffer[i + 2] = 255;  // R
-      mask_buffer[i + 3] = 255;  // A
-    }
+  if (mask_type == 2) {  // Luminosity - start with white (ARGB = 0xFFFFFFFF)
+    std::fill(mask_buffer.begin(), mask_buffer.end(), 0xFFFFFFFF);
   }
   // For alpha mask (type 1), buffer is already zeroed (transparent)
 
@@ -6594,7 +6599,7 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
     return true;
   }
 
-  if (mask_canvas->target(reinterpret_cast<uint32_t*>(mask_buffer.data()),
+  if (mask_canvas->target(mask_buffer.data(),
                           mask_width, mask_width, mask_height,
                           tvg::ColorSpace::ABGR8888) != tvg::Result::Success) {
     delete mask_canvas;
@@ -6617,7 +6622,7 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
   // Save current state
   tvg::SwCanvas* saved_canvas = canvas_;
   tvg::Scene* saved_scene = scene_;
-  std::vector<uint8_t> saved_buffer = std::move(buffer_);
+  std::vector<uint32_t> saved_buffer = std::move(buffer_);
   uint32_t saved_width = width_;
   uint32_t saved_height = height_;
   GraphicsState saved_state = state_;
@@ -6651,18 +6656,21 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
 
   for (uint32_t y = 0; y < mask_height; ++y) {
     for (uint32_t x = 0; x < mask_width; ++x) {
-      size_t src_idx = (y * mask_width + x) * 4;
-      size_t dst_idx = y * mask_width + x;
+      size_t idx = y * mask_width + x;
+
+      // Extract BGRA components from ABGR8888 format pixel
+      uint32_t pixel = buffer_[idx];
+      uint8_t b = static_cast<uint8_t>(pixel & 0xFF);
+      uint8_t g = static_cast<uint8_t>((pixel >> 8) & 0xFF);
+      uint8_t r = static_cast<uint8_t>((pixel >> 16) & 0xFF);
+      uint8_t a = static_cast<uint8_t>((pixel >> 24) & 0xFF);
 
       if (mask_type == 2) {  // Luminosity mask
         // Convert RGB to luminance using standard coefficients
-        float b = buffer_[src_idx + 0] / 255.0f;
-        float g = buffer_[src_idx + 1] / 255.0f;
-        float r = buffer_[src_idx + 2] / 255.0f;
-        float luminance = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-        state_.soft_mask_data[dst_idx] = static_cast<uint8_t>(luminance * 255.0f);
+        float luminance = 0.2126f * (r / 255.0f) + 0.7152f * (g / 255.0f) + 0.0722f * (b / 255.0f);
+        state_.soft_mask_data[idx] = static_cast<uint8_t>(luminance * 255.0f);
       } else {  // Alpha mask
-        state_.soft_mask_data[dst_idx] = buffer_[src_idx + 3];  // Alpha channel
+        state_.soft_mask_data[idx] = a;  // Alpha channel
       }
     }
   }

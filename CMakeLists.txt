@@ -233,6 +233,11 @@ if (NANOPDF_USE_THORVG)
       endif()
     endif()
     target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_THORVG")
+    # ThorVG may require OpenMP
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+      target_link_libraries(${BUILD_TARGET} PUBLIC OpenMP::OpenMP_CXX)
+    endif()
   endif()
 endif ()
 
@@ -440,6 +445,11 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     else()
       target_include_directories(test_thorvg PRIVATE ${THORVG_INCLUDE_DIRS})
       target_link_libraries(test_thorvg PRIVATE ${THORVG_LIBRARIES})
+    endif()
+    # ThorVG may require OpenMP
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+      target_link_libraries(test_thorvg PRIVATE OpenMP::OpenMP_CXX)
     endif()
   endif()
 
