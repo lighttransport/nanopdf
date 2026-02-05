@@ -78,7 +78,9 @@ int main(int argc, char** argv) {
     if (!pdf.catalog.pages.empty()) {
       printf("  Pages: %zu\n", pdf.catalog.pages.size());
 
-      const Page& page = pdf.catalog.pages[0];
+      size_t page_idx = 0;
+      const Page& page = pdf.catalog.pages[page_idx];
+      printf("  Rendering page %zu of %zu\n", page_idx + 1, pdf.catalog.pages.size());
       float page_width = 612.0f;
       float page_height = 792.0f;
 

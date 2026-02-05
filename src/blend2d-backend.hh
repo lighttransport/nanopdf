@@ -233,11 +233,17 @@ private:
   bool draw_glyph_by_index(int glyph_index, float x, float y, float size,
                            uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
+  // Render text string with CMap-aware encoding (handles CJK/CID fonts)
+  // Returns the total width rendered in pixels
+  float render_text_string(const std::string& text, float x, float y, float font_size,
+                           uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+
   // Load font from PDF FontDescriptor
   bool load_font(const Pdf& pdf, const std::string& font_name, const BaseFont* font);
 
   // Load fallback system font
   bool load_fallback_font(const std::string& font_name);
+  bool load_fallback_font_with_hint(const std::string& font_name, const BaseFont* font);
 
   // Get font cache entry
   FontCache* get_font(const std::string& font_name);
