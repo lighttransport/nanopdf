@@ -245,6 +245,7 @@ private:
 
   // Load fallback system font
   bool load_fallback_font(const std::string& font_name);
+  bool load_fallback_font_with_hint(const std::string& font_name, const BaseFont* font);
 
   // Get font cache entry
   FontCache* get_font(const std::string& font_name);

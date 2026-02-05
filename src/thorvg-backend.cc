@@ -97,6 +97,241 @@ static const uint16_t kMacRomanEncoding[256] = {
     0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7
 };
 
+// Adobe-Japan1 CID to Unicode mapping
+// Based on Adobe-Japan1-7 standard mapping (subset for common characters)
+static uint32_t adobe_japan1_cid_to_unicode(uint32_t cid) {
+  // CID 1 = space
+  if (cid == 1) return 0x0020;
+
+  // CIDs 2-94: Fullwidth ASCII punctuation and letters
+  static const uint32_t cid_2_94[] = {
+    0xFF01, 0xFF02, 0xFF03, 0xFF04, 0xFF05, 0xFF06, 0xFF07, 0xFF08, 0xFF09, 0xFF0A,
+    0xFF0B, 0xFF0C, 0xFF0D, 0xFF0E, 0xFF0F, 0xFF10, 0xFF11, 0xFF12, 0xFF13, 0xFF14,
+    0xFF15, 0xFF16, 0xFF17, 0xFF18, 0xFF19, 0xFF1A, 0xFF1B, 0xFF1C, 0xFF1D, 0xFF1E,
+    0xFF1F, 0xFF20, 0xFF21, 0xFF22, 0xFF23, 0xFF24, 0xFF25, 0xFF26, 0xFF27, 0xFF28,
+    0xFF29, 0xFF2A, 0xFF2B, 0xFF2C, 0xFF2D, 0xFF2E, 0xFF2F, 0xFF30, 0xFF31, 0xFF32,
+    0xFF33, 0xFF34, 0xFF35, 0xFF36, 0xFF37, 0xFF38, 0xFF39, 0xFF3A, 0xFF3B, 0xFFE5,
+    0xFF3D, 0xFF3E, 0xFF3F, 0xFF40, 0xFF41, 0xFF42, 0xFF43, 0xFF44, 0xFF45, 0xFF46,
+    0xFF47, 0xFF48, 0xFF49, 0xFF4A, 0xFF4B, 0xFF4C, 0xFF4D, 0xFF4E, 0xFF4F, 0xFF50,
+    0xFF51, 0xFF52, 0xFF53, 0xFF54, 0xFF55, 0xFF56, 0xFF57, 0xFF58, 0xFF59, 0xFF5A,
+    0xFF5B, 0xFF5C, 0xFF5D
+  };
+  if (cid >= 2 && cid <= 94) {
+    return cid_2_94[cid - 2];
+  }
+
+  // Hiragana (CID 842-924 -> U+3041-U+3093)
+  if (cid >= 842 && cid <= 924) {
+    return 0x3041 + (cid - 842);
+  }
+
+  // Katakana (CID 925-1010 -> U+30A1-U+30F6)
+  if (cid >= 925 && cid <= 1010) {
+    return 0x30A1 + (cid - 925);
+  }
+
+  // Common punctuation and symbols
+  static const std::map<uint32_t, uint32_t> punct_map = {
+    {631, 0x3001},  // 、 IDEOGRAPHIC COMMA
+    {632, 0x3002},  // 。 IDEOGRAPHIC FULL STOP
+    {633, 0xFF0C},  // ， FULLWIDTH COMMA
+    {634, 0xFF0E},  // ． FULLWIDTH FULL STOP
+    {635, 0x30FB},  // ・ KATAKANA MIDDLE DOT
+    {636, 0xFF1A},  // ： FULLWIDTH COLON
+    {637, 0xFF1B},  // ； FULLWIDTH SEMICOLON
+    {638, 0x3059},  // す
+    {639, 0xFF1F},  // ？ FULLWIDTH QUESTION MARK
+    {640, 0xFF01},  // ！ FULLWIDTH EXCLAMATION MARK
+    {674, 0x306E},  // の
+    {675, 0x306F},  // は
+    {676, 0x3070},  // ば
+    {677, 0x3071},  // ぱ
+    {678, 0x3072},  // ひ
+    {720, 0x300C},  // 「 LEFT CORNER BRACKET
+    {721, 0x300D},  // 」 RIGHT CORNER BRACKET
+    {722, 0x300E},  // 『 LEFT WHITE CORNER BRACKET
+    {723, 0x300F},  // 』 RIGHT WHITE CORNER BRACKET
+    {724, 0xFF08},  // （ FULLWIDTH LEFT PARENTHESIS
+    {725, 0xFF09},  // ） FULLWIDTH RIGHT PARENTHESIS
+    {783, 0x30C8},  // ト
+    {803, 0x30E9},  // ラ
+  };
+
+  auto punct_it = punct_map.find(cid);
+  if (punct_it != punct_map.end()) {
+    return punct_it->second;
+  }
+
+  // Common Kanji mappings (subset of most frequent characters)
+  static const std::map<uint32_t, uint32_t> kanji_map = {
+    // Numbers/counting
+    {1866, 0x4E00}, // 一
+    {1867, 0x4E8C}, // 二
+    {1868, 0x4E09}, // 三
+    {1869, 0x56DB}, // 四
+    {1870, 0x4E94}, // 五
+    {1871, 0x516D}, // 六
+    {1872, 0x4E03}, // 七
+    {1873, 0x516B}, // 八
+    {1874, 0x4E5D}, // 九
+    {1875, 0x5341}, // 十
+    {1876, 0x767E}, // 百
+    {1877, 0x5343}, // 千
+    {1878, 0x4E07}, // 万
+    {1879, 0x5104}, // 億
+    // Common characters
+    {1908, 0x5927}, // 大
+    {1909, 0x5C0F}, // 小
+    {1910, 0x4E2D}, // 中
+    {1911, 0x9AD8}, // 高
+    {1912, 0x4F4E}, // 低
+    {1913, 0x65B0}, // 新
+    {1914, 0x53E4}, // 古
+    {1915, 0x826F}, // 良
+    {1916, 0x60AA}, // 悪
+    {1917, 0x591A}, // 多
+    {1918, 0x5C11}, // 少
+    {1919, 0x5168}, // 全
+    {1920, 0x534A}, // 半
+    {1921, 0x6700}, // 最
+    {1922, 0x521D}, // 初
+    {1923, 0x5F8C}, // 後
+    {1924, 0x524D}, // 前
+    {1925, 0x6B21}, // 次
+    {1926, 0x4ECA}, // 今
+    {1927, 0x6628}, // 昨
+    {1928, 0x660E}, // 明
+    {1929, 0x65E5}, // 日
+    {1930, 0x6708}, // 月
+    {1931, 0x5E74}, // 年
+    {1932, 0x6642}, // 時
+    {1933, 0x5206}, // 分
+    {1934, 0x79D2}, // 秒
+    {1935, 0x9031}, // 週
+    {1936, 0x66DC}, // 曜
+    {1937, 0x706B}, // 火
+    {1938, 0x6C34}, // 水
+    {1939, 0x6728}, // 木
+    {1940, 0x91D1}, // 金
+    {1941, 0x571F}, // 土
+    {1942, 0x65E5}, // 日
+    {1943, 0x6625}, // 春
+    {1944, 0x590F}, // 夏
+    {1945, 0x79CB}, // 秋
+    {1946, 0x51AC}, // 冬
+    {1947, 0x6771}, // 東
+    {1948, 0x897F}, // 西
+    {1949, 0x5357}, // 南
+    {1950, 0x5317}, // 北
+    {1951, 0x4E0A}, // 上
+    {1952, 0x8A00}, // 言
+    {1953, 0x4E0B}, // 下
+    {1954, 0x5DE6}, // 左
+    {1955, 0x53F3}, // 右
+    {1956, 0x5185}, // 内
+    {1957, 0x5916}, // 外
+    // More common kanji
+    {2028, 0x4EBA}, // 人
+    {2029, 0x5B50}, // 子
+    {2030, 0x5973}, // 女
+    {2031, 0x7537}, // 男
+    {2032, 0x7236}, // 父
+    {2033, 0x6BCD}, // 母
+    {2034, 0x5144}, // 兄
+    {2035, 0x59C9}, // 姉
+    {2036, 0x5F1F}, // 弟
+    {2037, 0x59B9}, // 妹
+    {2038, 0x592B}, // 夫
+    {2039, 0x59BB}, // 妻
+    {2040, 0x53CB}, // 友
+    {2041, 0x5148}, // 先
+    {2042, 0x751F}, // 生
+    {2043, 0x5B66}, // 学
+    {2044, 0x6821}, // 校
+    {2045, 0x793E}, // 社
+    {2046, 0x4F1A}, // 会
+    {2047, 0x56FD}, // 国
+    {2048, 0x5E02}, // 市
+    {2049, 0x753A}, // 町
+    {2050, 0x6751}, // 村
+    {2051, 0x5C71}, // 山
+    {2052, 0x5DDD}, // 川
+    {2053, 0x6D77}, // 海
+    {2054, 0x7A7A}, // 空
+    {2055, 0x5730}, // 地
+    {2056, 0x5929}, // 天
+    {2057, 0x98A8}, // 風
+    {2058, 0x96E8}, // 雨
+    {2059, 0x96EA}, // 雪
+    {2060, 0x82B1}, // 花
+    {2061, 0x8349}, // 草
+    {2062, 0x6728}, // 木
+    {2063, 0x68EE}, // 森
+    {2064, 0x6797}, // 林
+    // Language/expression kanji
+    {2248, 0x80FD}, // 能
+    {2269, 0x660E}, // 明
+    // More kanji
+    {2890, 0x8A9E}, // 語
+    {2956, 0x529B}, // 力
+    {3592, 0x8A66}, // 試
+    {3824, 0x65E5}, // 日
+    {4011, 0x672C}, // 本
+    {4782, 0x8A9E}, // 語
+    // Additional common kanji
+    {2100, 0x898B}, // 見
+    {2101, 0x805E}, // 聞
+    {2102, 0x8AAD}, // 読
+    {2103, 0x66F8}, // 書
+    {2104, 0x8A71}, // 話
+    {2105, 0x601D}, // 思
+    {2106, 0x8003}, // 考
+    {2107, 0x77E5}, // 知
+    {2108, 0x4F7F}, // 使
+    {2109, 0x4F5C}, // 作
+    {2110, 0x52D5}, // 動
+    {2111, 0x6B62}, // 止
+    {2112, 0x884C}, // 行
+    {2113, 0x6765}, // 来
+    {2114, 0x5E30}, // 帰
+    {2115, 0x5165}, // 入
+    {2116, 0x51FA}, // 出
+    {2117, 0x7ACB}, // 立
+    {2118, 0x5EA7}, // 座
+    {2119, 0x98DF}, // 食
+    {2120, 0x98F2}, // 飲
+    {2121, 0x7720}, // 睡
+    {2122, 0x8D77}, // 起
+    {2123, 0x5BC4}, // 寄
+    {2124, 0x4E57}, // 乗
+    {2125, 0x964D}, // 降
+    {2126, 0x8D70}, // 走
+    {2127, 0x6B69}, // 歩
+    {2128, 0x6CF3}, // 泳
+    {2129, 0x98DB}, // 飛
+    {2130, 0x843D}, // 落
+    // Common verbs and adjectives
+    {2150, 0x3042}, // あ (hiragana a - sometimes mapped here)
+    {2151, 0x3044}, // い
+    {2152, 0x3046}, // う
+    {2153, 0x3048}, // え
+    {2154, 0x304A}, // お
+    // Additional important kanji
+    {2197, 0x793A}, // 示
+    {2198, 0x4F1D}, // 伝
+    {2199, 0x5831}, // 報
+    {2200, 0x77E5}, // 知
+  };
+
+  auto it = kanji_map.find(cid);
+  if (it != kanji_map.end()) {
+    return it->second;
+  }
+
+  // Not found - return 0 to indicate no mapping
+  return 0;
+}
+
 // Common Adobe glyph name to Unicode mapping
 static uint32_t glyph_name_to_unicode(const std::string& name) {
   // Most common glyph names - add more as needed
@@ -727,9 +962,22 @@ static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
   }
 
   // First check ToUnicode CMap
-  uint32_t unicode = font->to_unicode_cmap.map_code_to_unicode(char_code);
-  if (unicode != 0) {
-    return unicode;
+  // Note: map_code_to_unicode returns code as-is if no mapping found
+  // So we check if it's actually in the map
+  if (!font->to_unicode_cmap.code_to_unicode.empty()) {
+    auto it = font->to_unicode_cmap.code_to_unicode.find(char_code);
+    if (it != font->to_unicode_cmap.code_to_unicode.end()) {
+      return it->second;
+    }
+  }
+
+  // For Type0 fonts with Adobe-Japan1, try CID-to-Unicode mapping
+  auto* type0_font = dynamic_cast<const Type0Font*>(font);
+  if (type0_font && type0_font->ordering == "Japan1") {
+    uint32_t japan1_unicode = adobe_japan1_cid_to_unicode(char_code);
+    if (japan1_unicode != 0) {
+      return japan1_unicode;
+    }
   }
 
   // Check encoding differences
@@ -1220,11 +1468,32 @@ static bool load_font_file(const std::string& path, std::vector<uint8_t>& data) 
 }
 
 // Helper to determine font category from name
+// Helper to determine font category from name
+// Returns: 0=sans-serif, 1=monospace, 2=serif, 3=symbol, 4=CJK
 static int get_thorvg_font_category(const std::string& font_name) {
   // Convert to lowercase for comparison
   std::string lower_name;
   for (char c : font_name) {
     lower_name += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+
+  // Check for CJK fonts (Japanese, Chinese, Korean)
+  if (lower_name.find("japan") != std::string::npos ||
+      lower_name.find("mincho") != std::string::npos ||
+      lower_name.find("gothic") != std::string::npos ||
+      lower_name.find("meiryo") != std::string::npos ||
+      lower_name.find("hiragino") != std::string::npos ||
+      lower_name.find("msgothic") != std::string::npos ||
+      lower_name.find("msmincho") != std::string::npos ||
+      lower_name.find("futo") != std::string::npos ||
+      lower_name.find("china") != std::string::npos ||
+      lower_name.find("korea") != std::string::npos ||
+      lower_name.find("simsun") != std::string::npos ||
+      lower_name.find("simhei") != std::string::npos ||
+      lower_name.find("heiti") != std::string::npos ||
+      lower_name.find("songti") != std::string::npos ||
+      lower_name.find("noto") != std::string::npos) {
+    return 4;  // CJK
   }
 
   // Check for monospace/typewriter fonts
@@ -1259,12 +1528,45 @@ static int get_thorvg_font_category(const std::string& font_name) {
   return 0;  // Sans-serif
 }
 
+// Check if font is CJK based on Type0Font ordering
+static bool is_cjk_font(const BaseFont* font) {
+  if (!font) return false;
+  auto* type0_font = dynamic_cast<const Type0Font*>(font);
+  if (type0_font) {
+    // Check ordering for CJK collections
+    const std::string& ordering = type0_font->ordering;
+    if (ordering == "Japan1" || ordering == "CNS1" || ordering == "GB1" ||
+        ordering == "Korea1" || ordering == "KR") {
+      return true;
+    }
+    // Also check CMap name
+    const std::string& cmap_name = type0_font->encoding_cmap.name;
+    if (cmap_name.find("Japan") != std::string::npos ||
+        cmap_name.find("CNS") != std::string::npos ||
+        cmap_name.find("GB") != std::string::npos ||
+        cmap_name.find("Korea") != std::string::npos ||
+        cmap_name.find("UniJIS") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
+  return load_fallback_font_with_hint(font_name, nullptr);
+}
+
+bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, const BaseFont* font) {
   // Determine font category for better substitution
   int category = get_thorvg_font_category(font_name);
 
+  // Override category to CJK if font structure indicates CJK
+  if (is_cjk_font(font)) {
+    category = 4;  // CJK
+  }
+
   // Font paths organized by category
-  // Category 0: Sans-serif, 1: Monospace, 2: Serif, 3: Symbol
+  // Category 0: Sans-serif, 1: Monospace, 2: Serif, 3: Symbol, 4: CJK
   static const char* sans_fonts[] = {
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -1304,7 +1606,37 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
     nullptr
   };
 
-  static const char** font_lists[] = { sans_fonts, mono_fonts, serif_fonts, symbol_fonts };
+  // CJK fonts (Japanese, Chinese, Korean)
+  static const char* cjk_fonts[] = {
+    // Japanese
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",
+    "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
+    "/usr/share/fonts/truetype/sazanami/sazanami-gothic.ttf",
+    // Chinese
+    "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    // Korean
+    "/usr/share/fonts/opentype/noto/NotoSansKR-Regular.otf",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    // macOS
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/Library/Fonts/Osaka.ttf",
+    // Windows
+    "C:\\Windows\\Fonts\\msgothic.ttc",
+    "C:\\Windows\\Fonts\\meiryo.ttc",
+    "C:\\Windows\\Fonts\\YuGothR.ttc",
+    "C:\\Windows\\Fonts\\simsun.ttc",
+    "C:\\Windows\\Fonts\\malgun.ttf",
+    nullptr
+  };
+
+  static const char** font_lists[] = { sans_fonts, mono_fonts, serif_fonts, symbol_fonts, cjk_fonts };
 
   // Try fonts in the matching category first
   const char** font_list = font_lists[category];
@@ -1315,7 +1647,7 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
       if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
         cache.initialized = true;
         font_cache_[font_name] = std::move(cache);
-        NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s'", *path, font_name.c_str());
+        NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s' (cat=%d)", *path, font_name.c_str(), category);
         return true;
       }
     }
@@ -1330,7 +1662,7 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
-          NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s'", *path, font_name.c_str());
+          NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s' (fallback)", *path, font_name.c_str());
           return true;
         }
       }
@@ -1349,12 +1681,12 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
   // Check if font has embedded data
   if (!font || !font->descriptor) {
     // Try to load a fallback system font
-    return load_fallback_font(font_name);
+    return load_fallback_font_with_hint(font_name, font);
   }
   if (font->descriptor->font_file.type == Value::UNDEFINED ||
       font->descriptor->font_file.type == Value::NULL_OBJ) {
     // Try fallback for fonts with descriptors but no embedded file
-    return load_fallback_font(font_name);
+    return load_fallback_font_with_hint(font_name, font);
   }
 
   // Resolve and decode font file stream
@@ -1363,19 +1695,35 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
     auto resolved = resolve_reference(pdf, font_file_val.ref_object_number,
                                       font_file_val.ref_generation_number);
     if (!resolved.success) {
-      return false;
+      return load_fallback_font_with_hint(font_name, font);
     }
     font_file_val = resolved.value;
   }
 
   if (font_file_val.type != Value::STREAM) {
-    return false;
+    return load_fallback_font_with_hint(font_name, font);
   }
 
   // Decode the font stream
   auto decoded = decode_stream(pdf, font_file_val);
   if (!decoded.success || decoded.data.empty()) {
-    return false;
+    return load_fallback_font_with_hint(font_name, font);
+  }
+
+  // Check if this is a CFF font (stb_truetype doesn't support CFF)
+  bool is_cff = false;
+  if (decoded.data.size() >= 4) {
+    // CFF fonts start with specific signature or have OTTO header
+    if ((decoded.data[0] == 0x01 && decoded.data[1] == 0x00) ||  // CFF
+        (decoded.data[0] == 'O' && decoded.data[1] == 'T' &&
+         decoded.data[2] == 'T' && decoded.data[3] == 'O')) {    // OpenType CFF
+      is_cff = true;
+    }
+  }
+
+  if (is_cff) {
+    // CFF/OpenType CFF fonts not supported by stb_truetype, use fallback
+    return load_fallback_font_with_hint(font_name, font);
   }
 
   // Initialize stb_truetype with the font data
@@ -1384,12 +1732,12 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
 
   int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
   if (!stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
-    return false;
+    return load_fallback_font_with_hint(font_name, font);
   }
 
   cache.initialized = true;
   font_cache_[font_name] = std::move(cache);
-  NANOPDF_LOG_INFO("ThorVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), decoded.data.size());
+  NANOPDF_LOG_INFO("ThorVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), cache.font_data.size());
   return true;
 }
 
