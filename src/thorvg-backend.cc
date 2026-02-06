@@ -1915,7 +1915,8 @@ static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
                                    const std::vector<double>& inputs,
                                    std::vector<double>& outputs);
 
-bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height) {
+bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height,
+                               uint8_t fill_r, uint8_t fill_g, uint8_t fill_b) {
   NANOPDF_LOG_DEBUG("ThorVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
                     image.width, image.height, x, y, width, height, image.data.size());
 
@@ -1953,8 +1954,18 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
 
   // Handle image mask (1-bit data)
   if (image.image_mask) {
-    int bits_per_pixel = 1;
     int stride = (img_width + 7) / 8;  // Bytes per row
+
+    // PDF spec: With default Decode [0 1], sample 0 = paint, sample 1 = masked.
+    // With Decode [1 0], sample 1 = paint, sample 0 = masked.
+    bool invert = false;
+    if (image.decode.size() >= 2 && image.decode[0] > image.decode[1]) {
+      invert = true;  // Decode [1 0]: bit=1 means paint
+    }
+
+    uint32_t paint_color =
+        (0xFFu << 24) | (static_cast<uint32_t>(fill_r) << 16) |
+        (static_cast<uint32_t>(fill_g) << 8) | static_cast<uint32_t>(fill_b);
 
     for (int row = 0; row < img_height; row++) {
       for (int col = 0; col < img_width; col++) {
@@ -1962,13 +1973,11 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
         int bit_idx = 7 - (col % 8);
 
         if (byte_idx < static_cast<int>(image.data.size())) {
-          bool pixel_set = (image.data[byte_idx] >> bit_idx) & 1;
-          // Image mask: 1 = paint with current color, 0 = transparent
-          if (pixel_set) {
-            argb_data[row * img_width + col] = 0xFF000000;  // Opaque black
-          } else {
-            argb_data[row * img_width + col] = 0x00000000;  // Transparent
-          }
+          bool bit_set = (image.data[byte_idx] >> bit_idx) & 1;
+          // Default Decode [0 1]: bit=0 → paint, bit=1 → transparent
+          // Decode [1 0]: bit=1 → paint, bit=0 → transparent
+          bool should_paint = invert ? bit_set : !bit_set;
+          argb_data[row * img_width + col] = should_paint ? paint_color : 0x00000000;
         }
       }
     }
@@ -3961,7 +3970,8 @@ bool ThorVGBackend::parse_inline_image(const std::string& content, size_t& pos) 
   }
   img_y = (state_.page_height - img_y) * state_.scale - img_height;
 
-  draw_image(image, img_x, img_y, img_width, img_height);
+  draw_image(image, img_x, img_y, img_width, img_height,
+                          state_.fill_r, state_.fill_g, state_.fill_b);
 
   return true;
 }
@@ -6351,7 +6361,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                         img_y += img_height;
                         img_height = -img_height;
                       }
-                      draw_image(image, img_x, img_y, img_width, img_height);
+                      draw_image(image, img_x, img_y, img_width, img_height,
+                          state_.fill_r, state_.fill_g, state_.fill_b);
                     } else if (subtype_it->second.name == "Form") {
                       // Form XObject - decode and parse its content stream
                       auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
@@ -6451,7 +6462,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                       img_height = -img_height;
                     }
 
-                    draw_image(image, img_x, img_y, img_width, img_height);
+                    draw_image(image, img_x, img_y, img_width, img_height,
+                          state_.fill_r, state_.fill_g, state_.fill_b);
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream
                     auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);

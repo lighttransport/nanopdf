@@ -254,7 +254,9 @@ private:
   float calculate_text_width(const std::string& text, float font_size);
 
   // Draw an image XObject
-  bool draw_image(const ImageXObject& image, float x, float y, float width, float height);
+  // fill_r/g/b: current non-stroking color, used to paint image mask pixels
+  bool draw_image(const ImageXObject& image, float x, float y, float width, float height,
+                  uint8_t fill_r = 0, uint8_t fill_g = 0, uint8_t fill_b = 0);
 
   // Draw a shading (gradient)
   bool draw_shading(const std::string& shading_name);
