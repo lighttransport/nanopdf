@@ -1789,7 +1789,8 @@ float Blend2DBackend::render_text_string(const std::string& text,
   return cursor_x - x;  // Return total width rendered
 }
 
-bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, float w, float h) {
+bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, float w, float h,
+                                uint8_t fill_r, uint8_t fill_g, uint8_t fill_b) {
   if (!initialized_ || image.data.empty()) {
     return false;
   }
@@ -1807,8 +1808,44 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
   uint8_t* dst = static_cast<uint8_t*>(img_data.pixel_data);
   const uint8_t* src = image.data.data();
 
+  // Handle image mask (1-bit stencil data)
+  if (image.image_mask) {
+    int stride = (img_width + 7) / 8;  // Bytes per row
+
+    // PDF spec: With default Decode [0 1], sample 0 = paint, sample 1 = masked.
+    // With Decode [1 0], sample 1 = paint, sample 0 = masked.
+    bool invert = false;
+    if (image.decode.size() >= 2 && image.decode[0] > image.decode[1]) {
+      invert = true;
+    }
+
+    for (int row = 0; row < img_height; row++) {
+      for (int col = 0; col < img_width; col++) {
+        int byte_idx = row * stride + col / 8;
+        int bit_idx = 7 - (col % 8);
+        size_t dst_idx = row * img_data.stride + col * 4;
+
+        if (byte_idx < static_cast<int>(image.data.size())) {
+          bool bit_set = (image.data[byte_idx] >> bit_idx) & 1;
+          bool should_paint = invert ? bit_set : !bit_set;
+          if (should_paint) {
+            // PRGB32 is BGRA with premultiplied alpha
+            dst[dst_idx + 0] = fill_b;
+            dst[dst_idx + 1] = fill_g;
+            dst[dst_idx + 2] = fill_r;
+            dst[dst_idx + 3] = 255;
+          } else {
+            dst[dst_idx + 0] = 0;
+            dst[dst_idx + 1] = 0;
+            dst[dst_idx + 2] = 0;
+            dst[dst_idx + 3] = 0;
+          }
+        }
+      }
+    }
+  }
   // Handle ICCBased color space with profile conversion
-  if (image.color_space.type == ColorSpaceType::ICCBased) {
+  else if (image.color_space.type == ColorSpaceType::ICCBased) {
     std::vector<uint8_t> rgb_data;
     convert_icc_to_srgb(image.data, rgb_data, img_width, img_height, image.color_space);
 
@@ -3840,7 +3877,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                       img_height = -img_height;
                     }
                     img_y = (state_.page_height - img_y) * state_.scale - img_height;
-                    draw_image(image, img_x, img_y, img_width, img_height);
+                    draw_image(image, img_x, img_y, img_width, img_height,
+                        state_.fill_r, state_.fill_g, state_.fill_b);
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream
                     auto decoded = decode_stream(*current_pdf_, xobj_value);
@@ -4197,7 +4235,8 @@ bool Blend2DBackend::parse_inline_image(const std::string& content, size_t& pos)
   }
   img_y = (state_.page_height - img_y) * state_.scale - img_height;
 
-  draw_image(image, img_x, img_y, img_width, img_height);
+  draw_image(image, img_x, img_y, img_width, img_height,
+                        state_.fill_r, state_.fill_g, state_.fill_b);
 
   return true;
 }
