@@ -479,7 +479,42 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   target_include_directories(ccitt_compare PRIVATE ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(ccitt_compare PRIVATE ${BUILD_TARGET})
   add_sanitizers(ccitt_compare)
+
+  # Standalone visual comparison tool
+  add_executable(visual_compare tools/visual_compare.cc)
+  target_include_directories(visual_compare PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  add_sanitizers(visual_compare)
+
+  # Visual regression test (ThorVG backend)
+  if(NANOPDF_USE_THORVG AND THORVG_FOUND)
+    add_nanopdf_test(test_visual_thorvg src/test-visual-regression.cc)
+    target_compile_definitions(test_visual_thorvg PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    if (TARGET PkgConfig::THORVG)
+      target_link_libraries(test_visual_thorvg PRIVATE PkgConfig::THORVG)
+    else()
+      target_include_directories(test_visual_thorvg PRIVATE ${THORVG_INCLUDE_DIRS})
+      target_link_libraries(test_visual_thorvg PRIVATE ${THORVG_LIBRARIES})
+    endif()
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+      target_link_libraries(test_visual_thorvg PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+  endif()
+
+  # Visual regression test (Blend2D backend)
+  if(NANOPDF_USE_BLEND2D)
+    add_nanopdf_test(test_visual_blend2d src/test-visual-regression.cc)
+    target_compile_definitions(test_visual_blend2d PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    target_link_libraries(test_visual_blend2d PRIVATE blend2d::blend2d)
+  endif()
 endif()
+
+# Custom target to generate visual reference images
+add_custom_target(generate_visual_refs
+  COMMAND ${PROJECT_SOURCE_DIR}/scripts/generate-visual-refs.sh
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+  COMMENT "Generating visual reference images using pdftoppm"
+)
 
 # For WASM builds, create a JavaScript module
 if(NANOPDF_BUILD_WASM)

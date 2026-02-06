@@ -48,6 +48,7 @@ Thumbs.db
 canvas_output.*
 svg_output.*
 data/ccitt/
+data/visual_refs/
 
 # Emscripten
 *.wasm
