@@ -794,6 +794,9 @@ bool Blend2DBackend::initialize(uint32_t width, uint32_t height) {
     return false;
   }
 
+  // Use bilinear interpolation for image scaling (default is nearest-neighbor)
+  ctx_.set_pattern_quality(BL_PATTERN_QUALITY_BILINEAR);
+
   // Clear to white
   ctx_.set_comp_op(BL_COMP_OP_SRC_COPY);
   ctx_.set_fill_style(BLRgba32(0xFFFFFFFF));
@@ -1937,6 +1940,7 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
   ctx_.save();
   ctx_.translate(x, y);
   ctx_.scale(w / img_width, h / img_height);
+  ctx_.set_pattern_quality(BL_PATTERN_QUALITY_BILINEAR);
   ctx_.blit_image(BLPointI(0, 0), img);
   ctx_.restore();
 
@@ -3861,10 +3865,13 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             auto entry_it = xobj_dict.find(xobj_name);
             if (entry_it != xobj_dict.end()) {
               Value xobj_value;
+              uint32_t xobj_obj_num = 0;
+              uint16_t xobj_gen_num = 0;
               if (entry_it->second.type == Value::REFERENCE) {
+                xobj_obj_num = entry_it->second.ref_object_number;
+                xobj_gen_num = entry_it->second.ref_generation_number;
                 auto resolved = resolve_reference(*current_pdf_,
-                    entry_it->second.ref_object_number,
-                    entry_it->second.ref_generation_number);
+                    xobj_obj_num, xobj_gen_num);
                 if (resolved.success) {
                   xobj_value = std::move(resolved.value);
                 }
@@ -3877,7 +3884,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                 if (subtype_it != xobj_value.stream.dict.end() &&
                     subtype_it->second.type == Value::NAME) {
                   if (subtype_it->second.name == "Image") {
-                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value);
+                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value,
+                        xobj_obj_num, xobj_gen_num);
                     float img_x = state_.transform.e * state_.scale;
                     float img_y = state_.transform.f;
                     float img_width = state_.transform.a * state_.scale;
@@ -3891,7 +3899,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                         state_.fill_r, state_.fill_g, state_.fill_b);
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream
-                    auto decoded = decode_stream(*current_pdf_, xobj_value);
+                    auto decoded = decode_stream(*current_pdf_, xobj_value,
+                        xobj_obj_num, xobj_gen_num);
                     if (decoded.success && !decoded.data.empty()) {
                       GraphicsState saved_state = state_;
 
