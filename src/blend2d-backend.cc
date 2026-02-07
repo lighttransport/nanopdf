@@ -3822,6 +3822,35 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
           state_.text_matrix.e += total_advance;
         }
+      } else if (token == "'" || token == "\"") {
+        // ' = T* + Tj (move to next line, show text)
+        // " = set Tw, Tc, then T* + Tj
+        if (state_.in_text_block) {
+          size_t text_idx = operands.size() - 1;
+          if (token == "\"" && operands.size() >= 3) {
+            state_.word_spacing = std::stof(operands[0]);
+            state_.char_spacing = std::stof(operands[1]);
+          }
+
+          // T* - move to next line
+          state_.text_matrix.e = state_.text_line_matrix.e;
+          state_.text_matrix.f = state_.text_line_matrix.f - state_.text_leading;
+          state_.text_line_matrix = state_.text_matrix;
+
+          // Tj - show text
+          if (!operands.empty()) {
+            std::string text = operands[text_idx];
+            float x = state_.text_matrix.e * state_.scale;
+            float y = (state_.page_height - state_.text_matrix.f) * state_.scale;
+            float effective_font_size = state_.font_size * state_.text_matrix.a;
+            float font_size = effective_font_size * state_.scale;
+            uint8_t fill_alpha = static_cast<uint8_t>(state_.fill_a * state_.fill_opacity);
+
+            float text_width = render_text_string(text, x, y, font_size,
+                state_.fill_r, state_.fill_g, state_.fill_b, fill_alpha);
+            state_.text_matrix.e += text_width / state_.scale;
+          }
+        }
       }
       // Shading
       else if (token == "sh") {
@@ -4560,12 +4589,15 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
 bool Blend2DBackend::render_soft_mask_group(const Value& group_xobject, int mask_type) {
   if (!current_pdf_) return false;
 
-  // Get the XObject stream
+  // Get the XObject stream - capture obj/gen numbers for decryption
   Value xobject_value = group_xobject;
+  uint32_t smask_obj_num = 0;
+  uint16_t smask_gen_num = 0;
   if (xobject_value.type == Value::REFERENCE) {
+    smask_obj_num = xobject_value.ref_object_number;
+    smask_gen_num = xobject_value.ref_generation_number;
     auto resolved = resolve_reference(*current_pdf_,
-                                      xobject_value.ref_object_number,
-                                      xobject_value.ref_generation_number);
+                                      smask_obj_num, smask_gen_num);
     if (!resolved.success) return false;
     xobject_value = resolved.value;
   }
@@ -4599,7 +4631,8 @@ bool Blend2DBackend::render_soft_mask_group(const Value& group_xobject, int mask
   if (mask_height == 0) mask_height = height_;
 
   // Decode the XObject stream content
-  auto decoded = decode_stream(*current_pdf_, xobject_value);
+  auto decoded = decode_stream(*current_pdf_, xobject_value,
+                               smask_obj_num, smask_gen_num);
   if (!decoded.success) {
     return false;
   }
