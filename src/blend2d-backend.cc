@@ -1025,10 +1025,13 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
   // Process each content stream
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
+    uint32_t obj_num = 0;
+    uint16_t gen_num = 0;
 
     if (content_obj.type == Value::REFERENCE) {
-      auto resolved = resolve_reference(pdf, content_obj.ref_object_number,
-                                        content_obj.ref_generation_number);
+      obj_num = content_obj.ref_object_number;
+      gen_num = content_obj.ref_generation_number;
+      auto resolved = resolve_reference(pdf, obj_num, gen_num);
       if (resolved.success) {
         resolved_obj = resolved.value;
       } else {
@@ -1037,7 +1040,7 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
     }
 
     if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj);
+      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
       if (decoded_result.success) {
         state_ = GraphicsState();
         state_.page_width = page_width;
@@ -3003,11 +3006,14 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
   // Process each content stream
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
+    uint32_t obj_num = 0;
+    uint16_t gen_num = 0;
 
     // Resolve reference if needed
     if (content_obj.type == Value::REFERENCE) {
-      auto resolved = resolve_reference(pdf, content_obj.ref_object_number,
-                                        content_obj.ref_generation_number);
+      obj_num = content_obj.ref_object_number;
+      gen_num = content_obj.ref_generation_number;
+      auto resolved = resolve_reference(pdf, obj_num, gen_num);
       if (resolved.success) {
         resolved_obj = resolved.value;
       } else {
@@ -3016,7 +3022,7 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
     }
 
     if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj);
+      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
       if (decoded_result.success) {
         state_ = GraphicsState();  // Reset state
         // Set page coordinate info
@@ -3133,6 +3139,10 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
     } else if (content[pos] == ']') {
       token = "]";
       pos++;
+    } else if (content[pos] == '{' || content[pos] == '}') {
+      // PostScript procedure delimiters - skip (not used in PDF content streams)
+      pos++;
+      continue;
     } else if (content[pos] == '/') {
       // Name
       token = "/";

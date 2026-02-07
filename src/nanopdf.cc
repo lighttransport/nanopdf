@@ -301,15 +301,11 @@ bool parse_stream(StreamReader &sr, Parser &parser, Value *out_value) {
         if (i > 0) {
           char before = static_cast<char>(data[i - 1]);
           if (before == '\n' || before == '\r') {
-            // Trim trailing whitespace from stream data
-            length = i;
-            while (length > 0) {
-              char c = static_cast<char>(data[length - 1]);
-              if (c == '\n' || c == '\r') {
-                length--;
-              } else {
-                break;
-              }
+            // Remove only the EOL marker before endstream (per PDF spec 7.3.8.1)
+            // Do NOT trim further - encrypted streams may legitimately end with \n/\r
+            length = i - 1;
+            if (length > 0 && static_cast<char>(data[length - 1]) == '\r' && before == '\n') {
+              length--;  // Handle \r\n EOL
             }
             NANOPDF_LOG_DEBUG("parse_stream", "Found endstream at i=%zu, length=%zu", i, length);
             break;
