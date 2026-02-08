@@ -1448,9 +1448,16 @@ bool Blend2DBackend::draw_glyph(int codepoint, float x, float y, float size,
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
+  bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
   bool invisible = (render_mode == 3 || render_mode == 7);
 
   stbtt_FreeShape(&font->font_info, vertices);
+
+  // Accumulate glyph path into text clip path for modes 4-7
+  if (add_to_clip) {
+    state_.text_clip_active = true;
+    state_.text_clip_path.add_path(path);
+  }
 
   if (invisible) {
     return true;
@@ -1542,9 +1549,16 @@ bool Blend2DBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
+  bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
   bool invisible = (render_mode == 3 || render_mode == 7);
 
   stbtt_FreeShape(&font->font_info, vertices);
+
+  // Accumulate glyph path into text clip path for modes 4-7
+  if (add_to_clip) {
+    state_.text_clip_active = true;
+    state_.text_clip_path.add_path(path);
+  }
 
   // Restore clipping to full canvas before drawing text
   ctx_.restore_clipping();
@@ -1914,6 +1928,11 @@ float Blend2DBackend::render_text_string(const std::string& text,
   return cursor_x - x;  // Return total width rendered
 }
 
+// Forward declaration for evaluate_pdf_function (defined below)
+static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
+                                   const std::vector<double>& inputs,
+                                   std::vector<double>& outputs);
+
 bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, float w, float h,
                                 uint8_t fill_r, uint8_t fill_g, uint8_t fill_b) {
   if (!initialized_ || image.data.empty()) {
@@ -1990,6 +2009,187 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
         dst[dst_idx + 0] = b_val;
         dst[dst_idx + 1] = g_val;
         dst[dst_idx + 2] = r_val;
+        dst[dst_idx + 3] = 255;
+      }
+    }
+  }
+  // Handle Indexed color space
+  else if (image.color_space.type == ColorSpaceType::Indexed) {
+    const auto& lookup = image.color_space.lookup_table;
+    int base_components = 3;  // Assume RGB base
+    if (image.color_space.base_color_space) {
+      ColorSpaceType base_type = image.color_space.base_color_space->type;
+      if (base_type == ColorSpaceType::DeviceGray || base_type == ColorSpaceType::CalGray) {
+        base_components = 1;
+      } else if (base_type == ColorSpaceType::DeviceCMYK) {
+        base_components = 4;
+      }
+    }
+
+    for (int row = 0; row < img_height; row++) {
+      for (int col = 0; col < img_width; col++) {
+        int pixel = row * img_width + col;
+        size_t dst_idx = row * img_data.stride + col * 4;
+        uint8_t idx = (pixel < static_cast<int>(image.data.size())) ? image.data[pixel] : 0;
+        int lookup_idx = idx * base_components;
+
+        uint8_t r = 0, g = 0, b = 0;
+        if (base_components == 1 && lookup_idx < static_cast<int>(lookup.size())) {
+          r = g = b = lookup[lookup_idx];
+        } else if (base_components == 3 && lookup_idx + 2 < static_cast<int>(lookup.size())) {
+          r = lookup[lookup_idx];
+          g = lookup[lookup_idx + 1];
+          b = lookup[lookup_idx + 2];
+        } else if (base_components == 4 && lookup_idx + 3 < static_cast<int>(lookup.size())) {
+          float c = lookup[lookup_idx] / 255.0f;
+          float m = lookup[lookup_idx + 1] / 255.0f;
+          float y_val = lookup[lookup_idx + 2] / 255.0f;
+          float k = lookup[lookup_idx + 3] / 255.0f;
+          r = static_cast<uint8_t>(255 * (1.0f - c) * (1.0f - k));
+          g = static_cast<uint8_t>(255 * (1.0f - m) * (1.0f - k));
+          b = static_cast<uint8_t>(255 * (1.0f - y_val) * (1.0f - k));
+        }
+
+        // PRGB32 is BGRA
+        dst[dst_idx + 0] = b;
+        dst[dst_idx + 1] = g;
+        dst[dst_idx + 2] = r;
+        dst[dst_idx + 3] = 255;
+      }
+    }
+  }
+  // Handle Separation color space (single spot color)
+  else if (image.color_space.type == ColorSpaceType::Separation) {
+    const auto& tint_func = image.color_space.tint_function;
+
+    // Determine alternate color space components
+    int alt_components = 4;  // Default CMYK
+    if (image.color_space.base_color_space) {
+      ColorSpaceType alt_type = image.color_space.base_color_space->type;
+      if (alt_type == ColorSpaceType::DeviceGray || alt_type == ColorSpaceType::CalGray) {
+        alt_components = 1;
+      } else if (alt_type == ColorSpaceType::DeviceRGB || alt_type == ColorSpaceType::CalRGB) {
+        alt_components = 3;
+      }
+    }
+
+    for (int row = 0; row < img_height; row++) {
+      for (int col = 0; col < img_width; col++) {
+        int pixel = row * img_width + col;
+        size_t dst_idx = row * img_data.stride + col * 4;
+
+        // Get tint value (0-1 range from 8-bit data)
+        double tint = (pixel < static_cast<int>(image.data.size())) ? image.data[pixel] / 255.0 : 0.0;
+
+        // Evaluate tint function if present
+        std::vector<double> outputs;
+        uint8_t r = 0, g = 0, b = 0;
+
+        if (tint_func.type != Value::UNDEFINED && current_pdf_ &&
+            evaluate_pdf_function(*current_pdf_, tint_func, {tint}, outputs) &&
+            !outputs.empty()) {
+          // Convert alternate color to RGB
+          if (alt_components == 1) {
+            uint8_t gray = static_cast<uint8_t>(outputs[0] * 255);
+            r = g = b = gray;
+          } else if (alt_components == 3 && outputs.size() >= 3) {
+            r = static_cast<uint8_t>(outputs[0] * 255);
+            g = static_cast<uint8_t>(outputs[1] * 255);
+            b = static_cast<uint8_t>(outputs[2] * 255);
+          } else if (alt_components == 4 && outputs.size() >= 4) {
+            float c = static_cast<float>(outputs[0]);
+            float m = static_cast<float>(outputs[1]);
+            float y = static_cast<float>(outputs[2]);
+            float k = static_cast<float>(outputs[3]);
+            r = static_cast<uint8_t>(255 * (1.0f - c) * (1.0f - k));
+            g = static_cast<uint8_t>(255 * (1.0f - m) * (1.0f - k));
+            b = static_cast<uint8_t>(255 * (1.0f - y) * (1.0f - k));
+          }
+        } else {
+          // Fallback: treat as grayscale tint
+          uint8_t gray = static_cast<uint8_t>((1.0 - tint) * 255);
+          r = g = b = gray;
+        }
+
+        // PRGB32 is BGRA
+        dst[dst_idx + 0] = b;
+        dst[dst_idx + 1] = g;
+        dst[dst_idx + 2] = r;
+        dst[dst_idx + 3] = 255;
+      }
+    }
+  }
+  // Handle DeviceN color space (multiple spot colors)
+  else if (image.color_space.type == ColorSpaceType::DeviceN) {
+    int n_colorants = static_cast<int>(image.color_space.colorant_names.size());
+    if (n_colorants == 0) n_colorants = image.color_space.num_components;
+    if (n_colorants == 0) n_colorants = 1;  // Fallback
+    const auto& tint_func = image.color_space.tint_function;
+
+    // Determine alternate color space components
+    int alt_components = 4;  // Default CMYK
+    if (image.color_space.base_color_space) {
+      ColorSpaceType alt_type = image.color_space.base_color_space->type;
+      if (alt_type == ColorSpaceType::DeviceGray || alt_type == ColorSpaceType::CalGray) {
+        alt_components = 1;
+      } else if (alt_type == ColorSpaceType::DeviceRGB || alt_type == ColorSpaceType::CalRGB) {
+        alt_components = 3;
+      }
+    }
+
+    for (int row = 0; row < img_height; row++) {
+      for (int col = 0; col < img_width; col++) {
+        int pixel = row * img_width + col;
+        int src_idx = pixel * n_colorants;
+        size_t dst_idx = row * img_data.stride + col * 4;
+
+        // Collect tint values
+        std::vector<double> inputs;
+        for (int j = 0; j < n_colorants; j++) {
+          if (src_idx + j < static_cast<int>(image.data.size())) {
+            inputs.push_back(image.data[src_idx + j] / 255.0);
+          } else {
+            inputs.push_back(0.0);
+          }
+        }
+
+        // Evaluate tint function
+        std::vector<double> outputs;
+        uint8_t r = 0, g = 0, b = 0;
+
+        if (tint_func.type != Value::UNDEFINED && current_pdf_ &&
+            evaluate_pdf_function(*current_pdf_, tint_func, inputs, outputs) &&
+            !outputs.empty()) {
+          // Convert alternate color to RGB
+          if (alt_components == 1) {
+            uint8_t gray = static_cast<uint8_t>(outputs[0] * 255);
+            r = g = b = gray;
+          } else if (alt_components == 3 && outputs.size() >= 3) {
+            r = static_cast<uint8_t>(outputs[0] * 255);
+            g = static_cast<uint8_t>(outputs[1] * 255);
+            b = static_cast<uint8_t>(outputs[2] * 255);
+          } else if (alt_components == 4 && outputs.size() >= 4) {
+            float c = static_cast<float>(outputs[0]);
+            float m = static_cast<float>(outputs[1]);
+            float y = static_cast<float>(outputs[2]);
+            float k = static_cast<float>(outputs[3]);
+            r = static_cast<uint8_t>(255 * (1.0f - c) * (1.0f - k));
+            g = static_cast<uint8_t>(255 * (1.0f - m) * (1.0f - k));
+            b = static_cast<uint8_t>(255 * (1.0f - y) * (1.0f - k));
+          }
+        } else {
+          // Fallback: average tints as gray
+          double avg = 0;
+          for (double t : inputs) avg += t;
+          avg /= (inputs.empty() ? 1.0 : inputs.size());
+          uint8_t gray = static_cast<uint8_t>((1.0 - avg) * 255);
+          r = g = b = gray;
+        }
+
+        // PRGB32 is BGRA
+        dst[dst_idx + 0] = b;
+        dst[dst_idx + 1] = g;
+        dst[dst_idx + 2] = r;
         dst[dst_idx + 3] = 255;
       }
     }
@@ -4413,6 +4613,10 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                   state_.blend_mode = BL_COMP_OP_DIFFERENCE;
                 } else if (bm_name == "Exclusion") {
                   state_.blend_mode = BL_COMP_OP_EXCLUSION;
+                } else if (bm_name == "Hue" || bm_name == "Saturation" ||
+                           bm_name == "Color" || bm_name == "Luminosity") {
+                  // Non-separable blend modes - not supported natively, fall back to Normal
+                  state_.blend_mode = BL_COMP_OP_SRC_OVER;
                 } else {
                   state_.blend_mode = BL_COMP_OP_SRC_OVER;  // Default
                 }
@@ -4525,6 +4729,13 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         state_.text_line_matrix.reset();
       } else if (token == "ET") {
         state_.in_text_block = false;
+        // Merge accumulated text clip into main clip path
+        if (state_.text_clip_active && !state_.text_clip_path.is_empty()) {
+          state_.clip_path.add_path(state_.text_clip_path);
+          state_.has_clip = true;
+          state_.text_clip_path.reset();
+          state_.text_clip_active = false;
+        }
       } else if (token == "Tf") {
         if (operands.size() >= 2) {
           std::string font_name = operands[0];
@@ -5299,10 +5510,17 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
 
     // Calculate tile dimensions from bbox
     float tile_width = 1.0f, tile_height = 1.0f;
+    float bbox_x0 = 0.0f, bbox_y0 = 0.0f;
     if (tiling.bbox.size() >= 4) {
+      bbox_x0 = static_cast<float>(tiling.bbox[0]);
+      bbox_y0 = static_cast<float>(tiling.bbox[1]);
       tile_width = static_cast<float>(tiling.bbox[2] - tiling.bbox[0]);
       tile_height = static_cast<float>(tiling.bbox[3] - tiling.bbox[1]);
     }
+
+    // Use XStep/YStep for repeat interval if available (may differ from bbox)
+    float step_width = (tiling.x_step > 0) ? static_cast<float>(tiling.x_step) : tile_width;
+    float step_height = (tiling.y_step > 0) ? static_cast<float>(std::fabs(tiling.y_step)) : tile_height;
 
     if (tile_width <= 0 || tile_height <= 0 || tiling.content_stream.empty()) {
       // No content to render - fallback
@@ -5314,10 +5532,10 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
       return true;
     }
 
-    // Scale tile dimensions
+    // Scale tile dimensions - use step size for image dimensions (repeat interval)
     float pattern_scale = state_.scale;
-    uint32_t img_width = static_cast<uint32_t>(std::ceil(tile_width * pattern_scale));
-    uint32_t img_height = static_cast<uint32_t>(std::ceil(tile_height * pattern_scale));
+    uint32_t img_width = static_cast<uint32_t>(std::ceil(step_width * pattern_scale));
+    uint32_t img_height = static_cast<uint32_t>(std::ceil(step_height * pattern_scale));
 
     if (img_width == 0) img_width = 1;
     if (img_height == 0) img_height = 1;
@@ -5353,9 +5571,15 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
 
     // Reset graphics state for tile rendering
     state_ = GraphicsState();
-    state_.page_width = tile_width;
-    state_.page_height = tile_height;
+    state_.page_width = step_width;
+    state_.page_height = step_height;
     state_.scale = pattern_scale;
+
+    // Apply BBox origin offset (translate for non-zero BBox origin)
+    if (bbox_x0 != 0.0f || bbox_y0 != 0.0f) {
+      state_.transform.e = -bbox_x0 * pattern_scale;
+      state_.transform.f = -bbox_y0 * pattern_scale;
+    }
 
     // Push pattern resources if available
     if (!tiling.resources.empty()) {

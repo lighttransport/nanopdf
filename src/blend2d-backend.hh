@@ -164,6 +164,10 @@ private:
     bool clip_even_odd{false};  // true for W* (even-odd), false for W (non-zero)
     BLPath clip_path;
 
+    // Text clipping path (accumulated during text block for modes 4-7)
+    bool text_clip_active{false};
+    BLPath text_clip_path;
+
     // Page coordinate system info (set by render_page)
     float page_width{612.0f};
     float page_height{792.0f};
