@@ -3,7 +3,14 @@
 
 #include "pdf-writer.hh"
 
+#ifdef NANOPDF_USE_MINIZ
+#include "miniz.h"
+// miniz defines `#define compress mz_compress` which clashes with struct field names.
+// We only use compress2/compressBound, so undef the bare `compress` macro.
+#undef compress
+#else
 #include <zlib.h>
+#endif
 
 #include <algorithm>
 #include <cmath>

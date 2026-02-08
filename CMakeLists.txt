@@ -17,6 +17,7 @@ option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
 option(NANOPDF_USE_POPPLER_CCITT "Use Poppler for CCITT/Fax decoding (GPL)" OFF)
 option(NANOPDF_USE_BUILTIN_CCITT "Use built-in CCITT decoder instead of PDFium-based" OFF)
+option(NANOPDF_USE_MINIZ "Use embedded miniz instead of system zlib" OFF)
 
 # Log level: 0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
 set(NANOPDF_LOG_LEVEL "3" CACHE STRING "Log level (0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace)")
@@ -34,6 +35,11 @@ find_package(Sanitizers) # Address sanitizer (-DSANITIZE_ADDRESS=ON)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Windows/MinGW: enable M_PI and other POSIX math constants
+if(WIN32 OR MINGW)
+  add_compile_definitions(_USE_MATH_DEFINES)
+endif()
 
 # Emscripten-specific settings
 if(NANOPDF_BUILD_WASM)
@@ -145,11 +151,16 @@ endif()
 add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_LOG_LEVEL=${NANOPDF_LOG_LEVEL}")
 
-# Link with zlib - Emscripten provides it via USE_ZLIB flag
+# Link with zlib (or use embedded miniz)
 if(NANOPDF_BUILD_WASM)
   # For Emscripten, USE_ZLIB must be specified for both compilation and linking
   target_compile_options(${BUILD_TARGET} PRIVATE "SHELL:-s USE_ZLIB=1")
   target_link_options(${BUILD_TARGET} PRIVATE "SHELL:-s USE_ZLIB=1")
+elseif(NANOPDF_USE_MINIZ)
+  # Use embedded miniz as zlib replacement (for cross-compilation without system zlib)
+  target_sources(${BUILD_TARGET} PRIVATE src/miniz.c)
+  target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_MINIZ")
+  message(STATUS "Using embedded miniz instead of system zlib")
 else()
   target_link_libraries(${BUILD_TARGET} PUBLIC z)
 endif()

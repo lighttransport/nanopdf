@@ -18,7 +18,11 @@
 #include <unordered_set>
 #endif
 
+#ifdef NANOPDF_USE_MINIZ
+#include "miniz.h"
+#else
 #include <zlib.h>
+#endif
 
 #include "common-macros.inc"
 #include "ccitt-decoder.hh"
