@@ -1571,6 +1571,88 @@ bool Blend2DBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
   return true;
 }
 
+bool Blend2DBackend::render_type3_glyph(const Type3Font* type3_font, const std::string& glyph_name,
+                                         float x, float y, float size,
+                                         uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  if (!type3_font || !current_pdf_ || glyph_name.empty()) {
+    return false;
+  }
+
+  // Look up the glyph procedure in CharProcs
+  auto proc_it = type3_font->char_procs.find(glyph_name);
+  if (proc_it == type3_font->char_procs.end()) {
+    // Glyph not found - draw placeholder rectangle
+    ctx_.set_fill_style(BLRgba32(r, g, b, static_cast<uint8_t>(a * 0.3f)));
+    ctx_.fill_rect(x, y - size, size * 0.5f, size);
+    return true;
+  }
+
+  // Resolve the glyph procedure (it's usually a stream)
+  Value proc_value = proc_it->second;
+  if (proc_value.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_, proc_value.ref_object_number,
+                                       proc_value.ref_generation_number);
+    if (!resolved.success) {
+      return false;
+    }
+    proc_value = resolved.value;
+  }
+
+  if (proc_value.type != Value::STREAM) {
+    return false;
+  }
+
+  // Decode the glyph content stream
+  auto decoded = decode_stream(*current_pdf_, proc_value);
+  if (!decoded.success || decoded.data.empty()) {
+    return false;
+  }
+
+  // Calculate transformation based on font matrix and size
+  double fm_a = type3_font->font_matrix.size() >= 1 ? type3_font->font_matrix[0] : 0.001;
+  double fm_d = type3_font->font_matrix.size() >= 4 ? type3_font->font_matrix[3] : 0.001;
+
+  // Save current state
+  GraphicsState saved_state = state_;
+
+  // Set up graphics state for glyph rendering
+  float glyph_scale = size * static_cast<float>(fm_a) * state_.scale;
+
+  // Offset to glyph position
+  state_.transform.e = x;
+  state_.transform.f = y;
+
+  // Apply font matrix scaling with Y-flip for glyph space
+  state_.transform.a = glyph_scale;
+  state_.transform.d = -glyph_scale;
+  state_.transform.b = 0.0f;
+  state_.transform.c = 0.0f;
+
+  // Set fill color
+  state_.fill_r = r;
+  state_.fill_g = g;
+  state_.fill_b = b;
+  state_.fill_a = a;
+
+  // Push Type 3 font resources
+  if (!type3_font->resources.empty()) {
+    form_resources_stack_.push_back(type3_font->resources);
+  }
+
+  // Parse and render the glyph content stream
+  parse_pdf_content(decoded.data);
+
+  // Pop resources
+  if (!type3_font->resources.empty() && !form_resources_stack_.empty()) {
+    form_resources_stack_.pop_back();
+  }
+
+  // Restore state
+  state_ = saved_state;
+
+  return true;
+}
+
 float Blend2DBackend::calculate_text_width(const std::string& text, float font_size) {
   // First try to use PDF font width information for Type0/CID fonts
   auto* type0_font = dynamic_cast<const Type0Font*>(current_font_);
@@ -1657,6 +1739,43 @@ float Blend2DBackend::calculate_text_width(const std::string& text, float font_s
 float Blend2DBackend::render_text_string(const std::string& text,
     float x, float y, float font_size,
     uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  // Check for Type 3 font (user-defined glyphs) first
+  auto* type3_font = dynamic_cast<const Type3Font*>(current_font_);
+  if (type3_font) {
+    float cursor_x = x;
+
+    for (size_t i = 0; i < text.length(); ++i) {
+      uint8_t char_code = static_cast<uint8_t>(text[i]);
+
+      // Get glyph name from encoding
+      std::string glyph_name;
+      if (char_code < type3_font->encoding.size()) {
+        glyph_name = type3_font->encoding[char_code];
+      }
+
+      if (glyph_name.empty() || glyph_name == ".notdef") {
+        // No glyph - draw placeholder and advance
+        ctx_.set_fill_style(BLRgba32(r, g, b, static_cast<uint8_t>(a * 0.2f)));
+        ctx_.fill_rect(cursor_x, y - font_size, font_size * 0.5f, font_size);
+        cursor_x += font_size * 0.6f;
+        continue;
+      }
+
+      // Render the Type 3 glyph
+      render_type3_glyph(type3_font, glyph_name, cursor_x, y, font_size, r, g, b, a);
+
+      // Get advance width from Widths array if available
+      float advance = font_size * 0.6f;  // Default advance
+      if (char_code < type3_font->widths.size()) {
+        double fm_a = type3_font->font_matrix.size() >= 1 ? type3_font->font_matrix[0] : 0.001;
+        advance = static_cast<float>(type3_font->widths[char_code] * fm_a * font_size);
+      }
+
+      cursor_x += advance;
+    }
+    return cursor_x - x;
+  }
+
   FontCache* font = get_font(current_font_name_);
   float cursor_x = x;
 
@@ -2659,6 +2778,517 @@ const Value* Blend2DBackend::lookup_resource(const std::string& resource_type, c
   return nullptr;
 }
 
+// Extract color stops from a PDF function (Type 2 or Type 3 stitching)
+// Returns vector of (offset, BLRgba32) pairs suitable for BLGradient::add_stop()
+static std::vector<std::pair<float, BLRgba32>> extract_color_stops_from_function(
+    const Pdf& pdf, const Value& function) {
+  std::vector<std::pair<float, BLRgba32>> stops;
+
+  if (function.type != Value::DICTIONARY) {
+    stops.push_back({0.0f, BLRgba32(0, 0, 0, 255)});
+    stops.push_back({1.0f, BLRgba32(255, 255, 255, 255)});
+    return stops;
+  }
+
+  auto func_type_it = function.dict.find("FunctionType");
+  if (func_type_it == function.dict.end() || func_type_it->second.type != Value::NUMBER) {
+    stops.push_back({0.0f, BLRgba32(0, 0, 0, 255)});
+    stops.push_back({1.0f, BLRgba32(255, 255, 255, 255)});
+    return stops;
+  }
+
+  int func_type = static_cast<int>(func_type_it->second.number);
+
+  if (func_type == 2) {
+    // Type 2: Exponential interpolation function
+    auto c0_it = function.dict.find("C0");
+    auto c1_it = function.dict.find("C1");
+
+    float r0 = 0, g0 = 0, b0 = 0;
+    float r1 = 1, g1 = 1, b1 = 1;
+
+    if (c0_it != function.dict.end() && c0_it->second.type == Value::ARRAY &&
+        c0_it->second.array.size() >= 3) {
+      r0 = static_cast<float>(c0_it->second.array[0].number);
+      g0 = static_cast<float>(c0_it->second.array[1].number);
+      b0 = static_cast<float>(c0_it->second.array[2].number);
+    }
+
+    if (c1_it != function.dict.end() && c1_it->second.type == Value::ARRAY &&
+        c1_it->second.array.size() >= 3) {
+      r1 = static_cast<float>(c1_it->second.array[0].number);
+      g1 = static_cast<float>(c1_it->second.array[1].number);
+      b1 = static_cast<float>(c1_it->second.array[2].number);
+    }
+
+    stops.push_back({0.0f, BLRgba32(
+      static_cast<uint8_t>(r0 * 255), static_cast<uint8_t>(g0 * 255),
+      static_cast<uint8_t>(b0 * 255), 255)});
+    stops.push_back({1.0f, BLRgba32(
+      static_cast<uint8_t>(r1 * 255), static_cast<uint8_t>(g1 * 255),
+      static_cast<uint8_t>(b1 * 255), 255)});
+  }
+  else if (func_type == 3) {
+    // Type 3: Stitching function - combines multiple sub-functions
+    auto functions_it = function.dict.find("Functions");
+    auto bounds_it = function.dict.find("Bounds");
+
+    if (functions_it == function.dict.end() || functions_it->second.type != Value::ARRAY) {
+      stops.push_back({0.0f, BLRgba32(0, 0, 0, 255)});
+      stops.push_back({1.0f, BLRgba32(255, 255, 255, 255)});
+      return stops;
+    }
+
+    const auto& functions = functions_it->second.array;
+
+    // Build boundary positions: [0, bounds[0], bounds[1], ..., 1]
+    std::vector<float> boundaries;
+    boundaries.push_back(0.0f);
+
+    if (bounds_it != function.dict.end() && bounds_it->second.type == Value::ARRAY) {
+      for (const auto& b : bounds_it->second.array) {
+        if (b.type == Value::NUMBER) {
+          boundaries.push_back(static_cast<float>(b.number));
+        }
+      }
+    }
+    boundaries.push_back(1.0f);
+
+    // For each sub-function, extract its start color (C0)
+    for (size_t i = 0; i < functions.size() && i < boundaries.size(); i++) {
+      Value sub_func = functions[i];
+
+      if (sub_func.type == Value::REFERENCE) {
+        auto resolved = resolve_reference(pdf, sub_func.ref_object_number,
+                                          sub_func.ref_generation_number);
+        if (resolved.success) {
+          sub_func = resolved.value;
+        }
+      }
+
+      if (sub_func.type == Value::DICTIONARY) {
+        auto sub_c0_it = sub_func.dict.find("C0");
+        if (sub_c0_it != sub_func.dict.end() && sub_c0_it->second.type == Value::ARRAY &&
+            sub_c0_it->second.array.size() >= 3) {
+          float r = static_cast<float>(sub_c0_it->second.array[0].number);
+          float g = static_cast<float>(sub_c0_it->second.array[1].number);
+          float b = static_cast<float>(sub_c0_it->second.array[2].number);
+          stops.push_back({boundaries[i], BLRgba32(
+            static_cast<uint8_t>(r * 255), static_cast<uint8_t>(g * 255),
+            static_cast<uint8_t>(b * 255), 255)});
+        }
+      }
+    }
+
+    // Add final color from last sub-function's C1
+    if (!functions.empty()) {
+      Value last_func = functions.back();
+      if (last_func.type == Value::REFERENCE) {
+        auto resolved = resolve_reference(pdf, last_func.ref_object_number,
+                                          last_func.ref_generation_number);
+        if (resolved.success) {
+          last_func = resolved.value;
+        }
+      }
+
+      if (last_func.type == Value::DICTIONARY) {
+        auto c1_it = last_func.dict.find("C1");
+        if (c1_it != last_func.dict.end() && c1_it->second.type == Value::ARRAY &&
+            c1_it->second.array.size() >= 3) {
+          float r = static_cast<float>(c1_it->second.array[0].number);
+          float g = static_cast<float>(c1_it->second.array[1].number);
+          float b = static_cast<float>(c1_it->second.array[2].number);
+          stops.push_back({1.0f, BLRgba32(
+            static_cast<uint8_t>(r * 255), static_cast<uint8_t>(g * 255),
+            static_cast<uint8_t>(b * 255), 255)});
+        }
+      }
+    }
+
+    // Ensure we have at least 2 stops
+    if (stops.size() < 2) {
+      stops.clear();
+      stops.push_back({0.0f, BLRgba32(0, 0, 0, 255)});
+      stops.push_back({1.0f, BLRgba32(255, 255, 255, 255)});
+    }
+  }
+  else {
+    // Unsupported function type - default gradient
+    stops.push_back({0.0f, BLRgba32(0, 0, 0, 255)});
+    stops.push_back({1.0f, BLRgba32(255, 255, 255, 255)});
+  }
+
+  return stops;
+}
+
+// ============================================================
+// Mesh shading helpers (shared between Types 4, 5, 6, 7)
+// ============================================================
+
+// Bit-packed stream reader for mesh shading data
+class BitStream {
+public:
+  BitStream(const uint8_t* data, size_t size) : data_(data), size_(size), bit_pos_(0) {}
+
+  bool is_eof() const { return bit_pos_ >= size_ * 8; }
+  size_t bits_remaining() const { return size_ * 8 - bit_pos_; }
+
+  uint32_t get_bits(uint32_t num_bits) {
+    if (num_bits == 0 || num_bits > 32) return 0;
+    if (bit_pos_ + num_bits > size_ * 8) return 0;
+
+    uint32_t result = 0;
+    while (num_bits > 0) {
+      size_t byte_pos = bit_pos_ / 8;
+      size_t bit_offset = bit_pos_ % 8;
+      size_t bits_in_byte = std::min(num_bits, 8 - static_cast<uint32_t>(bit_offset));
+
+      uint8_t mask = static_cast<uint8_t>((1 << bits_in_byte) - 1);
+      uint8_t value = (data_[byte_pos] >> (8 - bit_offset - bits_in_byte)) & mask;
+
+      result = (result << bits_in_byte) | value;
+      bit_pos_ += bits_in_byte;
+      num_bits -= bits_in_byte;
+    }
+    return result;
+  }
+
+  void byte_align() {
+    if (bit_pos_ % 8 != 0) {
+      bit_pos_ = ((bit_pos_ / 8) + 1) * 8;
+    }
+  }
+
+private:
+  const uint8_t* data_;
+  size_t size_;
+  size_t bit_pos_;
+};
+
+// Mesh vertex with position and RGB color
+struct MeshVertex {
+  float x, y;
+  float r, g, b;  // RGB in [0,1] range
+};
+
+// Decode coordinate from bit-packed value
+static float decode_coord(uint32_t encoded, uint32_t bits_per_coord,
+                          float min_val, float max_val) {
+  if (bits_per_coord == 0) return min_val;
+  uint32_t max_encoded = (bits_per_coord == 32) ? 0xFFFFFFFF : (1u << bits_per_coord) - 1;
+  if (max_encoded == 0) return min_val;
+  return min_val + (encoded / static_cast<float>(max_encoded)) * (max_val - min_val);
+}
+
+// Decode color component from bit-packed value
+static float decode_component(uint32_t encoded, uint32_t bits_per_component,
+                               float min_val, float max_val) {
+  if (bits_per_component == 0) return min_val;
+  uint32_t max_encoded = (1u << bits_per_component) - 1;
+  if (max_encoded == 0) return min_val;
+  return min_val + (encoded / static_cast<float>(max_encoded)) * (max_val - min_val);
+}
+
+// Draw a Gouraud-shaded triangle to a bitmap (scanline algorithm)
+// Pixel format: PRGB32 (BGRA with premultiplied alpha, opaque)
+static void draw_gouraud_triangle(uint32_t* bitmap, int width, int height,
+                                   const MeshVertex& v0, const MeshVertex& v1, const MeshVertex& v2) {
+  float min_y = std::min({v0.y, v1.y, v2.y});
+  float max_y = std::max({v0.y, v1.y, v2.y});
+
+  if (min_y == max_y) return;
+
+  int min_yi = std::max(static_cast<int>(std::floor(min_y)), 0);
+  int max_yi = std::min(static_cast<int>(std::ceil(max_y)), height - 1);
+
+  for (int y = min_yi; y <= max_yi; ++y) {
+    float fy = static_cast<float>(y);
+
+    struct Intersection {
+      float x;
+      float r, g, b;
+    };
+    std::vector<Intersection> intersections;
+
+    const MeshVertex* edges[3][2] = {{&v0, &v1}, {&v1, &v2}, {&v2, &v0}};
+
+    for (int i = 0; i < 3; ++i) {
+      const MeshVertex* a = edges[i][0];
+      const MeshVertex* bp = edges[i][1];
+
+      if (a->y == bp->y) continue;
+
+      bool intersects = (a->y < bp->y) ? (fy >= a->y && fy <= bp->y) : (fy >= bp->y && fy <= a->y);
+      if (!intersects) continue;
+
+      float t = (fy - a->y) / (bp->y - a->y);
+      Intersection isect;
+      isect.x = a->x + t * (bp->x - a->x);
+      isect.r = a->r + t * (bp->r - a->r);
+      isect.g = a->g + t * (bp->g - a->g);
+      isect.b = a->b + t * (bp->b - a->b);
+      intersections.push_back(isect);
+    }
+
+    if (intersections.size() != 2) continue;
+
+    if (intersections[0].x > intersections[1].x) {
+      std::swap(intersections[0], intersections[1]);
+    }
+
+    int x_start = std::max(static_cast<int>(std::floor(intersections[0].x)), 0);
+    int x_end = std::min(static_cast<int>(std::ceil(intersections[1].x)), width - 1);
+
+    if (x_start >= x_end) continue;
+
+    float dx = intersections[1].x - intersections[0].x;
+    if (dx == 0) continue;
+
+    uint32_t* row = bitmap + y * width;
+    for (int x = x_start; x <= x_end; ++x) {
+      float t = (x - intersections[0].x) / dx;
+      float cr = intersections[0].r + t * (intersections[1].r - intersections[0].r);
+      float cg = intersections[0].g + t * (intersections[1].g - intersections[0].g);
+      float cb = intersections[0].b + t * (intersections[1].b - intersections[0].b);
+
+      uint8_t ri = static_cast<uint8_t>(clamp14(cr * 255.0f, 0.0f, 255.0f));
+      uint8_t gi = static_cast<uint8_t>(clamp14(cg * 255.0f, 0.0f, 255.0f));
+      uint8_t bi = static_cast<uint8_t>(clamp14(cb * 255.0f, 0.0f, 255.0f));
+
+      // PRGB32: 0xAARRGGBB (opaque)
+      row[x] = 0xFF000000u | (static_cast<uint32_t>(ri) << 16) |
+               (static_cast<uint32_t>(gi) << 8) | static_cast<uint32_t>(bi);
+    }
+  }
+}
+
+// Cubic Bezier patch for Coons/Tensor-product patch meshes
+struct BezierPatch {
+  float points[4][4][2];  // 4x4 grid of control points (x, y)
+  float colors[4][3];     // 4 corner colors (r, g, b)
+
+  bool is_small() const {
+    float min_x = points[0][0][0], max_x = points[0][0][0];
+    float min_y = points[0][0][1], max_y = points[0][0][1];
+
+    for (int i = 0; i < 4; ++i) {
+      for (int j = 0; j < 4; ++j) {
+        min_x = std::min(min_x, points[i][j][0]);
+        max_x = std::max(max_x, points[i][j][0]);
+        min_y = std::min(min_y, points[i][j][1]);
+        max_y = std::max(max_y, points[i][j][1]);
+      }
+    }
+
+    return (max_x - min_x < 2.0f) && (max_y - min_y < 2.0f);
+  }
+
+  void subdivide_vertical(BezierPatch& top, BezierPatch& bottom) const {
+    for (int x = 0; x < 4; ++x) {
+      float p0[2] = {points[x][0][0], points[x][0][1]};
+      float p1[2] = {points[x][1][0], points[x][1][1]};
+      float p2[2] = {points[x][2][0], points[x][2][1]};
+      float p3[2] = {points[x][3][0], points[x][3][1]};
+
+      float q0[2] = {(p0[0] + p1[0]) * 0.5f, (p0[1] + p1[1]) * 0.5f};
+      float q1[2] = {(p1[0] + p2[0]) * 0.5f, (p1[1] + p2[1]) * 0.5f};
+      float q2[2] = {(p2[0] + p3[0]) * 0.5f, (p2[1] + p3[1]) * 0.5f};
+
+      float r0[2] = {(q0[0] + q1[0]) * 0.5f, (q0[1] + q1[1]) * 0.5f};
+      float r1[2] = {(q1[0] + q2[0]) * 0.5f, (q1[1] + q2[1]) * 0.5f};
+
+      float s[2] = {(r0[0] + r1[0]) * 0.5f, (r0[1] + r1[1]) * 0.5f};
+
+      top.points[x][0][0] = p0[0]; top.points[x][0][1] = p0[1];
+      top.points[x][1][0] = q0[0]; top.points[x][1][1] = q0[1];
+      top.points[x][2][0] = r0[0]; top.points[x][2][1] = r0[1];
+      top.points[x][3][0] = s[0];  top.points[x][3][1] = s[1];
+
+      bottom.points[x][0][0] = s[0];  bottom.points[x][0][1] = s[1];
+      bottom.points[x][1][0] = r1[0]; bottom.points[x][1][1] = r1[1];
+      bottom.points[x][2][0] = q2[0]; bottom.points[x][2][1] = q2[1];
+      bottom.points[x][3][0] = p3[0]; bottom.points[x][3][1] = p3[1];
+    }
+
+    for (int i = 0; i < 3; ++i) {
+      top.colors[0][i] = colors[0][i];
+      top.colors[1][i] = (colors[0][i] + colors[1][i]) * 0.5f;
+      top.colors[2][i] = (colors[0][i] + colors[1][i]) * 0.5f;
+      top.colors[3][i] = colors[1][i];
+
+      bottom.colors[0][i] = (colors[0][i] + colors[1][i]) * 0.5f;
+      bottom.colors[1][i] = colors[1][i];
+      bottom.colors[2][i] = colors[2][i];
+      bottom.colors[3][i] = (colors[2][i] + colors[3][i]) * 0.5f;
+    }
+  }
+
+  void subdivide_horizontal(BezierPatch& left, BezierPatch& right) const {
+    for (int y = 0; y < 4; ++y) {
+      float p0[2] = {points[0][y][0], points[0][y][1]};
+      float p1[2] = {points[1][y][0], points[1][y][1]};
+      float p2[2] = {points[2][y][0], points[2][y][1]};
+      float p3[2] = {points[3][y][0], points[3][y][1]};
+
+      float q0[2] = {(p0[0] + p1[0]) * 0.5f, (p0[1] + p1[1]) * 0.5f};
+      float q1[2] = {(p1[0] + p2[0]) * 0.5f, (p1[1] + p2[1]) * 0.5f};
+      float q2[2] = {(p2[0] + p3[0]) * 0.5f, (p2[1] + p3[1]) * 0.5f};
+
+      float r0[2] = {(q0[0] + q1[0]) * 0.5f, (q0[1] + q1[1]) * 0.5f};
+      float r1[2] = {(q1[0] + q2[0]) * 0.5f, (q1[1] + q2[1]) * 0.5f};
+
+      float s[2] = {(r0[0] + r1[0]) * 0.5f, (r0[1] + r1[1]) * 0.5f};
+
+      left.points[0][y][0] = p0[0]; left.points[0][y][1] = p0[1];
+      left.points[1][y][0] = q0[0]; left.points[1][y][1] = q0[1];
+      left.points[2][y][0] = r0[0]; left.points[2][y][1] = r0[1];
+      left.points[3][y][0] = s[0];  left.points[3][y][1] = s[1];
+
+      right.points[0][y][0] = s[0];  right.points[0][y][1] = s[1];
+      right.points[1][y][0] = r1[0]; right.points[1][y][1] = r1[1];
+      right.points[2][y][0] = q2[0]; right.points[2][y][1] = q2[1];
+      right.points[3][y][0] = p3[0]; right.points[3][y][1] = p3[1];
+    }
+
+    for (int i = 0; i < 3; ++i) {
+      left.colors[0][i] = colors[0][i];
+      left.colors[1][i] = (colors[0][i] + colors[3][i]) * 0.5f;
+      left.colors[2][i] = (colors[0][i] + colors[3][i]) * 0.5f;
+      left.colors[3][i] = colors[3][i];
+
+      right.colors[0][i] = (colors[0][i] + colors[3][i]) * 0.5f;
+      right.colors[1][i] = colors[3][i];
+      right.colors[2][i] = colors[2][i];
+      right.colors[3][i] = (colors[1][i] + colors[2][i]) * 0.5f;
+    }
+  }
+
+  void draw_to_bitmap(uint32_t* bitmap, int width, int height) const {
+    MeshVertex v0 = {points[0][0][0], points[0][0][1], colors[0][0], colors[0][1], colors[0][2]};
+    MeshVertex v1 = {points[3][0][0], points[3][0][1], colors[3][0], colors[3][1], colors[3][2]};
+    MeshVertex v2 = {points[3][3][0], points[3][3][1], colors[2][0], colors[2][1], colors[2][2]};
+    MeshVertex v3 = {points[0][3][0], points[0][3][1], colors[1][0], colors[1][1], colors[1][2]};
+
+    draw_gouraud_triangle(bitmap, width, height, v0, v1, v2);
+    draw_gouraud_triangle(bitmap, width, height, v0, v2, v3);
+  }
+};
+
+// Recursively subdivide and draw a Bezier patch
+static void draw_patch_recursive(uint32_t* bitmap, int width, int height,
+                                  const BezierPatch& patch, int depth = 0) {
+  const int max_depth = 8;
+
+  if (patch.is_small() || depth >= max_depth) {
+    patch.draw_to_bitmap(bitmap, width, height);
+    return;
+  }
+
+  BezierPatch top, bottom;
+  patch.subdivide_vertical(top, bottom);
+
+  BezierPatch top_left, top_right;
+  top.subdivide_horizontal(top_left, top_right);
+
+  BezierPatch bottom_left, bottom_right;
+  bottom.subdivide_horizontal(bottom_left, bottom_right);
+
+  draw_patch_recursive(bitmap, width, height, top_left, depth + 1);
+  draw_patch_recursive(bitmap, width, height, top_right, depth + 1);
+  draw_patch_recursive(bitmap, width, height, bottom_left, depth + 1);
+  draw_patch_recursive(bitmap, width, height, bottom_right, depth + 1);
+}
+
+// Rasterize function-based shading (Type 1) to a pixel buffer
+// Pixels are in BL_FORMAT_PRGB32 (BGRA with premultiplied alpha)
+static bool rasterize_function_shading(const Pdf& pdf, const Shading& shading,
+                                        int width, int height, float scale,
+                                        float page_height,
+                                        std::vector<uint32_t>& pixels) {
+  pixels.resize(width * height);
+
+  // Get domain bounds
+  double x_min = shading.domain.size() >= 1 ? shading.domain[0] : 0.0;
+  double x_max = shading.domain.size() >= 2 ? shading.domain[1] : 1.0;
+  double y_min = shading.domain.size() >= 3 ? shading.domain[2] : 0.0;
+  double y_max = shading.domain.size() >= 4 ? shading.domain[3] : 1.0;
+
+  // Get transformation matrix
+  double a = shading.matrix.size() >= 1 ? shading.matrix[0] : 1.0;
+  double b = shading.matrix.size() >= 2 ? shading.matrix[1] : 0.0;
+  double c = shading.matrix.size() >= 3 ? shading.matrix[2] : 0.0;
+  double d = shading.matrix.size() >= 4 ? shading.matrix[3] : 1.0;
+  double e = shading.matrix.size() >= 5 ? shading.matrix[4] : 0.0;
+  double f = shading.matrix.size() >= 6 ? shading.matrix[5] : 0.0;
+
+  // Compute inverse matrix for device-to-domain transform
+  double det = a * d - b * c;
+  if (std::abs(det) < 1e-10) {
+    // Degenerate matrix
+    std::fill(pixels.begin(), pixels.end(), 0xFF808080u);
+    return true;
+  }
+
+  double inv_a = d / det;
+  double inv_b = -b / det;
+  double inv_c = -c / det;
+  double inv_d = a / det;
+  double inv_e = (c * f - d * e) / det;
+  double inv_f = (b * e - a * f) / det;
+
+  // Rasterize each pixel
+  for (int py = 0; py < height; ++py) {
+    for (int px = 0; px < width; ++px) {
+      // Convert pixel coords to user space (flip Y)
+      double ux = px / scale;
+      double uy = (height - 1 - py) / scale;
+
+      // Apply inverse matrix to get domain coordinates
+      double dx = inv_a * ux + inv_c * uy + inv_e;
+      double dy = inv_b * ux + inv_d * uy + inv_f;
+
+      // Check if in domain
+      uint8_t r = 128, g = 128, bl = 128, alpha = 255;
+
+      if (dx >= x_min && dx <= x_max && dy >= y_min && dy <= y_max) {
+        // Evaluate function at (dx, dy)
+        std::vector<double> outputs;
+        if (evaluate_pdf_function(pdf, shading.function, {dx, dy}, outputs)) {
+          if (outputs.size() >= 3) {
+            r = static_cast<uint8_t>(clamp14(outputs[0], 0.0, 1.0) * 255);
+            g = static_cast<uint8_t>(clamp14(outputs[1], 0.0, 1.0) * 255);
+            bl = static_cast<uint8_t>(clamp14(outputs[2], 0.0, 1.0) * 255);
+          } else if (outputs.size() == 1) {
+            uint8_t gray = static_cast<uint8_t>(clamp14(outputs[0], 0.0, 1.0) * 255);
+            r = g = bl = gray;
+          }
+        }
+      } else if (!shading.background.empty()) {
+        if (shading.background.size() >= 3) {
+          r = static_cast<uint8_t>(clamp14(shading.background[0], 0.0, 1.0) * 255);
+          g = static_cast<uint8_t>(clamp14(shading.background[1], 0.0, 1.0) * 255);
+          bl = static_cast<uint8_t>(clamp14(shading.background[2], 0.0, 1.0) * 255);
+        }
+      } else {
+        alpha = 0;
+      }
+
+      // PRGB32 format: BGRA with premultiplied alpha
+      // For opaque pixels (alpha=255), premultiplied == straight
+      if (alpha == 0) {
+        pixels[py * width + px] = 0;
+      } else {
+        pixels[py * width + px] = (static_cast<uint32_t>(alpha) << 24) |
+                                   (static_cast<uint32_t>(r) << 16) |
+                                   (static_cast<uint32_t>(g) << 8) |
+                                   static_cast<uint32_t>(bl);
+      }
+    }
+  }
+
+  return true;
+}
+
 bool Blend2DBackend::draw_shading(const std::string& shading_name) {
   if (!current_pdf_ || !current_page_) {
     return false;
@@ -2722,48 +3352,10 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
 
     BLGradient gradient(BLLinearGradientValues(x0, y0, x1, y1));
 
-    // Extract colors from function
-    if (shading->function.type == Value::DICTIONARY) {
-      auto func_type_it = shading->function.dict.find("FunctionType");
-      if (func_type_it != shading->function.dict.end() &&
-          func_type_it->second.type == Value::NUMBER) {
-        int func_type = static_cast<int>(func_type_it->second.number);
-
-        if (func_type == 2) {
-          // Exponential interpolation
-          auto c0_it = shading->function.dict.find("C0");
-          auto c1_it = shading->function.dict.find("C1");
-
-          float r0 = 0, g0 = 0, b0 = 0;
-          float r1 = 1, g1 = 1, b1 = 1;
-
-          if (c0_it != shading->function.dict.end() && c0_it->second.type == Value::ARRAY) {
-            if (c0_it->second.array.size() >= 3) {
-              r0 = static_cast<float>(c0_it->second.array[0].number);
-              g0 = static_cast<float>(c0_it->second.array[1].number);
-              b0 = static_cast<float>(c0_it->second.array[2].number);
-            }
-          }
-          if (c1_it != shading->function.dict.end() && c1_it->second.type == Value::ARRAY) {
-            if (c1_it->second.array.size() >= 3) {
-              r1 = static_cast<float>(c1_it->second.array[0].number);
-              g1 = static_cast<float>(c1_it->second.array[1].number);
-              b1 = static_cast<float>(c1_it->second.array[2].number);
-            }
-          }
-
-          gradient.add_stop(0.0, BLRgba32(
-            static_cast<uint8_t>(r0 * 255),
-            static_cast<uint8_t>(g0 * 255),
-            static_cast<uint8_t>(b0 * 255),
-            255));
-          gradient.add_stop(1.0, BLRgba32(
-            static_cast<uint8_t>(r1 * 255),
-            static_cast<uint8_t>(g1 * 255),
-            static_cast<uint8_t>(b1 * 255),
-            255));
-        }
-      }
+    // Extract color stops from function (supports Type 2 and Type 3 stitching)
+    auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+    for (auto& s : color_stops) {
+      gradient.add_stop(s.first, s.second);
     }
 
     // Fill page with gradient
@@ -2782,51 +3374,270 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
 
     BLGradient gradient(BLRadialGradientValues(x1, y1, x0, y0, r1, r0));
 
-    // Extract colors (same as axial)
-    if (shading->function.type == Value::DICTIONARY) {
-      auto func_type_it = shading->function.dict.find("FunctionType");
-      if (func_type_it != shading->function.dict.end() &&
-          func_type_it->second.type == Value::NUMBER) {
-        int func_type = static_cast<int>(func_type_it->second.number);
-
-        if (func_type == 2) {
-          auto c0_it = shading->function.dict.find("C0");
-          auto c1_it = shading->function.dict.find("C1");
-
-          float r0_c = 0, g0 = 0, b0 = 0;
-          float r1_c = 1, g1 = 1, b1 = 1;
-
-          if (c0_it != shading->function.dict.end() && c0_it->second.type == Value::ARRAY) {
-            if (c0_it->second.array.size() >= 3) {
-              r0_c = static_cast<float>(c0_it->second.array[0].number);
-              g0 = static_cast<float>(c0_it->second.array[1].number);
-              b0 = static_cast<float>(c0_it->second.array[2].number);
-            }
-          }
-          if (c1_it != shading->function.dict.end() && c1_it->second.type == Value::ARRAY) {
-            if (c1_it->second.array.size() >= 3) {
-              r1_c = static_cast<float>(c1_it->second.array[0].number);
-              g1 = static_cast<float>(c1_it->second.array[1].number);
-              b1 = static_cast<float>(c1_it->second.array[2].number);
-            }
-          }
-
-          gradient.add_stop(0.0, BLRgba32(
-            static_cast<uint8_t>(r0_c * 255),
-            static_cast<uint8_t>(g0 * 255),
-            static_cast<uint8_t>(b0 * 255),
-            255));
-          gradient.add_stop(1.0, BLRgba32(
-            static_cast<uint8_t>(r1_c * 255),
-            static_cast<uint8_t>(g1 * 255),
-            static_cast<uint8_t>(b1 * 255),
-            255));
-        }
-      }
+    // Extract color stops from function (supports Type 2 and Type 3 stitching)
+    auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+    for (auto& s : color_stops) {
+      gradient.add_stop(s.first, s.second);
     }
 
     ctx_.set_fill_style(gradient);
     ctx_.fill_rect(0, 0, width_, height_);
+    return true;
+  }
+  else if (shading->type == ShadingType::FunctionBased) {
+    // Type 1: Function-based shading
+    // Evaluate function at each point in domain and rasterize to bitmap
+
+    // Calculate raster dimensions
+    float x = 0, y = 0;
+    float w = state_.page_width * state_.scale;
+    float h = state_.page_height * state_.scale;
+
+    if (shading->bbox.size() >= 4) {
+      x = static_cast<float>(shading->bbox[0]) * state_.scale;
+      y = (state_.page_height - static_cast<float>(shading->bbox[3])) * state_.scale;
+      w = (static_cast<float>(shading->bbox[2]) - static_cast<float>(shading->bbox[0])) * state_.scale;
+      h = (static_cast<float>(shading->bbox[3]) - static_cast<float>(shading->bbox[1])) * state_.scale;
+    }
+
+    int raster_w = static_cast<int>(w);
+    int raster_h = static_cast<int>(h);
+    if (raster_w <= 0) raster_w = 256;
+    if (raster_h <= 0) raster_h = 256;
+
+    std::vector<uint32_t> pixels;
+    if (rasterize_function_shading(*current_pdf_, *shading, raster_w, raster_h,
+                                    state_.scale, state_.page_height, pixels)) {
+      // Create BLImage from rasterized pixels
+      BLImage shading_img;
+      shading_img.create_from_data(raster_w, raster_h, BL_FORMAT_PRGB32,
+                                    pixels.data(), raster_w * 4);
+
+      // Blit to context at the correct position
+      ctx_.blit_image(BLPointI(static_cast<int>(x), static_cast<int>(y)), shading_img);
+      return true;
+    }
+
+    return false;
+  }
+  else if (shading->type == ShadingType::FreeFormTriangleMesh ||
+           shading->type == ShadingType::LatticeFormTriangleMesh) {
+    // Type 4/5: Triangle mesh shadings
+
+    if (shading->data_stream.empty() || shading->decode.size() < 4) {
+      return false;
+    }
+
+    // Calculate bitmap dimensions
+    float x = 0, y = 0;
+    float w = state_.page_width * state_.scale;
+    float h = state_.page_height * state_.scale;
+    if (shading->bbox.size() >= 4) {
+      x = static_cast<float>(shading->bbox[0]) * state_.scale;
+      y = (state_.page_height - static_cast<float>(shading->bbox[3])) * state_.scale;
+      w = (static_cast<float>(shading->bbox[2]) - static_cast<float>(shading->bbox[0])) * state_.scale;
+      h = (static_cast<float>(shading->bbox[3]) - static_cast<float>(shading->bbox[1])) * state_.scale;
+    }
+
+    int bmp_width = static_cast<int>(w);
+    int bmp_height = static_cast<int>(h);
+    if (bmp_width <= 0 || bmp_height <= 0 || bmp_width > 4096 || bmp_height > 4096) {
+      return false;
+    }
+
+    std::vector<uint32_t> bitmap(bmp_width * bmp_height, 0x00000000);
+
+    // Parse decode array
+    float x_min = static_cast<float>(shading->decode[0]);
+    float x_max = static_cast<float>(shading->decode[1]);
+    float y_min = static_cast<float>(shading->decode[2]);
+    float y_max = static_cast<float>(shading->decode[3]);
+
+    int num_components = 3;
+    std::vector<float> color_min, color_max;
+    for (size_t i = 4; i + 1 < shading->decode.size() && i < 4 + num_components * 2; i += 2) {
+      color_min.push_back(static_cast<float>(shading->decode[i]));
+      color_max.push_back(static_cast<float>(shading->decode[i + 1]));
+    }
+
+    BitStream bit_stream(shading->data_stream.data(), shading->data_stream.size());
+
+    if (shading->type == ShadingType::FreeFormTriangleMesh) {
+      MeshVertex triangle[3];
+      int vertex_count = 0;
+
+      while (!bit_stream.is_eof()) {
+        uint32_t flag = 0;
+        if (shading->bits_per_flag > 0 && bit_stream.bits_remaining() >= static_cast<size_t>(shading->bits_per_flag)) {
+          flag = bit_stream.get_bits(shading->bits_per_flag) & 0x03;
+        } else {
+          break;
+        }
+
+        if (bit_stream.bits_remaining() < static_cast<size_t>(shading->bits_per_coordinate * 2)) break;
+        uint32_t x_enc = bit_stream.get_bits(shading->bits_per_coordinate);
+        uint32_t y_enc = bit_stream.get_bits(shading->bits_per_coordinate);
+
+        MeshVertex vert;
+        vert.x = decode_coord(x_enc, shading->bits_per_coordinate, x_min, x_max) * state_.scale;
+        vert.y = (y_max - decode_coord(y_enc, shading->bits_per_coordinate, y_min, y_max) + y_min) * state_.scale;
+
+        if (bit_stream.bits_remaining() < static_cast<size_t>(shading->bits_per_component * num_components)) break;
+        vert.r = decode_component(bit_stream.get_bits(shading->bits_per_component),
+                                  shading->bits_per_component,
+                                  color_min.size() > 0 ? color_min[0] : 0.0f,
+                                  color_max.size() > 0 ? color_max[0] : 1.0f);
+        vert.g = decode_component(bit_stream.get_bits(shading->bits_per_component),
+                                  shading->bits_per_component,
+                                  color_min.size() > 1 ? color_min[1] : 0.0f,
+                                  color_max.size() > 1 ? color_max[1] : 1.0f);
+        vert.b = decode_component(bit_stream.get_bits(shading->bits_per_component),
+                                  shading->bits_per_component,
+                                  color_min.size() > 2 ? color_min[2] : 0.0f,
+                                  color_max.size() > 2 ? color_max[2] : 1.0f);
+
+        bit_stream.byte_align();
+
+        if (flag == 0) {
+          triangle[0] = vert;
+          vertex_count = 1;
+        } else {
+          if (vertex_count < 3) {
+            triangle[vertex_count++] = vert;
+          }
+
+          if (vertex_count == 3) {
+            draw_gouraud_triangle(bitmap.data(), bmp_width, bmp_height,
+                                  triangle[0], triangle[1], triangle[2]);
+
+            if (flag == 1) {
+              triangle[0] = triangle[1];
+              triangle[1] = triangle[2];
+            } else if (flag == 2) {
+              triangle[1] = triangle[2];
+            }
+            triangle[2] = vert;
+          }
+        }
+      }
+    }
+
+    // Create BLImage from bitmap and blit
+    BLImage mesh_img;
+    mesh_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
+                               bitmap.data(), bmp_width * 4);
+
+    ctx_.blit_image(BLPointI(static_cast<int>(x), static_cast<int>(y)), mesh_img);
+    return true;
+  }
+  else if (shading->type == ShadingType::CoonsPatchMesh ||
+           shading->type == ShadingType::TensorProductPatchMesh) {
+    // Type 6/7: Coons patch / Tensor-product patch mesh shadings
+
+    bool is_tensor = (shading->type == ShadingType::TensorProductPatchMesh);
+
+    if (shading->data_stream.empty() || shading->decode.size() < 4) {
+      return false;
+    }
+
+    // Calculate bitmap dimensions
+    float x = 0, y = 0;
+    float w = state_.page_width * state_.scale;
+    float h = state_.page_height * state_.scale;
+    if (shading->bbox.size() >= 4) {
+      x = static_cast<float>(shading->bbox[0]) * state_.scale;
+      y = (state_.page_height - static_cast<float>(shading->bbox[3])) * state_.scale;
+      w = (static_cast<float>(shading->bbox[2]) - static_cast<float>(shading->bbox[0])) * state_.scale;
+      h = (static_cast<float>(shading->bbox[3]) - static_cast<float>(shading->bbox[1])) * state_.scale;
+    }
+
+    int bmp_width = static_cast<int>(w);
+    int bmp_height = static_cast<int>(h);
+    if (bmp_width <= 0 || bmp_height <= 0 || bmp_width > 4096 || bmp_height > 4096) {
+      return false;
+    }
+
+    std::vector<uint32_t> bitmap(bmp_width * bmp_height, 0x00000000);
+
+    float x_min = static_cast<float>(shading->decode[0]);
+    float x_max = static_cast<float>(shading->decode[1]);
+    float y_min = static_cast<float>(shading->decode[2]);
+    float y_max = static_cast<float>(shading->decode[3]);
+
+    int num_components = 3;
+    std::vector<float> color_min, color_max;
+    for (size_t i = 4; i + 1 < shading->decode.size() && i < 4 + num_components * 2; i += 2) {
+      color_min.push_back(static_cast<float>(shading->decode[i]));
+      color_max.push_back(static_cast<float>(shading->decode[i + 1]));
+    }
+
+    BitStream bit_stream(shading->data_stream.data(), shading->data_stream.size());
+
+    BezierPatch prev_patch;
+    bool have_prev = false;
+
+    while (!bit_stream.is_eof()) {
+      uint32_t flag = 0;
+      if (shading->bits_per_flag > 0 && bit_stream.bits_remaining() >= static_cast<size_t>(shading->bits_per_flag)) {
+        flag = bit_stream.get_bits(shading->bits_per_flag) & 0x03;
+      } else {
+        break;
+      }
+
+      BezierPatch patch;
+
+      int num_points_to_read = is_tensor ? 16 : 12;
+      if (flag > 0 && have_prev) {
+        num_points_to_read = is_tensor ? 12 : 8;
+      }
+
+      // Read control points
+      for (int i = 0; i < 4 && i < num_points_to_read / 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+          if (bit_stream.bits_remaining() < static_cast<size_t>(shading->bits_per_coordinate * 2)) break;
+
+          uint32_t x_enc = bit_stream.get_bits(shading->bits_per_coordinate);
+          uint32_t y_enc = bit_stream.get_bits(shading->bits_per_coordinate);
+
+          patch.points[i][j][0] = decode_coord(x_enc, shading->bits_per_coordinate,
+                                                x_min, x_max) * state_.scale;
+          patch.points[i][j][1] = (y_max - decode_coord(y_enc, shading->bits_per_coordinate,
+                                                         y_min, y_max) + y_min) * state_.scale;
+        }
+      }
+
+      // Read 4 corner colors
+      for (int corner = 0; corner < 4; ++corner) {
+        if (bit_stream.bits_remaining() < static_cast<size_t>(shading->bits_per_component * num_components)) break;
+
+        patch.colors[corner][0] = decode_component(bit_stream.get_bits(shading->bits_per_component),
+                                                    shading->bits_per_component,
+                                                    color_min.size() > 0 ? color_min[0] : 0.0f,
+                                                    color_max.size() > 0 ? color_max[0] : 1.0f);
+        patch.colors[corner][1] = decode_component(bit_stream.get_bits(shading->bits_per_component),
+                                                    shading->bits_per_component,
+                                                    color_min.size() > 1 ? color_min[1] : 0.0f,
+                                                    color_max.size() > 1 ? color_max[1] : 1.0f);
+        patch.colors[corner][2] = decode_component(bit_stream.get_bits(shading->bits_per_component),
+                                                    shading->bits_per_component,
+                                                    color_min.size() > 2 ? color_min[2] : 0.0f,
+                                                    color_max.size() > 2 ? color_max[2] : 1.0f);
+      }
+
+      bit_stream.byte_align();
+
+      draw_patch_recursive(bitmap.data(), bmp_width, bmp_height, patch);
+
+      prev_patch = patch;
+      have_prev = true;
+    }
+
+    // Create BLImage from bitmap and blit
+    BLImage mesh_img;
+    mesh_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
+                               bitmap.data(), bmp_width * 4);
+
+    ctx_.blit_image(BLPointI(static_cast<int>(x), static_cast<int>(y)), mesh_img);
     return true;
   }
 
@@ -4380,39 +5191,11 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
 
       BLGradient gradient(BLLinearGradientValues(x0, y0, x1, y1));
 
-      // Get colors from function
-      uint8_t start_r = 0, start_g = 0, start_b = 0;
-      uint8_t end_r = 255, end_g = 255, end_b = 255;
-
-      if (shading->function.type == Value::DICTIONARY) {
-        auto func_type_it = shading->function.dict.find("FunctionType");
-        if (func_type_it != shading->function.dict.end() &&
-            func_type_it->second.type == Value::NUMBER &&
-            static_cast<int>(func_type_it->second.number) == 2) {
-          auto c0_it = shading->function.dict.find("C0");
-          auto c1_it = shading->function.dict.find("C1");
-
-          if (c0_it != shading->function.dict.end() && c0_it->second.type == Value::ARRAY) {
-            const auto& c0 = c0_it->second.array;
-            if (c0.size() >= 3) {
-              start_r = static_cast<uint8_t>(c0[0].number * 255);
-              start_g = static_cast<uint8_t>(c0[1].number * 255);
-              start_b = static_cast<uint8_t>(c0[2].number * 255);
-            }
-          }
-          if (c1_it != shading->function.dict.end() && c1_it->second.type == Value::ARRAY) {
-            const auto& c1 = c1_it->second.array;
-            if (c1.size() >= 3) {
-              end_r = static_cast<uint8_t>(c1[0].number * 255);
-              end_g = static_cast<uint8_t>(c1[1].number * 255);
-              end_b = static_cast<uint8_t>(c1[2].number * 255);
-            }
-          }
-        }
+      // Extract color stops from function (supports Type 2 and Type 3 stitching)
+      auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+      for (auto& s : color_stops) {
+        gradient.add_stop(s.first, s.second);
       }
-
-      gradient.add_stop(0.0, BLRgba32(start_r, start_g, start_b, 255));
-      gradient.add_stop(1.0, BLRgba32(end_r, end_g, end_b, 255));
 
       if (is_stroke) {
         ctx_.set_stroke_style(gradient);
@@ -4462,39 +5245,11 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
 
       BLGradient gradient(BLRadialGradientValues(x1, y1, x0, y0, r1, r0));
 
-      // Get colors from function (similar to axial)
-      uint8_t start_r = 0, start_g = 0, start_b = 0;
-      uint8_t end_r = 255, end_g = 255, end_b = 255;
-
-      if (shading->function.type == Value::DICTIONARY) {
-        auto func_type_it = shading->function.dict.find("FunctionType");
-        if (func_type_it != shading->function.dict.end() &&
-            func_type_it->second.type == Value::NUMBER &&
-            static_cast<int>(func_type_it->second.number) == 2) {
-          auto c0_it = shading->function.dict.find("C0");
-          auto c1_it = shading->function.dict.find("C1");
-
-          if (c0_it != shading->function.dict.end() && c0_it->second.type == Value::ARRAY) {
-            const auto& c0 = c0_it->second.array;
-            if (c0.size() >= 3) {
-              start_r = static_cast<uint8_t>(c0[0].number * 255);
-              start_g = static_cast<uint8_t>(c0[1].number * 255);
-              start_b = static_cast<uint8_t>(c0[2].number * 255);
-            }
-          }
-          if (c1_it != shading->function.dict.end() && c1_it->second.type == Value::ARRAY) {
-            const auto& c1 = c1_it->second.array;
-            if (c1.size() >= 3) {
-              end_r = static_cast<uint8_t>(c1[0].number * 255);
-              end_g = static_cast<uint8_t>(c1[1].number * 255);
-              end_b = static_cast<uint8_t>(c1[2].number * 255);
-            }
-          }
-        }
+      // Extract color stops from function (supports Type 2 and Type 3 stitching)
+      auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+      for (auto& s : color_stops) {
+        gradient.add_stop(s.first, s.second);
       }
-
-      gradient.add_stop(0.0, BLRgba32(start_r, start_g, start_b, 255));
-      gradient.add_stop(1.0, BLRgba32(end_r, end_g, end_b, 255));
 
       if (is_stroke) {
         ctx_.set_stroke_style(gradient);
@@ -4505,7 +5260,7 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
     }
   }
   else if (pattern->type == PatternType::Tiling && pattern->tiling) {
-    // Tiling pattern - render tile to an image and create BLPattern
+    // Tiling pattern - render tile content stream to an image and create BLPattern
     auto& tiling = *pattern->tiling;
 
     // Calculate tile dimensions from bbox
@@ -4515,48 +5270,113 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
       tile_height = static_cast<float>(tiling.bbox[3] - tiling.bbox[1]);
     }
 
-    // Apply step if specified
-    float x_step = tiling.x_step > 0 ? static_cast<float>(tiling.x_step) : tile_width;
-    float y_step = tiling.y_step > 0 ? static_cast<float>(tiling.y_step) : tile_height;
+    if (tile_width <= 0 || tile_height <= 0 || tiling.content_stream.empty()) {
+      // No content to render - fallback
+      if (is_stroke) {
+        ctx_.set_stroke_style(BLRgba32(128, 128, 128, 255));
+      } else {
+        ctx_.set_fill_style(BLRgba32(200, 200, 200, 255));
+      }
+      return true;
+    }
 
     // Scale tile dimensions
-    uint32_t img_width = static_cast<uint32_t>(x_step * state_.scale);
-    uint32_t img_height = static_cast<uint32_t>(y_step * state_.scale);
+    float pattern_scale = state_.scale;
+    uint32_t img_width = static_cast<uint32_t>(std::ceil(tile_width * pattern_scale));
+    uint32_t img_height = static_cast<uint32_t>(std::ceil(tile_height * pattern_scale));
 
-    if (img_width == 0) img_width = 32;
-    if (img_height == 0) img_height = 32;
-    if (img_width > 512) img_width = 512;  // Limit size for performance
+    if (img_width == 0) img_width = 1;
+    if (img_height == 0) img_height = 1;
+    if (img_width > 512) img_width = 512;
     if (img_height > 512) img_height = 512;
 
-    // Create tile image
+    // Create tile image and context
     BLImage tile_image(img_width, img_height, BL_FORMAT_PRGB32);
     BLContext tile_ctx(tile_image);
 
-    // Clear with transparent
-    tile_ctx.set_comp_op(BL_COMP_OP_CLEAR);
-    tile_ctx.fill_all();
-    tile_ctx.set_comp_op(BL_COMP_OP_SRC_OVER);
-
-    // For colored tiles, we would render the content stream
-    // For now, use a simple placeholder pattern
+    // Clear with transparent (colored) or white (uncolored)
     if (tiling.paint_type == TilingPaintType::ColoredTiles) {
-      // Use a checkered pattern as placeholder
-      tile_ctx.set_fill_style(BLRgba32(200, 200, 200, 255));
-      tile_ctx.fill_rect(0, 0, img_width / 2, img_height / 2);
-      tile_ctx.fill_rect(img_width / 2, img_height / 2, img_width / 2, img_height / 2);
-      tile_ctx.set_fill_style(BLRgba32(230, 230, 230, 255));
-      tile_ctx.fill_rect(img_width / 2, 0, img_width / 2, img_height / 2);
-      tile_ctx.fill_rect(0, img_height / 2, img_width / 2, img_height / 2);
+      tile_ctx.set_comp_op(BL_COMP_OP_CLEAR);
+      tile_ctx.fill_all();
+      tile_ctx.set_comp_op(BL_COMP_OP_SRC_OVER);
     } else {
-      // Uncolored tiles - use current fill color
-      tile_ctx.set_fill_style(BLRgba32(state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a));
+      tile_ctx.set_fill_style(BLRgba32(255, 255, 255, 255));
       tile_ctx.fill_all();
     }
 
-    tile_ctx.end();
+    // Save current rendering state
+    BLImage saved_image = std::move(image_);
+    BLContext saved_ctx = std::move(ctx_);
+    uint32_t saved_width = width_;
+    uint32_t saved_height = height_;
+    GraphicsState saved_state = state_;
 
-    // Create repeating pattern
-    BLPattern bl_pattern(tile_image, BL_EXTEND_MODE_REPEAT);
+    // Switch to tile canvas
+    image_ = std::move(tile_image);
+    ctx_ = std::move(tile_ctx);
+    width_ = img_width;
+    height_ = img_height;
+
+    // Reset graphics state for tile rendering
+    state_ = GraphicsState();
+    state_.page_width = tile_width;
+    state_.page_height = tile_height;
+    state_.scale = pattern_scale;
+
+    // Push pattern resources if available
+    if (!tiling.resources.empty()) {
+      form_resources_stack_.push_back(tiling.resources);
+    }
+
+    // Parse and render the tile content stream
+    parse_pdf_content(tiling.content_stream);
+
+    // Pop pattern resources
+    if (!tiling.resources.empty() && !form_resources_stack_.empty()) {
+      form_resources_stack_.pop_back();
+    }
+
+    // Retrieve rendered tile
+    ctx_.end();
+    BLImage rendered_tile = std::move(image_);
+
+    // Restore original state
+    image_ = std::move(saved_image);
+    ctx_ = std::move(saved_ctx);
+    width_ = saved_width;
+    height_ = saved_height;
+    state_ = saved_state;
+
+    // For uncolored tiles: convert rendered content to alpha mask and apply current fill color
+    if (tiling.paint_type == TilingPaintType::UncoloredTiles) {
+      BLImageData tile_data;
+      rendered_tile.get_data(&tile_data);
+      uint8_t* pixels = static_cast<uint8_t*>(tile_data.pixel_data);
+
+      uint8_t pattern_r = is_stroke ? state_.stroke_r : state_.fill_r;
+      uint8_t pattern_g = is_stroke ? state_.stroke_g : state_.fill_g;
+      uint8_t pattern_b = is_stroke ? state_.stroke_b : state_.fill_b;
+
+      for (uint32_t py = 0; py < img_height; ++py) {
+        for (uint32_t px = 0; px < img_width; ++px) {
+          size_t idx = py * tile_data.stride + px * 4;
+          // PRGB32 is BGRA order
+          uint8_t b_val = pixels[idx + 0];
+          uint8_t g_val = pixels[idx + 1];
+          uint8_t r_val = pixels[idx + 2];
+          // Convert RGB to intensity, invert (white bg → 0 alpha, black content → 255 alpha)
+          uint8_t intensity = static_cast<uint8_t>(255 - ((r_val + g_val + b_val) / 3));
+          // Apply fill color with intensity as alpha (premultiplied)
+          pixels[idx + 0] = static_cast<uint8_t>((pattern_b * intensity) / 255);
+          pixels[idx + 1] = static_cast<uint8_t>((pattern_g * intensity) / 255);
+          pixels[idx + 2] = static_cast<uint8_t>((pattern_r * intensity) / 255);
+          pixels[idx + 3] = intensity;
+        }
+      }
+    }
+
+    // Create repeating pattern - Blend2D handles tiling natively
+    BLPattern bl_pattern(rendered_tile, BL_EXTEND_MODE_REPEAT);
 
     // Apply pattern matrix
     if (pattern->matrix.size() >= 6) {
