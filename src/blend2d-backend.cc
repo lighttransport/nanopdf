@@ -4546,8 +4546,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         if (operands.size() >= 2) {
           float tx = std::stof(operands[0]);
           float ty = std::stof(operands[1]);
-          state_.text_matrix.e += tx;
-          state_.text_matrix.f += ty;
+          state_.text_matrix.e += tx * state_.text_matrix.a + ty * state_.text_matrix.c;
+          state_.text_matrix.f += tx * state_.text_matrix.b + ty * state_.text_matrix.d;
           state_.text_line_matrix = state_.text_matrix;
         }
       } else if (token == "TD") {
@@ -4555,8 +4555,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           float tx = std::stof(operands[0]);
           float ty = std::stof(operands[1]);
           state_.text_leading = -ty;
-          state_.text_matrix.e += tx;
-          state_.text_matrix.f += ty;
+          state_.text_matrix.e += tx * state_.text_matrix.a + ty * state_.text_matrix.c;
+          state_.text_matrix.f += tx * state_.text_matrix.b + ty * state_.text_matrix.d;
           state_.text_line_matrix = state_.text_matrix;
         }
       } else if (token == "Tm") {
@@ -4570,8 +4570,11 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.text_line_matrix = state_.text_matrix;
         }
       } else if (token == "T*") {
-        state_.text_matrix.e = state_.text_line_matrix.e;
-        state_.text_matrix.f = state_.text_line_matrix.f - state_.text_leading;
+        // Equivalent to: 0 -TL Td
+        float leading = state_.text_leading;
+        if (leading == 0) leading = state_.font_size;
+        state_.text_matrix.e = state_.text_line_matrix.e + (-leading) * state_.text_line_matrix.c;
+        state_.text_matrix.f = state_.text_line_matrix.f + (-leading) * state_.text_line_matrix.d;
         state_.text_line_matrix = state_.text_matrix;
       } else if (token == "TL") {
         if (operands.size() >= 1) {
@@ -4847,6 +4850,10 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           m.f = std::stof(operands[5]);
           state_.transform = state_.transform * m;
         }
+      } else if (token == "ri") {
+        // Rendering intent - not implemented (color management)
+      } else if (token == "i") {
+        // Flatness tolerance - not implemented
       }
 
       operands.clear();
