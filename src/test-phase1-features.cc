@@ -58,6 +58,239 @@ void test_runlength_decode() {
   std::cout << "RunLengthDecode tests completed successfully!" << std::endl << std::endl;
 }
 
+// Test ASCII85Decode filter
+void test_ascii85_decode() {
+  std::cout << "Testing ASCII85Decode filter..." << std::endl;
+
+  // Test case 1: Standard encoding of "Man " (RFC example)
+  // "Man " = 0x4D616E20 => base-85 digits: 9*85^3 + 60*85^2 + 51*85 + 8 + 33 offsets = "9jqo^"
+  {
+    const char *encoded = "9jqo^~>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 4);
+    assert(result.data[0] == 'M');
+    assert(result.data[1] == 'a');
+    assert(result.data[2] == 'n');
+    assert(result.data[3] == ' ');
+    std::cout << "  Test 1 (standard group): PASSED" << std::endl;
+  }
+
+  // Test case 2: 'z' shorthand for four zero bytes
+  {
+    const char *encoded = "z~>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 4);
+    assert(result.data[0] == 0);
+    assert(result.data[1] == 0);
+    assert(result.data[2] == 0);
+    assert(result.data[3] == 0);
+    std::cout << "  Test 2 (z shorthand): PASSED" << std::endl;
+  }
+
+  // Test case 3: Partial group (fewer than 5 encoded chars)
+  // Encoding of "Ma" (2 bytes) → 3 encoded chars "9jq"
+  {
+    const char *encoded = "9jq~>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 2);
+    assert(result.data[0] == 'M');
+    assert(result.data[1] == 'a');
+    std::cout << "  Test 3 (partial group): PASSED" << std::endl;
+  }
+
+  // Test case 4: Whitespace is ignored
+  {
+    const char *encoded = "9jqo ^\r\n~>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 4);
+    assert(result.data[0] == 'M');
+    assert(result.data[1] == 'a');
+    assert(result.data[2] == 'n');
+    assert(result.data[3] == ' ');
+    std::cout << "  Test 4 (whitespace ignored): PASSED" << std::endl;
+  }
+
+  // Test case 5: Multiple groups + z
+  {
+    // "Man " + 4 zeros = "9jqo^" + "z"
+    const char *encoded = "9jqo^z~>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 8);
+    assert(result.data[0] == 'M');
+    assert(result.data[4] == 0);
+    assert(result.data[5] == 0);
+    assert(result.data[6] == 0);
+    assert(result.data[7] == 0);
+    std::cout << "  Test 5 (multiple groups + z): PASSED" << std::endl;
+  }
+
+  // Test case 6: Empty input (just end marker)
+  {
+    const char *encoded = "~>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 0);
+    std::cout << "  Test 6 (empty input): PASSED" << std::endl;
+  }
+
+  // Test case 7: Invalid character
+  {
+    const char *encoded = "9jqo{~>";  // '{' is out of '!'..'u' range
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(!result.success);
+    std::cout << "  Test 7 (invalid character): PASSED" << std::endl;
+  }
+
+  // Test case 8: Longer known encoding
+  // "Hello" = 0x48656C6C 6F => "87cUR" + partial "DZ"
+  {
+    const char *encoded = "87cURDZ~>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_ascii85(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 5);
+    assert(result.data[0] == 'H');
+    assert(result.data[1] == 'e');
+    assert(result.data[2] == 'l');
+    assert(result.data[3] == 'l');
+    assert(result.data[4] == 'o');
+    std::cout << "  Test 8 (Hello encoding): PASSED" << std::endl;
+  }
+
+  std::cout << "ASCII85Decode tests completed successfully!" << std::endl << std::endl;
+}
+
+// Test LZWDecode filter
+void test_lzw_decode() {
+  std::cout << "Testing LZWDecode filter..." << std::endl;
+
+  // LZW encoding uses MSB-first bit packing, starting with 9-bit codes.
+  // Clear code = 256, EOD code = 257.
+
+  // Test case 1: Clear + single byte + EOD
+  // Encode: CLEAR(256) + 'A'(65) + EOD(257)
+  // 9-bit codes: 256=0x100, 65=0x041, 257=0x101
+  // Bit stream (MSB first):
+  //   100000000 000100001 100000001
+  //   = 1000 0000 0000 1000 0110 0000 001(0 0000)
+  //   = 0x80 0x08 0x60 0x20
+  {
+    uint8_t encoded[] = {0x80, 0x10, 0x60, 0x20};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_lzw(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 1);
+    assert(result.data[0] == 'A');
+    std::cout << "  Test 1 (single byte): PASSED" << std::endl;
+  }
+
+  // Test case 2: Clear + multiple bytes + EOD
+  // Encode: CLEAR(256) + 'A'(65) + 'B'(66) + 'C'(67) + EOD(257)
+  // 9-bit codes: 256, 65, 66, 67, 257
+  // Binary (MSB-first, 9 bits each):
+  //   100000000 001000001 001000010 001000011 100000001
+  // Pack into bytes:
+  //   10000000 00010000 01001000 01000100 00111000 00001(000)
+  //   0x80     0x10     0x48     0x44     0x38     0x08
+  {
+    uint8_t encoded[] = {0x80, 0x10, 0x48, 0x44, 0x38, 0x08};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_lzw(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 3);
+    assert(result.data[0] == 'A');
+    assert(result.data[1] == 'B');
+    assert(result.data[2] == 'C');
+    std::cout << "  Test 2 (multiple bytes): PASSED" << std::endl;
+  }
+
+  // Test case 3: Clear + repeated byte (triggers dictionary entry) + EOD
+  // Encode: CLEAR(256) + 'A'(65) + 'A'(65) + 258(="AA") + EOD(257)
+  // After first 'A' and second 'A', dict entry 258="AA" is created.
+  // Then code 258 outputs "AA".
+  // 9-bit codes: 256, 65, 65, 258, 257
+  // Binary:
+  //   100000000 001000001 001000001 100000010 100000001
+  // Pack:
+  //   10000000 00010000 01001000 00110000 00101000 00001(000)
+  //   0x80     0x10     0x48     0x30     0x28     0x08
+  {
+    uint8_t encoded[] = {0x80, 0x10, 0x48, 0x30, 0x28, 0x08};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_lzw(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 4);
+    assert(result.data[0] == 'A');
+    assert(result.data[1] == 'A');
+    assert(result.data[2] == 'A');
+    assert(result.data[3] == 'A');
+    std::cout << "  Test 3 (repeated byte with dict): PASSED" << std::endl;
+  }
+
+  // Test case 4: Empty data should fail
+  {
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_lzw(nullptr, 0, params);
+
+    // Should either fail or produce empty output
+    // Implementation returns error on get_code failure
+    assert(!result.success || result.data.empty());
+    std::cout << "  Test 4 (empty input): PASSED" << std::endl;
+  }
+
+  // Test case 5: Clear + EOD only (no data)
+  // 9-bit codes: 256, 257
+  // Binary: 100000000 100000001
+  // Pack: 10000000 01000000 01(000000)
+  //        0x80     0x40     0x40
+  {
+    uint8_t encoded[] = {0x80, 0x40, 0x40};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_lzw(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 0);
+    std::cout << "  Test 5 (clear + EOD only): PASSED" << std::endl;
+  }
+
+  std::cout << "LZWDecode tests completed successfully!" << std::endl << std::endl;
+}
+
 // Test Color Space parsing
 void test_color_space_parsing() {
   std::cout << "Testing ColorSpace parsing..." << std::endl;
@@ -260,6 +493,8 @@ int main() {
   std::cout << "=== Phase 1 Feature Tests ===" << std::endl << std::endl;
 
   test_runlength_decode();
+  test_ascii85_decode();
+  test_lzw_decode();
   test_color_space_parsing();
   test_image_xobject_parsing();
 
