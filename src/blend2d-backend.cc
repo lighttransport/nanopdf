@@ -2778,6 +2778,44 @@ const Value* Blend2DBackend::lookup_resource(const std::string& resource_type, c
   return nullptr;
 }
 
+Dictionary Blend2DBackend::lookup_resource_type_dict(const std::string& resource_type) const {
+  // Check Form XObject resources stack (from top to bottom)
+  for (auto it = form_resources_stack_.rbegin(); it != form_resources_stack_.rend(); ++it) {
+    auto type_it = it->find(resource_type);
+    if (type_it != it->end()) {
+      Value resolved_dict = type_it->second;
+      if (resolved_dict.type == Value::REFERENCE && current_pdf_) {
+        auto resolved = resolve_reference(*current_pdf_, resolved_dict.ref_object_number,
+                                          resolved_dict.ref_generation_number);
+        if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+          return resolved.value.dict;
+        }
+      } else if (resolved_dict.type == Value::DICTIONARY) {
+        return resolved_dict.dict;
+      }
+    }
+  }
+
+  // Fall back to page resources
+  if (current_page_) {
+    auto type_it = current_page_->resources.find(resource_type);
+    if (type_it != current_page_->resources.end()) {
+      Value resolved_dict = type_it->second;
+      if (resolved_dict.type == Value::REFERENCE && current_pdf_) {
+        auto resolved = resolve_reference(*current_pdf_, resolved_dict.ref_object_number,
+                                          resolved_dict.ref_generation_number);
+        if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+          return resolved.value.dict;
+        }
+      } else if (resolved_dict.type == Value::DICTIONARY) {
+        return resolved_dict.dict;
+      }
+    }
+  }
+
+  return Dictionary();
+}
+
 // Extract color stops from a PDF function (Type 2 or Type 3 stitching)
 // Returns vector of (offset, BLRgba32) pairs suitable for BLGradient::add_stop()
 static std::vector<std::pair<float, BLRgba32>> extract_color_stops_from_function(
@@ -3294,24 +3332,9 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     return false;
   }
 
-  // Look up shading from page resources
-  auto shading_dict_it = current_page_->resources.find("Shading");
-  if (shading_dict_it == current_page_->resources.end()) {
-    return false;
-  }
-
-  Dictionary shading_resources;
-  if (shading_dict_it->second.type == Value::DICTIONARY) {
-    shading_resources = shading_dict_it->second.dict;
-  } else if (shading_dict_it->second.type == Value::REFERENCE) {
-    auto resolved = resolve_reference(*current_pdf_,
-                                      shading_dict_it->second.ref_object_number,
-                                      shading_dict_it->second.ref_generation_number);
-    if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
-      return false;
-    }
-    shading_resources = resolved.value.dict;
-  } else {
+  // Look up shading from resources (Form XObject stack first, then page)
+  Dictionary shading_resources = lookup_resource_type_dict("Shading");
+  if (shading_resources.empty()) {
     return false;
   }
 
@@ -4326,20 +4349,9 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           if (!gs_name.empty() && gs_name[0] == '/') {
             gs_name = gs_name.substr(1);
           }
-          // Look up ExtGState from page resources
-          auto extgstate_it = current_page_->resources.find("ExtGState");
-          if (extgstate_it != current_page_->resources.end()) {
-            Dictionary extgstate_dict;
-            if (extgstate_it->second.type == Value::DICTIONARY) {
-              extgstate_dict = extgstate_it->second.dict;
-            } else if (extgstate_it->second.type == Value::REFERENCE) {
-              auto resolved = resolve_reference(*current_pdf_,
-                                                extgstate_it->second.ref_object_number,
-                                                extgstate_it->second.ref_generation_number);
-              if (resolved.success && resolved.value.type == Value::DICTIONARY) {
-                extgstate_dict = resolved.value.dict;
-              }
-            }
+          // Look up ExtGState from resources (Form XObject stack first, then page)
+          Dictionary extgstate_dict = lookup_resource_type_dict("ExtGState");
+          if (!extgstate_dict.empty()) {
             // Find the specific graphics state
             auto gs_it = extgstate_dict.find(gs_name);
             if (gs_it != extgstate_dict.end()) {
@@ -4687,21 +4699,9 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             xobj_name = xobj_name.substr(1);
           }
 
-          // Look up XObject in page resources
-          auto xobj_it = current_page_->resources.find("XObject");
-          if (xobj_it != current_page_->resources.end()) {
-            Dictionary xobj_dict;
-            if (xobj_it->second.type == Value::REFERENCE) {
-              auto resolved = resolve_reference(*current_pdf_,
-                  xobj_it->second.ref_object_number,
-                  xobj_it->second.ref_generation_number);
-              if (resolved.success && resolved.value.type == Value::DICTIONARY) {
-                xobj_dict = resolved.value.dict;
-              }
-            } else if (xobj_it->second.type == Value::DICTIONARY) {
-              xobj_dict = xobj_it->second.dict;
-            }
-
+          // Look up XObject from resources (Form XObject stack first, then page)
+          Dictionary xobj_dict = lookup_resource_type_dict("XObject");
+          if (!xobj_dict.empty()) {
             auto entry_it = xobj_dict.find(xobj_name);
             if (entry_it != xobj_dict.end()) {
               Value xobj_value;
@@ -4777,7 +4777,49 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                         form_matrix.f = static_cast<float>(matrix_it->second.array[5].number);
                         state_.transform = state_.transform * form_matrix;
                       }
+
+                      // Apply BBox clipping if present
+                      bool has_bbox_clip = false;
+                      auto bbox_it = xobj_value.stream.dict.find("BBox");
+                      if (bbox_it != xobj_value.stream.dict.end() &&
+                          bbox_it->second.type == Value::ARRAY &&
+                          bbox_it->second.array.size() >= 4) {
+                        float bx0 = static_cast<float>(bbox_it->second.array[0].number);
+                        float by0 = static_cast<float>(bbox_it->second.array[1].number);
+                        float bx1 = static_cast<float>(bbox_it->second.array[2].number);
+                        float by1 = static_cast<float>(bbox_it->second.array[3].number);
+
+                        // Transform BBox corners through the current CTM
+                        float x0 = bx0, y0 = by0;
+                        float x1 = bx1, y1 = by1;
+                        state_.transform.transform(x0, y0);
+                        state_.transform.transform(x1, y1);
+
+                        // Convert to screen coordinates (Y-flip) and scale
+                        float sx0 = x0 * state_.scale;
+                        float sy0 = (state_.page_height - y0) * state_.scale;
+                        float sx1 = x1 * state_.scale;
+                        float sy1 = (state_.page_height - y1) * state_.scale;
+
+                        // Normalize to get min/max
+                        float clip_x = std::min(sx0, sx1);
+                        float clip_y = std::min(sy0, sy1);
+                        float clip_w = std::abs(sx1 - sx0);
+                        float clip_h = std::abs(sy1 - sy0);
+
+                        if (clip_w > 0 && clip_h > 0) {
+                          ctx_.save();
+                          ctx_.clip_to_rect(clip_x, clip_y, clip_w, clip_h);
+                          has_bbox_clip = true;
+                        }
+                      }
+
                       parse_pdf_content(decoded.data);
+
+                      // Restore BBox clipping
+                      if (has_bbox_clip) {
+                        ctx_.restore();
+                      }
 
                       // Pop Form resources from stack
                       if (has_form_resources) {
@@ -5105,24 +5147,9 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
     return false;
   }
 
-  // Look up pattern resources
-  auto pattern_dict_it = current_page_->resources.find("Pattern");
-  if (pattern_dict_it == current_page_->resources.end()) {
-    return false;
-  }
-
-  Dictionary pattern_resources;
-  if (pattern_dict_it->second.type == Value::DICTIONARY) {
-    pattern_resources = pattern_dict_it->second.dict;
-  } else if (pattern_dict_it->second.type == Value::REFERENCE) {
-    auto resolved = resolve_reference(*current_pdf_,
-                                      pattern_dict_it->second.ref_object_number,
-                                      pattern_dict_it->second.ref_generation_number);
-    if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
-      return false;
-    }
-    pattern_resources = resolved.value.dict;
-  } else {
+  // Look up pattern from resources (Form XObject stack first, then page)
+  Dictionary pattern_resources = lookup_resource_type_dict("Pattern");
+  if (pattern_resources.empty()) {
     return false;
   }
 

@@ -300,6 +300,10 @@ private:
 
   // Helper to lookup a resource, checking Form resources first, then page resources
   const Value* lookup_resource(const std::string& resource_type, const std::string& name) const;
+
+  // Helper to lookup a resource type sub-dictionary (e.g., "Shading", "ExtGState"),
+  // checking form_resources_stack_ first (top-down), then falling back to page resources.
+  Dictionary lookup_resource_type_dict(const std::string& resource_type) const;
 };
 
 }  // namespace nanopdf
