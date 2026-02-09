@@ -790,6 +790,208 @@ void test_color_space_parsing() {
     std::cout << "  Test 4 (CalGray with params): PASSED" << std::endl;
   }
 
+  // Test case 5: CalRGB with WhitePoint, Gamma, Matrix
+  {
+    Value cs_value;
+    cs_value.SetType(Value::ARRAY);
+
+    Value type_val;
+    type_val.SetType(Value::NAME);
+    type_val.name = "CalRGB";
+    cs_value.array.push_back(type_val);
+
+    Value params_val;
+    params_val.SetType(Value::DICTIONARY);
+
+    // WhitePoint D65
+    Value wp_val;
+    wp_val.SetType(Value::ARRAY);
+    for (double d : {0.9505, 1.0, 1.0890}) {
+      Value v;
+      v.SetType(Value::NUMBER);
+      v.number = d;
+      wp_val.array.push_back(v);
+    }
+    params_val.dict["WhitePoint"] = wp_val;
+
+    // Gamma [2.2, 2.2, 2.2]
+    Value gamma_val;
+    gamma_val.SetType(Value::ARRAY);
+    for (int i = 0; i < 3; i++) {
+      Value v;
+      v.SetType(Value::NUMBER);
+      v.number = 2.2;
+      gamma_val.array.push_back(v);
+    }
+    params_val.dict["Gamma"] = gamma_val;
+
+    // Matrix (identity-like, 9 values)
+    Value mat_val;
+    mat_val.SetType(Value::ARRAY);
+    double mat[] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    for (double d : mat) {
+      Value v;
+      v.SetType(Value::NUMBER);
+      v.number = d;
+      mat_val.array.push_back(v);
+    }
+    params_val.dict["Matrix"] = mat_val;
+
+    cs_value.array.push_back(params_val);
+
+    ColorSpace cs = parse_color_space(pdf, cs_value);
+    assert(cs.type == ColorSpaceType::CalRGB);
+    assert(cs.white_point.size() == 3);
+    assert(cs.gamma.size() == 3);
+    assert(cs.gamma[0] == 2.2);
+    assert(cs.matrix.size() == 9);
+    assert(cs.matrix[0] == 1.0);
+    assert(cs.matrix[4] == 1.0);
+    std::cout << "  Test 5 (CalRGB): PASSED" << std::endl;
+  }
+
+  // Test case 6: Indexed color space with RGB base and lookup table
+  {
+    Value cs_value;
+    cs_value.SetType(Value::ARRAY);
+
+    // [/Indexed /DeviceRGB 2 <lookup_string>]
+    Value type_val;
+    type_val.SetType(Value::NAME);
+    type_val.name = "Indexed";
+    cs_value.array.push_back(type_val);
+
+    Value base_val;
+    base_val.SetType(Value::NAME);
+    base_val.name = "DeviceRGB";
+    cs_value.array.push_back(base_val);
+
+    Value hival_val;
+    hival_val.SetType(Value::NUMBER);
+    hival_val.number = 2;
+    cs_value.array.push_back(hival_val);
+
+    // Lookup table: 3 colors * 3 components = 9 bytes
+    // Index 0 = Red(255,0,0), Index 1 = Green(0,255,0), Index 2 = Blue(0,0,255)
+    Value lookup_val;
+    lookup_val.SetType(Value::STRING);
+    lookup_val.str = std::string("\xFF\x00\x00\x00\xFF\x00\x00\x00\xFF", 9);
+    cs_value.array.push_back(lookup_val);
+
+    ColorSpace cs = parse_color_space(pdf, cs_value);
+    assert(cs.type == ColorSpaceType::Indexed);
+    assert(cs.base_color_space != nullptr);
+    assert(cs.base_color_space->type == ColorSpaceType::DeviceRGB);
+    assert(cs.hival == 2);
+    assert(cs.lookup_table.size() == 9);
+    assert(cs.lookup_table[0] == 0xFF);  // Red R
+    assert(cs.lookup_table[1] == 0x00);  // Red G
+    assert(cs.lookup_table[3] == 0x00);  // Green R
+    assert(cs.lookup_table[4] == 0xFF);  // Green G
+    std::cout << "  Test 6 (Indexed RGB): PASSED" << std::endl;
+  }
+
+  // Test case 7: Separation color space
+  {
+    Value cs_value;
+    cs_value.SetType(Value::ARRAY);
+
+    // [/Separation /PANTONE_Red /DeviceCMYK <tint_function>]
+    Value type_val;
+    type_val.SetType(Value::NAME);
+    type_val.name = "Separation";
+    cs_value.array.push_back(type_val);
+
+    Value name_val;
+    name_val.SetType(Value::NAME);
+    name_val.name = "PANTONE_Red";
+    cs_value.array.push_back(name_val);
+
+    Value alt_val;
+    alt_val.SetType(Value::NAME);
+    alt_val.name = "DeviceCMYK";
+    cs_value.array.push_back(alt_val);
+
+    Value func_val;
+    func_val.SetType(Value::DICTIONARY);  // placeholder tint function
+    cs_value.array.push_back(func_val);
+
+    ColorSpace cs = parse_color_space(pdf, cs_value);
+    assert(cs.type == ColorSpaceType::Separation);
+    assert(cs.name == "PANTONE_Red");
+    assert(cs.base_color_space != nullptr);
+    assert(cs.base_color_space->type == ColorSpaceType::DeviceCMYK);
+    assert(cs.tint_function.type == Value::DICTIONARY);
+    std::cout << "  Test 7 (Separation): PASSED" << std::endl;
+  }
+
+  // Test case 8: DeviceN color space
+  {
+    Value cs_value;
+    cs_value.SetType(Value::ARRAY);
+
+    // [/DeviceN [/Cyan /Magenta /Yellow] /DeviceCMYK <tint_function>]
+    Value type_val;
+    type_val.SetType(Value::NAME);
+    type_val.name = "DeviceN";
+    cs_value.array.push_back(type_val);
+
+    Value names_val;
+    names_val.SetType(Value::ARRAY);
+    for (const char* n : {"Cyan", "Magenta", "Yellow"}) {
+      Value v;
+      v.SetType(Value::NAME);
+      v.name = n;
+      names_val.array.push_back(v);
+    }
+    cs_value.array.push_back(names_val);
+
+    Value alt_val;
+    alt_val.SetType(Value::NAME);
+    alt_val.name = "DeviceCMYK";
+    cs_value.array.push_back(alt_val);
+
+    Value func_val;
+    func_val.SetType(Value::DICTIONARY);
+    cs_value.array.push_back(func_val);
+
+    ColorSpace cs = parse_color_space(pdf, cs_value);
+    assert(cs.type == ColorSpaceType::DeviceN);
+    assert(cs.colorant_names.size() == 3);
+    assert(cs.colorant_names[0] == "Cyan");
+    assert(cs.colorant_names[1] == "Magenta");
+    assert(cs.colorant_names[2] == "Yellow");
+    assert(cs.base_color_space != nullptr);
+    assert(cs.base_color_space->type == ColorSpaceType::DeviceCMYK);
+    std::cout << "  Test 8 (DeviceN): PASSED" << std::endl;
+  }
+
+  // Test case 9: ICCBased color space
+  {
+    Value cs_value;
+    cs_value.SetType(Value::ARRAY);
+
+    Value type_val;
+    type_val.SetType(Value::NAME);
+    type_val.name = "ICCBased";
+    cs_value.array.push_back(type_val);
+
+    Value stream_val;
+    stream_val.SetType(Value::STREAM);
+    Value n_val;
+    n_val.SetType(Value::NUMBER);
+    n_val.number = 3;
+    stream_val.stream.dict["N"] = n_val;
+    stream_val.stream.data = {0x00, 0x01, 0x02};  // dummy profile data
+    cs_value.array.push_back(stream_val);
+
+    ColorSpace cs = parse_color_space(pdf, cs_value);
+    assert(cs.type == ColorSpaceType::ICCBased);
+    assert(cs.num_components == 3);
+    assert(cs.icc_profile_data.size() == 3);
+    std::cout << "  Test 9 (ICCBased): PASSED" << std::endl;
+  }
+
   std::cout << "ColorSpace parsing tests completed successfully!" << std::endl << std::endl;
 }
 
