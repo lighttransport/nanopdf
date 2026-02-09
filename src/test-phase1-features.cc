@@ -572,6 +572,138 @@ void test_filter_chain() {
             << std::endl;
 }
 
+// Test FlateDecode with PNG predictors
+void test_flate_png_predictors() {
+  std::cout << "Testing FlateDecode with PNG predictors..." << std::endl;
+
+  // All tests use predictor=10+ (PNG), columns=3, colors=1, bpc=8
+
+  // Test case 1: PNG None (filter=0) — just strips the filter byte
+  {
+    uint8_t encoded[] = {0x78, 0x9C, 0x63, 0x70, 0x74, 0x72, 0x06, 0x00,
+                         0x01, 0x8E, 0x00, 0xC7};
+    filters::DecodeParams params;
+    params.predictor = 10;
+    params.columns = 3;
+    params.colors = 1;
+    params.bits_per_component = 8;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 3);
+    assert(result.data[0] == 65);  // 'A'
+    assert(result.data[1] == 66);  // 'B'
+    assert(result.data[2] == 67);  // 'C'
+    std::cout << "  Test 1 (PNG None): PASSED" << std::endl;
+  }
+
+  // Test case 2: PNG Sub (filter=1) — each byte = diff from left neighbor
+  // Raw (with filter byte): [1, 10, 20, 30]
+  // Decoded: [10, 10+20=30, 30+30=60]
+  {
+    uint8_t encoded[] = {0x78, 0x9C, 0x63, 0xE4, 0x12, 0x91, 0x03, 0x00,
+                         0x00, 0x6C, 0x00, 0x3E};
+    filters::DecodeParams params;
+    params.predictor = 11;
+    params.columns = 3;
+    params.colors = 1;
+    params.bits_per_component = 8;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 3);
+    assert(result.data[0] == 10);
+    assert(result.data[1] == 30);
+    assert(result.data[2] == 60);
+    std::cout << "  Test 2 (PNG Sub): PASSED" << std::endl;
+  }
+
+  // Test case 3: PNG Up (filter=2) — each byte = diff from above
+  // Row 1 (None): [10, 20, 30]
+  // Row 2 (Up):   [5, 10, 15] → [10+5=15, 20+10=30, 30+15=45]
+  {
+    uint8_t encoded[] = {0x78, 0x9C, 0x63, 0xE0, 0x12, 0x91, 0x63, 0x62,
+                         0xE5, 0xE2, 0x07, 0x00, 0x01, 0x96, 0x00, 0x5D};
+    filters::DecodeParams params;
+    params.predictor = 12;
+    params.columns = 3;
+    params.colors = 1;
+    params.bits_per_component = 8;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 6);
+    // Row 1
+    assert(result.data[0] == 10);
+    assert(result.data[1] == 20);
+    assert(result.data[2] == 30);
+    // Row 2
+    assert(result.data[3] == 15);
+    assert(result.data[4] == 30);
+    assert(result.data[5] == 45);
+    std::cout << "  Test 3 (PNG Up): PASSED" << std::endl;
+  }
+
+  // Test case 4: PNG Average (filter=3)
+  // Row 1 (None): [100, 100, 100]
+  // Row 2 (Avg):  [10, 10, 10]
+  //   col0: 10 + floor((0+100)/2) = 60
+  //   col1: 10 + floor((60+100)/2) = 90
+  //   col2: 10 + floor((90+100)/2) = 105
+  {
+    uint8_t encoded[] = {0x78, 0x9C, 0x63, 0x48, 0x49, 0x49, 0x61, 0xE6,
+                         0xE2, 0xE2, 0x02, 0x00, 0x07, 0x58, 0x01, 0x4E};
+    filters::DecodeParams params;
+    params.predictor = 13;
+    params.columns = 3;
+    params.colors = 1;
+    params.bits_per_component = 8;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 6);
+    assert(result.data[0] == 100);
+    assert(result.data[1] == 100);
+    assert(result.data[2] == 100);
+    assert(result.data[3] == 60);
+    assert(result.data[4] == 90);
+    assert(result.data[5] == 105);
+    std::cout << "  Test 4 (PNG Average): PASSED" << std::endl;
+  }
+
+  // Test case 5: PNG Paeth (filter=4)
+  // Row 1 (None): [10, 20, 30]
+  // Row 2 (Paeth): [5, 5, 5] → [15, 25, 35]
+  {
+    uint8_t encoded[] = {0x78, 0x9C, 0x63, 0xE0, 0x12, 0x91, 0x63, 0x61,
+                         0x65, 0x65, 0x05, 0x00, 0x01, 0x8A, 0x00, 0x50};
+    filters::DecodeParams params;
+    params.predictor = 14;
+    params.columns = 3;
+    params.colors = 1;
+    params.bits_per_component = 8;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 6);
+    assert(result.data[0] == 10);
+    assert(result.data[1] == 20);
+    assert(result.data[2] == 30);
+    assert(result.data[3] == 15);
+    assert(result.data[4] == 25);
+    assert(result.data[5] == 35);
+    std::cout << "  Test 5 (PNG Paeth): PASSED" << std::endl;
+  }
+
+  std::cout << "FlateDecode PNG predictor tests completed successfully!"
+            << std::endl << std::endl;
+}
+
 // Test Color Space parsing
 void test_color_space_parsing() {
   std::cout << "Testing ColorSpace parsing..." << std::endl;
@@ -779,6 +911,7 @@ int main() {
   test_lzw_decode();
   test_flate_decode();
   test_filter_chain();
+  test_flate_png_predictors();
   test_color_space_parsing();
   test_image_xobject_parsing();
 
