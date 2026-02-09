@@ -1,5 +1,4 @@
 #include "nanopdf.hh"
-#include <cassert>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -7,6 +6,16 @@
 #include <vector>
 
 using namespace nanopdf;
+
+// Always-active assertion (not disabled by NDEBUG)
+#define REQUIRE(expr)                                                    \
+  do {                                                                   \
+    if (!(expr)) {                                                       \
+      std::cerr << "FAIL: " #expr " at " __FILE__ ":" << __LINE__       \
+                << std::endl;                                            \
+      return false;                                                      \
+    }                                                                    \
+  } while (0)
 
 #ifdef NANOPDF_SOURCE_DIR
 std::string data_dir() { return std::string(NANOPDF_SOURCE_DIR) + "/data"; }
@@ -25,43 +34,38 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }
 
 // Test: Parse blank.pdf and verify basic structure
-void test_parse_blank_pdf() {
+bool test_parse_blank_pdf() {
   std::cout << "Testing blank.pdf parsing..." << std::endl;
 
   std::vector<uint8_t> buf;
   std::string path = data_dir() + "/blank.pdf";
-  assert(read_file(path, buf));
+  REQUIRE(read_file(path, buf));
 
   Pdf pdf;
-  bool ok = parse_from_memory(buf.data(), buf.size(), &pdf);
-  assert(ok);
+  REQUIRE(parse_from_memory(buf.data(), buf.size(), &pdf));
+  REQUIRE(pdf.load_document_structure());
+  REQUIRE(pdf.catalog.pages_count >= 1);
+  REQUIRE(pdf.catalog.pages.size() >= 1);
 
-  bool loaded = pdf.load_document_structure();
-  assert(loaded);
-
-  // blank.pdf should have at least 1 page
-  assert(pdf.catalog.pages_count >= 1);
-  assert(pdf.catalog.pages.size() >= 1);
-
-  // First page should have a valid media box
   const Page& page = pdf.catalog.pages[0];
-  assert(page.media_box.size() == 4);
-  assert(page.media_box[2] > page.media_box[0]);  // width > 0
-  assert(page.media_box[3] > page.media_box[1]);  // height > 0
+  REQUIRE(page.media_box.size() == 4);
+  REQUIRE(page.media_box[2] > page.media_box[0]);
+  REQUIRE(page.media_box[3] > page.media_box[1]);
 
   std::cout << "  Pages: " << pdf.catalog.pages_count << std::endl;
   std::cout << "  MediaBox: [" << page.media_box[0] << ", " << page.media_box[1]
             << ", " << page.media_box[2] << ", " << page.media_box[3] << "]"
             << std::endl;
   std::cout << "  blank.pdf: PASSED" << std::endl;
+  return true;
 }
 
 // Test: Parse all test PDFs without crashing
-void test_parse_all_test_pdfs() {
+bool test_parse_all_test_pdfs() {
   std::cout << "Testing parsing of all test PDFs..." << std::endl;
 
   const char* test_pdfs[] = {
-      "blank.pdf",       "test_clip.pdf",    "test_dash.pdf",
+      "blank.pdf",        "test_clip.pdf",     "test_dash.pdf",
       "test_gradient.pdf", "test_graphics.pdf", "test_image.pdf",
       "test_multistop.pdf", "test_pattern.pdf", "test_radial.pdf",
       "test_textmode.pdf", "test_textmode2.pdf",
@@ -80,59 +84,55 @@ void test_parse_all_test_pdfs() {
     }
 
     Pdf pdf;
-    bool ok = parse_from_memory(buf.data(), buf.size(), &pdf);
-    assert(ok);
+    REQUIRE(parse_from_memory(buf.data(), buf.size(), &pdf));
+    REQUIRE(pdf.load_document_structure());
+    REQUIRE(pdf.catalog.pages_count >= 1);
+    REQUIRE(pdf.catalog.pages.size() >= 1);
 
-    bool loaded = pdf.load_document_structure();
-    assert(loaded);
-    assert(pdf.catalog.pages_count >= 1);
-    assert(pdf.catalog.pages.size() >= 1);
-
-    // Every page should have a media box
     for (uint32_t i = 0; i < pdf.catalog.pages_count; i++) {
-      assert(pdf.catalog.pages[i].media_box.size() == 4);
+      REQUIRE(pdf.catalog.pages[i].media_box.size() == 4);
     }
 
-    std::cout << "  " << name << " (" << pdf.catalog.pages_count << " pages): PASSED"
-              << std::endl;
+    std::cout << "  " << name << " (" << pdf.catalog.pages_count
+              << " pages): PASSED" << std::endl;
     passed++;
   }
 
-  assert(passed > 0);  // At least blank.pdf must exist
+  REQUIRE(passed > 0);
   std::cout << "All test PDFs parsed: " << passed << " passed, " << skipped
             << " skipped" << std::endl << std::endl;
+  return true;
 }
 
 // Test: Page content streams can be loaded
-void test_page_content_loading() {
+bool test_page_content_loading() {
   std::cout << "Testing page content stream loading..." << std::endl;
 
   std::vector<uint8_t> buf;
   std::string path = data_dir() + "/blank.pdf";
-  assert(read_file(path, buf));
+  REQUIRE(read_file(path, buf));
 
   Pdf pdf;
-  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
-  assert(pdf.load_document_structure());
+  REQUIRE(parse_from_memory(buf.data(), buf.size(), &pdf));
+  REQUIRE(pdf.load_document_structure());
+  REQUIRE(pdf.catalog.pages.size() >= 1);
 
-  // Load content for the first page
   const Page& page = pdf.catalog.pages[0];
   PageContent content = page.load_contents(pdf);
 
-  // Content should be loadable (may be empty for blank page)
   std::cout << "  Content size: " << content.data.size() << " bytes" << std::endl;
   std::cout << "  Page content loading: PASSED" << std::endl << std::endl;
+  return true;
 }
 
 // Test: Malformed/truncated data should not crash
-void test_malformed_input() {
+bool test_malformed_input() {
   std::cout << "Testing malformed input handling..." << std::endl;
 
   // Test case 1: Empty data
   {
     Pdf pdf;
-    bool ok = parse_from_memory(nullptr, 0, &pdf);
-    assert(!ok);
+    REQUIRE(!parse_from_memory(nullptr, 0, &pdf));
     std::cout << "  Test 1 (empty data): PASSED" << std::endl;
   }
 
@@ -140,8 +140,7 @@ void test_malformed_input() {
   {
     uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03};
     Pdf pdf;
-    bool ok = parse_from_memory(garbage, sizeof(garbage), &pdf);
-    assert(!ok);
+    REQUIRE(!parse_from_memory(garbage, sizeof(garbage), &pdf));
     std::cout << "  Test 2 (random bytes): PASSED" << std::endl;
   }
 
@@ -149,9 +148,8 @@ void test_malformed_input() {
   {
     const char* header = "%PDF-1.4\n";
     Pdf pdf;
-    bool ok = parse_from_memory(reinterpret_cast<const uint8_t*>(header),
-                                strlen(header), &pdf);
-    assert(!ok);
+    REQUIRE(!parse_from_memory(reinterpret_cast<const uint8_t*>(header),
+                               strlen(header), &pdf));
     std::cout << "  Test 3 (header only): PASSED" << std::endl;
   }
 
@@ -161,8 +159,7 @@ void test_malformed_input() {
     std::string path = data_dir() + "/blank.pdf";
     if (read_file(path, buf) && buf.size() > 32) {
       Pdf pdf;
-      bool ok = parse_from_memory(buf.data(), 32, &pdf);
-      assert(!ok);
+      REQUIRE(!parse_from_memory(buf.data(), 32, &pdf));
       std::cout << "  Test 4 (truncated PDF): PASSED" << std::endl;
     } else {
       std::cout << "  Test 4 (truncated PDF): SKIPPED" << std::endl;
@@ -171,36 +168,43 @@ void test_malformed_input() {
 
   std::cout << "Malformed input tests completed successfully!" << std::endl
             << std::endl;
+  return true;
 }
 
 // Test: resolve_reference with invalid object numbers
-void test_invalid_references() {
+bool test_invalid_references() {
   std::cout << "Testing invalid reference handling..." << std::endl;
 
   std::vector<uint8_t> buf;
   std::string path = data_dir() + "/blank.pdf";
-  assert(read_file(path, buf));
+  REQUIRE(read_file(path, buf));
 
   Pdf pdf;
-  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
+  REQUIRE(parse_from_memory(buf.data(), buf.size(), &pdf));
 
-  // Try to resolve a non-existent object
   ResolvedObject result = resolve_reference(pdf, 99999, 0);
-  assert(!result.success);
+  REQUIRE(!result.success);
   std::cout << "  Invalid object number: PASSED" << std::endl;
 
   std::cout << "Invalid reference tests completed successfully!" << std::endl
             << std::endl;
+  return true;
 }
 
 int main() {
   std::cout << "=== End-to-End PDF Parsing Tests ===" << std::endl << std::endl;
 
-  test_parse_blank_pdf();
-  test_parse_all_test_pdfs();
-  test_page_content_loading();
-  test_malformed_input();
-  test_invalid_references();
+  int failures = 0;
+  if (!test_parse_blank_pdf()) failures++;
+  if (!test_parse_all_test_pdfs()) failures++;
+  if (!test_page_content_loading()) failures++;
+  if (!test_malformed_input()) failures++;
+  if (!test_invalid_references()) failures++;
+
+  if (failures > 0) {
+    std::cerr << failures << " test(s) FAILED" << std::endl;
+    return 1;
+  }
 
   std::cout << "=== All PDF parsing tests passed! ===" << std::endl;
   return 0;
