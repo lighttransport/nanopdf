@@ -431,6 +431,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     "test_phase4_document_structure|test_phase4_document_structure.cc"
     "test_phase5|src/test-phase5-features.cc"
     "test_phase6|src/test-phase6-features.cc"
+    "test_pdf_parsing|src/test-pdf-parsing.cc"
     #"test_phase7|src/test-phase7-features.cc"  # requires CCITT samples not in repo
   )
 
@@ -443,6 +444,9 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
 
   if(TARGET test_phase2_realpdf)
     target_compile_definitions(test_phase2_realpdf PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  endif()
+  if(TARGET test_pdf_parsing)
+    target_compile_definitions(test_pdf_parsing PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
   endif()
   # test_phase7 disabled — requires CCITT samples not in repo
   #if(TARGET test_phase7)
