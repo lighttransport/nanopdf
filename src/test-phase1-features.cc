@@ -429,6 +429,149 @@ void test_lzw_decode() {
   std::cout << "LZWDecode tests completed successfully!" << std::endl << std::endl;
 }
 
+// Test FlateDecode filter
+void test_flate_decode() {
+  std::cout << "Testing FlateDecode filter..." << std::endl;
+
+  // Test case 1: Decompress "Hello, World!" (zlib-compressed)
+  {
+    uint8_t encoded[] = {0x78, 0x9C, 0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xD7,
+                         0x51, 0x08, 0xCF, 0x2F, 0xCA, 0x49, 0x51, 0x04,
+                         0x00, 0x1F, 0x9E, 0x04, 0x6A};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 13);
+    std::string decoded(result.data.begin(), result.data.end());
+    assert(decoded == "Hello, World!");
+    std::cout << "  Test 1 (Hello, World!): PASSED" << std::endl;
+  }
+
+  // Test case 2: Repeated data (high compression ratio)
+  {
+    // zlib-compressed "AAAAAAAAAAAAAAAA" (16 As)
+    uint8_t encoded[] = {0x78, 0x9C, 0x73, 0x74, 0x44, 0x05, 0x00, 0x22,
+                         0x98, 0x04, 0x11};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 16);
+    for (size_t i = 0; i < 16; i++) {
+      assert(result.data[i] == 'A');
+    }
+    std::cout << "  Test 2 (repeated data): PASSED" << std::endl;
+  }
+
+  // Test case 3: Single byte
+  {
+    // zlib-compressed "X"
+    uint8_t encoded[] = {0x78, 0x9C, 0x8B, 0x00, 0x00, 0x00, 0x59, 0x00,
+                         0x59};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 1);
+    assert(result.data[0] == 'X');
+    std::cout << "  Test 3 (single byte): PASSED" << std::endl;
+  }
+
+  // Test case 4: Empty compressed stream
+  {
+    // zlib-compressed empty data
+    uint8_t encoded[] = {0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 0);
+    std::cout << "  Test 4 (empty stream): PASSED" << std::endl;
+  }
+
+  // Test case 5: Empty input (size=0) should fail
+  {
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_flate(nullptr, 0, params);
+
+    assert(!result.success);
+    std::cout << "  Test 5 (empty input error): PASSED" << std::endl;
+  }
+
+  // Test case 6: Corrupted data should fail
+  {
+    uint8_t encoded[] = {0xFF, 0xFE, 0xFD, 0xFC, 0xFB};
+    filters::DecodeParams params;
+    DecodedStream result =
+        filters::decode_flate(encoded, sizeof(encoded), params);
+
+    assert(!result.success);
+    std::cout << "  Test 6 (corrupted data): PASSED" << std::endl;
+  }
+
+  std::cout << "FlateDecode tests completed successfully!" << std::endl << std::endl;
+}
+
+// Test filter chain: ASCIIHex-encoded Flate data (simulates multi-filter PDF stream)
+void test_filter_chain() {
+  std::cout << "Testing filter chain (ASCIIHex → Flate)..." << std::endl;
+
+  // Step 1: ASCIIHex decode the hex-encoded zlib data
+  // Step 2: Flate decode the result
+  // This simulates a PDF stream with /Filter [/ASCIIHexDecode /FlateDecode]
+  // (applied in reverse order: ASCIIHex first, then Flate)
+
+  // Test case 1: ASCIIHex-encoded zlib data for "Hello, World!"
+  {
+    const char *hex_encoded =
+        "789CF348CDC9C9D75108CF2FCA495104001F9E046A>";
+    filters::DecodeParams params;
+
+    // Step 1: ASCIIHex decode
+    DecodedStream hex_result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(hex_encoded), strlen(hex_encoded),
+        params);
+    assert(hex_result.success);
+    assert(hex_result.data.size() == 21);  // zlib compressed size
+
+    // Step 2: Flate decode the result
+    DecodedStream flate_result = filters::decode_flate(
+        hex_result.data.data(), hex_result.data.size(), params);
+    assert(flate_result.success);
+
+    std::string decoded(flate_result.data.begin(), flate_result.data.end());
+    assert(decoded == "Hello, World!");
+    std::cout << "  Test 1 (ASCIIHex + Flate → Hello, World!): PASSED"
+              << std::endl;
+  }
+
+  // Test case 2: ASCII85-encoded zlib data
+  // First get ASCII85 encoding of the same zlib data
+  {
+    // zlib-compressed "Hello, World!" = the 21 bytes from test above
+    uint8_t zlib_data[] = {0x78, 0x9C, 0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0xD7,
+                           0x51, 0x08, 0xCF, 0x2F, 0xCA, 0x49, 0x51, 0x04,
+                           0x00, 0x1F, 0x9E, 0x04, 0x6A};
+
+    // First verify Flate alone works
+    filters::DecodeParams params;
+    DecodedStream flate_result =
+        filters::decode_flate(zlib_data, sizeof(zlib_data), params);
+    assert(flate_result.success);
+    std::string decoded(flate_result.data.begin(), flate_result.data.end());
+    assert(decoded == "Hello, World!");
+    std::cout << "  Test 2 (Flate baseline verified): PASSED" << std::endl;
+  }
+
+  std::cout << "Filter chain tests completed successfully!" << std::endl
+            << std::endl;
+}
+
 // Test Color Space parsing
 void test_color_space_parsing() {
   std::cout << "Testing ColorSpace parsing..." << std::endl;
@@ -634,6 +777,8 @@ int main() {
   test_asciihex_decode();
   test_ascii85_decode();
   test_lzw_decode();
+  test_flate_decode();
+  test_filter_chain();
   test_color_space_parsing();
   test_image_xobject_parsing();
 
