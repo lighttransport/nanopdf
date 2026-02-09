@@ -58,6 +58,144 @@ void test_runlength_decode() {
   std::cout << "RunLengthDecode tests completed successfully!" << std::endl << std::endl;
 }
 
+// Test ASCIIHexDecode filter
+void test_asciihex_decode() {
+  std::cout << "Testing ASCIIHexDecode filter..." << std::endl;
+
+  // Test case 1: Simple hex pairs
+  {
+    const char *encoded = "48656C6C6F>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 5);
+    assert(result.data[0] == 'H');
+    assert(result.data[1] == 'e');
+    assert(result.data[2] == 'l');
+    assert(result.data[3] == 'l');
+    assert(result.data[4] == 'o');
+    std::cout << "  Test 1 (simple hex pairs): PASSED" << std::endl;
+  }
+
+  // Test case 2: Lowercase hex digits
+  {
+    const char *encoded = "4d616e>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 3);
+    assert(result.data[0] == 'M');
+    assert(result.data[1] == 'a');
+    assert(result.data[2] == 'n');
+    std::cout << "  Test 2 (lowercase hex): PASSED" << std::endl;
+  }
+
+  // Test case 3: Mixed case
+  {
+    const char *encoded = "4d61 6E>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 3);
+    assert(result.data[0] == 'M');
+    assert(result.data[1] == 'a');
+    assert(result.data[2] == 'n');
+    std::cout << "  Test 3 (mixed case): PASSED" << std::endl;
+  }
+
+  // Test case 4: Whitespace is ignored (spaces, tabs, newlines)
+  {
+    const char *encoded = "48 65\t6C\r\n6C 6F>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 5);
+    assert(result.data[0] == 'H');
+    assert(result.data[1] == 'e');
+    assert(result.data[2] == 'l');
+    assert(result.data[3] == 'l');
+    assert(result.data[4] == 'o');
+    std::cout << "  Test 4 (whitespace ignored): PASSED" << std::endl;
+  }
+
+  // Test case 5: Odd number of hex digits — trailing nibble padded with 0
+  {
+    const char *encoded = "ABC>";  // AB C0
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 2);
+    assert(result.data[0] == 0xAB);
+    assert(result.data[1] == 0xC0);
+    std::cout << "  Test 5 (odd nibble padded): PASSED" << std::endl;
+  }
+
+  // Test case 6: Empty input (just end marker)
+  {
+    const char *encoded = ">";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 0);
+    std::cout << "  Test 6 (empty input): PASSED" << std::endl;
+  }
+
+  // Test case 7: Invalid hex character
+  {
+    const char *encoded = "48GG>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(!result.success);
+    std::cout << "  Test 7 (invalid character): PASSED" << std::endl;
+  }
+
+  // Test case 8: All zero bytes
+  {
+    const char *encoded = "00000000>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 4);
+    assert(result.data[0] == 0);
+    assert(result.data[1] == 0);
+    assert(result.data[2] == 0);
+    assert(result.data[3] == 0);
+    std::cout << "  Test 8 (all zeros): PASSED" << std::endl;
+  }
+
+  // Test case 9: All FF bytes
+  {
+    const char *encoded = "FFFF>";
+    filters::DecodeParams params;
+    DecodedStream result = filters::decode_asciihex(
+        reinterpret_cast<const uint8_t *>(encoded), strlen(encoded), params);
+
+    assert(result.success);
+    assert(result.data.size() == 2);
+    assert(result.data[0] == 0xFF);
+    assert(result.data[1] == 0xFF);
+    std::cout << "  Test 9 (FF bytes): PASSED" << std::endl;
+  }
+
+  std::cout << "ASCIIHexDecode tests completed successfully!" << std::endl << std::endl;
+}
+
 // Test ASCII85Decode filter
 void test_ascii85_decode() {
   std::cout << "Testing ASCII85Decode filter..." << std::endl;
@@ -493,6 +631,7 @@ int main() {
   std::cout << "=== Phase 1 Feature Tests ===" << std::endl << std::endl;
 
   test_runlength_decode();
+  test_asciihex_decode();
   test_ascii85_decode();
   test_lzw_decode();
   test_color_space_parsing();
