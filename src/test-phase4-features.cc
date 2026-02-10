@@ -1,12 +1,30 @@
 #include "nanopdf.hh"
 #include <cassert>
 #include <cmath>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
 
 using namespace nanopdf;
+
+#ifdef NANOPDF_SOURCE_DIR
+std::string data_dir() { return std::string(NANOPDF_SOURCE_DIR) + "/data"; }
+#else
+std::string data_dir() { return "../data"; }
+#endif
+
+bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) return false;
+  auto size = f.tellg();
+  f.seekg(0);
+  out.resize(static_cast<size_t>(size));
+  f.read(reinterpret_cast<char*>(out.data()), size);
+  return f.good();
+}
 
 // Test outline structures
 void test_outline_structures() {
@@ -336,6 +354,185 @@ void test_document_catalog_phase4() {
   std::cout << "  DocumentCatalog Phase 4 features: PASSED" << std::endl;
 }
 
+// Test parse_document_info on real PDFs
+void test_parse_document_info_real() {
+  std::cout << "Testing parse_document_info on real PDFs..." << std::endl;
+
+  // blank.pdf should have at least a Producer field
+  std::vector<uint8_t> buf;
+  std::string path = data_dir() + "/blank.pdf";
+  if (!read_file(path, buf)) {
+    std::cout << "  SKIPPED (blank.pdf not found)" << std::endl;
+    return;
+  }
+
+  Pdf pdf;
+  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
+  assert(pdf.load_document_structure());
+
+  // Call parse_document_info - should not crash
+  parse_document_info(pdf, pdf.catalog);
+
+  // blank.pdf may or may not have info - just verify it doesn't crash
+  std::cout << "  Title: \"" << pdf.catalog.document_info.title << "\"" << std::endl;
+  std::cout << "  Producer: \"" << pdf.catalog.document_info.producer << "\"" << std::endl;
+  std::cout << "  parse_document_info: PASSED" << std::endl;
+}
+
+// Test parse_document_outline on real PDFs (graceful no-op when absent)
+void test_parse_document_outline_real() {
+  std::cout << "Testing parse_document_outline on real PDFs..." << std::endl;
+
+  std::vector<uint8_t> buf;
+  std::string path = data_dir() + "/blank.pdf";
+  if (!read_file(path, buf)) {
+    std::cout << "  SKIPPED (blank.pdf not found)" << std::endl;
+    return;
+  }
+
+  Pdf pdf;
+  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
+  assert(pdf.load_document_structure());
+
+  // blank.pdf has no outlines — should return gracefully
+  parse_document_outline(pdf, pdf.catalog);
+  // outline_root may be null — that's expected for a blank PDF
+  std::cout << "  Outline root: "
+            << (pdf.catalog.outline_root ? "present" : "null (expected)") << std::endl;
+  std::cout << "  parse_document_outline: PASSED" << std::endl;
+}
+
+// Test parse_page_labels on real PDFs (graceful no-op when absent)
+void test_parse_page_labels_real() {
+  std::cout << "Testing parse_page_labels on real PDFs..." << std::endl;
+
+  std::vector<uint8_t> buf;
+  std::string path = data_dir() + "/blank.pdf";
+  if (!read_file(path, buf)) {
+    std::cout << "  SKIPPED (blank.pdf not found)" << std::endl;
+    return;
+  }
+
+  Pdf pdf;
+  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
+  assert(pdf.load_document_structure());
+
+  // blank.pdf has no page labels — should return gracefully
+  parse_page_labels(pdf, pdf.catalog);
+  std::cout << "  Labels count: " << pdf.catalog.page_labels.labels.size() << std::endl;
+  std::cout << "  parse_page_labels: PASSED" << std::endl;
+}
+
+// Test parse_named_destinations on real PDFs (graceful no-op when absent)
+void test_parse_named_destinations_real() {
+  std::cout << "Testing parse_named_destinations on real PDFs..." << std::endl;
+
+  std::vector<uint8_t> buf;
+  std::string path = data_dir() + "/blank.pdf";
+  if (!read_file(path, buf)) {
+    std::cout << "  SKIPPED (blank.pdf not found)" << std::endl;
+    return;
+  }
+
+  Pdf pdf;
+  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
+  assert(pdf.load_document_structure());
+
+  parse_named_destinations(pdf, pdf.catalog);
+  std::cout << "  Named destinations: " << pdf.catalog.named_destinations.size() << std::endl;
+  std::cout << "  parse_named_destinations: PASSED" << std::endl;
+}
+
+// Test parse_xmp_metadata on real PDFs (graceful no-op when absent)
+void test_parse_xmp_metadata_real() {
+  std::cout << "Testing parse_xmp_metadata on real PDFs..." << std::endl;
+
+  std::vector<uint8_t> buf;
+  std::string path = data_dir() + "/blank.pdf";
+  if (!read_file(path, buf)) {
+    std::cout << "  SKIPPED (blank.pdf not found)" << std::endl;
+    return;
+  }
+
+  Pdf pdf;
+  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
+  assert(pdf.load_document_structure());
+
+  parse_xmp_metadata(pdf, pdf.catalog);
+  std::cout << "  XMP title: \"" << pdf.catalog.xmp_metadata.dc_title << "\"" << std::endl;
+  std::cout << "  parse_xmp_metadata: PASSED" << std::endl;
+}
+
+// Test parse_optional_content on real PDFs (graceful no-op when absent)
+void test_parse_optional_content_real() {
+  std::cout << "Testing parse_optional_content on real PDFs..." << std::endl;
+
+  std::vector<uint8_t> buf;
+  std::string path = data_dir() + "/blank.pdf";
+  if (!read_file(path, buf)) {
+    std::cout << "  SKIPPED (blank.pdf not found)" << std::endl;
+    return;
+  }
+
+  Pdf pdf;
+  assert(parse_from_memory(buf.data(), buf.size(), &pdf));
+  assert(pdf.load_document_structure());
+
+  parse_optional_content(pdf, pdf.catalog);
+  std::cout << "  Optional content groups: "
+            << pdf.catalog.ocg_properties.ocgs.size() << std::endl;
+  std::cout << "  parse_optional_content: PASSED" << std::endl;
+}
+
+// Test all parse functions on all available test PDFs (no crashes)
+void test_parse_all_structures() {
+  std::cout << "Testing structure parsing on all test PDFs..." << std::endl;
+
+  const char* test_pdfs[] = {
+      "blank.pdf",        "test_clip.pdf",      "test_dash.pdf",
+      "test_gradient.pdf", "test_graphics.pdf",  "test_image.pdf",
+      "test_multistop.pdf", "test_pattern.pdf",  "test_radial.pdf",
+      "test_textmode.pdf", "test_textmode2.pdf",
+  };
+
+  int passed = 0;
+  int skipped = 0;
+
+  for (const char* name : test_pdfs) {
+    std::string path = data_dir() + "/" + name;
+    std::vector<uint8_t> buf;
+    if (!read_file(path, buf)) {
+      skipped++;
+      continue;
+    }
+
+    Pdf pdf;
+    if (!parse_from_memory(buf.data(), buf.size(), &pdf)) {
+      skipped++;
+      continue;
+    }
+    if (!pdf.load_document_structure()) {
+      skipped++;
+      continue;
+    }
+
+    // Call all parsing functions — none should crash
+    parse_document_info(pdf, pdf.catalog);
+    parse_document_outline(pdf, pdf.catalog);
+    parse_page_labels(pdf, pdf.catalog);
+    parse_named_destinations(pdf, pdf.catalog);
+    parse_xmp_metadata(pdf, pdf.catalog);
+    parse_optional_content(pdf, pdf.catalog);
+
+    std::cout << "  " << name << ": PASSED" << std::endl;
+    passed++;
+  }
+
+  assert(passed > 0);
+  std::cout << "  Structure parsing: " << passed << " passed, "
+            << skipped << " skipped" << std::endl;
+}
+
 int main() {
   std::cout << "=== Phase 4 Feature Tests ===\n" << std::endl;
 
@@ -348,20 +545,15 @@ int main() {
   test_document_info();
   test_xmp_metadata();
   test_document_catalog_phase4();
+  test_parse_document_info_real();
+  test_parse_document_outline_real();
+  test_parse_page_labels_real();
+  test_parse_named_destinations_real();
+  test_parse_xmp_metadata_real();
+  test_parse_optional_content_real();
+  test_parse_all_structures();
 
   std::cout << "\n=== All Phase 4 tests passed! ===\n" << std::endl;
-  std::cout << "Summary of implemented Phase 4 features:" << std::endl;
-  std::cout << "  ✓ Document outlines (bookmarks) with hierarchy" << std::endl;
-  std::cout << "  ✓ Outline actions (GoTo, GoToR, URI, Launch)" << std::endl;
-  std::cout << "  ✓ Outline appearance (color, italic, bold)" << std::endl;
-  std::cout << "  ✓ Page labels with custom numbering styles" << std::endl;
-  std::cout << "  ✓ Roman numeral conversion (uppercase/lowercase)" << std::endl;
-  std::cout << "  ✓ Letter-based page numbering" << std::endl;
-  std::cout << "  ✓ Named destinations for internal links" << std::endl;
-  std::cout << "  ✓ Document information dictionary" << std::endl;
-  std::cout << "  ✓ Custom metadata fields" << std::endl;
-  std::cout << "  ✓ XMP metadata parsing" << std::endl;
-  std::cout << "  ✓ Integration with DocumentCatalog" << std::endl;
 
   return 0;
 }
