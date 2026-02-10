@@ -442,6 +442,107 @@ void test_md5_vectors() {
   std::cout << "  MD5 vectors: PASSED" << std::endl;
 }
 
+// Test password verification round-trip
+void test_password_verification() {
+  std::cout << "Testing password verification..." << std::endl;
+
+  // Set up an encryption dictionary by computing keys from known passwords
+  std::string user_pwd = "userpass";
+  std::string owner_pwd = "ownerpass";
+  std::string file_id = "0123456789ABCDEF";
+  int key_length = 128;
+
+  // Revision 3
+  {
+    int revision = 3;
+
+    // Compute owner key (O value)
+    auto o_key = compute_owner_key(owner_pwd, user_pwd, key_length, revision);
+    assert(o_key.size() == 32);
+
+    // Create encryption dictionary
+    EncryptionDictionary dict;
+    dict.filter = "Standard";
+    dict.v = 2;
+    dict.r = revision;
+    dict.length = key_length;
+    dict.p = static_cast<uint32_t>(0xFFFFFFFC);
+    dict.o = std::string(o_key.begin(), o_key.end());
+
+    // Compute user key (U value)
+    std::vector<uint8_t> o_vec(dict.o.begin(), dict.o.end());
+    auto u_key = compute_user_key(user_pwd, o_vec, dict.p, file_id,
+                                   key_length, revision);
+    dict.u = std::string(u_key.begin(), u_key.end());
+
+    // Verify user password
+    assert(verify_user_password(user_pwd, dict, file_id));
+    std::cout << "  User password (R3): PASSED" << std::endl;
+
+    // Wrong user password should fail
+    assert(!verify_user_password("wrong", dict, file_id));
+    std::cout << "  Wrong user password (R3): PASSED" << std::endl;
+
+    // Verify owner password
+    assert(verify_owner_password(owner_pwd, dict, file_id));
+    std::cout << "  Owner password (R3): PASSED" << std::endl;
+
+    // Wrong owner password should fail
+    assert(!verify_owner_password("wrong", dict, file_id));
+    std::cout << "  Wrong owner password (R3): PASSED" << std::endl;
+  }
+
+  // Revision 2
+  {
+    int revision = 2;
+
+    auto o_key = compute_owner_key(owner_pwd, user_pwd, 40, revision);
+    EncryptionDictionary dict;
+    dict.filter = "Standard";
+    dict.v = 1;
+    dict.r = revision;
+    dict.length = 40;
+    dict.p = static_cast<uint32_t>(0xFFFFFFFC);
+    dict.o = std::string(o_key.begin(), o_key.end());
+
+    std::vector<uint8_t> o_vec(dict.o.begin(), dict.o.end());
+    auto u_key = compute_user_key(user_pwd, o_vec, dict.p, file_id,
+                                   40, revision);
+    dict.u = std::string(u_key.begin(), u_key.end());
+
+    assert(verify_user_password(user_pwd, dict, file_id));
+    std::cout << "  User password (R2): PASSED" << std::endl;
+
+    assert(!verify_user_password("wrong", dict, file_id));
+    std::cout << "  Wrong user password (R2): PASSED" << std::endl;
+  }
+
+  // Empty password
+  {
+    int revision = 3;
+    std::string empty_pwd = "";
+
+    auto o_key = compute_owner_key("owner", empty_pwd, key_length, revision);
+    EncryptionDictionary dict;
+    dict.filter = "Standard";
+    dict.v = 2;
+    dict.r = revision;
+    dict.length = key_length;
+    dict.p = static_cast<uint32_t>(0xFFFFFFFC);
+    dict.o = std::string(o_key.begin(), o_key.end());
+
+    std::vector<uint8_t> o_vec(dict.o.begin(), dict.o.end());
+    auto u_key = compute_user_key(empty_pwd, o_vec, dict.p, file_id,
+                                   key_length, revision);
+    dict.u = std::string(u_key.begin(), u_key.end());
+
+    assert(verify_user_password(empty_pwd, dict, file_id));
+    std::cout << "  Empty password: PASSED" << std::endl;
+  }
+
+  std::cout << "  Password verification: PASSED" << std::endl;
+}
+
 // Test permission flags
 void test_permission_flags() {
   std::cout << "Testing permission flags..." << std::endl;
@@ -485,6 +586,7 @@ int main() {
   test_owner_key_computation();
   test_user_key_computation();
   test_security_handler();
+  test_password_verification();
   test_permission_flags();
 
   std::cout << std::endl << "=== All Phase 5 tests passed! ===" << std::endl;

@@ -292,6 +292,288 @@ void test_page_annotations() {
   std::cout << "  Page annotations: PASSED" << std::endl;
 }
 
+// Test set_text_field_value
+void test_set_text_field_value() {
+  std::cout << "Testing set_text_field_value..." << std::endl;
+
+  // Basic set
+  TextField field;
+  field.full_name = "Name";
+  assert(set_text_field_value(&field, "John Doe"));
+  assert(field.field_value.type == Value::STRING);
+  assert(field.field_value.str == "John Doe");
+  std::cout << "  Basic set: PASSED" << std::endl;
+
+  // Null pointer
+  assert(!set_text_field_value(nullptr, "test"));
+  std::cout << "  Null pointer: PASSED" << std::endl;
+
+  // ReadOnly
+  TextField ro_field;
+  ro_field.flags = static_cast<uint32_t>(FormFieldFlags::ReadOnly);
+  assert(!set_text_field_value(&ro_field, "test"));
+  std::cout << "  ReadOnly: PASSED" << std::endl;
+
+  // Max length exceeded
+  TextField ml_field;
+  ml_field.max_length = 5;
+  assert(!set_text_field_value(&ml_field, "toolong"));
+  assert(set_text_field_value(&ml_field, "ok"));
+  assert(ml_field.field_value.str == "ok");
+  std::cout << "  Max length: PASSED" << std::endl;
+
+  std::cout << "  set_text_field_value: PASSED" << std::endl;
+}
+
+// Test set_button_field_checked
+void test_set_button_field_checked() {
+  std::cout << "Testing set_button_field_checked..." << std::endl;
+
+  // Checkbox check/uncheck
+  ButtonField cb;
+  cb.button_type = ButtonField::CheckBox;
+  assert(set_button_field_checked(&cb, true));
+  assert(cb.field_value.type == Value::NAME);
+  assert(cb.field_value.str == "/Yes");
+
+  assert(set_button_field_checked(&cb, false));
+  assert(cb.field_value.str == "/Off");
+  std::cout << "  Checkbox: PASSED" << std::endl;
+
+  // Radio button
+  ButtonField radio;
+  radio.button_type = ButtonField::RadioButton;
+  assert(set_button_field_checked(&radio, true));
+  assert(radio.field_value.str == "/Yes");
+  std::cout << "  RadioButton: PASSED" << std::endl;
+
+  // PushButton — should fail
+  ButtonField push;
+  push.button_type = ButtonField::PushButton;
+  assert(!set_button_field_checked(&push, true));
+  std::cout << "  PushButton rejected: PASSED" << std::endl;
+
+  // Null pointer
+  assert(!set_button_field_checked(nullptr, true));
+
+  // ReadOnly
+  ButtonField ro;
+  ro.button_type = ButtonField::CheckBox;
+  ro.flags = static_cast<uint32_t>(FormFieldFlags::ReadOnly);
+  assert(!set_button_field_checked(&ro, true));
+  std::cout << "  ReadOnly: PASSED" << std::endl;
+
+  std::cout << "  set_button_field_checked: PASSED" << std::endl;
+}
+
+// Test set_choice_field_selection
+void test_set_choice_field_selection() {
+  std::cout << "Testing set_choice_field_selection..." << std::endl;
+
+  ChoiceField field;
+  field.options = {"Red", "Green", "Blue"};
+
+  // Single selection
+  assert(set_choice_field_selection(&field, {1}));
+  assert(field.selected_indices.size() == 1);
+  assert(field.selected_indices[0] == 1);
+  assert(field.field_value.type == Value::STRING);
+  assert(field.field_value.str == "Green");
+  std::cout << "  Single select: PASSED" << std::endl;
+
+  // Out-of-range index
+  assert(!set_choice_field_selection(&field, {5}));
+  std::cout << "  Invalid index: PASSED" << std::endl;
+
+  // Multi-select without flag — should fail
+  assert(!set_choice_field_selection(&field, {0, 2}));
+  std::cout << "  Multi without flag: PASSED" << std::endl;
+
+  // Multi-select with flag
+  field.flags |= static_cast<uint32_t>(FormFieldFlags::MultiSelect);
+  assert(set_choice_field_selection(&field, {0, 2}));
+  assert(field.field_value.type == Value::ARRAY);
+  assert(field.field_value.array.size() == 2);
+  assert(field.field_value.array[0].str == "Red");
+  assert(field.field_value.array[1].str == "Blue");
+  std::cout << "  Multi select: PASSED" << std::endl;
+
+  // Empty selection
+  assert(set_choice_field_selection(&field, {}));
+  assert(field.field_value.type == Value::NULL_OBJ);
+  std::cout << "  Empty select: PASSED" << std::endl;
+
+  // Null pointer
+  assert(!set_choice_field_selection(nullptr, {0}));
+
+  std::cout << "  set_choice_field_selection: PASSED" << std::endl;
+}
+
+// Test validate_field_value
+void test_validate_field_value() {
+  std::cout << "Testing validate_field_value..." << std::endl;
+
+  // Text field validation
+  TextField text_field;
+  text_field.max_length = 10;
+  Value str_val;
+  str_val.SetType(Value::STRING);
+  str_val.str = "hello";
+  assert(validate_field_value(&text_field, str_val));
+
+  // Too long
+  str_val.str = "this string is way too long";
+  assert(!validate_field_value(&text_field, str_val));
+  std::cout << "  Text max length: PASSED" << std::endl;
+
+  // Required field with empty value
+  TextField req_field;
+  req_field.flags = static_cast<uint32_t>(FormFieldFlags::Required);
+  Value null_val;
+  null_val.SetType(Value::NULL_OBJ);
+  assert(!validate_field_value(&req_field, null_val));
+  Value empty_str;
+  empty_str.SetType(Value::STRING);
+  empty_str.str = "";
+  assert(!validate_field_value(&req_field, empty_str));
+  std::cout << "  Required: PASSED" << std::endl;
+
+  // Button field — should accept NAME type
+  ButtonField btn;
+  Value name_val;
+  name_val.SetType(Value::NAME);
+  name_val.str = "Yes";
+  assert(validate_field_value(&btn, name_val));
+  // Should reject STRING type
+  assert(!validate_field_value(&btn, str_val));
+  std::cout << "  Button type: PASSED" << std::endl;
+
+  // Null pointer
+  assert(!validate_field_value(nullptr, str_val));
+
+  std::cout << "  validate_field_value: PASSED" << std::endl;
+}
+
+// Test get_field_export_value
+void test_get_field_export_value() {
+  std::cout << "Testing get_field_export_value..." << std::endl;
+
+  // String value
+  TextField field;
+  field.field_value.SetType(Value::STRING);
+  field.field_value.str = "test_value";
+  assert(get_field_export_value(&field) == "test_value");
+  std::cout << "  String export: PASSED" << std::endl;
+
+  // Mapping name takes priority
+  field.mapping_name = "mapped_name";
+  assert(get_field_export_value(&field) == "mapped_name");
+  std::cout << "  Mapping name: PASSED" << std::endl;
+
+  // NoExport flag
+  TextField no_export;
+  no_export.flags = static_cast<uint32_t>(FormFieldFlags::NoExport);
+  no_export.field_value.SetType(Value::STRING);
+  no_export.field_value.str = "secret";
+  assert(get_field_export_value(&no_export) == "");
+  std::cout << "  NoExport: PASSED" << std::endl;
+
+  // Null pointer
+  assert(get_field_export_value(nullptr) == "");
+
+  std::cout << "  get_field_export_value: PASSED" << std::endl;
+}
+
+// Test find_field_by_name
+void test_find_field_by_name() {
+  std::cout << "Testing find_field_by_name..." << std::endl;
+
+  DocumentCatalog catalog;
+
+  auto f1 = std::unique_ptr<TextField>(new TextField());
+  f1->full_name = "Name";
+  f1->partial_name = "name";
+
+  auto f2 = std::unique_ptr<ButtonField>(new ButtonField());
+  f2->full_name = "Submit";
+
+  // Add child to f1
+  auto child = std::unique_ptr<TextField>(new TextField());
+  child->full_name = "Name.First";
+  child->partial_name = "First";
+  f1->children.push_back(std::move(child));
+
+  catalog.form_fields.push_back(std::move(f1));
+  catalog.form_fields.push_back(std::move(f2));
+
+  // Find top-level by full name
+  FormField* found = find_field_by_name(catalog, "Name");
+  assert(found != nullptr);
+  assert(found->full_name == "Name");
+  std::cout << "  Find by full name: PASSED" << std::endl;
+
+  // Find by partial name
+  found = find_field_by_name(catalog, "name");
+  assert(found != nullptr);
+  std::cout << "  Find by partial name: PASSED" << std::endl;
+
+  // Find nested child
+  found = find_field_by_name(catalog, "Name.First");
+  assert(found != nullptr);
+  assert(found->full_name == "Name.First");
+  std::cout << "  Find nested: PASSED" << std::endl;
+
+  // Not found
+  found = find_field_by_name(catalog, "NonExistent");
+  assert(found == nullptr);
+  std::cout << "  Not found: PASSED" << std::endl;
+
+  std::cout << "  find_field_by_name: PASSED" << std::endl;
+}
+
+// Test FDF export and import round-trip
+void test_fdf_round_trip() {
+  std::cout << "Testing FDF export/import round-trip..." << std::endl;
+
+  Pdf pdf;
+
+  // Create form fields
+  auto text_field = std::unique_ptr<TextField>(new TextField());
+  text_field->full_name = "UserName";
+  set_text_field_value(text_field.get(), "Alice");
+  pdf.catalog.form_fields.push_back(std::move(text_field));
+
+  auto check_field = std::unique_ptr<ButtonField>(new ButtonField());
+  check_field->full_name = "Agree";
+  check_field->button_type = ButtonField::CheckBox;
+  set_button_field_checked(check_field.get(), true);
+  pdf.catalog.form_fields.push_back(std::move(check_field));
+
+  // Export to FDF string
+  std::string fdf = export_form_data_fdf_string(pdf);
+  assert(!fdf.empty());
+  assert(fdf.find("%FDF") != std::string::npos);
+  assert(fdf.find("UserName") != std::string::npos);
+  assert(fdf.find("Alice") != std::string::npos);
+  std::cout << "  FDF export: PASSED" << std::endl;
+
+  // Import into a new Pdf with matching fields
+  Pdf pdf2;
+  auto tf2 = std::unique_ptr<TextField>(new TextField());
+  tf2->full_name = "UserName";
+  pdf2.catalog.form_fields.push_back(std::move(tf2));
+
+  assert(import_form_data_fdf_string(pdf2, fdf));
+
+  FormField* imported = find_field_by_name(pdf2.catalog, "UserName");
+  assert(imported != nullptr);
+  assert(imported->field_value.type == Value::STRING);
+  assert(imported->field_value.str == "Alice");
+  std::cout << "  FDF import: PASSED" << std::endl;
+
+  std::cout << "  FDF round-trip: PASSED" << std::endl;
+}
+
 // Test document catalog with forms
 void test_document_catalog_forms() {
   std::cout << "Testing DocumentCatalog forms..." << std::endl;
@@ -332,23 +614,15 @@ int main() {
   test_appearance_generation();
   test_page_annotations();
   test_document_catalog_forms();
+  test_set_text_field_value();
+  test_set_button_field_checked();
+  test_set_choice_field_selection();
+  test_validate_field_value();
+  test_get_field_export_value();
+  test_find_field_by_name();
+  test_fdf_round_trip();
 
   std::cout << std::endl << "=== All Phase 3 tests passed! ===" << std::endl;
-  std::cout << std::endl;
-  std::cout << "Summary of implemented Phase 3 features:" << std::endl;
-  std::cout << "  ✓ Text annotations (sticky notes)" << std::endl;
-  std::cout << "  ✓ Link annotations with URI and GoTo actions" << std::endl;
-  std::cout << "  ✓ Markup annotations (Highlight, Underline, Squiggly, StrikeOut)" << std::endl;
-  std::cout << "  ✓ FreeText annotations" << std::endl;
-  std::cout << "  ✓ Widget annotations for form fields" << std::endl;
-  std::cout << "  ✓ Annotation borders and appearance states" << std::endl;
-  std::cout << "  ✓ Text fields with max length and justification" << std::endl;
-  std::cout << "  ✓ Button fields (checkbox, radio, pushbutton)" << std::endl;
-  std::cout << "  ✓ Choice fields (listbox, combobox)" << std::endl;
-  std::cout << "  ✓ Form field flags and properties" << std::endl;
-  std::cout << "  ✓ Appearance stream generation" << std::endl;
-  std::cout << "  ✓ Page annotation collections" << std::endl;
-  std::cout << "  ✓ AcroForm parsing" << std::endl;
 
   return 0;
 }
