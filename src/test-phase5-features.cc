@@ -145,8 +145,7 @@ void test_md5() {
   print_hex(hash, 16);
   std::cout << std::endl;
 
-  // For now, skip this assert to test other features
-  // assert(memcmp(hash, expected, 16) == 0);
+  assert(memcmp(hash, expected, 16) == 0);
 
   // Test empty string
   uint8_t empty_expected[16] = {
@@ -156,8 +155,7 @@ void test_md5() {
 
   uint8_t empty_data[] = {};
   MD5::hash(empty_data, 0, hash);
-  // Skip this assert for now to test other features
-  // assert(memcmp(hash, empty_expected, 16) == 0);
+  assert(memcmp(hash, empty_expected, 16) == 0);
 
   std::cout << "  MD5: PASSED" << std::endl;
 }
@@ -333,6 +331,117 @@ void test_xor_bytes() {
   std::cout << "  XOR bytes: PASSED" << std::endl;
 }
 
+// Test SHA-256 hash
+void test_sha256() {
+  std::cout << "Testing SHA-256 hash..." << std::endl;
+
+  // NIST test vector: SHA-256("abc")
+  {
+    const char* input = "abc";
+    uint8_t expected[32] = {
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
+
+    uint8_t hash[32];
+    SHA256::hash(reinterpret_cast<const uint8_t*>(input), strlen(input), hash);
+    assert(memcmp(hash, expected, 32) == 0);
+    std::cout << "  SHA-256(\"abc\"): PASSED" << std::endl;
+  }
+
+  // NIST test vector: SHA-256("")
+  {
+    uint8_t expected[32] = {
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55};
+
+    uint8_t hash[32];
+    SHA256::hash(nullptr, 0, hash);
+    assert(memcmp(hash, expected, 32) == 0);
+    std::cout << "  SHA-256(\"\"): PASSED" << std::endl;
+  }
+
+  // NIST test vector: SHA-256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+  {
+    const char* input =
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    uint8_t expected[32] = {
+        0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8,
+        0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
+        0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67,
+        0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1};
+
+    uint8_t hash[32];
+    SHA256::hash(reinterpret_cast<const uint8_t*>(input), strlen(input), hash);
+    assert(memcmp(hash, expected, 32) == 0);
+    std::cout << "  SHA-256(448-bit message): PASSED" << std::endl;
+  }
+
+  std::cout << "  SHA-256: PASSED" << std::endl;
+}
+
+// Note: AES256 is declared in crypto.hh but not yet implemented in crypto.cc
+
+// Test RC4 with known test vector
+void test_rc4_known_vector() {
+  std::cout << "Testing RC4 known test vector..." << std::endl;
+
+  // RC4("Key", "Plaintext") = BBF316E8D940AF0AD3
+  RC4 rc4;
+  uint8_t key[] = {'K', 'e', 'y'};
+  uint8_t data[] = {'P', 'l', 'a', 'i', 'n', 't', 'e', 'x', 't'};
+  uint8_t expected[] = {0xBB, 0xF3, 0x16, 0xE8, 0xD9, 0x40, 0xAF, 0x0A, 0xD3};
+
+  rc4.init(key, sizeof(key));
+  rc4.crypt(data, sizeof(data));
+  assert(memcmp(data, expected, sizeof(expected)) == 0);
+
+  std::cout << "  RC4 known vector: PASSED" << std::endl;
+}
+
+// Test MD5 with NIST test vectors
+void test_md5_vectors() {
+  std::cout << "Testing MD5 NIST vectors..." << std::endl;
+
+  // MD5("") = d41d8cd98f00b204e9800998ecf8427e
+  {
+    uint8_t expected[16] = {
+        0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04,
+        0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42, 0x7e};
+    uint8_t hash[16];
+    MD5::hash(reinterpret_cast<const uint8_t*>(""), 0, hash);
+    assert(memcmp(hash, expected, 16) == 0);
+    std::cout << "  MD5(\"\"): PASSED" << std::endl;
+  }
+
+  // MD5("a") = 0cc175b9c0f1b6a831c399e269772661
+  {
+    uint8_t expected[16] = {
+        0x0c, 0xc1, 0x75, 0xb9, 0xc0, 0xf1, 0xb6, 0xa8,
+        0x31, 0xc3, 0x99, 0xe2, 0x69, 0x77, 0x26, 0x61};
+    uint8_t hash[16];
+    MD5::hash(reinterpret_cast<const uint8_t*>("a"), 1, hash);
+    assert(memcmp(hash, expected, 16) == 0);
+    std::cout << "  MD5(\"a\"): PASSED" << std::endl;
+  }
+
+  // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72
+  {
+    uint8_t expected[16] = {
+        0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0,
+        0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72};
+    uint8_t hash[16];
+    MD5::hash(reinterpret_cast<const uint8_t*>("abc"), 3, hash);
+    assert(memcmp(hash, expected, 16) == 0);
+    std::cout << "  MD5(\"abc\"): PASSED" << std::endl;
+  }
+
+  std::cout << "  MD5 vectors: PASSED" << std::endl;
+}
+
 // Test permission flags
 void test_permission_flags() {
   std::cout << "Testing permission flags..." << std::endl;
@@ -360,9 +469,13 @@ int main() {
 
   // Test crypto primitives
   test_rc4();
+  test_rc4_known_vector();
   test_aes128();
   test_aes_cbc();
+  // Note: AES256 declared in crypto.hh but not implemented in crypto.cc
   test_md5();
+  test_md5_vectors();
+  test_sha256();
   test_xor_bytes();
   test_pkcs7_padding();
 

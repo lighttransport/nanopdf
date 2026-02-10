@@ -695,6 +695,9 @@ void SHA256::finalize() {
     return;
   }
 
+  // Save original bit count BEFORE adding padding
+  uint64_t bit_count = count;
+
   uint8_t pad_block[64];
   std::memset(pad_block, 0, sizeof(pad_block));
   pad_block[0] = 0x80;
@@ -704,7 +707,6 @@ void SHA256::finalize() {
   update(pad_block, pad_len);
 
   uint8_t bits[8];
-  uint64_t bit_count = count;
   for (int i = 0; i < 8; i++) {
     bits[7 - i] = static_cast<uint8_t>((bit_count >> (i * 8)) & 0xff);
   }
