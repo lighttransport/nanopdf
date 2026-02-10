@@ -463,12 +463,7 @@ std::vector<uint8_t> SecurityHandler::compute_object_key(uint32_t obj_num, uint1
     return std::vector<uint8_t>();
   }
 
-  // For V=1 or V=2, use the encryption key directly
-  if (encrypt_dict.v <= 2) {
-    return encryption_key;
-  }
-
-  // For V=3 and above, derive per-object key
+  // Derive per-object key (required for all encryption versions per PDF spec §7.6.2)
   std::vector<uint8_t> hash_data;
   hash_data.insert(hash_data.end(), encryption_key.begin(), encryption_key.end());
 
