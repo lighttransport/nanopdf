@@ -166,21 +166,195 @@ void test_font_substitution() {
 }
 
 // Test text extraction helpers
-void test_text_extraction_helpers() {
-  std::cout << "Testing text extraction helper functions..." << std::endl;
+namespace {
 
-  // Since the TextExtractor class is private, we'll test the public interface
-  // when we have a fully constructed PDF and Page object
+Value make_stream(const char* content) {
+  Value val;
+  val.SetType(Value::STREAM);
+  val.stream.data.assign(content, content + std::strlen(content));
+  return val;
+}
 
-  // For now, we can test that the structures compile and basic operations work
+void setup_simple_font(Page& page, const std::string& font_name) {
+  auto font = std::unique_ptr<BaseFont>(new BaseFont());
+  font->subtype = "Type1";
+  font->base_font = "Helvetica";
+  font->encoding = "WinAnsiEncoding";
+  page.fonts[font_name] = std::move(font);
+  page.fonts_loaded = true;
+}
+
+}  // namespace
+
+// Test basic text extraction with Tj operator
+void test_text_extraction_tj() {
+  std::cout << "Testing text extraction (Tj operator)..." << std::endl;
+
+  Pdf pdf;
+  Page page;
+  setup_simple_font(page, "F1");
+
+  page.contents.push_back(make_stream(
+      "BT\n"
+      "/F1 12 Tf\n"
+      "72 720 Td\n"
+      "(Hello World) Tj\n"
+      "ET\n"));
+
+  std::string text = extract_text_from_page(pdf, page);
+  assert(text.find("Hello World") != std::string::npos);
+  std::cout << "  Tj operator: PASSED" << std::endl;
+
+  std::cout << "Tj text extraction tests completed!" << std::endl << std::endl;
+}
+
+// Test text extraction with multiple Tj calls
+void test_text_extraction_multiple_tj() {
+  std::cout << "Testing text extraction (multiple Tj calls)..." << std::endl;
+
+  Pdf pdf;
+  Page page;
+  setup_simple_font(page, "F1");
+
+  page.contents.push_back(make_stream(
+      "BT\n"
+      "/F1 12 Tf\n"
+      "72 720 Td\n"
+      "(Hello ) Tj\n"
+      "(World) Tj\n"
+      "ET\n"));
+
+  std::string text = extract_text_from_page(pdf, page);
+  assert(text.find("Hello") != std::string::npos);
+  assert(text.find("World") != std::string::npos);
+  std::cout << "  Multiple Tj: PASSED" << std::endl;
+
+  std::cout << "Multiple Tj text extraction tests completed!" << std::endl << std::endl;
+}
+
+// Test text extraction with multiple lines (T* operator)
+void test_text_extraction_multiline() {
+  std::cout << "Testing text extraction (multiline T*)..." << std::endl;
+
+  Pdf pdf;
+  Page page;
+  setup_simple_font(page, "F1");
+
+  page.contents.push_back(make_stream(
+      "BT\n"
+      "/F1 12 Tf\n"
+      "14 TL\n"
+      "72 720 Td\n"
+      "(Line One) Tj\n"
+      "T*\n"
+      "(Line Two) Tj\n"
+      "ET\n"));
+
+  std::string text = extract_text_from_page(pdf, page);
+  assert(text.find("Line One") != std::string::npos);
+  assert(text.find("Line Two") != std::string::npos);
+  std::cout << "  Multiline T*: PASSED" << std::endl;
+
+  std::cout << "Multiline text extraction tests completed!" << std::endl << std::endl;
+}
+
+// Test text extraction with ' and " operators
+void test_text_extraction_quote_operators() {
+  std::cout << "Testing text extraction (' and \" operators)..." << std::endl;
+
+  Pdf pdf;
+  Page page;
+  setup_simple_font(page, "F1");
+
+  // ' operator: move to next line and show text
+  page.contents.push_back(make_stream(
+      "BT\n"
+      "/F1 12 Tf\n"
+      "14 TL\n"
+      "72 720 Td\n"
+      "(First) Tj\n"
+      "(Second) '\n"
+      "ET\n"));
+
+  std::string text = extract_text_from_page(pdf, page);
+  assert(text.find("First") != std::string::npos);
+  assert(text.find("Second") != std::string::npos);
+  std::cout << "  Quote operator ('): PASSED" << std::endl;
+
+  std::cout << "Quote operator text extraction tests completed!" << std::endl
+            << std::endl;
+}
+
+// Test text extraction with Td positioning
+void test_text_extraction_positioning() {
+  std::cout << "Testing text extraction (Td/TD positioning)..." << std::endl;
+
+  Pdf pdf;
+  Page page;
+  setup_simple_font(page, "F1");
+
+  page.contents.push_back(make_stream(
+      "BT\n"
+      "/F1 12 Tf\n"
+      "72 720 Td\n"
+      "(Part A) Tj\n"
+      "200 0 Td\n"
+      "(Part B) Tj\n"
+      "ET\n"));
+
+  std::string text = extract_text_from_page(pdf, page);
+  assert(text.find("Part A") != std::string::npos);
+  assert(text.find("Part B") != std::string::npos);
+  std::cout << "  Td positioning: PASSED" << std::endl;
+
+  std::cout << "Positioning text extraction tests completed!" << std::endl
+            << std::endl;
+}
+
+// Test hex string text extraction
+void test_text_extraction_hex_string() {
+  std::cout << "Testing text extraction (hex strings)..." << std::endl;
+
+  Pdf pdf;
+  Page page;
+  setup_simple_font(page, "F1");
+
+  // "Hi" in hex = 4869
+  page.contents.push_back(make_stream(
+      "BT\n"
+      "/F1 12 Tf\n"
+      "72 720 Td\n"
+      "<4869> Tj\n"
+      "ET\n"));
+
+  std::string text = extract_text_from_page(pdf, page);
+  assert(text.find("Hi") != std::string::npos);
+  std::cout << "  Hex string: PASSED" << std::endl;
+
+  std::cout << "Hex string text extraction tests completed!" << std::endl
+            << std::endl;
+}
+
+// Test empty text block
+void test_text_extraction_empty() {
+  std::cout << "Testing text extraction (empty/no text)..." << std::endl;
+
   Pdf pdf;
   Page page;
 
-  // This would normally extract text, but without a real PDF it returns empty
-  // std::string text = extract_text_from_page(pdf, page);
+  // No content at all
+  std::string text = extract_text_from_page(pdf, page);
+  // Should not crash, may return empty
+  std::cout << "  No content: PASSED (got " << text.size() << " chars)" << std::endl;
 
-  std::cout << "  Text extraction structures compile: PASSED" << std::endl;
-  std::cout << "Text extraction helper tests completed!" << std::endl << std::endl;
+  // Empty BT/ET block
+  Page page2;
+  setup_simple_font(page2, "F1");
+  page2.contents.push_back(make_stream("BT\nET\n"));
+  std::string text2 = extract_text_from_page(pdf, page2);
+  std::cout << "  Empty BT/ET: PASSED" << std::endl;
+
+  std::cout << "Empty text extraction tests completed!" << std::endl << std::endl;
 }
 
 int main() {
@@ -192,19 +366,15 @@ int main() {
   test_type0_font();
   test_type3_font();
   test_font_substitution();
-  test_text_extraction_helpers();
+  test_text_extraction_tj();
+  test_text_extraction_multiple_tj();
+  test_text_extraction_multiline();
+  test_text_extraction_quote_operators();
+  test_text_extraction_positioning();
+  test_text_extraction_hex_string();
+  test_text_extraction_empty();
 
   std::cout << "=== All Phase 2 tests passed! ===" << std::endl;
-  std::cout << std::endl;
-  std::cout << "Summary of implemented Phase 2 features:" << std::endl;
-  std::cout << "  ✓ Text positioning operators (Td, TD, Tm, T*)" << std::endl;
-  std::cout << "  ✓ Text rendering modes (8 modes)" << std::endl;
-  std::cout << "  ✓ Enhanced text extraction with proper state management" << std::endl;
-  std::cout << "  ✓ Type0 (CID) font support with CMap" << std::endl;
-  std::cout << "  ✓ Type3 (user-defined) font support" << std::endl;
-  std::cout << "  ✓ Font substitution for standard 14 fonts" << std::endl;
-  std::cout << "  ✓ ToUnicode CMap support" << std::endl;
-  std::cout << "  ✓ Complete text state tracking" << std::endl;
 
   return 0;
 }
