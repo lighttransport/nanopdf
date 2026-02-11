@@ -68,7 +68,8 @@ struct TimestampConfig {
 // Encryption Support
 // ============================================================
 
-/// Encryption algorithm
+/// Encryption algorithm (skip if already defined in nanopdf.hh)
+#ifndef NANOPDF_HH_INCLUDED
 enum class EncryptionAlgorithm {
   None,           // No encryption
   RC4_40,         // RC4 40-bit (PDF 1.1+, weak, deprecated)
@@ -76,6 +77,7 @@ enum class EncryptionAlgorithm {
   AES_128,        // AES 128-bit (PDF 1.5+, recommended minimum)
   AES_256,        // AES 256-bit (PDF 1.7 Extension Level 3 / PDF 2.0)
 };
+#endif
 
 /// User access permissions (bit flags)
 /// These control what operations are allowed when opening with user password
@@ -308,7 +310,8 @@ struct FontData {
 // Transparency Support
 // ============================================================
 
-/// Blend modes for transparency
+/// Blend modes for transparency (skip if already defined in nanopdf.hh)
+#ifndef NANOPDF_HH_INCLUDED
 enum class BlendMode {
   Normal,
   Multiply,
@@ -323,6 +326,7 @@ enum class BlendMode {
   Difference,
   Exclusion,
 };
+#endif
 
 // ============================================================
 // Link Annotations

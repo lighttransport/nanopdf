@@ -57,12 +57,8 @@ CMAKE_OPTIONS=(
     -DNANOPDF_USE_NANOSTL=OFF
 )
 
-# Additional Emscripten compiler flags
-export CXXFLAGS="-O2 -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -s EXPORT_ES6=1"
-export LDFLAGS="-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS'] -s EXPORTED_FUNCTIONS=['_malloc','_free']"
-
-# For library builds, we might want to export specific functions
-# Add -s EXPORTED_FUNCTIONS=['_parse_pdf','_extract_text'] etc. as needed
+# All Emscripten-specific flags are handled in CMakeLists.txt
+# Do NOT set CXXFLAGS/LDFLAGS here as they conflict with CMake's settings
 
 # Run CMake with Emscripten toolchain
 emcmake cmake "${CMAKE_OPTIONS[@]}" ..

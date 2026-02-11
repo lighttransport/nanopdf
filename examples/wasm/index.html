@@ -5,188 +5,772 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>nanopdf WASM Demo</title>
   <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 20px;
-      background: #f5f5f5;
-    }
-    h1 {
+      background: #f0f2f5;
       color: #333;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
-    .controls {
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-      margin-bottom: 20px;
-    }
-    .controls input[type="file"] {
-      margin-right: 10px;
-    }
-    .controls button {
-      background: #007bff;
-      color: white;
-      border: none;
+
+    /* Header / Toolbar */
+    .toolbar {
+      background: #fff;
+      border-bottom: 1px solid #ddd;
       padding: 8px 16px;
-      border-radius: 4px;
-      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    .toolbar h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #1a1a1a;
       margin-right: 8px;
     }
-    .controls button:hover {
-      background: #0056b3;
+    .toolbar-separator {
+      width: 1px;
+      height: 24px;
+      background: #ddd;
     }
-    .controls button:disabled {
-      background: #ccc;
+    .toolbar button, .toolbar label {
+      background: #f5f5f5;
+      border: 1px solid #ccc;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #333;
+      white-space: nowrap;
+    }
+    .toolbar button:hover, .toolbar label:hover {
+      background: #e8e8e8;
+    }
+    .toolbar button:disabled {
+      opacity: 0.4;
       cursor: not-allowed;
     }
-    #status {
-      margin-top: 10px;
-      padding: 10px;
-      background: #e7f3ff;
+    .toolbar button:disabled:hover {
+      background: #f5f5f5;
+    }
+    .toolbar input[type="file"] { display: none; }
+    .toolbar .page-nav {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .toolbar .page-nav button {
+      padding: 6px 10px;
+      min-width: 32px;
+    }
+    .toolbar .page-display {
+      font-size: 13px;
+      cursor: pointer;
+      padding: 4px 8px;
       border-radius: 4px;
-      display: none;
+      user-select: none;
     }
-    #status.error {
-      background: #ffe7e7;
-      color: #cc0000;
+    .toolbar .page-display:hover {
+      background: #e8e8e8;
     }
-    #canvas-container {
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    .page-jump-input {
+      width: 50px;
+      padding: 4px 6px;
+      border: 1px solid #007bff;
+      border-radius: 4px;
+      font-size: 13px;
       text-align: center;
+      outline: none;
     }
-    #pdf-canvas {
-      border: 1px solid #ddd;
-      max-width: 100%;
+
+    /* Search bar */
+    .search-bar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      margin-left: auto;
     }
-    #page-info {
-      margin-top: 10px;
+    .search-bar input[type="text"] {
+      width: 180px;
+      padding: 6px 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 13px;
+      outline: none;
+    }
+    .search-bar input[type="text"]:focus {
+      border-color: #007bff;
+    }
+    .search-bar .search-info {
+      font-size: 12px;
+      color: #666;
+      min-width: 60px;
+    }
+
+    /* Main content area */
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 260px;
+      background: #fff;
+      border-right: 1px solid #ddd;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .sidebar.hidden { display: none; }
+    .sidebar-header {
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      border-bottom: 1px solid #eee;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .sidebar-header button {
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+      color: #666;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .sidebar-header button:hover {
+      background: #f0f0f0;
+    }
+    .sidebar-tabs {
+      display: flex;
+      border-bottom: 1px solid #eee;
+    }
+    .sidebar-tabs button {
+      flex: 1;
+      padding: 8px;
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      font-size: 12px;
       color: #666;
     }
-    .page-nav {
-      margin-top: 10px;
+    .sidebar-tabs button.active {
+      color: #007bff;
+      border-bottom-color: #007bff;
     }
-    #text-output {
-      margin-top: 20px;
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-      white-space: pre-wrap;
-      font-family: monospace;
-      max-height: 300px;
+    .sidebar-content {
+      flex: 1;
       overflow-y: auto;
+      padding: 8px;
+    }
+
+    /* Outline items */
+    .outline-item {
+      padding: 6px 8px;
+      font-size: 13px;
+      cursor: pointer;
+      border-radius: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .outline-item:hover {
+      background: #f0f4ff;
+    }
+    .outline-item.active {
+      background: #e0ecff;
+      color: #0050cc;
+    }
+
+    /* Doc info */
+    .doc-info-item {
+      padding: 6px 0;
+      font-size: 13px;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .doc-info-item .label {
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .doc-info-item .value {
+      margin-top: 2px;
+      word-break: break-all;
+    }
+
+    /* Canvas area */
+    .canvas-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+    .canvas-scroll {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+      padding: 20px;
+      background: #e8eaed;
+    }
+    #pdf-canvas {
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      background: #fff;
       display: none;
     }
+
+    /* Text output panel */
+    .text-panel {
+      border-top: 1px solid #ddd;
+      background: #fff;
+      max-height: 200px;
+      overflow-y: auto;
+      display: none;
+      flex-shrink: 0;
+    }
+    .text-panel-header {
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      border-bottom: 1px solid #eee;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      background: #fff;
+      z-index: 1;
+    }
+    .text-panel-header button {
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+      color: #666;
+      padding: 2px 6px;
+    }
+    .text-panel-content {
+      padding: 12px;
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    /* Status / notifications */
+    .status-bar {
+      background: #fff;
+      border-top: 1px solid #ddd;
+      padding: 4px 16px;
+      font-size: 12px;
+      color: #666;
+      flex-shrink: 0;
+      display: flex;
+      justify-content: space-between;
+    }
+    .status-bar.error { color: #cc0000; background: #fff5f5; }
+
+    /* Loading overlay */
+    .loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(255,255,255,0.9);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    .loading-overlay.hidden { display: none; }
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid #e0e0e0;
+      border-top-color: #007bff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-text {
+      margin-top: 12px;
+      font-size: 14px;
+      color: #666;
+    }
+
+    /* Drag-drop overlay */
+    .drop-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 123, 255, 0.1);
+      border: 3px dashed #007bff;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 90;
+      pointer-events: none;
+    }
+    .drop-overlay.active { display: flex; }
+    .drop-overlay-text {
+      background: #007bff;
+      color: #fff;
+      padding: 16px 32px;
+      border-radius: 8px;
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    /* Welcome / empty state */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: #999;
+    }
+    .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+    .empty-state .hint { font-size: 14px; margin-top: 8px; }
   </style>
 </head>
 <body>
-  <h1>nanopdf WASM Demo</h1>
-
-  <div class="controls">
-    <input type="file" id="pdf-input" accept=".pdf" />
-    <button id="render-btn" disabled>Render Page</button>
-    <button id="extract-btn" disabled>Extract Text</button>
-    <div id="status"></div>
+  <!-- Loading overlay -->
+  <div class="loading-overlay" id="loading-overlay">
+    <div class="spinner"></div>
+    <div class="loading-text" id="loading-text">Loading WASM module...</div>
   </div>
 
-  <div id="canvas-container">
-    <canvas id="pdf-canvas" width="800" height="600"></canvas>
-    <div id="page-info"></div>
+  <!-- Drag-drop overlay -->
+  <div class="drop-overlay" id="drop-overlay">
+    <div class="drop-overlay-text">Drop PDF file here</div>
+  </div>
+
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <h1>nanopdf</h1>
+    <div class="toolbar-separator"></div>
+    <label for="pdf-input">Open PDF</label>
+    <input type="file" id="pdf-input" accept=".pdf" />
+    <div class="toolbar-separator"></div>
     <div class="page-nav">
-      <button id="prev-btn" disabled>&larr; Previous</button>
-      <span id="page-display">Page 0 / 0</span>
-      <button id="next-btn" disabled>Next &rarr;</button>
+      <button id="prev-btn" disabled title="Previous page (Left arrow)">&larr;</button>
+      <span id="page-display" class="page-display" title="Click to jump to page">Page 0 / 0</span>
+      <button id="next-btn" disabled title="Next page (Right arrow)">&rarr;</button>
+    </div>
+    <div class="toolbar-separator"></div>
+    <button id="sidebar-toggle-btn" disabled title="Toggle sidebar">Outline</button>
+    <button id="extract-btn" disabled title="Extract text from current page">Text</button>
+    <button id="render-btn" disabled title="Re-render current page">Render</button>
+
+    <!-- Search -->
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="Search text..." disabled />
+      <button id="search-prev-btn" disabled title="Previous match">&uarr;</button>
+      <button id="search-next-btn" disabled title="Next match">&darr;</button>
+      <span id="search-info" class="search-info"></span>
     </div>
   </div>
 
-  <div id="text-output"></div>
+  <!-- Main content -->
+  <div class="main">
+    <!-- Sidebar -->
+    <div class="sidebar hidden" id="sidebar">
+      <div class="sidebar-tabs">
+        <button class="active" data-tab="outline">Outline</button>
+        <button data-tab="info">Info</button>
+      </div>
+      <div class="sidebar-content" id="sidebar-content">
+        <!-- Filled dynamically -->
+      </div>
+    </div>
+
+    <!-- Canvas area -->
+    <div class="canvas-area">
+      <div class="canvas-scroll" id="canvas-scroll">
+        <div class="empty-state" id="empty-state">
+          <div class="icon">PDF</div>
+          <div>No PDF loaded</div>
+          <div class="hint">Click "Open PDF" or drag and drop a file</div>
+        </div>
+        <canvas id="pdf-canvas"></canvas>
+      </div>
+
+      <!-- Text extraction panel -->
+      <div class="text-panel" id="text-panel">
+        <div class="text-panel-header">
+          <span>Extracted Text</span>
+          <button id="text-panel-close" title="Close">&times;</button>
+        </div>
+        <div class="text-panel-content" id="text-content"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="status-bar" id="status-bar">
+    <span id="status-text">Initializing...</span>
+    <span id="status-right"></span>
+  </div>
 
   <script type="module">
-    // Import the nanopdf WASM module
-    // Adjust the path based on your build output location
     import createModule from '../../build_wasm/nanopdf.js';
 
+    // State
     let Module = null;
-    let pdf = null;
     let currentPage = 0;
     let totalPages = 0;
+    let hasRendering = false;
+    let fileName = '';
+    let fileSize = 0;
+    let outlineData = null;
+    let searchResults = [];
+    let currentSearchIndex = -1;
+    let currentSearchTerm = '';
+    let isPageJumpMode = false;
+    let activeSidebarTab = 'outline';
 
+    // DOM refs
+    const loadingOverlay = document.getElementById('loading-overlay');
+    const loadingText = document.getElementById('loading-text');
+    const dropOverlay = document.getElementById('drop-overlay');
     const pdfInput = document.getElementById('pdf-input');
     const renderBtn = document.getElementById('render-btn');
     const extractBtn = document.getElementById('extract-btn');
     const prevBtn = document.getElementById('prev-btn');
     const nextBtn = document.getElementById('next-btn');
+    const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
     const canvas = document.getElementById('pdf-canvas');
-    const status = document.getElementById('status');
-    const pageInfo = document.getElementById('page-info');
     const pageDisplay = document.getElementById('page-display');
-    const textOutput = document.getElementById('text-output');
+    const statusText = document.getElementById('status-text');
+    const statusRight = document.getElementById('status-right');
+    const statusBar = document.getElementById('status-bar');
+    const emptyState = document.getElementById('empty-state');
+    const sidebar = document.getElementById('sidebar');
+    const sidebarContent = document.getElementById('sidebar-content');
+    const textPanel = document.getElementById('text-panel');
+    const textContent = document.getElementById('text-content');
+    const searchInput = document.getElementById('search-input');
+    const searchPrevBtn = document.getElementById('search-prev-btn');
+    const searchNextBtn = document.getElementById('search-next-btn');
+    const searchInfo = document.getElementById('search-info');
 
-    function showStatus(msg, isError = false) {
-      status.textContent = msg;
-      status.style.display = 'block';
-      status.className = isError ? 'error' : '';
+    function setStatus(msg, isError = false) {
+      statusText.textContent = msg;
+      statusBar.className = 'status-bar' + (isError ? ' error' : '');
     }
 
-    function hideStatus() {
-      status.style.display = 'none';
+    function showLoading(msg) {
+      loadingText.textContent = msg;
+      loadingOverlay.classList.remove('hidden');
+    }
+
+    function hideLoading() {
+      loadingOverlay.classList.add('hidden');
     }
 
     function updatePageDisplay() {
+      if (isPageJumpMode) return;
       pageDisplay.textContent = `Page ${currentPage + 1} / ${totalPages}`;
       prevBtn.disabled = currentPage <= 0;
       nextBtn.disabled = currentPage >= totalPages - 1;
     }
 
-    async function init() {
-      showStatus('Loading WASM module...');
-      try {
-        Module = await createModule();
+    function formatFileSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
 
-        // Initialize nanopdf
-        const result = Module._nanopdf_init();
-        if (result !== 1) {
-          throw new Error('Failed to initialize nanopdf');
+    // ---- Sidebar ----
+
+    function renderOutlineTab() {
+      if (!outlineData || !outlineData.outline || outlineData.outline.length === 0) {
+        sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">No bookmarks in this document.</div>';
+        return;
+      }
+
+      let html = '';
+      function renderItems(items, depth) {
+        for (const item of items) {
+          const indent = depth * 16;
+          const pageLabel = item.page !== undefined ? ` (p.${item.page + 1})` : '';
+          const clickAttr = item.page !== undefined
+            ? `onclick="window._jumpToPage(${item.page})"` : '';
+          const style = `padding-left:${indent + 8}px`;
+          const boldStyle = item.bold ? 'font-weight:600;' : '';
+          const italicStyle = item.italic ? 'font-style:italic;' : '';
+          html += `<div class="outline-item" ${clickAttr} style="${style};${boldStyle}${italicStyle}" title="${escapeHtml(item.title)}${pageLabel}">${escapeHtml(item.title)}<span style="color:#999;font-size:11px;">${pageLabel}</span></div>`;
+          if (item.children && item.children.length > 0) {
+            renderItems(item.children, depth + 1);
+          }
         }
+      }
+      renderItems(outlineData.outline, 0);
+      sidebarContent.innerHTML = html;
+    }
 
-        // Check if rendering is available
-        const hasRendering = Module._nanopdf_has_rendering() === 1;
-        if (!hasRendering) {
-          showStatus('Note: Rendering not available. Build with NANOPDF_USE_THORVG=ON or NANOPDF_USE_BLEND2D=ON for rendering support. Text extraction is still available.');
-          renderBtn.style.display = 'none';
-          canvas.style.display = 'none';
-        } else {
-          hideStatus();
-        }
+    function renderInfoTab() {
+      let html = '';
+      const info = [
+        { label: 'File Name', value: fileName || 'N/A' },
+        { label: 'File Size', value: fileSize ? formatFileSize(fileSize) : 'N/A' },
+        { label: 'Pages', value: totalPages || 'N/A' },
+        { label: 'Rendering', value: hasRendering ? 'Available' : 'Not available' },
+      ];
 
-        console.log('nanopdf WASM module loaded successfully');
-        console.log('Rendering available:', hasRendering);
-      } catch (err) {
-        showStatus('Failed to load WASM module: ' + err.message, true);
-        console.error(err);
+      if (totalPages > 0 && Module) {
+        const pw = Module._nanopdf_get_page_width(currentPage);
+        const ph = Module._nanopdf_get_page_height(currentPage);
+        info.push({ label: 'Current Page Size', value: `${pw.toFixed(1)} x ${ph.toFixed(1)} pts` });
+        info.push({ label: 'Inches', value: `${(pw/72).toFixed(2)}" x ${(ph/72).toFixed(2)}"` });
+
+        const hasOutline = Module._nanopdf_has_outline() === 1;
+        info.push({ label: 'Bookmarks', value: hasOutline ? `${Module._nanopdf_get_outline_count()} items` : 'None' });
+
+        const hasForms = Module._nanopdf_has_form_fields() === 1;
+        info.push({ label: 'Form Fields', value: hasForms ? `${Module._nanopdf_get_form_field_count()} fields` : 'None' });
+      }
+
+      for (const item of info) {
+        html += `<div class="doc-info-item"><div class="label">${item.label}</div><div class="value">${item.value}</div></div>`;
+      }
+      sidebarContent.innerHTML = html;
+    }
+
+    function updateSidebar() {
+      if (activeSidebarTab === 'outline') {
+        renderOutlineTab();
+      } else {
+        renderInfoTab();
       }
     }
 
-    pdfInput.addEventListener('change', async (e) => {
-      const file = e.target.files[0];
-      if (!file || !Module) return;
+    // ---- Page Navigation ----
 
-      showStatus('Loading PDF...');
+    function goToPage(pageIndex) {
+      if (pageIndex < 0 || pageIndex >= totalPages) return;
+      currentPage = pageIndex;
+      updatePageDisplay();
+      renderCurrentPage();
+      clearSearch();
+    }
+
+    window._jumpToPage = function(pageIndex) {
+      goToPage(pageIndex);
+    };
+
+    function enterPageJump() {
+      if (totalPages <= 0 || isPageJumpMode) return;
+      isPageJumpMode = true;
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.className = 'page-jump-input';
+      input.min = 1;
+      input.max = totalPages;
+      input.value = currentPage + 1;
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          const page = parseInt(input.value, 10) - 1;
+          exitPageJump();
+          if (page >= 0 && page < totalPages) {
+            goToPage(page);
+          }
+        } else if (e.key === 'Escape') {
+          exitPageJump();
+        }
+        e.stopPropagation();
+      });
+      input.addEventListener('blur', () => {
+        exitPageJump();
+      });
+      pageDisplay.textContent = '';
+      pageDisplay.appendChild(input);
+      input.select();
+    }
+
+    function exitPageJump() {
+      isPageJumpMode = false;
+      updatePageDisplay();
+    }
+
+    // ---- Rendering ----
+
+    function renderCurrentPage() {
+      if (!Module || totalPages <= 0) return;
+      if (!hasRendering) {
+        // No rendering backend, just update info
+        setStatus(`Page ${currentPage + 1} / ${totalPages} (rendering not available)`);
+        if (activeSidebarTab === 'info') renderInfoTab();
+        return;
+      }
+
+      const pageWidth = Module._nanopdf_get_page_width(currentPage);
+      const pageHeight = Module._nanopdf_get_page_height(currentPage);
+
+      const maxWidth = Math.min(800, window.innerWidth - (sidebar.classList.contains('hidden') ? 80 : 340));
+      const scale = maxWidth / pageWidth;
+      const width = Math.floor(pageWidth * scale);
+      const height = Math.floor(pageHeight * scale);
+
+      canvas.width = width;
+      canvas.height = height;
+
+      const dpi = 72 * scale;
+      const result = Module._nanopdf_render_page(currentPage, width, height, dpi);
+
+      if (result !== 1) {
+        const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+        setStatus('Render error: ' + error, true);
+        return;
+      }
+
+      const bufferPtr = Module._nanopdf_get_render_buffer();
+      const bufferSize = Module._nanopdf_get_render_buffer_size();
+      const renderWidth = Module._nanopdf_get_render_width();
+      const renderHeight = Module._nanopdf_get_render_height();
+
+      const ctx = canvas.getContext('2d');
+      const imageData = ctx.createImageData(renderWidth, renderHeight);
+      const srcData = new Uint8ClampedArray(Module.HEAPU8.buffer, bufferPtr, bufferSize);
+      imageData.data.set(srcData);
+      ctx.putImageData(imageData, 0, 0);
+
+      emptyState.style.display = 'none';
+      canvas.style.display = 'block';
+
+      setStatus(`Page ${currentPage + 1} / ${totalPages} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts`);
+      statusRight.textContent = fileName;
+
+      if (activeSidebarTab === 'info') renderInfoTab();
+    }
+
+    // ---- Text Extraction ----
+
+    function extractText() {
+      if (!Module || totalPages <= 0) return;
+
+      const textPtr = Module._nanopdf_extract_text(currentPage);
+      const text = Module.UTF8ToString(textPtr);
+
+      textContent.textContent = text || '(No text extracted)';
+      textPanel.style.display = 'block';
+    }
+
+    // ---- Search ----
+
+    let searchDebounce = null;
+
+    function performSearch(term) {
+      searchResults = [];
+      currentSearchIndex = -1;
+      currentSearchTerm = term;
+
+      if (!Module || totalPages <= 0 || !term) {
+        searchInfo.textContent = '';
+        searchPrevBtn.disabled = true;
+        searchNextBtn.disabled = true;
+        return;
+      }
+
+      // Search across all pages
+      const termPtr = Module.stringToNewUTF8(term);
+      const pagesPtr = Module.stringToNewUTF8('all');
+      const resultPtr = Module._nanopdf_batch_find_text(termPtr, pagesPtr);
+      const resultStr = Module.UTF8ToString(resultPtr);
+      Module._free(termPtr);
+      Module._free(pagesPtr);
 
       try {
-        const arrayBuffer = await file.arrayBuffer();
-        const bytes = new Uint8Array(arrayBuffer);
+        const data = JSON.parse(resultStr);
+        if (data.results) {
+          for (const pageResult of data.results) {
+            for (const match of pageResult.matches) {
+              searchResults.push({
+                page: pageResult.page,
+                start: match.start,
+                end: match.end,
+                context: match.context
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Search parse error:', e);
+      }
 
-        // Allocate memory and copy data
+      if (searchResults.length > 0) {
+        currentSearchIndex = 0;
+        // Jump to first result's page
+        const firstPage = searchResults[0].page;
+        if (firstPage !== currentPage) {
+          goToPage(firstPage);
+        }
+        updateSearchInfo();
+        searchPrevBtn.disabled = false;
+        searchNextBtn.disabled = false;
+      } else {
+        searchInfo.textContent = 'No matches';
+        searchPrevBtn.disabled = true;
+        searchNextBtn.disabled = true;
+      }
+    }
+
+    function updateSearchInfo() {
+      if (searchResults.length === 0) {
+        searchInfo.textContent = '';
+        return;
+      }
+      searchInfo.textContent = `${currentSearchIndex + 1} / ${searchResults.length}`;
+    }
+
+    function nextSearchResult() {
+      if (searchResults.length === 0) return;
+      currentSearchIndex = (currentSearchIndex + 1) % searchResults.length;
+      const result = searchResults[currentSearchIndex];
+      if (result.page !== currentPage) {
+        goToPage(result.page);
+      }
+      updateSearchInfo();
+    }
+
+    function prevSearchResult() {
+      if (searchResults.length === 0) return;
+      currentSearchIndex = (currentSearchIndex - 1 + searchResults.length) % searchResults.length;
+      const result = searchResults[currentSearchIndex];
+      if (result.page !== currentPage) {
+        goToPage(result.page);
+      }
+      updateSearchInfo();
+    }
+
+    function clearSearch() {
+      // Don't clear input or results, just reset current match tracking
+    }
+
+    // ---- PDF Loading ----
+
+    async function loadPDF(arrayBuffer, name) {
+      if (!Module) return;
+
+      showLoading('Loading PDF...');
+      const bytes = new Uint8Array(arrayBuffer);
+
+      try {
         const ptr = Module._nanopdf_malloc(bytes.length);
         Module.HEAPU8.set(bytes, ptr);
 
-        // Load PDF
         totalPages = Module._nanopdf_load_pdf(ptr, bytes.length);
         Module._nanopdf_free(ptr);
 
@@ -195,94 +779,231 @@
           throw new Error(error || 'Failed to load PDF');
         }
 
+        fileName = name;
+        fileSize = bytes.length;
         currentPage = 0;
-        renderBtn.disabled = false;
+
+        // Enable controls
+        renderBtn.disabled = !hasRendering;
         extractBtn.disabled = false;
         prevBtn.disabled = false;
         nextBtn.disabled = false;
+        sidebarToggleBtn.disabled = false;
+        searchInput.disabled = false;
 
         updatePageDisplay();
-        showStatus(`Loaded ${file.name}: ${totalPages} page(s)`);
 
-        // Auto-render first page
-        renderCurrentPage();
+        // Load outline
+        loadOutline();
+
+        // Auto-show sidebar if there are bookmarks
+        if (outlineData && outlineData.outline && outlineData.outline.length > 0) {
+          sidebar.classList.remove('hidden');
+          updateSidebar();
+        }
+
+        // Render first page
+        if (hasRendering) {
+          renderCurrentPage();
+        } else {
+          emptyState.style.display = 'none';
+          canvas.style.display = 'none';
+          setStatus(`Loaded ${name}: ${totalPages} page(s) (no rendering backend)`);
+        }
+
+        hideLoading();
+        setStatus(`Loaded ${name}: ${totalPages} page(s), ${formatFileSize(fileSize)}`);
+        statusRight.textContent = name;
+
       } catch (err) {
-        showStatus('Error: ' + err.message, true);
+        hideLoading();
+        setStatus('Error: ' + err.message, true);
         console.error(err);
       }
-    });
-
-    function renderCurrentPage() {
-      if (!Module || totalPages <= 0) return;
-
-      // Get page dimensions
-      const pageWidth = Module._nanopdf_get_page_width(currentPage);
-      const pageHeight = Module._nanopdf_get_page_height(currentPage);
-
-      // Calculate canvas size (scale to fit)
-      const maxWidth = 800;
-      const scale = maxWidth / pageWidth;
-      const width = Math.floor(pageWidth * scale);
-      const height = Math.floor(pageHeight * scale);
-
-      canvas.width = width;
-      canvas.height = height;
-
-      // Render page
-      const dpi = 72 * scale;
-      const result = Module._nanopdf_render_page(currentPage, width, height, dpi);
-
-      if (result !== 1) {
-        const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
-        showStatus('Render error: ' + error, true);
-        return;
-      }
-
-      // Get render buffer
-      const bufferPtr = Module._nanopdf_get_render_buffer();
-      const bufferSize = Module._nanopdf_get_render_buffer_size();
-      const renderWidth = Module._nanopdf_get_render_width();
-      const renderHeight = Module._nanopdf_get_render_height();
-
-      // Copy to canvas
-      const ctx = canvas.getContext('2d');
-      const imageData = ctx.createImageData(renderWidth, renderHeight);
-      const srcData = new Uint8ClampedArray(Module.HEAPU8.buffer, bufferPtr, bufferSize);
-      imageData.data.set(srcData);
-      ctx.putImageData(imageData, 0, 0);
-
-      pageInfo.textContent = `Page size: ${pageWidth.toFixed(1)} x ${pageHeight.toFixed(1)} pts (${(pageWidth/72).toFixed(2)}" x ${(pageHeight/72).toFixed(2)}")`;
-      updatePageDisplay();
-      hideStatus();
     }
 
-    renderBtn.addEventListener('click', renderCurrentPage);
+    function loadOutline() {
+      if (!Module) return;
+      try {
+        const hasOutline = Module._nanopdf_has_outline();
+        if (hasOutline === 1) {
+          const outlinePtr = Module._nanopdf_get_outline();
+          const outlineStr = Module.UTF8ToString(outlinePtr);
+          outlineData = JSON.parse(outlineStr);
+        } else {
+          outlineData = null;
+        }
+      } catch (e) {
+        console.error('Outline parse error:', e);
+        outlineData = null;
+      }
+    }
 
-    extractBtn.addEventListener('click', () => {
-      if (!Module || totalPages <= 0) return;
+    // ---- Helpers ----
 
-      const textPtr = Module._nanopdf_extract_text(currentPage);
-      const text = Module.UTF8ToString(textPtr);
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
 
-      textOutput.style.display = 'block';
-      textOutput.textContent = text || '(No text extracted)';
+    // ---- Event Handlers ----
+
+    // File input
+    pdfInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const arrayBuffer = await file.arrayBuffer();
+      loadPDF(arrayBuffer, file.name);
     });
 
+    // Drag and drop
+    let dragCounter = 0;
+    document.addEventListener('dragenter', (e) => {
+      e.preventDefault();
+      dragCounter++;
+      dropOverlay.classList.add('active');
+    });
+    document.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      dragCounter--;
+      if (dragCounter <= 0) {
+        dragCounter = 0;
+        dropOverlay.classList.remove('active');
+      }
+    });
+    document.addEventListener('dragover', (e) => {
+      e.preventDefault();
+    });
+    document.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dragCounter = 0;
+      dropOverlay.classList.remove('active');
+
+      const files = e.dataTransfer.files;
+      if (files.length > 0 && files[0].type === 'application/pdf') {
+        const arrayBuffer = await files[0].arrayBuffer();
+        loadPDF(arrayBuffer, files[0].name);
+      } else if (files.length > 0 && files[0].name.toLowerCase().endsWith('.pdf')) {
+        const arrayBuffer = await files[0].arrayBuffer();
+        loadPDF(arrayBuffer, files[0].name);
+      }
+    });
+
+    // Page navigation
     prevBtn.addEventListener('click', () => {
-      if (currentPage > 0) {
-        currentPage--;
-        renderCurrentPage();
-      }
+      if (currentPage > 0) goToPage(currentPage - 1);
     });
-
     nextBtn.addEventListener('click', () => {
-      if (currentPage < totalPages - 1) {
-        currentPage++;
-        renderCurrentPage();
+      if (currentPage < totalPages - 1) goToPage(currentPage + 1);
+    });
+    pageDisplay.addEventListener('click', enterPageJump);
+
+    // Keyboard navigation
+    document.addEventListener('keydown', (e) => {
+      // Don't capture if user is typing in an input
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (currentPage > 0) goToPage(currentPage - 1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (currentPage < totalPages - 1) goToPage(currentPage + 1);
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        if (totalPages > 0) goToPage(0);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        if (totalPages > 0) goToPage(totalPages - 1);
+      } else if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        searchInput.focus();
       }
     });
 
-    // Initialize on load
+    // Render / Extract buttons
+    renderBtn.addEventListener('click', renderCurrentPage);
+    extractBtn.addEventListener('click', extractText);
+
+    // Close text panel
+    document.getElementById('text-panel-close').addEventListener('click', () => {
+      textPanel.style.display = 'none';
+    });
+
+    // Sidebar toggle
+    sidebarToggleBtn.addEventListener('click', () => {
+      sidebar.classList.toggle('hidden');
+      updateSidebar();
+      // Re-render to adjust canvas size
+      if (hasRendering && totalPages > 0) {
+        setTimeout(renderCurrentPage, 50);
+      }
+    });
+
+    // Sidebar tabs
+    document.querySelectorAll('.sidebar-tabs button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.sidebar-tabs button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        activeSidebarTab = btn.dataset.tab;
+        updateSidebar();
+      });
+    });
+
+    // Search
+    searchInput.addEventListener('input', (e) => {
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(() => {
+        performSearch(e.target.value.trim());
+      }, 300);
+    });
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          prevSearchResult();
+        } else {
+          nextSearchResult();
+        }
+      } else if (e.key === 'Escape') {
+        searchInput.blur();
+      }
+    });
+    searchPrevBtn.addEventListener('click', prevSearchResult);
+    searchNextBtn.addEventListener('click', nextSearchResult);
+
+    // ---- Initialize ----
+
+    async function init() {
+      showLoading('Loading WASM module...');
+      try {
+        Module = await createModule();
+
+        const result = Module._nanopdf_init();
+        if (result !== 1) {
+          throw new Error('Failed to initialize nanopdf');
+        }
+
+        hasRendering = Module._nanopdf_has_rendering() === 1;
+
+        hideLoading();
+
+        if (!hasRendering) {
+          setStatus('Ready (rendering not available - build with NANOPDF_USE_THORVG or NANOPDF_USE_BLEND2D for rendering)');
+          renderBtn.style.display = 'none';
+        } else {
+          setStatus('Ready - open a PDF file or drag and drop');
+        }
+
+        console.log('nanopdf WASM loaded. Rendering:', hasRendering);
+      } catch (err) {
+        hideLoading();
+        setStatus('Failed to load WASM: ' + err.message, true);
+        console.error(err);
+      }
+    }
+
     init();
   </script>
 </body>

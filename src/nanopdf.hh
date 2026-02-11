@@ -2,6 +2,7 @@
 // Copyright 2024 - Present, Light Transport Entertainment Inc.
 
 #pragma once
+#define NANOPDF_HH_INCLUDED
 
 #if defined(NANOPDF_USE_NANOSTL)
 #include "nanocstddef.h"

@@ -60,7 +60,7 @@ if(NANOPDF_BUILD_WASM)
   # Set Emscripten-specific linker flags (all -s flags go here)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s WASM=1 -s ALLOW_MEMORY_GROWTH=1")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s MODULARIZE=1 -s EXPORT_ES6=1")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','allocateUTF8','UTF8ToString'] -s EXPORTED_FUNCTIONS=['_malloc','_free']")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','stringToNewUTF8','UTF8ToString'] -s EXPORTED_FUNCTIONS=['_malloc','_free']")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s USE_ZLIB=1")
 endif()
 
@@ -146,9 +146,17 @@ endif()
 # Add WASM API for Emscripten builds
 if(NANOPDF_BUILD_WASM)
   list(APPEND NANOPDF_SOURCES src/wasm-api.cc)
+  # Remove document-structure.cc for WASM builds because nanopdf.cc already
+  # contains the same function definitions (parse_document_outline, etc.)
+  # and duplicate symbols cause linker errors in executable targets.
+  list(REMOVE_ITEM NANOPDF_SOURCES src/document-structure.cc)
 endif()
 
-add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
+if(NANOPDF_BUILD_WASM)
+  add_executable(${BUILD_TARGET} ${NANOPDF_SOURCES})
+else()
+  add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
+endif()
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_LOG_LEVEL=${NANOPDF_LOG_LEVEL}")
 
 # Link with zlib (or use embedded miniz)
@@ -537,10 +545,10 @@ add_custom_target(generate_visual_refs
 
 # For WASM builds, create a JavaScript module
 if(NANOPDF_BUILD_WASM)
-  # Set output as JavaScript module
+  # Set output as JavaScript module with --no-entry (no main function)
   set_target_properties(${BUILD_TARGET} PROPERTIES
     SUFFIX ".js"
-    LINK_FLAGS "-s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS'] -s EXPORTED_FUNCTIONS=['_malloc','_free'] -s USE_ZLIB=1 -s ALLOW_MEMORY_GROWTH=1"
+    LINK_FLAGS "-s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','stringToNewUTF8','UTF8ToString'] -s EXPORTED_FUNCTIONS=['_malloc','_free'] -s USE_ZLIB=1 -s ALLOW_MEMORY_GROWTH=1 --no-entry"
   )
 
   # Install headers for potential Node.js usage

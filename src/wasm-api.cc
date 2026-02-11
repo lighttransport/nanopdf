@@ -148,15 +148,14 @@ int nanopdf_load_pdf(const uint8_t* data, size_t size) {
   g_pdf_data.assign(data, data + size);
 
   g_pdf = new nanopdf::Pdf();
-  nanopdf::Parser parser;
-  if (!parser.parse(g_pdf_data.data(), g_pdf_data.size(), g_pdf)) {
+  if (!nanopdf::parse_from_memory(g_pdf_data.data(), g_pdf_data.size(), g_pdf)) {
     g_last_error = "Failed to parse PDF";
     delete g_pdf;
     g_pdf = nullptr;
     return 0;
   }
 
-  if (!nanopdf::parse_document_catalog(*g_pdf)) {
+  if (!g_pdf->load_document_structure()) {
     g_last_error = "Failed to parse document catalog";
     delete g_pdf;
     g_pdf = nullptr;
@@ -306,7 +305,7 @@ const char* nanopdf_extract_text(int page_index) {
   }
 
   const auto& page = g_pdf->catalog.pages[page_index];
-  g_text_buffer = nanopdf::extract_text(*g_pdf, page);
+  g_text_buffer = nanopdf::extract_text_from_page(*g_pdf, page);
   return g_text_buffer.c_str();
 }
 
@@ -518,14 +517,13 @@ int nanopdf_doc_load(const uint8_t* data, size_t size) {
   doc.data.assign(data, data + size);
   doc.pdf = new nanopdf::Pdf();
 
-  nanopdf::Parser parser;
-  if (!parser.parse(doc.data.data(), doc.data.size(), doc.pdf)) {
+  if (!nanopdf::parse_from_memory(doc.data.data(), doc.data.size(), doc.pdf)) {
     g_last_error = "Failed to parse PDF";
     delete doc.pdf;
     return -1;
   }
 
-  if (!nanopdf::parse_document_catalog(*doc.pdf)) {
+  if (!doc.pdf->load_document_structure()) {
     g_last_error = "Failed to parse document catalog";
     delete doc.pdf;
     return -1;
@@ -1414,7 +1412,7 @@ const char* nanopdf_batch_extract_text(const char* page_indices) {
     first = false;
 
     const auto& page = g_pdf->catalog.pages[page_idx];
-    std::string text = nanopdf::extract_text(*g_pdf, page);
+    std::string text = nanopdf::extract_text_from_page(*g_pdf, page);
 
     json += "{\"page\":" + std::to_string(page_idx);
     json += ",\"text\":\"" + json_escape(text) + "\"}";
@@ -1467,22 +1465,23 @@ const char* nanopdf_batch_get_page_info(const char* page_indices) {
     first = false;
 
     const auto& page = g_pdf->catalog.pages[page_idx];
-    double width = page.media_box.urx - page.media_box.llx;
-    double height = page.media_box.ury - page.media_box.lly;
+    double width = (page.media_box.size() >= 4) ? (page.media_box[2] - page.media_box[0]) : 612.0;
+    double height = (page.media_box.size() >= 4) ? (page.media_box[3] - page.media_box[1]) : 792.0;
 
     json += "{\"page\":" + std::to_string(page_idx);
     json += ",\"width\":" + std::to_string(width);
     json += ",\"height\":" + std::to_string(height);
-    json += ",\"rotation\":" + std::to_string(page.rotation);
+    json += ",\"rotation\":" + std::to_string(page.rotate);
 
     // Crop box if different from media box
-    if (page.crop_box.llx != 0 || page.crop_box.lly != 0 ||
-        page.crop_box.urx != width || page.crop_box.ury != height) {
+    if (page.crop_box.size() >= 4 &&
+        (page.crop_box[0] != 0 || page.crop_box[1] != 0 ||
+         page.crop_box[2] != width || page.crop_box[3] != height)) {
       json += ",\"cropBox\":{";
-      json += "\"llx\":" + std::to_string(page.crop_box.llx) + ",";
-      json += "\"lly\":" + std::to_string(page.crop_box.lly) + ",";
-      json += "\"urx\":" + std::to_string(page.crop_box.urx) + ",";
-      json += "\"ury\":" + std::to_string(page.crop_box.ury) + "}";
+      json += "\"llx\":" + std::to_string(page.crop_box[0]) + ",";
+      json += "\"lly\":" + std::to_string(page.crop_box[1]) + ",";
+      json += "\"urx\":" + std::to_string(page.crop_box[2]) + ",";
+      json += "\"ury\":" + std::to_string(page.crop_box[3]) + "}";
     }
 
     json += ",\"fontCount\":" + std::to_string(page.fonts.size());
@@ -1542,7 +1541,7 @@ const char* nanopdf_batch_find_text(const char* search_term, const char* page_in
 
   for (int page_idx : pages) {
     const auto& page = g_pdf->catalog.pages[page_idx];
-    std::string text = nanopdf::extract_text(*g_pdf, page);
+    std::string text = nanopdf::extract_text_from_page(*g_pdf, page);
 
     std::vector<std::pair<size_t, size_t>> matches;
     size_t pos = 0;
@@ -1636,12 +1635,12 @@ const char* nanopdf_batch_extract_text_layout(const char* page_indices) {
 
     json += ",\"pageWidth\":" + std::to_string(text_page->page_width);
     json += ",\"pageHeight\":" + std::to_string(text_page->page_height);
-    json += ",\"charCount\":" + std::to_string(text_page->characters.size());
+    json += ",\"charCount\":" + std::to_string(text_page->chars.size());
     json += ",\"lineCount\":" + std::to_string(text_page->lines.size());
     json += ",\"wordCount\":" + std::to_string(text_page->words.size());
 
     // Include plain text
-    json += ",\"text\":\"" + json_escape(text_page->plain_text) + "\"}";
+    json += ",\"text\":\"" + json_escape(text_page->get_text()) + "\"}";
   }
   json += "]}";
 
@@ -1686,9 +1685,6 @@ static void serialize_outline_item(const nanopdf::OutlineItem* item,
     case nanopdf::OutlineAction::Launch:
       json += ",\"action\":\"launch\"";
       json += ",\"file\":\"" + json_escape(item->file) + "\"";
-      break;
-    case nanopdf::OutlineAction::Named:
-      json += ",\"action\":\"named\"";
       break;
     default:
       json += ",\"action\":\"unknown\"";
@@ -1851,7 +1847,7 @@ const char* nanopdf_get_form_fields() {
 
   g_pdf->ensure_acro_form_loaded();
 
-  if (g_pdf->catalog.acro_form.fields.empty()) {
+  if (g_pdf->catalog.form_fields.empty()) {
     g_text_buffer = "{\"fields\":[]}";
     return g_text_buffer.c_str();
   }
@@ -1859,11 +1855,11 @@ const char* nanopdf_get_form_fields() {
   std::string json = "{\"fields\":[";
   bool first = true;
 
-  for (const auto& field : g_pdf->catalog.acro_form.fields) {
+  for (const auto& field : g_pdf->catalog.form_fields) {
     if (!first) json += ",";
     first = false;
 
-    json += "{\"name\":\"" + json_escape(field->name) + "\"";
+    json += "{\"name\":\"" + json_escape(field->partial_name) + "\"";
     json += ",\"fullName\":\"" + json_escape(field->full_name) + "\"";
 
     // Field type
@@ -1871,11 +1867,12 @@ const char* nanopdf_get_form_fields() {
       case nanopdf::FieldType::Text:
         json += ",\"type\":\"text\"";
         if (auto* tf = dynamic_cast<const nanopdf::TextField*>(field.get())) {
-          json += ",\"value\":\"" + json_escape(tf->value) + "\"";
-          json += ",\"defaultValue\":\"" + json_escape(tf->default_value) + "\"";
           json += ",\"maxLength\":" + std::to_string(tf->max_length);
-          json += ",\"multiline\":" + std::string(tf->multiline ? "true" : "false");
-          json += ",\"password\":" + std::string(tf->password ? "true" : "false");
+          // Check multiline/password via field flags
+          bool multiline = (tf->flags & static_cast<uint32_t>(nanopdf::FormFieldFlags::Multiline)) != 0;
+          bool password = (tf->flags & static_cast<uint32_t>(nanopdf::FormFieldFlags::Password)) != 0;
+          json += ",\"multiline\":" + std::string(multiline ? "true" : "false");
+          json += ",\"password\":" + std::string(password ? "true" : "false");
         }
         break;
       case nanopdf::FieldType::Button:
@@ -1883,29 +1880,22 @@ const char* nanopdf_get_form_fields() {
         if (auto* bf = dynamic_cast<const nanopdf::ButtonField*>(field.get())) {
           json += ",\"buttonType\":\"";
           switch (bf->button_type) {
-            case nanopdf::ButtonType::PushButton: json += "push"; break;
-            case nanopdf::ButtonType::CheckBox: json += "checkbox"; break;
-            case nanopdf::ButtonType::Radio: json += "radio"; break;
+            case nanopdf::ButtonField::PushButton: json += "push"; break;
+            case nanopdf::ButtonField::CheckBox: json += "checkbox"; break;
+            case nanopdf::ButtonField::RadioButton: json += "radio"; break;
           }
           json += "\"";
-          json += ",\"checked\":" + std::string(bf->is_checked ? "true" : "false");
-          if (!bf->export_value.empty()) {
-            json += ",\"exportValue\":\"" + json_escape(bf->export_value) + "\"";
-          }
         }
         break;
       case nanopdf::FieldType::Choice:
         json += ",\"type\":\"choice\"";
         if (auto* cf = dynamic_cast<const nanopdf::ChoiceField*>(field.get())) {
-          json += ",\"isCombo\":" + std::string(cf->is_combo ? "true" : "false");
-          json += ",\"multiSelect\":" + std::string(cf->multi_select ? "true" : "false");
           json += ",\"options\":[";
           bool first_opt = true;
           for (const auto& opt : cf->options) {
             if (!first_opt) json += ",";
             first_opt = false;
-            json += "{\"display\":\"" + json_escape(opt.display_value) + "\"";
-            json += ",\"export\":\"" + json_escape(opt.export_value) + "\"}";
+            json += "\"" + json_escape(opt) + "\"";
           }
           json += "]";
           if (!cf->selected_indices.empty()) {
@@ -1928,9 +1918,11 @@ const char* nanopdf_get_form_fields() {
         break;
     }
 
-    // Common field properties
-    json += ",\"readOnly\":" + std::string(field->read_only ? "true" : "false");
-    json += ",\"required\":" + std::string(field->required ? "true" : "false");
+    // Common field properties via flags
+    bool read_only = (field->flags & static_cast<uint32_t>(nanopdf::FormFieldFlags::ReadOnly)) != 0;
+    bool required = (field->flags & static_cast<uint32_t>(nanopdf::FormFieldFlags::Required)) != 0;
+    json += ",\"readOnly\":" + std::string(read_only ? "true" : "false");
+    json += ",\"required\":" + std::string(required ? "true" : "false");
 
     // Widget info if available
     if (!field->widgets.empty()) {
@@ -1939,12 +1931,15 @@ const char* nanopdf_get_form_fields() {
       for (const auto& widget : field->widgets) {
         if (!first_w) json += ",";
         first_w = false;
-        json += "{\"page\":" + std::to_string(widget.page_index);
-        json += ",\"rect\":{";
-        json += "\"x\":" + std::to_string(widget.rect.llx) + ",";
-        json += "\"y\":" + std::to_string(widget.rect.lly) + ",";
-        json += "\"width\":" + std::to_string(widget.rect.urx - widget.rect.llx) + ",";
-        json += "\"height\":" + std::to_string(widget.rect.ury - widget.rect.lly) + "}}";
+        json += "{";
+        if (widget->rect.size() >= 4) {
+          json += "\"rect\":{";
+          json += "\"x\":" + std::to_string(widget->rect[0]) + ",";
+          json += "\"y\":" + std::to_string(widget->rect[1]) + ",";
+          json += "\"width\":" + std::to_string(widget->rect[2] - widget->rect[0]) + ",";
+          json += "\"height\":" + std::to_string(widget->rect[3] - widget->rect[1]) + "}";
+        }
+        json += "}";
       }
       json += "]";
     }
@@ -1952,7 +1947,7 @@ const char* nanopdf_get_form_fields() {
     json += "}";
   }
 
-  json += "],\"count\":" + std::to_string(g_pdf->catalog.acro_form.fields.size()) + "}";
+  json += "],\"count\":" + std::to_string(g_pdf->catalog.form_fields.size()) + "}";
 
   g_text_buffer = json;
   return g_text_buffer.c_str();
@@ -1963,7 +1958,7 @@ EMSCRIPTEN_KEEPALIVE
 int nanopdf_has_form_fields() {
   if (!g_pdf) return 0;
   g_pdf->ensure_acro_form_loaded();
-  return g_pdf->catalog.acro_form.fields.empty() ? 0 : 1;
+  return g_pdf->catalog.form_fields.empty() ? 0 : 1;
 }
 
 // Get form field count
@@ -1971,7 +1966,7 @@ EMSCRIPTEN_KEEPALIVE
 int nanopdf_get_form_field_count() {
   if (!g_pdf) return 0;
   g_pdf->ensure_acro_form_loaded();
-  return static_cast<int>(g_pdf->catalog.acro_form.fields.size());
+  return static_cast<int>(g_pdf->catalog.form_fields.size());
 }
 
 // ============================================================
