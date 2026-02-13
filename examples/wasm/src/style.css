@@ -219,10 +219,18 @@ body {
   padding: 20px;
   background: #e8eaed;
 }
+/* Canvas wrapper for rotation support */
+.canvas-wrapper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: width 0.3s, height 0.3s;
+}
 #pdf-canvas {
   box-shadow: 0 2px 8px rgba(0,0,0,0.15);
   background: #fff;
   display: none;
+  transition: transform 0.3s ease;
 }
 
 /* Text output panel */
@@ -336,3 +344,132 @@ body {
 }
 .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
 .empty-state .hint { font-size: 14px; margin-top: 8px; }
+
+/* Zoom controls */
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.zoom-controls button {
+  min-width: 30px;
+  padding: 6px 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.zoom-display {
+  font-size: 12px;
+  min-width: 44px;
+  text-align: center;
+  user-select: none;
+  padding: 4px 4px;
+}
+
+/* Thumbnail list */
+.thumbnail-list {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.thumbnail-item {
+  cursor: pointer;
+  border: 2px solid transparent;
+  border-radius: 4px;
+  padding: 4px;
+  text-align: center;
+  width: 100%;
+  transition: border-color 0.15s, background 0.15s;
+  position: relative;
+  user-select: none;
+}
+.thumbnail-item:hover {
+  border-color: #b0c4ff;
+}
+.thumbnail-item.active {
+  border-color: #007bff;
+  background: #f0f4ff;
+}
+.thumbnail-item.selected {
+  background: #e8f4e8;
+  border-color: #4caf50;
+}
+.thumbnail-item.selected.active {
+  border-color: #007bff;
+  background: #dceef8;
+}
+.thumbnail-item .select-check {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 18px;
+  height: 18px;
+  background: #4caf50;
+  color: #fff;
+  border-radius: 50%;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+  display: none;
+  pointer-events: none;
+}
+.thumbnail-item.selected .select-check {
+  display: block;
+}
+.thumbnail-item canvas {
+  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+  background: #fff;
+  display: block;
+  margin: 0 auto;
+}
+.thumbnail-item .thumb-label {
+  font-size: 11px;
+  color: #666;
+  margin-top: 4px;
+}
+.thumbnail-item.active .thumb-label {
+  color: #007bff;
+  font-weight: 600;
+}
+.thumbnail-item.selected .thumb-label {
+  color: #2e7d32;
+  font-weight: 600;
+}
+.thumbnail-item.selected.active .thumb-label {
+  color: #007bff;
+}
+
+/* Selection toolbar in sidebar */
+.selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  background: #f8f9fa;
+  border-bottom: 1px solid #eee;
+  font-size: 12px;
+  color: #555;
+}
+.selection-bar button {
+  background: none;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  color: #555;
+}
+.selection-bar button:hover {
+  background: #e8e8e8;
+}
+
+/* Export button highlight when pages selected */
+.toolbar button#export-btn.has-selection {
+  background: #4caf50;
+  border-color: #43a047;
+  color: #fff;
+}
+.toolbar button#export-btn.has-selection:hover {
+  background: #43a047;
+}

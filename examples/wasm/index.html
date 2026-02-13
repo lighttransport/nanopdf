@@ -30,9 +30,18 @@
       <button id="next-btn" disabled title="Next page (Right arrow)">&rarr;</button>
     </div>
     <div class="toolbar-separator"></div>
+    <div class="zoom-controls">
+      <button id="zoom-out-btn" disabled title="Zoom out (Ctrl+-)">&#x2212;</button>
+      <span id="zoom-display" class="zoom-display" title="Current zoom level">100%</span>
+      <button id="zoom-in-btn" disabled title="Zoom in (Ctrl++)">+</button>
+    </div>
+    <button id="fit-mode-btn" disabled title="Toggle fit mode">Fit Width</button>
+    <button id="rotate-btn" disabled title="Rotate clockwise (R)">Rotate</button>
+    <div class="toolbar-separator"></div>
     <button id="sidebar-toggle-btn" disabled title="Toggle sidebar">Outline</button>
     <button id="extract-btn" disabled title="Extract text from current page">Text</button>
     <button id="render-btn" disabled title="Re-render current page">Render</button>
+    <button id="export-btn" disabled title="Export selected pages as PDF">Export</button>
 
     <!-- Search -->
     <div class="search-bar">
@@ -49,6 +58,7 @@
     <div class="sidebar hidden" id="sidebar">
       <div class="sidebar-tabs">
         <button class="active" data-tab="outline">Outline</button>
+        <button data-tab="thumbs">Thumbs</button>
         <button data-tab="info">Info</button>
       </div>
       <div class="sidebar-content" id="sidebar-content">
@@ -64,7 +74,9 @@
           <div>No PDF loaded</div>
           <div class="hint">Click "Open PDF" or drag and drop a file</div>
         </div>
-        <canvas id="pdf-canvas"></canvas>
+        <div class="canvas-wrapper" id="canvas-wrapper">
+          <canvas id="pdf-canvas"></canvas>
+        </div>
       </div>
 
       <!-- Text extraction panel -->
