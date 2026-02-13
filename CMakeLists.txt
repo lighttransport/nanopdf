@@ -186,26 +186,30 @@ endif ()
 if (NANOPDF_USE_THORVG)
   # First check if ThorVG is in the dist/ directory
   set(THORVG_DIST_DIR ${CMAKE_SOURCE_DIR}/dist)
-  if(EXISTS ${THORVG_DIST_DIR}/include/thorvg-1/thorvg.h)
-    set(THORVG_FOUND TRUE)
-    set(THORVG_INCLUDE_DIRS ${THORVG_DIST_DIR}/include/thorvg-1)
-    # Find the library based on architecture
+  # Check dist/include/ for thorvg.h (with or without thorvg-1 subdirectory)
+  if(EXISTS ${THORVG_DIST_DIR}/include/thorvg.h)
+    set(_THORVG_DIST_INCLUDE ${THORVG_DIST_DIR}/include)
+  elseif(EXISTS ${THORVG_DIST_DIR}/include/thorvg-1/thorvg.h)
+    set(_THORVG_DIST_INCLUDE ${THORVG_DIST_DIR}/include/thorvg-1)
+  endif()
+  if(_THORVG_DIST_INCLUDE)
+    set(THORVG_INCLUDE_DIRS ${_THORVG_DIST_INCLUDE})
+    # Search dist/lib/ directly, then architecture-specific subdirectories
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/x86_64-linux-gnu)
+      set(_THORVG_LIB_SEARCH_DIRS ${THORVG_DIST_DIR}/lib ${THORVG_DIST_DIR}/lib/x86_64-linux-gnu)
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/aarch64-linux-gnu)
+      set(_THORVG_LIB_SEARCH_DIRS ${THORVG_DIST_DIR}/lib ${THORVG_DIST_DIR}/lib/aarch64-linux-gnu)
     else()
-      set(THORVG_LIB_DIR ${THORVG_DIST_DIR}/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+      set(_THORVG_LIB_SEARCH_DIRS ${THORVG_DIST_DIR}/lib ${THORVG_DIST_DIR}/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
     endif()
     find_library(THORVG_LIBRARY NAMES thorvg-1 thorvg
-      PATHS ${THORVG_LIB_DIR}
-      NO_DEFAULT_PATH)
+      PATHS ${_THORVG_LIB_SEARCH_DIRS}
+      NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
     if(THORVG_LIBRARY)
+      set(THORVG_FOUND TRUE)
       set(THORVG_LIBRARIES ${THORVG_LIBRARY})
-      set(THORVG_LIBRARY_DIRS ${THORVG_LIB_DIR})
+      get_filename_component(THORVG_LIBRARY_DIRS ${THORVG_LIBRARY} DIRECTORY)
       message(STATUS "Found ThorVG in dist/: ${THORVG_LIBRARY}")
-    else()
-      set(THORVG_FOUND FALSE)
     endif()
   endif()
 
@@ -548,7 +552,18 @@ if(NANOPDF_BUILD_WASM)
   # Set output as JavaScript module with --no-entry (no main function)
   set_target_properties(${BUILD_TARGET} PROPERTIES
     SUFFIX ".js"
-    LINK_FLAGS "-s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','stringToNewUTF8','UTF8ToString'] -s EXPORTED_FUNCTIONS=['_malloc','_free'] -s USE_ZLIB=1 -s ALLOW_MEMORY_GROWTH=1 --no-entry"
+    LINK_FLAGS "-s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','stringToNewUTF8','UTF8ToString','HEAPU8'] -s EXPORTED_FUNCTIONS=['_malloc','_free'] -s USE_ZLIB=1 -s ALLOW_MEMORY_GROWTH=1 --no-entry"
+  )
+
+  # Copy .js and .wasm files to examples/wasm/src/ after build
+  add_custom_command(TARGET ${BUILD_TARGET} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+      $<TARGET_FILE_DIR:${BUILD_TARGET}>/${BUILD_TARGET}.js
+      ${PROJECT_SOURCE_DIR}/examples/wasm/src/${BUILD_TARGET}.js
+    COMMAND ${CMAKE_COMMAND} -E copy
+      $<TARGET_FILE_DIR:${BUILD_TARGET}>/${BUILD_TARGET}.wasm
+      ${PROJECT_SOURCE_DIR}/examples/wasm/src/${BUILD_TARGET}.wasm
+    COMMENT "Copying WASM build artifacts to examples/wasm/src/"
   )
 
   # Install headers for potential Node.js usage

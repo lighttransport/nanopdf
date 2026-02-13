@@ -1118,7 +1118,7 @@ static std::string render_source_page_to_image(
   img.width = static_cast<int>(result.width);
   img.height = static_cast<int>(result.height);
   img.channels = 3;
-  img.format = nanopdf::ImageFormat::RGB;
+  img.format = nanopdf::ImageFormat::Unknown;
 
   // Add to writer and return name
   return writer->add_image(img, nanopdf::ImageCompression::DCT);
@@ -1153,7 +1153,7 @@ static std::string render_source_page_to_image(
   img.width = static_cast<int>(result.width);
   img.height = static_cast<int>(result.height);
   img.channels = 3;
-  img.format = nanopdf::ImageFormat::RGB;
+  img.format = nanopdf::ImageFormat::Unknown;
 
   return writer->add_image(img, nanopdf::ImageCompression::DCT);
 
