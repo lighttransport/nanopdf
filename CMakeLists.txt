@@ -464,6 +464,40 @@ if(NOT NANOPDF_BUILD_WASM)
   add_sanitizers(${BUILD_TARGET})
 endif()
 
+# ============================================================
+# MCP (Model Context Protocol) server
+# ============================================================
+if(NOT NANOPDF_BUILD_WASM)
+  # MCP library
+  add_library(nanopdf_mcp
+    src/mcp-json.cc
+    src/mcp-protocol.cc
+    src/mcp-transport.cc
+    src/mcp-tools.cc
+  )
+  target_link_libraries(nanopdf_mcp PUBLIC ${BUILD_TARGET})
+  target_include_directories(nanopdf_mcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_sanitizers(nanopdf_mcp)
+
+  # MCP server executable
+  add_executable(nanopdf-mcp src/mcp-server.cc)
+  target_link_libraries(nanopdf-mcp PRIVATE nanopdf_mcp)
+  add_sanitizers(nanopdf-mcp)
+
+  # Install MCP server
+  install(TARGETS nanopdf-mcp DESTINATION bin)
+
+  # MCP JSON test (optional)
+  if(NANOPDF_BUILD_TESTS)
+    add_executable(test_mcp_json examples/mcp/test-mcp-json.cc)
+    target_link_libraries(test_mcp_json PRIVATE nanopdf_mcp)
+    add_sanitizers(test_mcp_json)
+    add_test(NAME test_mcp_json COMMAND test_mcp_json)
+  endif()
+
+  message(STATUS "MCP server target enabled: nanopdf-mcp")
+endif()
+
 # Build test executables only if requested and not building for WASM
 if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   enable_testing()
