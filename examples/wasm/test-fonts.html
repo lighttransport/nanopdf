@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>nanopdf - Embedded Fonts Test</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+        }
+        .section {
+            background: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .status.loading {
+            background: #fff3cd;
+            color: #856404;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        th, td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background: #007bff;
+            color: white;
+            font-weight: 600;
+        }
+        tr:hover {
+            background: #f8f9fa;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .font-sample {
+            margin-top: 20px;
+        }
+        #fontCanvas {
+            border: 1px solid #ddd;
+            max-width: 100%;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .stat-card {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+        }
+        .stat-label {
+            font-size: 12px;
+            color: #6c757d;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+        }
+        code {
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <h1>📚 nanopdf Embedded Fonts Test</h1>
+
+    <div class="section">
+        <h2>WASM Module Status</h2>
+        <div id="wasmStatus" class="status loading">Loading WASM module...</div>
+    </div>
+
+    <div class="section" id="statsSection" style="display: none;">
+        <h2>Font Statistics</h2>
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-label">Total Fonts</div>
+                <div class="stat-value" id="totalFonts">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Original Size</div>
+                <div class="stat-value" id="originalSize">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Compressed Size</div>
+                <div class="stat-value" id="compressedSize">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Space Saved</div>
+                <div class="stat-value" id="spaceSaved">-</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section" id="fontsSection" style="display: none;">
+        <h2>Available Fonts</h2>
+        <p>All 14 PDF Standard 14 alternative fonts embedded in the WASM bundle:</p>
+        <table>
+            <thead>
+                <tr>
+                    <th>Font Name</th>
+                    <th>Filename</th>
+                    <th>Original Size</th>
+                    <th>Compressed</th>
+                    <th>Saved</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="fontsList"></tbody>
+        </table>
+    </div>
+
+    <div class="section" id="mappingSection" style="display: none;">
+        <h2>PDF Standard 14 Mapping</h2>
+        <p>PDF Standard 14 font names mapped to embedded alternatives:</p>
+        <table>
+            <thead>
+                <tr>
+                    <th>PDF Font Name</th>
+                    <th>Substitute Font</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="mappingList"></tbody>
+        </table>
+    </div>
+
+    <div class="section" id="testSection" style="display: none;">
+        <h2>Font Loading Test</h2>
+        <div id="testStatus" class="status" style="display: none;"></div>
+        <div id="testResult"></div>
+    </div>
+
+    <script src="src/nanopdf.js"></script>
+    <script>
+        let Module;
+
+        // Format bytes to human-readable
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+        }
+
+        // Format percentage
+        function formatPercent(ratio) {
+            return (ratio * 100).toFixed(1) + '%';
+        }
+
+        // Test loading a font
+        async function testLoadFont(fontName, isPdfStandard = false) {
+            const testStatus = document.getElementById('testStatus');
+            const testResult = document.getElementById('testResult');
+
+            testStatus.className = 'status loading';
+            testStatus.style.display = 'block';
+            testStatus.textContent = `Loading font: ${fontName}...`;
+            testResult.innerHTML = '';
+
+            try {
+                // Allocate string in WASM memory
+                const namePtr = Module.allocateUTF8(fontName);
+
+                // Load font
+                const dataPtr = isPdfStandard
+                    ? Module._nanopdf_fonts_load_pdf_standard(namePtr)
+                    : Module._nanopdf_fonts_load(namePtr);
+
+                Module._free(namePtr);
+
+                if (dataPtr === 0) {
+                    const errorPtr = Module._nanopdf_get_last_error();
+                    const error = Module.UTF8ToString(errorPtr);
+                    throw new Error(error);
+                }
+
+                // Get size
+                const size = Module._nanopdf_fonts_get_loaded_size();
+
+                // Read font data
+                const fontData = new Uint8Array(Module.HEAPU8.buffer, dataPtr, size);
+
+                // Verify font signature (TTF/OTF magic numbers)
+                const signature = new TextDecoder().decode(fontData.slice(0, 4));
+                let fontType = 'Unknown';
+                if (signature === '\x00\x01\x00\x00' || signature === 'true') {
+                    fontType = 'TrueType (TTF)';
+                } else if (signature === 'OTTO') {
+                    fontType = 'OpenType (OTF)';
+                }
+
+                testStatus.className = 'status success';
+                testStatus.textContent = `✓ Font loaded successfully!`;
+
+                testResult.innerHTML = `
+                    <p><strong>Font:</strong> <code>${fontName}</code></p>
+                    <p><strong>Type:</strong> ${fontType}</p>
+                    <p><strong>Size:</strong> ${formatBytes(size)}</p>
+                    <p><strong>Signature:</strong> <code>${Array.from(fontData.slice(0, 4)).map(b => '0x' + b.toString(16).padStart(2, '0')).join(' ')}</code></p>
+                    <p><strong>First 64 bytes:</strong></p>
+                    <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto;">${
+                        Array.from(fontData.slice(0, 64))
+                            .map((b, i) => (i % 16 === 0 ? '\n' : '') + b.toString(16).padStart(2, '0') + ' ')
+                            .join('')
+                    }</pre>
+                `;
+
+            } catch (error) {
+                testStatus.className = 'status error';
+                testStatus.textContent = `✗ Error: ${error.message}`;
+                testResult.innerHTML = '';
+            }
+        }
+
+        // Initialize when WASM is ready
+        Module = {
+            onRuntimeInitialized: function() {
+                const wasmStatus = document.getElementById('wasmStatus');
+
+                // Initialize nanopdf
+                Module._nanopdf_init();
+
+                // Check if fonts are available
+                const fontsAvailable = Module._nanopdf_fonts_available();
+
+                if (!fontsAvailable) {
+                    wasmStatus.className = 'status error';
+                    wasmStatus.textContent = '✗ Embedded fonts not available in this build';
+                    return;
+                }
+
+                wasmStatus.className = 'status success';
+                wasmStatus.textContent = '✓ WASM module loaded successfully with embedded fonts!';
+
+                // Get font count
+                const fontCount = Module._nanopdf_fonts_get_count();
+
+                // Get fonts list
+                const fontsListPtr = Module._nanopdf_fonts_list();
+                const fontsListJson = Module.UTF8ToString(fontsListPtr);
+                const fontsList = JSON.parse(fontsListJson);
+
+                // Calculate totals
+                let totalOriginal = 0;
+                let totalCompressed = 0;
+                fontsList.fonts.forEach(font => {
+                    totalOriginal += font.originalSize;
+                    totalCompressed += font.compressedSize;
+                });
+                const totalSaved = totalOriginal - totalCompressed;
+                const overallRatio = totalSaved / totalOriginal;
+
+                // Update stats
+                document.getElementById('totalFonts').textContent = fontCount;
+                document.getElementById('originalSize').textContent = formatBytes(totalOriginal);
+                document.getElementById('compressedSize').textContent = formatBytes(totalCompressed);
+                document.getElementById('spaceSaved').textContent = formatPercent(overallRatio);
+                document.getElementById('statsSection').style.display = 'block';
+
+                // Populate fonts table
+                const fontsTableBody = document.getElementById('fontsList');
+                fontsList.fonts.forEach(font => {
+                    const row = document.createElement('tr');
+                    const saved = font.originalSize - font.compressedSize;
+                    row.innerHTML = `
+                        <td><code>${font.name}</code></td>
+                        <td>${font.filename}</td>
+                        <td>${formatBytes(font.originalSize)}</td>
+                        <td>${formatBytes(font.compressedSize)}</td>
+                        <td>${formatPercent(font.compressionRatio)}</td>
+                        <td><button onclick="testLoadFont('${font.name}', false)">Load</button></td>
+                    `;
+                    fontsTableBody.appendChild(row);
+                });
+                document.getElementById('fontsSection').style.display = 'block';
+
+                // Get PDF mapping
+                const mappingPtr = Module._nanopdf_fonts_get_pdf_mapping();
+                const mappingJson = Module.UTF8ToString(mappingPtr);
+                const mapping = JSON.parse(mappingJson);
+
+                // Populate mapping table
+                const mappingTableBody = document.getElementById('mappingList');
+                mapping.mapping.forEach(map => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td><code>${map.pdfName}</code></td>
+                        <td><code>${map.substituteName}</code></td>
+                        <td><button onclick="testLoadFont('${map.pdfName}', true)">Load</button></td>
+                    `;
+                    mappingTableBody.appendChild(row);
+                });
+                document.getElementById('mappingSection').style.display = 'block';
+
+                // Show test section
+                document.getElementById('testSection').style.display = 'block';
+
+                console.log('Embedded Fonts Ready!');
+                console.log('- Total fonts:', fontCount);
+                console.log('- Original size:', formatBytes(totalOriginal));
+                console.log('- Compressed size:', formatBytes(totalCompressed));
+                console.log('- Space saved:', formatPercent(overallRatio));
+            }
+        };
+    </script>
+</body>
+</html>

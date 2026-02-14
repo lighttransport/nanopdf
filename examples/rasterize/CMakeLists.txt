@@ -76,8 +76,53 @@ if(USE_THORVG)
   endif()
 endif()
 
+# Embed fonts option (enabled by default for rasterize)
+option(EMBED_FONTS "Embed PDF Standard 14 alternative fonts as binary data" ON)
+
+if(EMBED_FONTS)
+  set(FONTS_DIR ${NANOPDF_ROOT}/fonts)
+  set(EMBEDDED_FONTS_HEADER ${CMAKE_CURRENT_BINARY_DIR}/embedded-fonts.hh)
+
+  # Find all font files to establish dependencies
+  file(GLOB_RECURSE FONT_FILES
+    "${FONTS_DIR}/*.ttf"
+    "${FONTS_DIR}/*.otf"
+  )
+
+  if(FONT_FILES)
+    # Generate the embedded fonts header
+    add_custom_command(
+      OUTPUT ${EMBEDDED_FONTS_HEADER}
+      COMMAND ${CMAKE_COMMAND}
+        -DFONTS_DIR=${FONTS_DIR}
+        -DOUTPUT_FILE=${EMBEDDED_FONTS_HEADER}
+        -P ${NANOPDF_ROOT}/cmake/embed_fonts.cmake
+      DEPENDS ${FONT_FILES} ${NANOPDF_ROOT}/cmake/embed_fonts.cmake
+      COMMENT "Generating embedded fonts header for rasterize"
+      VERBATIM
+    )
+
+    # Add a custom target
+    add_custom_target(generate_embedded_fonts_rasterize
+      DEPENDS ${EMBEDDED_FONTS_HEADER}
+    )
+
+    message(STATUS "Font embedding enabled for rasterize (${FONTS_DIR})")
+  else()
+    message(WARNING "Font embedding enabled but no fonts found in ${FONTS_DIR}")
+    set(EMBED_FONTS OFF)
+  endif()
+endif()
+
 # Create the rasterize executable
 add_executable(rasterize rasterize.cc)
+
+# Add embedded fonts support
+if(EMBED_FONTS)
+  add_dependencies(rasterize generate_embedded_fonts_rasterize)
+  target_include_directories(rasterize PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  target_compile_definitions(rasterize PRIVATE "NANOPDF_EMBED_FONTS=1")
+endif()
 
 # Link with nanopdf library
 if(EXISTS ${NANOPDF_BUILD_DIR}/libnanopdf.a)

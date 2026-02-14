@@ -26,6 +26,10 @@
 #include "thorvg-backend.hh"
 #endif
 
+#ifdef NANOPDF_EMBED_FONTS
+#include "embedded-fonts.hh"
+#endif
+
 // ============================================================
 // Global state for PDF reading
 // ============================================================
@@ -43,6 +47,9 @@ static std::string g_text_buffer;
 
 // Export settings
 static int g_export_render_scale = 2;  // Default 2x for good quality
+
+// Font buffer (for embedded fonts)
+static std::vector<uint8_t> g_font_buffer;
 
 // ============================================================
 // Global state for PDF writing / editing
@@ -1968,6 +1975,215 @@ int nanopdf_get_form_field_count() {
   g_pdf->ensure_acro_form_loaded();
   return static_cast<int>(g_pdf->catalog.form_fields.size());
 }
+
+// ============================================================
+// Embedded Fonts API
+// ============================================================
+
+#ifdef NANOPDF_EMBED_FONTS
+
+// Check if embedded fonts are available
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_fonts_available() {
+  return 1;
+}
+
+// Get number of embedded fonts
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_fonts_get_count() {
+  return static_cast<int>(nanopdf::embedded_fonts::font_count);
+}
+
+// Get list of all embedded fonts as JSON
+// Returns: {"fonts":[{"name":"Arimo-Regular","filename":"Arimo-Regular.ttf","originalSize":123,"compressedSize":456,"compressionRatio":0.409},...]}
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_fonts_list() {
+  std::string json = "{\"fonts\":[";
+
+  for (size_t i = 0; i < nanopdf::embedded_fonts::font_count; ++i) {
+    const auto& font = nanopdf::embedded_fonts::font_registry[i];
+
+    if (i > 0) json += ",";
+
+    float ratio = 1.0f - static_cast<float>(font.compressed_size) / static_cast<float>(font.original_size);
+
+    json += "{";
+    json += "\"name\":\"" + json_escape(font.base_name) + "\",";
+    json += "\"filename\":\"" + json_escape(font.filename) + "\",";
+    json += "\"originalSize\":" + std::to_string(font.original_size) + ",";
+    json += "\"compressedSize\":" + std::to_string(font.compressed_size) + ",";
+    json += "\"compressionRatio\":" + std::to_string(ratio);
+    json += "}";
+  }
+
+  json += "],\"count\":" + std::to_string(nanopdf::embedded_fonts::font_count) + "}";
+
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Get PDF Standard 14 font mapping as JSON
+// Returns: {"mapping":[{"pdfName":"Helvetica","substituteName":"Arimo-Regular"},...]}
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_fonts_get_pdf_mapping() {
+  std::string json = "{\"mapping\":[";
+
+  for (size_t i = 0; i < nanopdf::embedded_fonts::pdf_mapping_count; ++i) {
+    const auto& mapping = nanopdf::embedded_fonts::pdf_standard_14_mapping[i];
+
+    if (i > 0) json += ",";
+
+    json += "{";
+    json += "\"pdfName\":\"" + json_escape(mapping.pdf_name) + "\",";
+    json += "\"substituteName\":\"" + json_escape(mapping.substitute_name) + "\"";
+    json += "}";
+  }
+
+  json += "],\"count\":" + std::to_string(nanopdf::embedded_fonts::pdf_mapping_count) + "}";
+
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Load a font by base name (e.g., "Arimo-Regular")
+// Returns pointer to decompressed font data (valid until next font load)
+// Returns nullptr on error
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_fonts_load(const char* name) {
+  if (!name) {
+    g_last_error = "Font name is null";
+    return nullptr;
+  }
+
+  const auto* font = nanopdf::embedded_fonts::find_font(name);
+  if (!font) {
+    g_last_error = std::string("Font not found: ") + name;
+    return nullptr;
+  }
+
+  // Decompress font
+  g_font_buffer.clear();
+  if (!nanopdf::embedded_fonts::decompress_font(font, g_font_buffer)) {
+    g_last_error = std::string("Failed to decompress font: ") + name;
+    return nullptr;
+  }
+
+  return g_font_buffer.data();
+}
+
+// Load a PDF Standard 14 font (e.g., "Helvetica", "Times-Bold")
+// Returns pointer to decompressed font data (valid until next font load)
+// Returns nullptr on error
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_fonts_load_pdf_standard(const char* pdf_name) {
+  if (!pdf_name) {
+    g_last_error = "PDF font name is null";
+    return nullptr;
+  }
+
+  const auto* font = nanopdf::embedded_fonts::get_pdf_standard_font(pdf_name);
+  if (!font) {
+    g_last_error = std::string("PDF Standard 14 font not found: ") + pdf_name;
+    return nullptr;
+  }
+
+  // Decompress font
+  g_font_buffer.clear();
+  if (!nanopdf::embedded_fonts::decompress_font(font, g_font_buffer)) {
+    g_last_error = std::string("Failed to decompress font: ") + pdf_name;
+    return nullptr;
+  }
+
+  return g_font_buffer.data();
+}
+
+// Get size of currently loaded font data
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_fonts_get_loaded_size() {
+  return g_font_buffer.size();
+}
+
+// Get font info by name as JSON
+// Returns: {"found":true,"name":"...","filename":"...","originalSize":123,"compressedSize":456}
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_fonts_get_info(const char* name) {
+  if (!name) {
+    g_text_buffer = "{\"found\":false,\"error\":\"Font name is null\"}";
+    return g_text_buffer.c_str();
+  }
+
+  const auto* font = nanopdf::embedded_fonts::find_font(name);
+  if (!font) {
+    g_text_buffer = "{\"found\":false,\"error\":\"Font not found\"}";
+    return g_text_buffer.c_str();
+  }
+
+  float ratio = 1.0f - static_cast<float>(font->compressed_size) / static_cast<float>(font->original_size);
+
+  std::string json = "{\"found\":true";
+  json += ",\"name\":\"" + json_escape(font->base_name) + "\"";
+  json += ",\"filename\":\"" + json_escape(font->filename) + "\"";
+  json += ",\"originalSize\":" + std::to_string(font->original_size);
+  json += ",\"compressedSize\":" + std::to_string(font->compressed_size);
+  json += ",\"compressionRatio\":" + std::to_string(ratio);
+  json += "}";
+
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+#else  // !NANOPDF_EMBED_FONTS
+
+// Stub functions when fonts are not embedded
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_fonts_available() {
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_fonts_get_count() {
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_fonts_list() {
+  g_text_buffer = "{\"error\":\"Embedded fonts not available\",\"fonts\":[]}";
+  return g_text_buffer.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_fonts_get_pdf_mapping() {
+  g_text_buffer = "{\"error\":\"Embedded fonts not available\",\"mapping\":[]}";
+  return g_text_buffer.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_fonts_load(const char* name) {
+  (void)name;
+  g_last_error = "Embedded fonts not available in this build";
+  return nullptr;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_fonts_load_pdf_standard(const char* pdf_name) {
+  (void)pdf_name;
+  g_last_error = "Embedded fonts not available in this build";
+  return nullptr;
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_fonts_get_loaded_size() {
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_fonts_get_info(const char* name) {
+  (void)name;
+  g_text_buffer = "{\"found\":false,\"error\":\"Embedded fonts not available\"}";
+  return g_text_buffer.c_str();
+}
+
+#endif  // NANOPDF_EMBED_FONTS
 
 // ============================================================
 // Memory Management

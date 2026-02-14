@@ -53,3 +53,6 @@ data/visual_refs/
 # Emscripten
 *.wasm
 *.js.map
+# Generated font embedding headers
+embedded-fonts.hh
+**/embedded-fonts.hh

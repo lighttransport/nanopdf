@@ -152,12 +152,70 @@ if(NANOPDF_BUILD_WASM)
   list(REMOVE_ITEM NANOPDF_SOURCES src/document-structure.cc)
 endif()
 
+# Generate embedded fonts header for WASM and rasterize builds
+option(NANOPDF_EMBED_FONTS "Embed PDF Standard 14 alternative fonts as binary data" OFF)
+
+# Auto-enable font embedding for WASM builds
+if(NANOPDF_BUILD_WASM)
+  set(NANOPDF_EMBED_FONTS ON CACHE BOOL "Embed fonts for WASM build" FORCE)
+endif()
+
+if(NANOPDF_EMBED_FONTS)
+  set(FONTS_DIR ${CMAKE_SOURCE_DIR}/fonts)
+  set(EMBEDDED_FONTS_HEADER ${CMAKE_BINARY_DIR}/embedded-fonts.hh)
+
+  # Find all font files to establish dependencies
+  file(GLOB_RECURSE FONT_FILES
+    "${FONTS_DIR}/*.ttf"
+    "${FONTS_DIR}/*.otf"
+  )
+
+  if(FONT_FILES)
+    # Generate the embedded fonts header at configure time and when fonts change
+    add_custom_command(
+      OUTPUT ${EMBEDDED_FONTS_HEADER}
+      COMMAND ${CMAKE_COMMAND}
+        -DFONTS_DIR=${FONTS_DIR}
+        -DOUTPUT_FILE=${EMBEDDED_FONTS_HEADER}
+        -P ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.cmake
+      DEPENDS ${FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.cmake
+      COMMENT "Generating embedded fonts header"
+      VERBATIM
+    )
+
+    # Add a custom target to ensure the header is generated
+    add_custom_target(generate_embedded_fonts
+      DEPENDS ${EMBEDDED_FONTS_HEADER}
+    )
+
+    # Add the generated header to sources (as a dependency)
+    set_source_files_properties(${EMBEDDED_FONTS_HEADER} PROPERTIES GENERATED TRUE)
+
+    message(STATUS "Font embedding enabled (${FONTS_DIR})")
+  else()
+    message(WARNING "Font embedding enabled but no fonts found in ${FONTS_DIR}")
+    set(NANOPDF_EMBED_FONTS OFF)
+  endif()
+endif()
+
 if(NANOPDF_BUILD_WASM)
   add_executable(${BUILD_TARGET} ${NANOPDF_SOURCES})
 else()
   add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
 endif()
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_LOG_LEVEL=${NANOPDF_LOG_LEVEL}")
+
+# Add embedded fonts support
+if(NANOPDF_EMBED_FONTS)
+  # Add dependency on the generated header
+  add_dependencies(${BUILD_TARGET} generate_embedded_fonts)
+
+  # Add the build directory to include path so the generated header can be found
+  target_include_directories(${BUILD_TARGET} PRIVATE ${CMAKE_BINARY_DIR})
+
+  # Define macro to enable embedded fonts in the code
+  target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_EMBED_FONTS=1")
+endif()
 
 # Link with zlib (or use embedded miniz)
 if(NANOPDF_BUILD_WASM)
