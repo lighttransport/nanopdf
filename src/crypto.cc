@@ -733,6 +733,373 @@ void SHA256::hash(const uint8_t* data, size_t len, uint8_t* out) {
   sha.get_digest(out);
 }
 
+// SHA-1 Implementation
+SHA1::SHA1() : count(0), finalized(false) {
+  state[0] = 0x67452301;
+  state[1] = 0xEFCDAB89;
+  state[2] = 0x98BADCFE;
+  state[3] = 0x10325476;
+  state[4] = 0xC3D2E1F0;
+  std::memset(buffer, 0, sizeof(buffer));
+  std::memset(digest, 0, sizeof(digest));
+}
+
+uint32_t SHA1::rotl(uint32_t x, uint32_t n) {
+  return (x << n) | (x >> (32 - n));
+}
+
+void SHA1::transform(const uint8_t* block) {
+  uint32_t w[80];
+
+  for (int i = 0; i < 16; i++) {
+    w[i] = (static_cast<uint32_t>(block[i * 4]) << 24) |
+           (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
+           (static_cast<uint32_t>(block[i * 4 + 2]) << 8) |
+           static_cast<uint32_t>(block[i * 4 + 3]);
+  }
+
+  for (int i = 16; i < 80; i++) {
+    w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+  }
+
+  uint32_t a = state[0];
+  uint32_t b = state[1];
+  uint32_t c = state[2];
+  uint32_t d = state[3];
+  uint32_t e = state[4];
+
+  for (int i = 0; i < 80; i++) {
+    uint32_t f, k;
+    if (i < 20) {
+      f = (b & c) | (~b & d);
+      k = 0x5A827999;
+    } else if (i < 40) {
+      f = b ^ c ^ d;
+      k = 0x6ED9EBA1;
+    } else if (i < 60) {
+      f = (b & c) | (b & d) | (c & d);
+      k = 0x8F1BBCDC;
+    } else {
+      f = b ^ c ^ d;
+      k = 0xCA62C1D6;
+    }
+
+    uint32_t temp = rotl(a, 5) + f + e + k + w[i];
+    e = d;
+    d = c;
+    c = rotl(b, 30);
+    b = a;
+    a = temp;
+  }
+
+  state[0] += a;
+  state[1] += b;
+  state[2] += c;
+  state[3] += d;
+  state[4] += e;
+}
+
+void SHA1::update(const uint8_t* data, size_t len) {
+  if (finalized || len == 0 || data == nullptr) {
+    return;
+  }
+
+  size_t index = (count / 8) % 64;
+  count += static_cast<uint64_t>(len) * 8;
+
+  size_t part_len = 64 - index;
+  size_t i = 0;
+
+  if (len >= part_len) {
+    std::memcpy(&buffer[index], data, part_len);
+    transform(buffer);
+
+    for (i = part_len; i + 63 < len; i += 64) {
+      transform(&data[i]);
+    }
+
+    index = 0;
+  }
+
+  std::memcpy(&buffer[index], &data[i], len - i);
+}
+
+void SHA1::finalize() {
+  if (finalized) {
+    return;
+  }
+
+  uint64_t bit_count = count;
+
+  uint8_t pad_block[64];
+  std::memset(pad_block, 0, sizeof(pad_block));
+  pad_block[0] = 0x80;
+
+  uint32_t index = (count / 8) % 64;
+  uint32_t pad_len = (index < 56) ? (56 - index) : (120 - index);
+  update(pad_block, pad_len);
+
+  uint8_t bits[8];
+  for (int i = 0; i < 8; i++) {
+    bits[7 - i] = static_cast<uint8_t>((bit_count >> (i * 8)) & 0xff);
+  }
+  update(bits, 8);
+
+  for (int i = 0; i < 5; i++) {
+    digest[i * 4] = static_cast<uint8_t>((state[i] >> 24) & 0xff);
+    digest[i * 4 + 1] = static_cast<uint8_t>((state[i] >> 16) & 0xff);
+    digest[i * 4 + 2] = static_cast<uint8_t>((state[i] >> 8) & 0xff);
+    digest[i * 4 + 3] = static_cast<uint8_t>(state[i] & 0xff);
+  }
+
+  finalized = true;
+}
+
+void SHA1::get_digest(uint8_t* out) const {
+  std::memcpy(out, digest, DIGEST_SIZE);
+}
+
+void SHA1::hash(const uint8_t* data, size_t len, uint8_t* out) {
+  SHA1 sha;
+  sha.update(data, len);
+  sha.finalize();
+  sha.get_digest(out);
+}
+
+// AES-256 Implementation
+AES256::AES256() {
+  memset(round_keys, 0, sizeof(round_keys));
+}
+
+uint8_t AES256::gmul(uint8_t a, uint8_t b) {
+  uint8_t p = 0;
+  for (int i = 0; i < 8; i++) {
+    if (b & 1) {
+      p ^= a;
+    }
+    uint8_t hi_bit = a & 0x80;
+    a <<= 1;
+    if (hi_bit) {
+      a ^= 0x1b;
+    }
+    b >>= 1;
+  }
+  return p;
+}
+
+void AES256::sub_bytes(uint8_t* state) {
+  for (int i = 0; i < 16; i++) {
+    state[i] = sbox[state[i]];
+  }
+}
+
+void AES256::inv_sub_bytes(uint8_t* state) {
+  for (int i = 0; i < 16; i++) {
+    state[i] = inv_sbox[state[i]];
+  }
+}
+
+void AES256::shift_rows(uint8_t* state) {
+  uint8_t temp;
+  temp = state[1];
+  state[1] = state[5];
+  state[5] = state[9];
+  state[9] = state[13];
+  state[13] = temp;
+
+  temp = state[2];
+  state[2] = state[10];
+  state[10] = temp;
+  temp = state[6];
+  state[6] = state[14];
+  state[14] = temp;
+
+  temp = state[15];
+  state[15] = state[11];
+  state[11] = state[7];
+  state[7] = state[3];
+  state[3] = temp;
+}
+
+void AES256::inv_shift_rows(uint8_t* state) {
+  uint8_t temp;
+  temp = state[13];
+  state[13] = state[9];
+  state[9] = state[5];
+  state[5] = state[1];
+  state[1] = temp;
+
+  temp = state[2];
+  state[2] = state[10];
+  state[10] = temp;
+  temp = state[6];
+  state[6] = state[14];
+  state[14] = temp;
+
+  temp = state[3];
+  state[3] = state[7];
+  state[7] = state[11];
+  state[11] = state[15];
+  state[15] = temp;
+}
+
+void AES256::mix_columns(uint8_t* state) {
+  for (int i = 0; i < 4; i++) {
+    uint8_t a[4];
+    uint8_t b[4];
+    for (int j = 0; j < 4; j++) {
+      a[j] = state[i * 4 + j];
+      b[j] = (a[j] << 1) ^ ((a[j] & 0x80) ? 0x1b : 0);
+    }
+    state[i * 4 + 0] = b[0] ^ a[1] ^ b[1] ^ a[2] ^ a[3];
+    state[i * 4 + 1] = a[0] ^ b[1] ^ a[2] ^ b[2] ^ a[3];
+    state[i * 4 + 2] = a[0] ^ a[1] ^ b[2] ^ a[3] ^ b[3];
+    state[i * 4 + 3] = a[0] ^ b[0] ^ a[1] ^ a[2] ^ b[3];
+  }
+}
+
+void AES256::inv_mix_columns(uint8_t* state) {
+  for (int i = 0; i < 4; i++) {
+    uint8_t a[4];
+    for (int j = 0; j < 4; j++) {
+      a[j] = state[i * 4 + j];
+    }
+    state[i * 4 + 0] = gmul(a[0], 0x0e) ^ gmul(a[1], 0x0b) ^ gmul(a[2], 0x0d) ^ gmul(a[3], 0x09);
+    state[i * 4 + 1] = gmul(a[0], 0x09) ^ gmul(a[1], 0x0e) ^ gmul(a[2], 0x0b) ^ gmul(a[3], 0x0d);
+    state[i * 4 + 2] = gmul(a[0], 0x0d) ^ gmul(a[1], 0x09) ^ gmul(a[2], 0x0e) ^ gmul(a[3], 0x0b);
+    state[i * 4 + 3] = gmul(a[0], 0x0b) ^ gmul(a[1], 0x0d) ^ gmul(a[2], 0x09) ^ gmul(a[3], 0x0e);
+  }
+}
+
+void AES256::add_round_key(uint8_t* state, const uint8_t* round_key) {
+  for (int i = 0; i < 16; i++) {
+    state[i] ^= round_key[i];
+  }
+}
+
+void AES256::key_expansion(const uint8_t* key) {
+  // Copy the 32-byte key as the first two round keys
+  memcpy(round_keys[0], key, 16);
+  memcpy(round_keys[1], key + 16, 16);
+
+  // AES-256 key schedule: 8 words per key, generate words for rounds 2-14
+  // We work in terms of 4-byte words; round_keys[i] holds words 4i..4i+3
+  for (int i = 2; i < 15; i++) {
+    for (int w = 0; w < 4; w++) {
+      int word_idx = i * 4 + w;  // absolute word index
+      // Previous word (word_idx - 1)
+      uint8_t prev[4];
+      int prev_round = (word_idx - 1) / 4;
+      int prev_off = ((word_idx - 1) % 4) * 4;
+      memcpy(prev, &round_keys[prev_round][prev_off], 4);
+
+      if (word_idx % 8 == 0) {
+        // RotWord
+        uint8_t t = prev[0];
+        prev[0] = prev[1];
+        prev[1] = prev[2];
+        prev[2] = prev[3];
+        prev[3] = t;
+        // SubWord
+        for (int j = 0; j < 4; j++) {
+          prev[j] = sbox[prev[j]];
+        }
+        // XOR with Rcon
+        prev[0] ^= (rcon[(word_idx / 8) - 1] >> 24) & 0xFF;
+      } else if (word_idx % 8 == 4) {
+        // Extra SubWord for AES-256
+        for (int j = 0; j < 4; j++) {
+          prev[j] = sbox[prev[j]];
+        }
+      }
+
+      // XOR with word (word_idx - 8)
+      int back_round = (word_idx - 8) / 4;
+      int back_off = ((word_idx - 8) % 4) * 4;
+      for (int j = 0; j < 4; j++) {
+        round_keys[i][w * 4 + j] = round_keys[back_round][back_off + j] ^ prev[j];
+      }
+    }
+  }
+}
+
+void AES256::set_key(const uint8_t* key) {
+  key_expansion(key);
+}
+
+void AES256::encrypt_block(const uint8_t* in, uint8_t* out) {
+  uint8_t state[16];
+  memcpy(state, in, 16);
+
+  add_round_key(state, round_keys[0]);
+
+  for (int round = 1; round < 14; round++) {
+    sub_bytes(state);
+    shift_rows(state);
+    mix_columns(state);
+    add_round_key(state, round_keys[round]);
+  }
+
+  sub_bytes(state);
+  shift_rows(state);
+  add_round_key(state, round_keys[14]);
+
+  memcpy(out, state, 16);
+}
+
+void AES256::decrypt_block(const uint8_t* in, uint8_t* out) {
+  uint8_t state[16];
+  memcpy(state, in, 16);
+
+  add_round_key(state, round_keys[14]);
+
+  for (int round = 13; round > 0; round--) {
+    inv_shift_rows(state);
+    inv_sub_bytes(state);
+    add_round_key(state, round_keys[round]);
+    inv_mix_columns(state);
+  }
+
+  inv_shift_rows(state);
+  inv_sub_bytes(state);
+  add_round_key(state, round_keys[0]);
+
+  memcpy(out, state, 16);
+}
+
+void AES256::encrypt_cbc(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* iv) {
+  uint8_t prev_block[16];
+  memcpy(prev_block, iv, 16);
+
+  for (size_t i = 0; i < len; i += 16) {
+    uint8_t block[16];
+    memcpy(block, &in[i], 16);
+
+    for (int j = 0; j < 16; j++) {
+      block[j] ^= prev_block[j];
+    }
+
+    encrypt_block(block, &out[i]);
+    memcpy(prev_block, &out[i], 16);
+  }
+}
+
+void AES256::decrypt_cbc(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* iv) {
+  uint8_t prev_block[16];
+  memcpy(prev_block, iv, 16);
+
+  for (size_t i = 0; i < len; i += 16) {
+    uint8_t block[16];
+    decrypt_block(&in[i], block);
+
+    for (int j = 0; j < 16; j++) {
+      out[i + j] = block[j] ^ prev_block[j];
+    }
+
+    memcpy(prev_block, &in[i], 16);
+  }
+}
+
 // Utility functions
 void xor_bytes(uint8_t* dest, const uint8_t* src, size_t len) {
   for (size_t i = 0; i < len; i++) {

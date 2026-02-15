@@ -136,6 +136,7 @@ private:
     int overprint_mode{0};          // OPM - overprint mode (0 or 1)
     float flatness{1.0f};           // FL - flatness tolerance
     bool stroke_adjustment{false};  // SA - stroke adjustment
+    std::string rendering_intent{"RelativeColorimetric"};  // ri - rendering intent
 
     // Soft mask support
     bool has_soft_mask{false};

@@ -9442,116 +9442,140 @@ void parse_document_info(const Pdf& pdf, DocumentCatalog& catalog) {
   }
 }
 
+// Simple XMP XML parser helpers
+namespace {
+
+// Decode XML entities in a string
+std::string decode_xml_entities(const std::string& s) {
+  std::string result;
+  result.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '&') {
+      if (s.compare(i, 5, "&amp;") == 0) { result += '&'; i += 4; }
+      else if (s.compare(i, 4, "&lt;") == 0) { result += '<'; i += 3; }
+      else if (s.compare(i, 4, "&gt;") == 0) { result += '>'; i += 3; }
+      else if (s.compare(i, 6, "&quot;") == 0) { result += '"'; i += 5; }
+      else if (s.compare(i, 6, "&apos;") == 0) { result += '\''; i += 5; }
+      else { result += s[i]; }
+    } else {
+      result += s[i];
+    }
+  }
+  return result;
+}
+
+// Trim whitespace from both ends
+std::string trim_xmp(const std::string& s) {
+  size_t start = 0;
+  while (start < s.size() && (s[start] == ' ' || s[start] == '\t' ||
+                               s[start] == '\n' || s[start] == '\r'))
+    ++start;
+  size_t end = s.size();
+  while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' ||
+                          s[end - 1] == '\n' || s[end - 1] == '\r'))
+    --end;
+  return s.substr(start, end - start);
+}
+
+// Extract a simple XMP tag value. Handles both:
+//   <tag>value</tag>
+//   <tag><rdf:Alt><rdf:li ...>value</rdf:li></rdf:Alt></tag>
+//   <tag><rdf:Seq><rdf:li>value</rdf:li></rdf:Seq></tag>
+// Returns the first rdf:li value if present, otherwise direct content.
+std::string extract_simple_tag(const std::string& xml, const std::string& open_tag,
+                                const std::string& close_tag) {
+  size_t pos = xml.find(open_tag);
+  if (pos == std::string::npos) return "";
+  size_t end = xml.find(close_tag, pos);
+  if (end == std::string::npos) return "";
+
+  size_t content_start = xml.find(">", pos) + 1;
+
+  // Check for RDF container (Alt, Seq, Bag)
+  size_t rdf_alt = xml.find("<rdf:Alt>", content_start);
+  size_t rdf_seq = xml.find("<rdf:Seq>", content_start);
+  size_t rdf_bag = xml.find("<rdf:Bag>", content_start);
+  size_t container = std::string::npos;
+  if (rdf_alt != std::string::npos && rdf_alt < end) container = rdf_alt;
+  if (rdf_seq != std::string::npos && rdf_seq < end &&
+      (container == std::string::npos || rdf_seq < container)) container = rdf_seq;
+  if (rdf_bag != std::string::npos && rdf_bag < end &&
+      (container == std::string::npos || rdf_bag < container)) container = rdf_bag;
+
+  if (container != std::string::npos) {
+    // Extract first rdf:li value
+    size_t li_pos = xml.find("<rdf:li", container);
+    if (li_pos != std::string::npos && li_pos < end) {
+      li_pos = xml.find(">", li_pos) + 1;
+      size_t li_end = xml.find("</rdf:li>", li_pos);
+      if (li_end != std::string::npos && li_end <= end) {
+        return decode_xml_entities(trim_xmp(xml.substr(li_pos, li_end - li_pos)));
+      }
+    }
+    return "";
+  }
+
+  // Direct content
+  size_t tag_end = xml.find("<", content_start);
+  if (tag_end != std::string::npos && tag_end <= end) {
+    return decode_xml_entities(trim_xmp(xml.substr(content_start, tag_end - content_start)));
+  }
+  return "";
+}
+
+// Extract all rdf:li values from an RDF container (Bag/Seq)
+std::vector<std::string> extract_list_tag(const std::string& xml,
+                                           const std::string& open_tag,
+                                           const std::string& close_tag) {
+  std::vector<std::string> result;
+  size_t pos = xml.find(open_tag);
+  if (pos == std::string::npos) return result;
+  size_t end = xml.find(close_tag, pos);
+  if (end == std::string::npos) return result;
+
+  size_t search_pos = pos;
+  while (true) {
+    size_t li_pos = xml.find("<rdf:li", search_pos);
+    if (li_pos == std::string::npos || li_pos >= end) break;
+    li_pos = xml.find(">", li_pos) + 1;
+    size_t li_end = xml.find("</rdf:li>", li_pos);
+    if (li_end == std::string::npos || li_end > end) break;
+    std::string val = decode_xml_entities(trim_xmp(xml.substr(li_pos, li_end - li_pos)));
+    if (!val.empty()) result.push_back(std::move(val));
+    search_pos = li_end + 9;  // length of "</rdf:li>"
+  }
+  return result;
+}
+
+}  // namespace
+
 // Simple XMP XML parser
 bool XMPMetadata::parse_xml(const std::string& xml) {
   raw_xml = xml;
 
-  // Very basic XML parsing - production code should use a proper XML parser
-  // Look for common XMP fields
+  // Extract common fields using helper
+  dc_title = extract_simple_tag(xml, "<dc:title", "</dc:title>");
+  dc_creator = extract_simple_tag(xml, "<dc:creator", "</dc:creator>");
+  dc_description = extract_simple_tag(xml, "<dc:description", "</dc:description>");
+  dc_subject = extract_list_tag(xml, "<dc:subject", "</dc:subject>");
 
-  // Find dc:title
-  size_t pos = xml.find("<dc:title");
-  if (pos != std::string::npos) {
-    size_t end = xml.find("</dc:title>", pos);
-    if (end != std::string::npos) {
-      pos = xml.find(">", pos) + 1; // Skip to after the tag
-      // Skip any nested tags
-      size_t nested = xml.find("<rdf:Alt>", pos);
-      if (nested != std::string::npos && nested < end) {
-        pos = xml.find("<rdf:li", nested);
-        if (pos != std::string::npos && pos < end) {
-          pos = xml.find(">", pos) + 1;
-          size_t li_end = xml.find("</rdf:li>", pos);
-          if (li_end != std::string::npos) {
-            dc_title = xml.substr(pos, li_end - pos);
-          }
-        }
-      }
-    }
-  }
+  xmp_create_date = extract_simple_tag(xml, "<xmp:CreateDate", "</xmp:CreateDate>");
+  xmp_modify_date = extract_simple_tag(xml, "<xmp:ModifyDate", "</xmp:ModifyDate>");
+  xmp_metadata_date = extract_simple_tag(xml, "<xmp:MetadataDate", "</xmp:MetadataDate>");
+  xmp_creator_tool = extract_simple_tag(xml, "<xmp:CreatorTool", "</xmp:CreatorTool>");
 
-  // Find dc:creator
-  pos = xml.find("<dc:creator");
-  if (pos != std::string::npos) {
-    size_t end = xml.find("</dc:creator>", pos);
-    if (end != std::string::npos) {
-      pos = xml.find(">", pos) + 1; // Skip to after the tag
-      size_t nested = xml.find("<rdf:Seq>", pos);
-      if (nested != std::string::npos && nested < end) {
-        pos = xml.find("<rdf:li", nested);
-        if (pos != std::string::npos && pos < end) {
-          pos = xml.find(">", pos) + 1;
-          size_t li_end = xml.find("</rdf:li>", pos);
-          if (li_end != std::string::npos) {
-            dc_creator = xml.substr(pos, li_end - pos);
-          }
-        }
-      }
-    }
-  }
+  pdf_producer = extract_simple_tag(xml, "<pdf:Producer", "</pdf:Producer>");
+  pdf_version = extract_simple_tag(xml, "<pdf:PDFVersion", "</pdf:PDFVersion>");
 
-  // Find xmp:CreateDate
-  pos = xml.find("xmp:CreateDate");
-  if (pos != std::string::npos) {
-    pos = xml.find(">", pos) + 1;
-    size_t end = xml.find("<", pos);
-    if (end != std::string::npos) {
-      xmp_create_date = xml.substr(pos, end - pos);
-    }
-  }
+  xmpmm_document_id = extract_simple_tag(xml, "<xmpMM:DocumentID", "</xmpMM:DocumentID>");
+  xmpmm_instance_id = extract_simple_tag(xml, "<xmpMM:InstanceID", "</xmpMM:InstanceID>");
 
-  // Find xmp:ModifyDate
-  pos = xml.find("xmp:ModifyDate");
-  if (pos != std::string::npos) {
-    pos = xml.find(">", pos) + 1;
-    size_t end = xml.find("<", pos);
-    if (end != std::string::npos) {
-      xmp_modify_date = xml.substr(pos, end - pos);
-    }
+  // PDF/A identification
+  std::string part_str = extract_simple_tag(xml, "<pdfaid:part", "</pdfaid:part>");
+  if (!part_str.empty()) {
+    pdfa_part = std::atoi(part_str.c_str());
   }
-
-  // Find pdf:Producer
-  pos = xml.find("pdf:Producer");
-  if (pos != std::string::npos) {
-    pos = xml.find(">", pos) + 1;
-    size_t end = xml.find("<", pos);
-    if (end != std::string::npos) {
-      pdf_producer = xml.substr(pos, end - pos);
-    }
-  }
-
-  // Find pdfaid:part (PDF/A identification)
-  pos = xml.find("pdfaid:part");
-  if (pos != std::string::npos) {
-    pos = xml.find(">", pos) + 1;
-    size_t end = xml.find("<", pos);
-    if (end != std::string::npos) {
-      std::string part_str = xml.substr(pos, end - pos);
-      // Trim whitespace
-      while (!part_str.empty() && (part_str.front() == ' ' || part_str.front() == '\t'))
-        part_str.erase(part_str.begin());
-      while (!part_str.empty() && (part_str.back() == ' ' || part_str.back() == '\t'))
-        part_str.pop_back();
-      if (!part_str.empty()) {
-        pdfa_part = std::atoi(part_str.c_str());
-      }
-    }
-  }
-
-  // Find pdfaid:conformance (PDF/A conformance level)
-  pos = xml.find("pdfaid:conformance");
-  if (pos != std::string::npos) {
-    pos = xml.find(">", pos) + 1;
-    size_t end = xml.find("<", pos);
-    if (end != std::string::npos) {
-      pdfa_conformance = xml.substr(pos, end - pos);
-      // Trim whitespace
-      while (!pdfa_conformance.empty() && (pdfa_conformance.front() == ' ' || pdfa_conformance.front() == '\t'))
-        pdfa_conformance.erase(pdfa_conformance.begin());
-      while (!pdfa_conformance.empty() && (pdfa_conformance.back() == ' ' || pdfa_conformance.back() == '\t'))
-        pdfa_conformance.pop_back();
-    }
-  }
+  pdfa_conformance = extract_simple_tag(xml, "<pdfaid:conformance", "</pdfaid:conformance>");
 
   return true;
 }
@@ -11750,13 +11774,18 @@ SignatureValidationResult validate_signature(const Pdf& pdf,
       result.digest_algorithm.empty()) {
     final_computed_digest = computed_digest;
   } else if (result.digest_algorithm == "SHA-1") {
-    // SHA-1 is not implemented in crypto.hh, fall back to noting this
-    result.error =
-        "SHA-1 digest algorithm detected but not implemented; "
-        "cannot verify integrity";
-    // Still set what we found
-    result.signature_valid = true;  // Structure parsed OK
-    return result;
+    // Recompute with SHA-1
+    nanopdf::crypto::SHA1 sha1;
+    for (size_t i = 0; i < field.byte_range.size(); i += 2) {
+      uint64_t offset = field.byte_range[i];
+      uint64_t length = field.byte_range[i + 1];
+      if (length == 0) continue;
+      sha1.update(pdf.data + static_cast<size_t>(offset),
+                  static_cast<size_t>(length));
+    }
+    sha1.finalize();
+    final_computed_digest.resize(nanopdf::crypto::SHA1::DIGEST_SIZE);
+    sha1.get_digest(final_computed_digest.data());
   } else if (result.digest_algorithm == "MD5") {
     // Recompute with MD5
     nanopdf::crypto::MD5 md5;

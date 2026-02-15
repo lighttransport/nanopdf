@@ -147,6 +147,30 @@ private:
   static uint32_t rotr(uint32_t x, uint32_t n);
 };
 
+// SHA-1 hash function
+class SHA1 {
+public:
+  static const size_t DIGEST_SIZE = 20;
+
+  SHA1();
+  void update(const uint8_t* data, size_t len);
+  void finalize();
+  void get_digest(uint8_t* digest) const;
+
+  // Convenience function
+  static void hash(const uint8_t* data, size_t len, uint8_t* digest);
+
+private:
+  uint32_t state[5];
+  uint64_t count;
+  uint8_t buffer[64];
+  uint8_t digest[20];
+  bool finalized;
+
+  void transform(const uint8_t* block);
+  static uint32_t rotl(uint32_t x, uint32_t n);
+};
+
 // Utility functions
 void xor_bytes(uint8_t* dest, const uint8_t* src, size_t len);
 void pad_pkcs7(std::vector<uint8_t>& data, size_t block_size);

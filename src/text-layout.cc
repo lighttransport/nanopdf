@@ -126,11 +126,12 @@ std::vector<std::vector<int>> group_into_lines(
 }
 
 // Detect reading order for lines (handles multi-column layouts)
-void assign_reading_order(
+// Returns the detected number of columns.
+int assign_reading_order(
     std::vector<TextLine>& lines,
     const TextLayoutOptions& options) {
 
-  if (lines.empty()) return;
+  if (lines.empty()) return 1;
 
   // Detect columns if enabled
   int num_columns = 1;
@@ -191,6 +192,8 @@ void assign_reading_order(
   for (size_t i = 0; i < indices.size(); ++i) {
     lines[indices[i]].reading_order = static_cast<int>(i);
   }
+
+  return num_columns;
 }
 
 // Segment lines into words based on spacing
@@ -589,14 +592,7 @@ std::unique_ptr<TextPage> extract_text_layout_with_collector(
   }
 
   // Step 4: Assign reading order (handles multi-column)
-  assign_reading_order(page->lines, options);
-
-  // Detect number of columns
-  std::set<int> reading_orders;
-  for (const auto& line : page->lines) {
-    reading_orders.insert(line.reading_order);
-  }
-  page->num_columns = 1;  // Simplified for now
+  page->num_columns = assign_reading_order(page->lines, options);
 
   // Step 5: Segment into words
   page->words = segment_into_words(page->lines, options);

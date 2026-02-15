@@ -2542,12 +2542,37 @@ static bool is_ps_number(const std::string& token, double& value) {
   return end != token.c_str() && *end == '\0';
 }
 
+// Helper: collect tokens for a procedure body (between { and matching })
+// pos should point to the token after the opening {.
+static std::vector<std::string> collect_procedure(const std::vector<std::string>& tokens,
+                                                   size_t& pos) {
+  std::vector<std::string> proc;
+  int brace_count = 1;
+  while (pos < tokens.size() && brace_count > 0) {
+    if (tokens[pos] == "{") ++brace_count;
+    else if (tokens[pos] == "}") {
+      --brace_count;
+      if (brace_count == 0) { ++pos; break; }
+    }
+    proc.push_back(tokens[pos]);
+    ++pos;
+  }
+  return proc;
+}
+
+// Forward declaration
+static bool execute_procedure(const std::vector<std::string>& proc_tokens,
+                               PSStack& stack, int depth);
+
 // Execute PostScript tokens
 static bool execute_postscript(const std::vector<std::string>& tokens,
                                 size_t& pos, PSStack& stack,
                                 int depth = 0) {
-  const int MAX_DEPTH = 100;  // Prevent infinite recursion
+  const int MAX_DEPTH = 100;
   if (depth > MAX_DEPTH) return false;
+
+  // Procedure stack for collecting { ... } bodies
+  std::vector<std::vector<std::string>> proc_stack;
 
   while (pos < tokens.size()) {
     const std::string& tok = tokens[pos];
@@ -2558,17 +2583,9 @@ static bool execute_postscript(const std::vector<std::string>& tokens,
       return true;
     }
 
-    // Start of procedure - find matching end and skip
+    // Start of procedure - collect body and push onto procedure stack
     if (tok == "{") {
-      // Find the matching closing brace and collect procedure tokens
-      int brace_count = 1;
-      size_t proc_start = pos;
-      while (pos < tokens.size() && brace_count > 0) {
-        if (tokens[pos] == "{") ++brace_count;
-        else if (tokens[pos] == "}") --brace_count;
-        ++pos;
-      }
-      // Push procedure marker (we'll handle this specially in if/ifelse)
+      proc_stack.push_back(collect_procedure(tokens, pos));
       continue;
     }
 
@@ -2695,22 +2712,32 @@ static bool execute_postscript(const std::vector<std::string>& tokens,
       int n = static_cast<int>(stack.pop());
       stack.roll(n, j);
     }
-    // Conditional operators - these need special handling
+    // Conditional operators
     else if (tok == "if") {
-      // Find the procedure before this 'if'
       // Format: { proc } bool if
-      // We need to backtrack to find the procedure
-      // For simplicity, we'll handle this by looking at prior tokens
-      // This is a simplified implementation
       bool cond = stack.pop() != 0.0;
-      if (cond) {
-        // Execute the procedure (already executed inline)
+      if (!proc_stack.empty()) {
+        auto proc = std::move(proc_stack.back());
+        proc_stack.pop_back();
+        if (cond) {
+          execute_procedure(proc, stack, depth + 1);
+        }
       }
-      // Note: Full implementation would need procedure objects
     } else if (tok == "ifelse") {
-      // { proc1 } { proc2 } bool ifelse
+      // Format: { true_proc } { false_proc } bool ifelse
       bool cond = stack.pop() != 0.0;
-      // Simplified - full implementation needs procedure handling
+      std::vector<std::string> false_proc, true_proc;
+      if (proc_stack.size() >= 2) {
+        false_proc = std::move(proc_stack.back());
+        proc_stack.pop_back();
+        true_proc = std::move(proc_stack.back());
+        proc_stack.pop_back();
+      }
+      if (cond) {
+        execute_procedure(true_proc, stack, depth + 1);
+      } else {
+        execute_procedure(false_proc, stack, depth + 1);
+      }
     }
     // Value clamping (common in PDF functions)
     else if (tok == "cvr") {
@@ -2721,6 +2748,13 @@ static bool execute_postscript(const std::vector<std::string>& tokens,
     // Unknown operator - ignore
   }
   return true;
+}
+
+// Execute a collected procedure's tokens
+static bool execute_procedure(const std::vector<std::string>& proc_tokens,
+                               PSStack& stack, int depth) {
+  size_t pos = 0;
+  return execute_postscript(proc_tokens, pos, stack, depth);
 }
 
 // Evaluate a PostScript Type 4 function
@@ -5760,9 +5794,15 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           }
         }
       } else if (token == "ri") {  // Set rendering intent
-        // Ignore - color management not implemented
+        if (!operands.empty()) {
+          state_.rendering_intent = operands[0];
+        }
       } else if (token == "i") {  // Set flatness tolerance
-        // Ignore - affects rendering quality, not appearance
+        if (!operands.empty()) {
+          try {
+            state_.flatness = std::stof(operands[0]);
+          } catch (...) {}
+        }
       }
       // Graphics state operators
       else if (token == "q") {  // Save graphics state

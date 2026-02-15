@@ -4615,7 +4615,12 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                   state_.blend_mode = BL_COMP_OP_EXCLUSION;
                 } else if (bm_name == "Hue" || bm_name == "Saturation" ||
                            bm_name == "Color" || bm_name == "Luminosity") {
-                  // Non-separable blend modes - not supported natively, fall back to Normal
+                  // Non-separable blend modes require HSL compositing which
+                  // Blend2D doesn't support natively. Falling back to Normal.
+#ifdef NANOPDF_DEBUG_PRINT
+                  printf("DEBUG: Non-separable blend mode '%s' not supported by Blend2D, "
+                         "falling back to Normal\n", bm_name.c_str());
+#endif
                   state_.blend_mode = BL_COMP_OP_SRC_OVER;
                 } else {
                   state_.blend_mode = BL_COMP_OP_SRC_OVER;  // Default
@@ -5062,9 +5067,15 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.transform = state_.transform * m;
         }
       } else if (token == "ri") {
-        // Rendering intent - not implemented (color management)
+        // Rendering intent
+        if (!operands.empty()) {
+          state_.rendering_intent = operands[0];
+        }
       } else if (token == "i") {
-        // Flatness tolerance - not implemented
+        // Flatness tolerance from content stream
+        if (!operands.empty()) {
+          state_.flatness = std::stof(operands[0]);
+        }
       }
 
       operands.clear();

@@ -985,6 +985,9 @@ struct XMPMetadata {
   std::string xmp_metadata_date;
   std::string pdf_producer;
   std::string pdf_version;
+  std::string xmp_creator_tool;        // xmp:CreatorTool
+  std::string xmpmm_document_id;       // xmpMM:DocumentID
+  std::string xmpmm_instance_id;       // xmpMM:InstanceID
 
   // PDF/A identification (from pdfaid namespace)
   int pdfa_part{0};                  // pdfaid:part (1, 2, 3, 4)

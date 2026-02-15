@@ -4447,11 +4447,19 @@ void PdfWriter::draw_text_layout(PageBuilder& builder, const TextLayout& layout,
   for (const auto& line : impl->lines) {
     // Calculate x position based on alignment
     double line_x = x;
-    if (impl->alignment == TextAlign::Center) {
-      // Would need to measure line width
-      line_x = x;  // Simplified - center alignment needs width measurement
-    } else if (impl->alignment == TextAlign::Right) {
-      line_x = x;  // Simplified
+    if (impl->alignment == TextAlign::Center || impl->alignment == TextAlign::Right) {
+      double text_width = 0;
+      if (metrics && metrics->units_per_em > 0) {
+        for (unsigned char ch : line.text) {
+          int glyph_width = metrics->get_width(static_cast<uint32_t>(ch));
+          text_width += glyph_width * impl->style.font_size / metrics->units_per_em;
+        }
+      }
+      if (impl->alignment == TextAlign::Center) {
+        line_x = x + (impl->width - text_width) / 2.0;
+      } else {
+        line_x = x + impl->width - text_width;
+      }
     }
 
     if (!line.text.empty()) {
