@@ -6,6 +6,7 @@ add_nanopdf_unit_test(test_asciihex_decode test_asciihex_decode.cc)
 add_nanopdf_unit_test(test_lzw_decode test_lzw_decode.cc)
 add_nanopdf_unit_test(test_runlength_decode test_runlength_decode.cc)
 add_nanopdf_unit_test(test_dct_decode test_dct_decode.cc)
+add_nanopdf_unit_test(test_filter_chains test_filter_chains.cc)
+add_nanopdf_unit_test(test_png_predictors test_png_predictors.cc)
 # add_nanopdf_unit_test(test_ccitt_decode test_ccitt_decode.cc)  # TODO: Migrate from phase6
 # add_nanopdf_unit_test(test_jbig2_decode test_jbig2_decode.cc)  # TODO: Create tests
-# add_nanopdf_unit_test(test_filter_chains test_filter_chains.cc)  # TODO: Migrate
