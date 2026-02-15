@@ -913,7 +913,7 @@ void test_color_space_parsing() {
     cs_value.array.push_back(alt_val);
 
     Value func_val;
-    func_val.SetType(Value::DICTIONARY);  // placeholder tint function
+    func_val.SetType(Value::DICTIONARY);  // tint function (minimal for test)
     cs_value.array.push_back(func_val);
 
     ColorSpace cs = parse_color_space(pdf, cs_value);
