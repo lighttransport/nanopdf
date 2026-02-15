@@ -655,6 +655,16 @@ TransformResult transform_to_rgb(const ColorSpace& color_space,
     return result;
   }
 
+  // Pre-parse ICC profile if available (once, before pixel loop)
+  IccProfileInfo icc_profile;
+  bool have_icc_profile = false;
+  if (color_space.type == ColorSpaceType::ICCBased &&
+      !color_space.icc_profile_data.empty()) {
+    icc_profile = parse_icc_profile(color_space.icc_profile_data.data(),
+                                    color_space.icc_profile_data.size());
+    have_icc_profile = icc_profile.valid && icc_profile.is_matrix_profile;
+  }
+
   // Transform pixel by pixel
   for (int i = 0; i < num_pixels; ++i) {
     RGB rgb;
@@ -706,7 +716,11 @@ TransformResult transform_to_rgb(const ColorSpace& color_space,
         }
 
         case ColorSpaceType::ICCBased:
-          rgb = iccbased_to_rgb_simple(components, src_components);
+          if (have_icc_profile) {
+            rgb = iccbased_to_rgb(components, src_components, icc_profile);
+          } else {
+            rgb = iccbased_to_rgb_simple(components, src_components);
+          }
           break;
 
         default:
@@ -755,7 +769,11 @@ TransformResult transform_to_rgb(const ColorSpace& color_space,
           break;
         }
         case ColorSpaceType::ICCBased:
-          rgb = iccbased_to_rgb_simple(components, src_components);
+          if (have_icc_profile) {
+            rgb = iccbased_to_rgb(components, src_components, icc_profile);
+          } else {
+            rgb = iccbased_to_rgb_simple(components, src_components);
+          }
           break;
         default:
           rgb = RGB(0.5f, 0.5f, 0.5f);

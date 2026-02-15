@@ -121,6 +121,122 @@ struct DecodeResult {
   uint8_t bit_depth{8};
 };
 
+// SOP marker code (Start of Packet)
+constexpr uint16_t JPX_SOP = 0xFF91;
+// EPH marker code (End of Packet Header)
+constexpr uint16_t JPX_EPH = 0xFF92;
+
+// MQ arithmetic decoder for entropy coding (used by TagTree and JPXDecoder)
+class MQDecoder {
+public:
+  MQDecoder();
+  void init(const uint8_t* data, size_t size);
+  int decode(int cx);
+  void reset();
+
+private:
+  void bytein();
+  int mps_exchange(int cx);
+  int lps_exchange(int cx);
+  void renormd();
+
+  const uint8_t* data_{nullptr};
+  size_t size_{0};
+  size_t pos_{0};
+  uint32_t c_{0};   // C register
+  uint16_t a_{0};   // A register (interval)
+  int ct_{0};       // Counter
+  uint8_t cx_states_[19];  // Context states
+  uint8_t cx_mps_[19];     // MPS for each context
+};
+
+// Tag tree for encoding inclusion and zero-bit-plane information
+class TagTree {
+public:
+  TagTree() : width_(0), height_(0) {}
+  TagTree(int width, int height);
+
+  // Decode a value at (x,y) up to threshold
+  // Returns true if value <= threshold
+  bool decode(int x, int y, int threshold, MQDecoder& mq, int ctx);
+
+  // Get the current value at (x,y)
+  int value(int x, int y) const;
+
+private:
+  struct Node {
+    int value{0};
+    bool known{false};
+  };
+
+  int width_;
+  int height_;
+  std::vector<std::vector<Node>> levels_;  // levels_[level][index]
+};
+
+// A single codeblock within a subband
+struct Codeblock {
+  int x0{0}, y0{0};  // Position in subband coordinates
+  int width{0}, height{0};
+  int num_passes{0};       // Total coding passes decoded so far
+  int zero_bit_planes{0};  // Number of zero bit-planes (missing MSBs)
+  int num_len_bits{3};     // Number of bits for length coding
+  bool included{false};    // Whether included in the current packet
+  std::vector<uint8_t> data;  // Compressed codeblock data
+  std::vector<int> pass_lengths;  // Length of each coding pass segment
+  std::vector<int32_t> coeffs;    // Decoded coefficients
+};
+
+// Subband information (LL, HL, LH, HH)
+enum class SubbandType { LL, HL, LH, HH };
+
+struct Subband {
+  SubbandType type{SubbandType::LL};
+  int x0{0}, y0{0};  // Top-left in tile coordinates
+  int width{0}, height{0};
+  int res_level{0};    // Resolution level this subband belongs to
+  int band_index{0};   // Index within QCD step sizes
+  std::vector<Codeblock> codeblocks;
+  int num_xcb{0};  // Number of codeblocks horizontally
+  int num_ycb{0};  // Number of codeblocks vertically
+};
+
+// Precinct: spatial region within a resolution level
+struct Precinct {
+  int x0{0}, y0{0};
+  int width{0}, height{0};
+  // Tag trees for inclusion and zero-bit-plane info
+  // One pair per subband in this precinct
+  struct SubbandInfo {
+    TagTree inclusion;
+    TagTree zero_bit_planes;
+    int cb_x0{0}, cb_y0{0};  // First codeblock index
+    int num_xcb{0}, num_ycb{0};
+  };
+  std::vector<SubbandInfo> subbands;  // 1 for LL, 3 for others (HL,LH,HH)
+};
+
+// Resolution level containing subbands and precincts
+struct ResLevel {
+  int level{0};
+  int x0{0}, y0{0};
+  int width{0}, height{0};
+  int precinct_width{0};
+  int precinct_height{0};
+  int num_precincts_x{0};
+  int num_precincts_y{0};
+  std::vector<Subband> subbands;
+  std::vector<Precinct> precincts;
+};
+
+// Per-component tile data
+struct TileComponent {
+  int x0{0}, y0{0};
+  int width{0}, height{0};
+  std::vector<ResLevel> res_levels;
+  std::vector<int32_t> coeffs;  // Final coefficient array
+};
+
 // Main decoder class
 class JPXDecoder {
 public:
@@ -135,7 +251,6 @@ public:
                 uint32_t& width, uint32_t& height,
                 uint16_t& num_components, uint8_t& bit_depth);
 
-private:
   // Bit reader for entropy decoding
   class BitReader {
   public:
@@ -146,6 +261,8 @@ private:
     bool eof() const;
     size_t position() const { return pos_; }
     void seek(size_t pos) { pos_ = pos; bit_pos_ = 0; }
+    const uint8_t* data() const { return data_; }
+    size_t size() const { return size_; }
 
   private:
     const uint8_t* data_;
@@ -154,30 +271,9 @@ private:
     int bit_pos_{0};
   };
 
-  // MQ arithmetic decoder for entropy coding
-  class MQDecoder {
-  public:
-    MQDecoder();
-    void init(const uint8_t* data, size_t size);
-    int decode(int cx);
-    void reset();
+  // MQDecoder is now a standalone class in the jpx namespace (above)
 
-  private:
-    void bytein();
-    int mps_exchange(int cx);
-    int lps_exchange(int cx);
-    void renormd();
-
-    const uint8_t* data_{nullptr};
-    size_t size_{0};
-    size_t pos_{0};
-    uint32_t c_{0};   // C register
-    uint16_t a_{0};   // A register (interval)
-    int ct_{0};       // Counter
-    uint8_t cx_states_[19];  // Context states
-    uint8_t cx_mps_[19];     // MPS for each context
-  };
-
+private:
   // Parse main header markers
   bool parse_main_header(BitReader& reader);
   bool parse_siz(BitReader& reader, uint16_t length);
@@ -187,17 +283,65 @@ private:
   // Parse tile-part
   bool parse_tile_part(BitReader& reader);
 
-  // Decode tile data
-  bool decode_tile(const uint8_t* data, size_t size, int tile_idx);
+  // Build tile component structure (subbands, codeblocks, precincts)
+  void build_tile_component(TileComponent& tc, int comp_idx,
+                            int tile_x0, int tile_y0,
+                            int tile_x1, int tile_y1);
 
-  // Decode codeblock
-  bool decode_codeblock(const uint8_t* data, size_t size,
-                        int width, int height,
-                        std::vector<int32_t>& coeffs);
+  // Packet-level parsing
+  // Reads packet header and body from the data stream
+  bool parse_packet(const uint8_t* data, size_t size, size_t& offset,
+                    ResLevel& res, int layer_idx,
+                    std::vector<Subband>& subbands);
+
+  // Decode tile data (all packets for a tile)
+  bool decode_tile_data(const uint8_t* data, size_t size,
+                        std::vector<TileComponent>& tile_comps);
+
+  // Decode a single codeblock's compressed data using MQ decoder
+  bool decode_codeblock(Codeblock& cb, int subband_type);
+
+  // Codeblock bit-plane coding passes
+  void significance_propagation_pass(MQDecoder& mq,
+                                     std::vector<int32_t>& coeffs,
+                                     std::vector<uint8_t>& state,
+                                     int width, int height,
+                                     int bit_plane, int subband_type);
+  void magnitude_refinement_pass(MQDecoder& mq,
+                                 std::vector<int32_t>& coeffs,
+                                 std::vector<uint8_t>& state,
+                                 int width, int height,
+                                 int bit_plane);
+  void cleanup_pass(MQDecoder& mq,
+                    std::vector<int32_t>& coeffs,
+                    std::vector<uint8_t>& state,
+                    int width, int height,
+                    int bit_plane, int subband_type);
+
+  // Context formation for significance coding
+  int get_significance_context(const std::vector<uint8_t>& state,
+                               int x, int y, int width, int height,
+                               int subband_type) const;
+  int get_sign_context(const std::vector<uint8_t>& state,
+                       const std::vector<int32_t>& coeffs,
+                       int x, int y, int width, int height,
+                       int& sign_flip) const;
+  int get_magnitude_refinement_context(const std::vector<uint8_t>& state,
+                                       int x, int y, int width,
+                                       int height) const;
+
+  // Place decoded codeblock coefficients into the subband coefficient array
+  void place_codeblock_coeffs(const Codeblock& cb, const Subband& sb,
+                              TileComponent& tc);
+
+  // Apply dequantization
+  void dequantize_subband(Subband& sb, TileComponent& tc, int comp_idx);
 
   // Inverse wavelet transform
-  void inverse_dwt_53(std::vector<int32_t>& data, int width, int height, int levels);
-  void inverse_dwt_97(std::vector<float>& data, int width, int height, int levels);
+  void inverse_dwt_53(std::vector<int32_t>& data, int width, int height,
+                      int levels);
+  void inverse_dwt_97(std::vector<float>& data, int width, int height,
+                      int levels);
 
   // Apply multiple component transform (color transform)
   void apply_inverse_mct(std::vector<std::vector<int32_t>>& components);
@@ -213,6 +357,10 @@ private:
 
   // Tile data storage
   std::vector<std::vector<int32_t>> tile_coeffs_;
+
+  // Raw codestream pointer (for tile data access)
+  const uint8_t* codestream_data_{nullptr};
+  size_t codestream_size_{0};
 };
 
 }  // namespace jpx

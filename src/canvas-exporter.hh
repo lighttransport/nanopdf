@@ -241,6 +241,11 @@ private:
     Value soft_mask_value;
   } state_;
 
+  // OCG (Optional Content Group) visibility tracking
+  // Stack of skip depth counters: >0 means content is hidden
+  int ocg_skip_depth_{0};
+  std::vector<bool> marked_content_visibility_stack_;
+
   std::map<std::string, ImageXObject> image_xobjects_;
   std::vector<std::vector<uint8_t>> inline_images_;
   std::unique_ptr<ImageXObject> pending_inline_mask_;

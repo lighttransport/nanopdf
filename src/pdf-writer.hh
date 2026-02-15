@@ -836,6 +836,7 @@ class TableBuilder {
 };
 
 // Forward declarations
+struct Pdf;
 class PdfWriter;
 class TextLayout;
 
@@ -1330,6 +1331,65 @@ class PdfWriter {
   /// Check if timestamp is configured
   bool has_timestamp_config() const;
 
+  // ============================================================
+  // Form Fill (for existing PDFs loaded via load_existing)
+  // ============================================================
+
+  /// Set a text field value by field name. The field must exist in the loaded PDF.
+  /// @param field_name  Fully-qualified field name (e.g., "form1[0].Name[0]" or "Name")
+  /// @param value       New text value
+  /// @return true if the field was found and updated
+  bool set_field_value(const std::string& field_name, const std::string& value);
+
+  /// Set a checkbox/radio button state by field name.
+  /// @param field_name  Fully-qualified field name
+  /// @param checked     true = checked ("/Yes"), false = unchecked ("/Off")
+  /// @return true if the field was found and updated
+  bool set_field_checked(const std::string& field_name, bool checked);
+
+  /// Set a choice field (dropdown/listbox) selection by field name.
+  /// @param field_name  Fully-qualified field name
+  /// @param value       Selected option value
+  /// @return true if the field was found and updated
+  bool set_field_choice(const std::string& field_name, const std::string& value);
+
+  // ============================================================
+  // PDF Merge and Split
+  // ============================================================
+
+  /// Import pages from another parsed PDF into this writer.
+  /// Each imported page is wrapped as a Form XObject and placed on a new page
+  /// with matching dimensions, preserving the visual appearance.
+  /// @param source_pdf  A parsed Pdf object (from parse_from_memory)
+  /// @param page_indices  0-based page indices to import. Empty = all pages.
+  /// @return Number of pages successfully imported, or -1 on error.
+  int import_pages_from(const Pdf& source_pdf,
+                        const std::vector<int>& page_indices = {});
+
+  /// Extract specific pages from a parsed PDF into a new PDF document.
+  /// @param source_pdf   A parsed Pdf object
+  /// @param page_indices 0-based page indices to extract
+  /// @param output       Output buffer for the new PDF
+  /// @return WriteResult indicating success or failure
+  static WriteResult split_pages(const Pdf& source_pdf,
+                                 const std::vector<int>& page_indices,
+                                 std::vector<uint8_t>& output);
+
+  /// Merge multiple PDF documents (given as raw bytes) into a single PDF.
+  /// @param pdf_data  Vector of PDF file contents
+  /// @param output    Output buffer for the merged PDF
+  /// @return WriteResult indicating success or failure
+  static WriteResult merge_pdfs(const std::vector<std::vector<uint8_t>>& pdf_data,
+                                std::vector<uint8_t>& output);
+
+  /// Apply redaction annotations: remove content under redacted areas,
+  /// draw overlay rectangles, and remove the redaction annotations.
+  /// @param source_pdf   A parsed Pdf object containing redaction annotations
+  /// @param output       Output buffer for the redacted PDF
+  /// @return WriteResult indicating success or failure
+  static WriteResult apply_redactions(const Pdf& source_pdf,
+                                       std::vector<uint8_t>& output);
+
   // Output
   /// Write PDF to file
   WriteResult write_to_file(const std::string& path);
@@ -1343,8 +1403,49 @@ class PdfWriter {
   WriteResult write_for_signing(std::vector<uint8_t>& output,
                                 size_t content_length = 8192);
 
+  // ============================================================
+  // Annotation CRUD on Existing PDFs
+  // ============================================================
+
+  /// Add a text annotation (sticky note) to an existing PDF page.
+  /// Requires load_existing() to have been called first.
+  /// @param page_index  0-based page index in the existing PDF
+  /// @param x           Annotation rect x position
+  /// @param y           Annotation rect y position
+  /// @param w           Annotation rect width
+  /// @param h           Annotation rect height
+  /// @param contents    Annotation text content
+  /// @return true if the annotation was queued for writing
+  bool add_text_annotation_to_existing_page(int page_index,
+                                             double x, double y,
+                                             double w, double h,
+                                             const std::string& contents);
+
+  /// Add a highlight annotation to an existing PDF page.
+  /// @param page_index  0-based page index
+  /// @param config      Highlight configuration with quad points and color
+  /// @return true if the annotation was queued
+  bool add_highlight_to_existing_page(int page_index,
+                                       const HighlightConfig& config);
+
+  /// Add a link annotation to an existing PDF page.
+  /// @param page_index  0-based page index
+  /// @param config      Link configuration with rect, action, and URI/dest
+  /// @return true if the annotation was queued
+  bool add_link_to_existing_page(int page_index,
+                                  const LinkConfig& config);
+
+  /// Delete an annotation from an existing PDF page by index.
+  /// The index corresponds to the order of annotations in the page's /Annots array.
+  /// @param page_index  0-based page index
+  /// @param annot_index 0-based annotation index within the page
+  /// @return true if the deletion was queued
+  bool delete_annotation_from_existing_page(int page_index,
+                                             int annot_index);
+
  private:
   friend class PageBuilder;
+  friend class ObjectCopier;
 
   // Internal method for PageBuilder to encode text for embedded fonts
   std::string encode_text_internal(const std::string& font_name,

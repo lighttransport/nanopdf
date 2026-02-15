@@ -370,12 +370,8 @@ class StreamReader {
   bool eof() const { return idx_ >= length_; }
 
   bool is_nullchar() const {
-    if (idx_ < length_) {
-      return binary_[idx_] == '\0';
-    }
-
-    // TODO: report true when eof()?
-    return false;
+    if (idx_ >= length_) return true;
+    return binary_[idx_] == '\0';
   }
 
   const uint8_t *data() const { return binary_; }

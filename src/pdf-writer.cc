@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 Light Transport Entertainment Inc.
 
+// nanopdf core for PDF parsing (needed for merge/split)
+// IMPORTANT: Must be included BEFORE pdf-writer.hh so that NANOPDF_HH_INCLUDED
+// is defined, preventing duplicate enum class definitions (EncryptionAlgorithm,
+// BlendMode) which are conditionally defined in pdf-writer.hh.
+#include "nanopdf.hh"
+
 #include "pdf-writer.hh"
 
 #ifdef NANOPDF_USE_MINIZ
@@ -18,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <random>
@@ -1958,6 +1965,42 @@ struct PdfWriter::Impl {
   bool has_acroform = false;
   int acroform_obj_id = 0;
 
+  // Form field updates (for fill & save on existing PDFs)
+  struct FieldUpdate {
+    std::string field_name;
+    std::string value;           // PDF value string (e.g. "(text)" or "/Yes")
+    uint32_t object_number{0};   // Original object number in existing PDF
+    uint16_t generation{0};
+  };
+  std::vector<FieldUpdate> field_updates;
+
+  // Annotation updates for existing PDFs
+  enum class AnnotationUpdateType {
+    AddText,
+    AddHighlight,
+    AddLink,
+    Delete
+  };
+
+  struct AnnotationUpdate {
+    AnnotationUpdateType update_type;
+    int page_index{0};
+
+    // For AddText:
+    double x{0}, y{0}, w{0}, h{0};
+    std::string contents;
+
+    // For AddHighlight:
+    HighlightConfig highlight_config;
+
+    // For AddLink:
+    LinkConfig link_config;
+
+    // For Delete:
+    int annot_index{0};
+  };
+  std::vector<AnnotationUpdate> annotation_updates;
+
   // Signature placeholders (filled after writing)
   std::vector<SignaturePlaceholder> sig_placeholders;
   size_t sig_content_length = 8192;  // Reserved space for signature
@@ -2099,9 +2142,31 @@ struct PdfWriter::Impl {
     std::vector<std::string> used_images;
     std::vector<std::string> used_fonts;
     int obj_id = 0;
+
+    // For imported pages: pre-built resource dictionary string and
+    // associated imported object IDs. When is_imported is true,
+    // the resources are written from imported_resources_str instead of
+    // looking up fonts/images in the writer's registry.
+    bool is_imported = false;
+    std::string imported_resources_str;  // Serialized /Resources dict content
   };
   std::vector<TemplateData> templates;
   int template_counter = 0;
+
+  // ============================================================
+  // Imported PDF Objects (for merge/split)
+  // ============================================================
+  // Each imported object holds raw PDF object data to be written verbatim.
+  struct ImportedObject {
+    int obj_id = 0;               // Object ID in the new PDF
+    std::string serialized_data;  // Complete serialized PDF object body
+                                  // (everything between "N 0 obj\n" and "endobj\n")
+    // For stream objects:
+    bool is_stream = false;
+    std::string stream_dict;          // Dictionary portion (including << >>)
+    std::vector<uint8_t> stream_data; // Raw stream bytes
+  };
+  std::vector<ImportedObject> imported_objects;
 
   // ============================================================
   // Watermarks
@@ -3196,6 +3261,404 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
     impl_->output << "/SigFlags 3\n";
     impl_->output << ">>\n";
     impl_->output << "endobj\n";
+  }
+
+  // Write updated form field objects (for form fill & save)
+  if (!impl_->field_updates.empty()) {
+    // Parse existing PDF to get original field dictionaries
+    Pdf existing_pdf;
+    bool parsed = parse_from_memory(impl_->existing_pdf.data(),
+                                    impl_->existing_pdf.size(), &existing_pdf);
+
+    for (const auto& update : impl_->field_updates) {
+      if (update.object_number == 0) continue;
+
+      size_t field_offset = base_offset + impl_->output.tellp();
+      new_obj_offsets.push_back({static_cast<int>(update.object_number), field_offset});
+
+      impl_->output << update.object_number << " " << update.generation << " obj\n";
+
+      // Try to preserve original field dictionary, just update /V
+      if (parsed) {
+        ResolvedObject resolved = resolve_reference(
+            existing_pdf, update.object_number, update.generation);
+        if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+          impl_->output << "<<\n";
+          for (const auto& kv : resolved.value.dict) {
+            if (kv.first == "V" || kv.first == "AS") continue;  // Skip old value
+            // Simple serialization of common value types
+            impl_->output << "/" << kv.first << " ";
+            const Value& v = kv.second;
+            if (v.type == Value::NAME) {
+              impl_->output << "/" << v.name;
+            } else if (v.type == Value::NUMBER) {
+              if (v.number == static_cast<int64_t>(v.number)) {
+                impl_->output << static_cast<int64_t>(v.number);
+              } else {
+                impl_->output << format_number(v.number);
+              }
+            } else if (v.type == Value::STRING) {
+              impl_->output << "(" << escape_pdf_string(v.str) << ")";
+            } else if (v.type == Value::BOOLEAN) {
+              impl_->output << (v.boolean ? "true" : "false");
+            } else if (v.type == Value::REFERENCE) {
+              impl_->output << v.ref_object_number << " "
+                            << v.ref_generation_number << " R";
+            } else if (v.type == Value::ARRAY) {
+              impl_->output << "[";
+              for (size_t ai = 0; ai < v.array.size(); ++ai) {
+                if (ai > 0) impl_->output << " ";
+                const Value& av = v.array[ai];
+                if (av.type == Value::NUMBER) {
+                  if (av.number == static_cast<int64_t>(av.number)) {
+                    impl_->output << static_cast<int64_t>(av.number);
+                  } else {
+                    impl_->output << format_number(av.number);
+                  }
+                } else if (av.type == Value::REFERENCE) {
+                  impl_->output << av.ref_object_number << " "
+                                << av.ref_generation_number << " R";
+                } else if (av.type == Value::NAME) {
+                  impl_->output << "/" << av.name;
+                } else if (av.type == Value::STRING) {
+                  impl_->output << "(" << escape_pdf_string(av.str) << ")";
+                }
+              }
+              impl_->output << "]";
+            }
+            impl_->output << "\n";
+          }
+          // Write updated value
+          impl_->output << "/V " << update.value << "\n";
+          // For checkboxes/radio buttons, also update /AS
+          if (update.value[0] == '/') {
+            impl_->output << "/AS " << update.value << "\n";
+          }
+          impl_->output << ">>\n";
+        } else {
+          // Fallback: minimal field dict with just the value
+          impl_->output << "<<\n";
+          impl_->output << "/V " << update.value << "\n";
+          impl_->output << ">>\n";
+        }
+      } else {
+        impl_->output << "<<\n";
+        impl_->output << "/V " << update.value << "\n";
+        impl_->output << ">>\n";
+      }
+
+      impl_->output << "endobj\n";
+    }
+  }
+
+  // Write annotation updates for existing pages
+  if (!impl_->annotation_updates.empty()) {
+    // Parse existing PDF to get page /Annots arrays
+    Pdf existing_pdf;
+    bool parsed = parse_from_memory(impl_->existing_pdf.data(),
+                                    impl_->existing_pdf.size(), &existing_pdf);
+    if (parsed) {
+      parsed = existing_pdf.load_document_structure();
+    }
+
+    if (parsed) {
+      // Group updates by page
+      std::map<int, std::vector<const Impl::AnnotationUpdate*>> page_updates;
+      for (const auto& update : impl_->annotation_updates) {
+        page_updates[update.page_index].push_back(&update);
+      }
+
+      for (auto& kv : page_updates) {
+        int page_idx = kv.first;
+        const auto& updates = kv.second;
+
+        if (page_idx < 0 || page_idx >= static_cast<int>(existing_pdf.catalog.pages.size())) {
+          continue;
+        }
+
+        const auto& page = existing_pdf.catalog.pages[page_idx];
+
+        // Get the page's object number from the xref
+        // We need to find the page object number. Pages are indexed in catalog order.
+        // Find the page object by looking it up.
+        uint32_t page_obj_num = 0;
+        uint16_t page_gen = 0;
+
+        // The page object number should be stored when we parse.
+        // Look for pages in the xref that are page objects.
+        // Use a simpler approach: scan the /Pages /Kids array.
+        {
+          auto root_it = existing_pdf.trailer.find("Root");
+          if (root_it != existing_pdf.trailer.end() && root_it->second.type == Value::REFERENCE) {
+            ResolvedObject root = resolve_reference(existing_pdf, root_it->second.ref_object_number,
+                                                    root_it->second.ref_generation_number);
+            if (root.success && root.value.type == Value::DICTIONARY) {
+              auto pages_it = root.value.dict.find("Pages");
+              if (pages_it != root.value.dict.end() && pages_it->second.type == Value::REFERENCE) {
+                // Collect page obj numbers by traversing /Kids
+                std::vector<std::pair<uint32_t, uint16_t>> page_obj_nums;
+                std::function<void(uint32_t, uint16_t)> collect_pages;
+                collect_pages = [&](uint32_t obj_n, uint16_t gen_n) {
+                  ResolvedObject node = resolve_reference(existing_pdf, obj_n, gen_n);
+                  if (!node.success || node.value.type != Value::DICTIONARY) return;
+                  auto type_it = node.value.dict.find("Type");
+                  if (type_it != node.value.dict.end() && type_it->second.type == Value::NAME) {
+                    if (type_it->second.name == "Page") {
+                      page_obj_nums.push_back({obj_n, gen_n});
+                      return;
+                    }
+                  }
+                  auto kids_it = node.value.dict.find("Kids");
+                  if (kids_it != node.value.dict.end() && kids_it->second.type == Value::ARRAY) {
+                    for (const auto& kid : kids_it->second.array) {
+                      if (kid.type == Value::REFERENCE) {
+                        collect_pages(kid.ref_object_number, kid.ref_generation_number);
+                      }
+                    }
+                  }
+                };
+                collect_pages(pages_it->second.ref_object_number,
+                              pages_it->second.ref_generation_number);
+
+                if (page_idx < static_cast<int>(page_obj_nums.size())) {
+                  page_obj_num = page_obj_nums[page_idx].first;
+                  page_gen = page_obj_nums[page_idx].second;
+                }
+              }
+            }
+          }
+        }
+
+        if (page_obj_num == 0) continue;
+
+        // Get existing /Annots array references
+        std::vector<Value> existing_annots;
+        {
+          ResolvedObject page_obj = resolve_reference(existing_pdf, page_obj_num, page_gen);
+          if (page_obj.success && page_obj.value.type == Value::DICTIONARY) {
+            auto annots_it = page_obj.value.dict.find("Annots");
+            if (annots_it != page_obj.value.dict.end()) {
+              const Value* annots_val = &annots_it->second;
+              if (annots_val->type == Value::REFERENCE) {
+                ResolvedObject resolved = resolve_reference(existing_pdf,
+                    annots_val->ref_object_number, annots_val->ref_generation_number);
+                if (resolved.success && resolved.value.type == Value::ARRAY) {
+                  existing_annots = resolved.value.array;
+                }
+              } else if (annots_val->type == Value::ARRAY) {
+                existing_annots = annots_val->array;
+              }
+            }
+          }
+        }
+
+        // Collect indices to delete (process deletes)
+        std::set<int> delete_indices;
+        for (const auto* upd : updates) {
+          if (upd->update_type == Impl::AnnotationUpdateType::Delete) {
+            delete_indices.insert(upd->annot_index);
+          }
+        }
+
+        // Remove deleted annotations from existing list
+        std::vector<Value> kept_annots;
+        for (int i = 0; i < static_cast<int>(existing_annots.size()); ++i) {
+          if (delete_indices.find(i) == delete_indices.end()) {
+            kept_annots.push_back(existing_annots[i]);
+          }
+        }
+
+        // Write new annotation objects and collect their IDs
+        std::vector<int> new_annot_obj_ids;
+        for (const auto* upd : updates) {
+          if (upd->update_type == Impl::AnnotationUpdateType::Delete) continue;
+
+          int annot_obj_id = impl_->next_obj_id++;
+          new_annot_obj_ids.push_back(annot_obj_id);
+
+          size_t annot_offset = base_offset + impl_->output.tellp();
+          new_obj_offsets.push_back({annot_obj_id, annot_offset});
+
+          impl_->output << annot_obj_id << " 0 obj\n";
+          impl_->output << "<<\n";
+          impl_->output << "/Type /Annot\n";
+
+          if (upd->update_type == Impl::AnnotationUpdateType::AddText) {
+            impl_->output << "/Subtype /Text\n";
+            impl_->output << "/Rect [" << format_number(upd->x) << " "
+                          << format_number(upd->y) << " "
+                          << format_number(upd->x + upd->w) << " "
+                          << format_number(upd->y + upd->h) << "]\n";
+            impl_->output << "/Contents (" << escape_pdf_string(upd->contents) << ")\n";
+            impl_->output << "/F 4\n";  // Print flag
+            impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
+          } else if (upd->update_type == Impl::AnnotationUpdateType::AddHighlight) {
+            const auto& hc = upd->highlight_config;
+            impl_->output << "/Subtype /Highlight\n";
+
+            // Build rect from quads bounding box
+            double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
+            for (const auto& q : hc.quads) {
+              double xs[] = {q.x1, q.x2, q.x3, q.x4};
+              double ys[] = {q.y1, q.y2, q.y3, q.y4};
+              for (int i = 0; i < 4; ++i) {
+                if (xs[i] < min_x) min_x = xs[i];
+                if (xs[i] > max_x) max_x = xs[i];
+                if (ys[i] < min_y) min_y = ys[i];
+                if (ys[i] > max_y) max_y = ys[i];
+              }
+            }
+            impl_->output << "/Rect [" << format_number(min_x) << " "
+                          << format_number(min_y) << " "
+                          << format_number(max_x) << " "
+                          << format_number(max_y) << "]\n";
+
+            // QuadPoints
+            impl_->output << "/QuadPoints [";
+            for (size_t qi = 0; qi < hc.quads.size(); ++qi) {
+              const auto& q = hc.quads[qi];
+              if (qi > 0) impl_->output << " ";
+              impl_->output << format_number(q.x4) << " " << format_number(q.y4) << " "
+                            << format_number(q.x3) << " " << format_number(q.y3) << " "
+                            << format_number(q.x1) << " " << format_number(q.y1) << " "
+                            << format_number(q.x2) << " " << format_number(q.y2);
+            }
+            impl_->output << "]\n";
+
+            // Color
+            impl_->output << "/C [" << format_number(hc.r) << " "
+                          << format_number(hc.g) << " "
+                          << format_number(hc.b) << "]\n";
+            if (!hc.contents.empty()) {
+              impl_->output << "/Contents (" << escape_pdf_string(hc.contents) << ")\n";
+            }
+            if (!hc.author.empty()) {
+              impl_->output << "/T (" << escape_pdf_string(hc.author) << ")\n";
+            }
+            impl_->output << "/F " << (hc.print ? 4 : 0) << "\n";
+            impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
+          } else if (upd->update_type == Impl::AnnotationUpdateType::AddLink) {
+            const auto& lc = upd->link_config;
+            impl_->output << "/Subtype /Link\n";
+            impl_->output << "/Rect [" << format_number(lc.x) << " "
+                          << format_number(lc.y) << " "
+                          << format_number(lc.x + lc.width) << " "
+                          << format_number(lc.y + lc.height) << "]\n";
+
+            if (!lc.show_border) {
+              impl_->output << "/Border [0 0 0]\n";
+            }
+
+            if (lc.action == LinkAction::URI && !lc.uri.empty()) {
+              impl_->output << "/A << /Type /Action /S /URI /URI ("
+                            << escape_pdf_string(lc.uri) << ") >>\n";
+            } else if (lc.action == LinkAction::GoTo) {
+              impl_->output << "/Dest [" << lc.dest_page << " /XYZ null "
+                            << format_number(lc.dest_y) << " null]\n";
+            }
+
+            impl_->output << "/F 4\n";
+            impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
+          }
+
+          impl_->output << ">>\n";
+          impl_->output << "endobj\n";
+        }
+
+        // Now write the updated page object with modified /Annots array
+        size_t page_offset = base_offset + impl_->output.tellp();
+        new_obj_offsets.push_back({static_cast<int>(page_obj_num), page_offset});
+
+        // Get original page dict to preserve all other keys
+        ResolvedObject orig_page = resolve_reference(existing_pdf, page_obj_num, page_gen);
+        impl_->output << page_obj_num << " " << page_gen << " obj\n";
+        impl_->output << "<<\n";
+
+        if (orig_page.success && orig_page.value.type == Value::DICTIONARY) {
+          for (const auto& entry : orig_page.value.dict) {
+            if (entry.first == "Annots") continue;  // We'll write our own
+            impl_->output << "/" << entry.first << " ";
+            const Value& v = entry.second;
+            if (v.type == Value::NAME) {
+              impl_->output << "/" << v.name;
+            } else if (v.type == Value::NUMBER) {
+              if (v.number == static_cast<int64_t>(v.number)) {
+                impl_->output << static_cast<int64_t>(v.number);
+              } else {
+                impl_->output << format_number(v.number);
+              }
+            } else if (v.type == Value::STRING) {
+              impl_->output << "(" << escape_pdf_string(v.str) << ")";
+            } else if (v.type == Value::BOOLEAN) {
+              impl_->output << (v.boolean ? "true" : "false");
+            } else if (v.type == Value::REFERENCE) {
+              impl_->output << v.ref_object_number << " "
+                            << v.ref_generation_number << " R";
+            } else if (v.type == Value::ARRAY) {
+              impl_->output << "[";
+              for (size_t ai = 0; ai < v.array.size(); ++ai) {
+                if (ai > 0) impl_->output << " ";
+                const Value& av = v.array[ai];
+                if (av.type == Value::NUMBER) {
+                  if (av.number == static_cast<int64_t>(av.number)) {
+                    impl_->output << static_cast<int64_t>(av.number);
+                  } else {
+                    impl_->output << format_number(av.number);
+                  }
+                } else if (av.type == Value::REFERENCE) {
+                  impl_->output << av.ref_object_number << " "
+                                << av.ref_generation_number << " R";
+                } else if (av.type == Value::NAME) {
+                  impl_->output << "/" << av.name;
+                } else if (av.type == Value::STRING) {
+                  impl_->output << "(" << escape_pdf_string(av.str) << ")";
+                }
+              }
+              impl_->output << "]";
+            } else if (v.type == Value::DICTIONARY) {
+              // Nested dictionary - write inline
+              impl_->output << "<<";
+              for (const auto& dkv : v.dict) {
+                impl_->output << " /" << dkv.first << " ";
+                const Value& dv = dkv.second;
+                if (dv.type == Value::NAME) impl_->output << "/" << dv.name;
+                else if (dv.type == Value::NUMBER) {
+                  if (dv.number == static_cast<int64_t>(dv.number))
+                    impl_->output << static_cast<int64_t>(dv.number);
+                  else
+                    impl_->output << format_number(dv.number);
+                }
+                else if (dv.type == Value::STRING) impl_->output << "(" << escape_pdf_string(dv.str) << ")";
+                else if (dv.type == Value::BOOLEAN) impl_->output << (dv.boolean ? "true" : "false");
+                else if (dv.type == Value::REFERENCE) impl_->output << dv.ref_object_number << " " << dv.ref_generation_number << " R";
+              }
+              impl_->output << " >>";
+            }
+            impl_->output << "\n";
+          }
+        }
+
+        // Write updated /Annots array
+        impl_->output << "/Annots [";
+        for (size_t ai = 0; ai < kept_annots.size(); ++ai) {
+          if (ai > 0) impl_->output << " ";
+          const Value& av = kept_annots[ai];
+          if (av.type == Value::REFERENCE) {
+            impl_->output << av.ref_object_number << " "
+                          << av.ref_generation_number << " R";
+          }
+        }
+        for (int new_id : new_annot_obj_ids) {
+          if (!kept_annots.empty() || &new_id != &new_annot_obj_ids.front()) {
+            impl_->output << " ";
+          }
+          impl_->output << new_id << " 0 R";
+        }
+        impl_->output << "]\n";
+        impl_->output << ">>\n";
+        impl_->output << "endobj\n";
+      }
+    }
   }
 
   // Write incremental xref table
@@ -4595,6 +5058,528 @@ void PdfWriter::add_image_page_fit(const ImageData& img, double margin) {
   add_image_page(img, size, margin, false);
 }
 
+// ============================================================================
+// PDF Merge and Split Implementation
+// ============================================================================
+
+// Helper class to recursively copy PDF objects from a source PDF into
+// new objects in the target PdfWriter, remapping all object references.
+class ObjectCopier {
+ public:
+  ObjectCopier(const Pdf& src, PdfWriter::Impl* dst_impl)
+      : source_(src), impl_(dst_impl) {}
+
+  // Copy a Value from the source PDF, creating new objects as needed.
+  // Returns the serialized PDF representation with remapped references.
+  std::string serialize_value(const Value& val) {
+    switch (val.type) {
+      case Value::BOOLEAN:
+        return val.boolean ? "true" : "false";
+
+      case Value::NUMBER: {
+        // Use integer representation when possible
+        if (val.number == static_cast<int64_t>(val.number) &&
+            std::abs(val.number) < 1e15) {
+          return std::to_string(static_cast<int64_t>(val.number));
+        }
+        return format_number(val.number);
+      }
+
+      case Value::STRING: {
+        // Check if string contains non-printable characters
+        bool has_binary = false;
+        for (unsigned char c : val.str) {
+          if (c < 32 && c != '\n' && c != '\r' && c != '\t') {
+            has_binary = true;
+            break;
+          }
+        }
+        if (has_binary) {
+          // Use hex string encoding for binary content
+          std::string hex = "<";
+          for (unsigned char c : val.str) {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%02X", c);
+            hex += buf;
+          }
+          hex += ">";
+          return hex;
+        }
+        // Use literal string with escaping
+        std::string escaped;
+        escaped += '(';
+        for (char c : val.str) {
+          switch (c) {
+            case '(': escaped += "\\("; break;
+            case ')': escaped += "\\)"; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default: escaped += c; break;
+          }
+        }
+        escaped += ')';
+        return escaped;
+      }
+
+      case Value::NAME:
+        return "/" + val.name;
+
+      case Value::NULL_OBJ:
+        return "null";
+
+      case Value::ARRAY: {
+        std::string s = "[";
+        for (size_t i = 0; i < val.array.size(); ++i) {
+          if (i > 0) s += " ";
+          s += serialize_value(val.array[i]);
+        }
+        s += "]";
+        return s;
+      }
+
+      case Value::DICTIONARY: {
+        std::string s = "<<\n";
+        for (const auto& kv : val.dict) {
+          s += "/" + kv.first + " " + serialize_value(kv.second) + "\n";
+        }
+        s += ">>";
+        return s;
+      }
+
+      case Value::REFERENCE: {
+        // This is the key part: we need to copy the referenced object
+        // from the source PDF and create a new object in the target PDF.
+        int new_id = copy_object(val.ref_object_number,
+                                 val.ref_generation_number);
+        return std::to_string(new_id) + " 0 R";
+      }
+
+      case Value::STREAM: {
+        // Streams are indirect objects; they need to be written as
+        // separate objects. Create a new imported object for the stream.
+        int new_id = impl_->allocate_obj();
+
+        PdfWriter::Impl::ImportedObject imp;
+        imp.obj_id = new_id;
+        imp.is_stream = true;
+
+        // Serialize stream dictionary, skipping Length (we override it)
+        std::string dict_str = "<<\n";
+        for (const auto& kv : val.stream.dict) {
+          if (kv.first == "Length") continue;  // Override below
+          dict_str += "/" + kv.first + " " + serialize_value(kv.second) + "\n";
+        }
+        dict_str += "/Length " + std::to_string(val.stream.data.size()) + "\n";
+        dict_str += ">>";
+
+        imp.stream_dict = dict_str;
+        imp.stream_data = val.stream.data;
+
+        impl_->imported_objects.push_back(std::move(imp));
+
+        return std::to_string(new_id) + " 0 R";
+      }
+
+      default:
+        return "null";
+    }
+  }
+
+  // Copy an indirect object from the source PDF. Returns the new object ID
+  // in the target PDF. Caches results to avoid duplicating objects.
+  int copy_object(uint32_t obj_num, uint16_t gen_num) {
+    uint64_t key = (static_cast<uint64_t>(obj_num) << 16) |
+                   static_cast<uint64_t>(gen_num);
+
+    auto it = obj_map_.find(key);
+    if (it != obj_map_.end()) {
+      return it->second;
+    }
+
+    // Allocate a new object ID first (before resolving, to handle cycles)
+    int new_id = impl_->allocate_obj();
+    obj_map_[key] = new_id;
+
+    // Resolve the object in the source PDF
+    ResolvedObject resolved = resolve_reference(source_, obj_num, gen_num);
+    if (!resolved.success) {
+      // Write a null placeholder for unresolvable objects
+      PdfWriter::Impl::ImportedObject imp;
+      imp.obj_id = new_id;
+      imp.is_stream = false;
+      imp.serialized_data = "null";
+      impl_->imported_objects.push_back(std::move(imp));
+      return new_id;
+    }
+
+    const Value& val = resolved.value;
+
+    if (val.type == Value::STREAM) {
+      // Stream object - serialize dict and keep raw stream data
+      PdfWriter::Impl::ImportedObject imp;
+      imp.obj_id = new_id;
+      imp.is_stream = true;
+
+      std::string dict_str = "<<\n";
+      for (const auto& kv : val.stream.dict) {
+        if (kv.first == "Length") continue;  // Override below
+        dict_str += "/" + kv.first + " " + serialize_value(kv.second) + "\n";
+      }
+      // Always write Length with actual stream data size
+      dict_str += "/Length " + std::to_string(val.stream.data.size()) + "\n";
+      dict_str += ">>";
+
+      imp.stream_dict = dict_str;
+      imp.stream_data = val.stream.data;
+
+      impl_->imported_objects.push_back(std::move(imp));
+    } else {
+      // Non-stream object
+      PdfWriter::Impl::ImportedObject imp;
+      imp.obj_id = new_id;
+      imp.is_stream = false;
+      imp.serialized_data = serialize_value(val);
+
+      impl_->imported_objects.push_back(std::move(imp));
+    }
+
+    return new_id;
+  }
+
+ private:
+  const Pdf& source_;
+  PdfWriter::Impl* impl_;
+  // Maps (source_obj_num << 16 | gen_num) -> new_obj_id
+  std::map<uint64_t, int> obj_map_;
+};
+
+int PdfWriter::import_pages_from(const Pdf& source_pdf,
+                                 const std::vector<int>& page_indices) {
+  const auto& pages = source_pdf.catalog.pages;
+  if (pages.empty()) {
+    return 0;
+  }
+
+  // Determine which pages to import
+  std::vector<int> indices;
+  if (page_indices.empty()) {
+    // Import all pages
+    for (int i = 0; i < static_cast<int>(pages.size()); ++i) {
+      indices.push_back(i);
+    }
+  } else {
+    indices = page_indices;
+  }
+
+  // Create a single ObjectCopier for the entire import operation to share
+  // the object deduplication cache across all pages from the same source PDF.
+  ObjectCopier copier(source_pdf, impl_);
+
+  int imported_count = 0;
+
+  for (int idx : indices) {
+    if (idx < 0 || idx >= static_cast<int>(pages.size())) {
+      continue;  // Skip invalid indices
+    }
+
+    const Page& src_page = pages[idx];
+
+    // Get page dimensions from MediaBox
+    double page_width = 612.0;   // Default Letter width
+    double page_height = 792.0;  // Default Letter height
+    if (src_page.media_box.size() >= 4) {
+      page_width = src_page.media_box[2] - src_page.media_box[0];
+      page_height = src_page.media_box[3] - src_page.media_box[1];
+    }
+
+    // Load the content stream data from the source page
+    PageContent content = src_page.load_contents(source_pdf);
+    if (!content.success) {
+      continue;  // Skip pages we can't decode
+    }
+
+    // Build the content stream for the Form XObject
+    std::string form_content(content.data.begin(), content.data.end());
+
+    // Serialize the source page's resource dictionary with remapped references.
+    // This recursively copies all referenced objects (fonts, images, color
+    // spaces, graphics states, etc.) from the source PDF.
+    std::string resources_str = "<<>>";
+    if (!src_page.resources.empty()) {
+      // Build a Value to serialize
+      Value res_val;
+      res_val.type = Value::DICTIONARY;
+      res_val.dict = src_page.resources;
+      resources_str = copier.serialize_value(res_val);
+    }
+
+    // Create a template (Form XObject) for this page
+    impl_->template_counter++;
+    std::string tmpl_name = "Fm" + std::to_string(impl_->template_counter);
+
+    Impl::TemplateData tdata;
+    tdata.name = tmpl_name;
+    tdata.width = page_width;
+    tdata.height = page_height;
+    tdata.content = form_content;
+    tdata.obj_id = impl_->allocate_obj();
+    tdata.is_imported = true;
+    tdata.imported_resources_str = resources_str;
+
+    impl_->templates.push_back(tdata);
+
+    // Create a page that draws this Form XObject
+    PageSize ps;
+    ps.width = page_width;
+    ps.height = page_height;
+
+    Impl::PageData page_data;
+    page_data.size = ps;
+
+    // The page content simply invokes the Form XObject.
+    // Handle MediaBox origin offset if it's not (0,0).
+    std::ostringstream page_content;
+    if (src_page.media_box.size() >= 4 &&
+        (src_page.media_box[0] != 0.0 || src_page.media_box[1] != 0.0)) {
+      page_content << "q\n";
+      page_content << "1 0 0 1 "
+                   << format_number(-src_page.media_box[0]) << " "
+                   << format_number(-src_page.media_box[1]) << " cm\n";
+      page_content << "/" << tmpl_name << " Do\n";
+      page_content << "Q\n";
+    } else {
+      page_content << "/" << tmpl_name << " Do\n";
+    }
+
+    page_data.content = page_content.str();
+    page_data.used_templates.push_back(tmpl_name);
+
+    impl_->pages.push_back(page_data);
+    ++imported_count;
+  }
+
+  return imported_count;
+}
+
+WriteResult PdfWriter::split_pages(const Pdf& source_pdf,
+                                   const std::vector<int>& page_indices,
+                                   std::vector<uint8_t>& output) {
+  WriteResult result;
+
+  if (page_indices.empty()) {
+    result.success = false;
+    result.error = "No page indices specified for split";
+    return result;
+  }
+
+  // Validate indices
+  int total_pages = static_cast<int>(source_pdf.catalog.pages.size());
+  for (int idx : page_indices) {
+    if (idx < 0 || idx >= total_pages) {
+      result.success = false;
+      result.error = "Page index " + std::to_string(idx) + " out of range [0, " +
+                     std::to_string(total_pages - 1) + "]";
+      return result;
+    }
+  }
+
+  PdfWriter writer;
+  int imported = writer.import_pages_from(source_pdf, page_indices);
+  if (imported <= 0) {
+    result.success = false;
+    result.error = "Failed to import any pages from source PDF";
+    return result;
+  }
+
+  return writer.write_to_memory(output);
+}
+
+WriteResult PdfWriter::merge_pdfs(const std::vector<std::vector<uint8_t>>& pdf_data,
+                                  std::vector<uint8_t>& output) {
+  WriteResult result;
+
+  if (pdf_data.empty()) {
+    result.success = false;
+    result.error = "No PDF data provided for merge";
+    return result;
+  }
+
+  PdfWriter writer;
+  int total_imported = 0;
+
+  for (size_t i = 0; i < pdf_data.size(); ++i) {
+    const auto& data = pdf_data[i];
+    if (data.empty()) {
+      continue;
+    }
+
+    // Parse the source PDF
+    Pdf source_pdf;
+    if (!parse_from_memory(data.data(), data.size(), &source_pdf)) {
+      result.success = false;
+      result.error = "Failed to parse PDF #" + std::to_string(i);
+      return result;
+    }
+
+    // Import all pages from this PDF
+    int imported = writer.import_pages_from(source_pdf);
+    if (imported < 0) {
+      result.success = false;
+      result.error = "Failed to import pages from PDF #" + std::to_string(i);
+      return result;
+    }
+    total_imported += imported;
+  }
+
+  if (total_imported == 0) {
+    result.success = false;
+    result.error = "No pages were imported from any source PDF";
+    return result;
+  }
+
+  return writer.write_to_memory(output);
+}
+
+// ============================================================================
+// Form Fill & Save Implementation
+// ============================================================================
+
+namespace {
+
+// Find a form field's object number by name in a parsed PDF.
+// Searches recursively through the AcroForm /Fields array.
+bool find_field_obj_by_name(const Pdf& pdf, const std::string& target_name,
+                            uint32_t* out_obj_num, uint16_t* out_gen) {
+  auto acro_it = pdf.catalog.acro_form.find("Fields");
+  if (acro_it == pdf.catalog.acro_form.end() ||
+      acro_it->second.type != Value::ARRAY) {
+    return false;
+  }
+
+  // Recursive search through field tree
+  std::function<bool(const Value&, const std::string&)> search;
+  search = [&](const Value& field_ref, const std::string& parent_name) -> bool {
+    const Value* field_val = &field_ref;
+    uint32_t obj_num = 0;
+    uint16_t gen_num = 0;
+
+    if (field_ref.type == Value::REFERENCE) {
+      obj_num = field_ref.ref_object_number;
+      gen_num = field_ref.ref_generation_number;
+      ResolvedObject resolved = resolve_reference(pdf, obj_num, gen_num);
+      if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
+        return false;
+      }
+      field_val = &resolved.value;
+    } else if (field_ref.type == Value::DICTIONARY) {
+      // Inline - no object number
+    } else {
+      return false;
+    }
+
+    // Get partial name
+    std::string partial_name;
+    auto t_it = field_val->dict.find("T");
+    if (t_it != field_val->dict.end() && t_it->second.type == Value::STRING) {
+      partial_name = t_it->second.str;
+    }
+
+    // Build full name
+    std::string full_name = parent_name.empty() ? partial_name
+                          : (partial_name.empty() ? parent_name
+                          : parent_name + "." + partial_name);
+
+    // Check if this is our target
+    if (full_name == target_name || partial_name == target_name) {
+      *out_obj_num = obj_num;
+      *out_gen = gen_num;
+      return true;
+    }
+
+    // Search children (/Kids)
+    auto kids_it = field_val->dict.find("Kids");
+    if (kids_it != field_val->dict.end() && kids_it->second.type == Value::ARRAY) {
+      for (const auto& kid : kids_it->second.array) {
+        if (search(kid, full_name)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  };
+
+  for (const auto& field : acro_it->second.array) {
+    if (search(field, "")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+bool PdfWriter::set_field_value(const std::string& field_name,
+                                const std::string& value) {
+  if (!impl_->has_existing) return false;
+
+  // Parse existing PDF to find the field
+  Pdf pdf;
+  if (!parse_from_memory(impl_->existing_pdf.data(),
+                         impl_->existing_pdf.size(), &pdf)) {
+    return false;
+  }
+
+  uint32_t obj_num = 0;
+  uint16_t gen = 0;
+  if (!find_field_obj_by_name(pdf, field_name, &obj_num, &gen)) {
+    return false;
+  }
+  if (obj_num == 0) return false;
+
+  // Record the update - PDF string value
+  Impl::FieldUpdate update;
+  update.field_name = field_name;
+  update.value = "(" + escape_pdf_string(value) + ")";
+  update.object_number = obj_num;
+  update.generation = gen;
+  impl_->field_updates.push_back(update);
+  return true;
+}
+
+bool PdfWriter::set_field_checked(const std::string& field_name, bool checked) {
+  if (!impl_->has_existing) return false;
+
+  Pdf pdf;
+  if (!parse_from_memory(impl_->existing_pdf.data(),
+                         impl_->existing_pdf.size(), &pdf)) {
+    return false;
+  }
+
+  uint32_t obj_num = 0;
+  uint16_t gen = 0;
+  if (!find_field_obj_by_name(pdf, field_name, &obj_num, &gen)) {
+    return false;
+  }
+  if (obj_num == 0) return false;
+
+  Impl::FieldUpdate update;
+  update.field_name = field_name;
+  update.value = checked ? "/Yes" : "/Off";
+  update.object_number = obj_num;
+  update.generation = gen;
+  impl_->field_updates.push_back(update);
+  return true;
+}
+
+bool PdfWriter::set_field_choice(const std::string& field_name,
+                                 const std::string& value) {
+  // Same as set_field_value - choice fields also use /V with a string
+  return set_field_value(field_name, value);
+}
+
 WriteResult PdfWriter::write_to_file(const std::string& path) {
   std::vector<uint8_t> data;
   WriteResult result = write_to_memory(data);
@@ -5506,6 +6491,21 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->write_obj_end();
   }
 
+  // Write imported PDF objects (for merge/split)
+  for (const auto& imp_obj : impl_->imported_objects) {
+    impl_->write_obj_start(imp_obj.obj_id);
+    if (imp_obj.is_stream) {
+      impl_->output << imp_obj.stream_dict << "\n";
+      impl_->output << "stream\n";
+      impl_->output.write(reinterpret_cast<const char*>(imp_obj.stream_data.data()),
+                          imp_obj.stream_data.size());
+      impl_->output << "\nendstream\n";
+    } else {
+      impl_->output << imp_obj.serialized_data << "\n";
+    }
+    impl_->write_obj_end();
+  }
+
   // Write template (Form XObject) objects
   for (const auto& tmpl : impl_->templates) {
     std::vector<uint8_t> content_data(tmpl.content.begin(), tmpl.content.end());
@@ -5519,29 +6519,34 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
                   << format_number(tmpl.height) << "]\n";
     impl_->output << "/Matrix [1 0 0 1 0 0]\n";
 
-    // Template resources (simplified - just fonts and images)
-    impl_->output << "/Resources <<\n";
-    if (!tmpl.used_fonts.empty()) {
-      impl_->output << "  /Font <<\n";
-      for (const auto& font_name : tmpl.used_fonts) {
-        std::string ref = impl_->get_font_resource(font_name);
-        if (!ref.empty()) {
-          impl_->output << "    /" << font_name << " " << ref << "\n";
+    if (tmpl.is_imported && !tmpl.imported_resources_str.empty()) {
+      // For imported pages: use the pre-built resource dictionary
+      impl_->output << "/Resources " << tmpl.imported_resources_str << "\n";
+    } else {
+      // Template resources (simplified - just fonts and images)
+      impl_->output << "/Resources <<\n";
+      if (!tmpl.used_fonts.empty()) {
+        impl_->output << "  /Font <<\n";
+        for (const auto& font_name : tmpl.used_fonts) {
+          std::string ref = impl_->get_font_resource(font_name);
+          if (!ref.empty()) {
+            impl_->output << "    /" << font_name << " " << ref << "\n";
+          }
         }
+        impl_->output << "  >>\n";
       }
-      impl_->output << "  >>\n";
-    }
-    if (!tmpl.used_images.empty()) {
-      impl_->output << "  /XObject <<\n";
-      for (const auto& img_name : tmpl.used_images) {
-        std::string ref = impl_->get_image_resource(img_name);
-        if (!ref.empty()) {
-          impl_->output << "    /" << img_name << " " << ref << "\n";
+      if (!tmpl.used_images.empty()) {
+        impl_->output << "  /XObject <<\n";
+        for (const auto& img_name : tmpl.used_images) {
+          std::string ref = impl_->get_image_resource(img_name);
+          if (!ref.empty()) {
+            impl_->output << "    /" << img_name << " " << ref << "\n";
+          }
         }
+        impl_->output << "  >>\n";
       }
-      impl_->output << "  >>\n";
+      impl_->output << ">>\n";
     }
-    impl_->output << ">>\n";
 
     impl_->output << "/Filter /FlateDecode\n";
     impl_->output << "/Length " << compressed.size() << "\n";
@@ -5909,6 +6914,136 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
   result.success = true;
   result.bytes_written = output.size();
   return result;
+}
+
+bool PdfWriter::add_text_annotation_to_existing_page(int page_index,
+                                                       double x, double y,
+                                                       double w, double h,
+                                                       const std::string& contents) {
+  if (!impl_->has_existing) return false;
+  Impl::AnnotationUpdate update;
+  update.update_type = Impl::AnnotationUpdateType::AddText;
+  update.page_index = page_index;
+  update.x = x;
+  update.y = y;
+  update.w = w;
+  update.h = h;
+  update.contents = contents;
+  impl_->annotation_updates.push_back(update);
+  return true;
+}
+
+bool PdfWriter::add_highlight_to_existing_page(int page_index,
+                                                 const HighlightConfig& config) {
+  if (!impl_->has_existing) return false;
+  Impl::AnnotationUpdate update;
+  update.update_type = Impl::AnnotationUpdateType::AddHighlight;
+  update.page_index = page_index;
+  update.highlight_config = config;
+  impl_->annotation_updates.push_back(update);
+  return true;
+}
+
+bool PdfWriter::add_link_to_existing_page(int page_index,
+                                            const LinkConfig& config) {
+  if (!impl_->has_existing) return false;
+  Impl::AnnotationUpdate update;
+  update.update_type = Impl::AnnotationUpdateType::AddLink;
+  update.page_index = page_index;
+  update.link_config = config;
+  impl_->annotation_updates.push_back(update);
+  return true;
+}
+
+bool PdfWriter::delete_annotation_from_existing_page(int page_index,
+                                                       int annot_index) {
+  if (!impl_->has_existing) return false;
+  Impl::AnnotationUpdate update;
+  update.update_type = Impl::AnnotationUpdateType::Delete;
+  update.page_index = page_index;
+  update.annot_index = annot_index;
+  impl_->annotation_updates.push_back(update);
+  return true;
+}
+
+WriteResult PdfWriter::apply_redactions(const Pdf& source_pdf,
+                                         std::vector<uint8_t>& output) {
+  WriteResult result;
+
+  // Check for redactions
+  bool has_redactions = false;
+  for (const auto& page : source_pdf.catalog.pages) {
+    if (!page.redaction_annotations.empty()) {
+      has_redactions = true;
+      break;
+    }
+  }
+
+  if (!has_redactions) {
+    result.success = false;
+    result.error = "No redaction annotations found in the PDF";
+    return result;
+  }
+
+  // Build page indices for import - import all pages
+  // For pages WITHOUT redactions, import them directly.
+  // For pages WITH redactions, import them as Form XObjects and
+  // draw redaction overlays on top.
+
+  PdfWriter writer;
+  writer.set_creator("nanopdf Redaction");
+  std::string std_font = writer.add_standard_font(StandardFont::Helvetica);
+  (void)std_font;
+
+  for (size_t pi = 0; pi < source_pdf.catalog.pages.size(); ++pi) {
+    const auto& page = source_pdf.catalog.pages[pi];
+
+    if (page.redaction_annotations.empty()) {
+      // No redactions - just import directly
+      writer.import_pages_from(source_pdf, {static_cast<int>(pi)});
+    } else {
+      // Has redactions - import page then add overlay highlights
+
+      // Import the page into writer
+      writer.import_pages_from(source_pdf, {static_cast<int>(pi)});
+
+      // Add redaction overlays using highlight annotations with full opacity
+      for (const auto& redact : page.redaction_annotations) {
+        HighlightConfig hc;
+        hc.page = static_cast<int>(writer.get_page_count() - 1);
+        hc.r = redact.overlay_color_r;
+        hc.g = redact.overlay_color_g;
+        hc.b = redact.overlay_color_b;
+        hc.alpha = 1.0;  // Fully opaque to hide content
+        hc.print = true;
+
+        if (!redact.quad_points.empty()) {
+          for (const auto& quad : redact.quad_points) {
+            if (quad.size() >= 8) {
+              QuadPoints qp;
+              qp.x1 = quad[0]; qp.y1 = quad[1];
+              qp.x2 = quad[2]; qp.y2 = quad[3];
+              qp.x3 = quad[4]; qp.y3 = quad[5];
+              qp.x4 = quad[6]; qp.y4 = quad[7];
+              hc.quads.push_back(qp);
+            }
+          }
+        } else if (redact.rect.size() >= 4) {
+          QuadPoints qp = quad_from_rect(
+              redact.rect[0], redact.rect[1],
+              redact.rect[2] - redact.rect[0],
+              redact.rect[3] - redact.rect[1]);
+          hc.quads.push_back(qp);
+        }
+
+        if (!hc.quads.empty()) {
+          writer.add_highlight(hc.page, hc);
+        }
+      }
+    }
+  }
+
+  return writer.write_to_memory(output);
 }
 
 }  // namespace nanopdf

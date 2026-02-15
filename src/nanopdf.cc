@@ -35,6 +35,7 @@
 #include "cff-parser.hh"
 #include "stb_image.h"
 #include "stream-reader.hh"
+#include "text-layout.hh"
 #include "type1-parser.hh"
 
 namespace nanopdf {
@@ -661,6 +662,139 @@ bool parse_indirect_object(StreamReader &sr, Parser &parser, Value *out_value) {
   return true;
 }
 
+// Detect and parse linearization dictionary from the first indirect object
+// in the file. Returns true if the PDF is linearized.
+static bool parse_linearization_dict(const uint8_t* data, size_t data_size,
+                                     LinearizationParams* out) {
+  if (!data || data_size < 32 || !out) return false;
+
+  // Skip header line (%PDF-x.y) and any binary comment line
+  size_t pos = 0;
+  // Skip first line
+  while (pos < data_size && data[pos] != '\n' && data[pos] != '\r') ++pos;
+  while (pos < data_size && (data[pos] == '\n' || data[pos] == '\r')) ++pos;
+  // Skip optional binary comment line (starts with %)
+  if (pos < data_size && data[pos] == '%') {
+    while (pos < data_size && data[pos] != '\n' && data[pos] != '\r') ++pos;
+    while (pos < data_size && (data[pos] == '\n' || data[pos] == '\r')) ++pos;
+  }
+
+  // Now we should be at the first indirect object: "N G obj"
+  // Skip whitespace
+  while (pos < data_size && (data[pos] == ' ' || data[pos] == '\t')) ++pos;
+
+  // Parse object number and generation
+  size_t obj_start = pos;
+  while (pos < data_size && data[pos] >= '0' && data[pos] <= '9') ++pos;
+  if (pos == obj_start || pos >= data_size) return false;
+
+  // Skip space
+  while (pos < data_size && data[pos] == ' ') ++pos;
+
+  // Skip generation number
+  while (pos < data_size && data[pos] >= '0' && data[pos] <= '9') ++pos;
+
+  // Skip space
+  while (pos < data_size && data[pos] == ' ') ++pos;
+
+  // Check for "obj"
+  if (pos + 3 > data_size) return false;
+  if (data[pos] != 'o' || data[pos+1] != 'b' || data[pos+2] != 'j') return false;
+  pos += 3;
+
+  // Skip whitespace/newlines
+  while (pos < data_size && (data[pos] == ' ' || data[pos] == '\n' ||
+         data[pos] == '\r' || data[pos] == '\t')) ++pos;
+
+  // Should start with "<<"
+  if (pos + 2 > data_size || data[pos] != '<' || data[pos+1] != '<') return false;
+
+  // Find the end of the dictionary (>>). Scan up to a reasonable limit.
+  size_t dict_start = pos;
+  size_t dict_end = 0;
+  size_t scan_limit = std::min(data_size, dict_start + 2048);
+  for (size_t i = dict_start + 2; i + 1 < scan_limit; ++i) {
+    if (data[i] == '>' && data[i+1] == '>') {
+      dict_end = i + 2;
+      break;
+    }
+  }
+  if (dict_end == 0) return false;
+
+  // Extract the dictionary text
+  std::string dict_text(reinterpret_cast<const char*>(data + dict_start),
+                        dict_end - dict_start);
+
+  // Check for /Linearized key
+  if (dict_text.find("/Linearized") == std::string::npos) return false;
+
+  // Helper to extract a numeric value for a key
+  auto get_number = [&](const std::string& key) -> double {
+    size_t kpos = dict_text.find(key);
+    if (kpos == std::string::npos) return 0.0;
+    kpos += key.size();
+    // Skip whitespace
+    while (kpos < dict_text.size() && (dict_text[kpos] == ' ' ||
+           dict_text[kpos] == '\n' || dict_text[kpos] == '\r')) ++kpos;
+    // Parse number
+    size_t num_start = kpos;
+    while (kpos < dict_text.size() && (dict_text[kpos] == '-' ||
+           dict_text[kpos] == '+' || dict_text[kpos] == '.' ||
+           (dict_text[kpos] >= '0' && dict_text[kpos] <= '9'))) ++kpos;
+    if (kpos == num_start) return 0.0;
+    try {
+      return std::stod(dict_text.substr(num_start, kpos - num_start));
+    } catch (...) {
+      return 0.0;
+    }
+  };
+
+  // Parse /H array: [offset length] or [offset1 length1 offset2 length2]
+  auto parse_h_array = [&]() {
+    size_t hpos = dict_text.find("/H");
+    if (hpos == std::string::npos) return;
+    hpos += 2;
+    // Skip to '['
+    while (hpos < dict_text.size() && dict_text[hpos] != '[') ++hpos;
+    if (hpos >= dict_text.size()) return;
+    ++hpos;  // skip '['
+
+    std::vector<uint64_t> values;
+    while (hpos < dict_text.size() && dict_text[hpos] != ']' && values.size() < 4) {
+      while (hpos < dict_text.size() && (dict_text[hpos] == ' ' ||
+             dict_text[hpos] == '\n' || dict_text[hpos] == '\r')) ++hpos;
+      if (hpos >= dict_text.size() || dict_text[hpos] == ']') break;
+      size_t nstart = hpos;
+      while (hpos < dict_text.size() && dict_text[hpos] >= '0' &&
+             dict_text[hpos] <= '9') ++hpos;
+      if (hpos > nstart) {
+        try {
+          values.push_back(std::stoull(dict_text.substr(nstart, hpos - nstart)));
+        } catch (...) {}
+      }
+    }
+    if (values.size() >= 2) {
+      out->hint_offset = values[0];
+      out->hint_length = values[1];
+    }
+    if (values.size() >= 4) {
+      out->hint_offset2 = values[2];
+      out->hint_length2 = values[3];
+    }
+  };
+
+  out->is_linearized = true;
+  out->version = get_number("/Linearized");
+  out->file_length = static_cast<uint64_t>(get_number("/L"));
+  out->first_page_obj = static_cast<uint32_t>(get_number("/O"));
+  out->first_page_end = static_cast<uint64_t>(get_number("/E"));
+  out->num_pages = static_cast<uint32_t>(get_number("/N"));
+  out->xref_offset = static_cast<uint64_t>(get_number("/T"));
+  parse_h_array();
+
+  return true;
+}
+
 bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
   if (!addr || (size < 8) || !out_pdf) {
     return false;
@@ -680,6 +814,194 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
   out_pdf->version_minor = static_cast<int>(addr[7] - '0');
 
   return out_pdf->load_document_structure();
+}
+
+// Scan for "endstream" to recover a stream's actual length
+bool recover_stream_length(const uint8_t* data, size_t size,
+                           size_t stream_start, size_t* out_length) {
+  if (!data || !out_length || stream_start >= size) return false;
+
+  const char* pattern = "endstream";
+  const size_t pattern_len = 9;
+  size_t search_end = size - pattern_len;
+
+  for (size_t pos = stream_start; pos <= search_end; ++pos) {
+    if (std::memcmp(data + pos, pattern, pattern_len) == 0) {
+      // Verify it's preceded by whitespace/newline
+      if (pos > stream_start) {
+        uint8_t prev = data[pos - 1];
+        if (prev == '\n' || prev == '\r') {
+          *out_length = pos - stream_start;
+          // Trim trailing CR/LF
+          while (*out_length > 0 &&
+                 (data[stream_start + *out_length - 1] == '\n' ||
+                  data[stream_start + *out_length - 1] == '\r')) {
+            (*out_length)--;
+          }
+          return true;
+        }
+      }
+      *out_length = pos - stream_start;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Repair xref by scanning the entire file for "N G obj" patterns
+bool repair_xref(const uint8_t* data, size_t size, Pdf* out_pdf) {
+  if (!data || size < 20 || !out_pdf) return false;
+
+  out_pdf->data = data;
+  out_pdf->data_size = size;
+  out_pdf->swap_endian = !is_system_little_endian();
+
+  // Parse header
+  if (size >= 8 && data[0] == '%' && data[1] == 'P' && data[2] == 'D' &&
+      data[3] == 'F' && data[4] == '-' && data[6] == '.') {
+    out_pdf->version_major = static_cast<int>(data[5] - '0');
+    out_pdf->version_minor = static_cast<int>(data[7] - '0');
+  }
+
+  // Build a synthetic xref by scanning for "N G obj" patterns
+  XRefSection section;
+  section.start_object_id = 0;
+  uint32_t max_obj = 0;
+
+  const char* begin = reinterpret_cast<const char*>(data);
+  const char* end = begin + size;
+  const char* ptr = begin;
+
+  while (ptr < end - 5) {
+    // Skip non-digits
+    if (!std::isdigit(static_cast<unsigned char>(*ptr))) {
+      ++ptr;
+      continue;
+    }
+
+    const char* start = ptr;
+
+    // Parse object number
+    uint32_t obj = 0;
+    while (ptr < end && std::isdigit(static_cast<unsigned char>(*ptr))) {
+      obj = obj * 10 + static_cast<uint32_t>(*ptr - '0');
+      ++ptr;
+      if (obj > 999999) { ptr = start + 1; goto next_iter; }
+    }
+    if (ptr >= end || *ptr != ' ') { ptr = start + 1; continue; }
+    ++ptr;
+
+    // Parse generation number
+    if (ptr >= end || !std::isdigit(static_cast<unsigned char>(*ptr))) {
+      ptr = start + 1; continue;
+    }
+    {
+      uint32_t gen = 0;
+      while (ptr < end && std::isdigit(static_cast<unsigned char>(*ptr))) {
+        gen = gen * 10 + static_cast<uint32_t>(*ptr - '0');
+        ++ptr;
+        if (gen > 65535) { ptr = start + 1; goto next_iter; }
+      }
+      if (ptr >= end || *ptr != ' ') { ptr = start + 1; continue; }
+      ++ptr;
+
+      // Check for "obj"
+      if (ptr + 3 <= end && ptr[0] == 'o' && ptr[1] == 'b' && ptr[2] == 'j') {
+        // Found "N G obj" pattern
+        uint64_t offset = static_cast<uint64_t>(start - begin);
+
+        // Ensure xref vector is large enough
+        if (obj >= section.xrefs.size()) {
+          section.xrefs.resize(obj + 1);
+        }
+
+        XRef& xref = section.xrefs[obj];
+        xref.offset = offset;
+        xref.generation = static_cast<uint16_t>(gen);
+        xref.use = true;
+
+        if (obj > max_obj) max_obj = obj;
+
+        ptr += 3;  // Skip "obj"
+        continue;
+      }
+    }
+
+    ptr = start + 1;
+    continue;
+next_iter:
+    continue;
+  }
+
+  if (max_obj == 0) return false;
+
+  section.num_objectsid = max_obj + 1;
+  out_pdf->xref_sections.push_back(std::move(section));
+
+  // Scan for trailer dictionary (search backwards)
+  const char trailer_kw[] = "trailer";
+  const size_t trailer_len = sizeof(trailer_kw) - 1;
+  for (size_t pos = size - trailer_len; pos > 0; --pos) {
+    if (std::memcmp(begin + pos, trailer_kw, trailer_len) == 0) {
+      uint64_t dict_offset = static_cast<uint64_t>(pos + trailer_len);
+      while (dict_offset < size && (data[dict_offset] == ' ' || data[dict_offset] == '\n' ||
+             data[dict_offset] == '\r' || data[dict_offset] == '\t'))
+        dict_offset++;
+
+      if (dict_offset + 2 < size && data[dict_offset] == '<' && data[dict_offset + 1] == '<') {
+        StreamReader sr(data, size, out_pdf->swap_endian);
+        Parser parser(sr);
+        if (sr.seek_set(dict_offset + 2)) {
+          Value trailer_val;
+          trailer_val.SetType(Value::DICTIONARY);
+          if (parse_dictionary(sr, parser, &trailer_val.dict)) {
+            // Extract trailer fields
+            auto root_it = trailer_val.dict.find("Root");
+            if (root_it != trailer_val.dict.end() &&
+                root_it->second.type == Value::REFERENCE) {
+              out_pdf->root = root_it->second.ref_object_number;
+            }
+            auto size_it = trailer_val.dict.find("Size");
+            if (size_it != trailer_val.dict.end() &&
+                size_it->second.type == Value::NUMBER) {
+              out_pdf->size = static_cast<uint32_t>(size_it->second.number);
+            }
+            auto info_it = trailer_val.dict.find("Info");
+            if (info_it != trailer_val.dict.end() &&
+                info_it->second.type == Value::REFERENCE) {
+              out_pdf->info = info_it->second.ref_object_number;
+            }
+            out_pdf->trailer = trailer_val.dict;
+          }
+        }
+      }
+      break;
+    }
+    if (pos == 0) break;
+  }
+
+  if (out_pdf->root == 0) return false;
+
+  // Try loading document structure
+  return out_pdf->load_document_structure();
+}
+
+// parse_from_memory with ParseOptions
+bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf,
+                       const ParseOptions& options) {
+  // Try normal parsing first
+  if (parse_from_memory(addr, size, out_pdf)) {
+    return true;
+  }
+
+  // If auto_repair is enabled, try xref repair
+  if (options.auto_repair) {
+    // Reset the pdf struct
+    *out_pdf = Pdf{};
+    return repair_xref(addr, size, out_pdf);
+  }
+
+  return false;
 }
 
 namespace filters {
@@ -2927,7 +3249,9 @@ static DecodedStream apply_single_filter(const std::string &filter_name,
   } else if (filter_name == "JPXDecode") {
     return filters::decode_jpx(data, size, params);
   } else if (filter_name == "Crypt") {
-    // Crypt filter is handled at a higher level; pass through
+    // Crypt filter - data is passed through as-is here.
+    // The actual decryption using the named crypt filter is handled at
+    // the stream level in decode_stream() via the /Name param in DecodeParms.
     result.data.assign(data, data + size);
     result.success = true;
     return result;
@@ -2989,17 +3313,54 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   // Start with raw stream data
   std::vector<uint8_t> current_data = stream_obj.stream.data;
 
+  // Check if filter chain includes a Crypt filter (handles encryption via /Name)
+  bool has_crypt_filter = false;
+  std::string crypt_filter_name;
+  {
+    auto flt_it = stream_obj.stream.dict.find("Filter");
+    if (flt_it != stream_obj.stream.dict.end()) {
+      auto check_crypt = [&](const std::string& fname, size_t idx) {
+        if (fname == "Crypt") {
+          has_crypt_filter = true;
+          auto dp_it = stream_obj.stream.dict.find("DecodeParms");
+          if (dp_it != stream_obj.stream.dict.end()) {
+            const Value* dp_val = nullptr;
+            if (dp_it->second.type == Value::DICTIONARY) {
+              dp_val = &dp_it->second;
+            } else if (dp_it->second.type == Value::ARRAY && idx < dp_it->second.array.size()) {
+              dp_val = &dp_it->second.array[idx];
+            }
+            if (dp_val && dp_val->type == Value::DICTIONARY) {
+              auto name_it = dp_val->dict.find("Name");
+              if (name_it != dp_val->dict.end() && name_it->second.type == Value::NAME) {
+                crypt_filter_name = name_it->second.name;
+              }
+            }
+          }
+          if (crypt_filter_name.empty()) crypt_filter_name = "Identity";
+        }
+      };
+      if (flt_it->second.type == Value::NAME) {
+        check_crypt(flt_it->second.name, 0);
+      } else if (flt_it->second.type == Value::ARRAY) {
+        for (size_t fi = 0; fi < flt_it->second.array.size(); ++fi) {
+          if (flt_it->second.array[fi].type == Value::NAME)
+            check_crypt(flt_it->second.array[fi].name, fi);
+        }
+      }
+    }
+  }
+
   // Decrypt stream data if PDF is encrypted
   // Note: Decryption must happen BEFORE decompression
   if (pdf.security.authenticated && !pdf.security.encryption_key.empty()) {
-    // Check if this is a Crypt filter that should not be decrypted
-    // or if this is an XRef stream (XRef streams are not encrypted)
     auto type_it = stream_obj.stream.dict.find("Type");
     bool is_xref = (type_it != stream_obj.stream.dict.end() &&
                     type_it->second.type == Value::NAME &&
                     type_it->second.name == "XRef");
+    bool skip_decrypt = is_xref || (has_crypt_filter && crypt_filter_name == "Identity");
 
-    if (!is_xref) {
+    if (!skip_decrypt) {
       NANOPDF_LOG_TRACE("decode_stream", "Decrypting obj %u %u, before: %zu bytes",
                         obj_num, gen_num, current_data.size());
       if (current_data.size() >= 8) {
@@ -3007,7 +3368,8 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
                           current_data[0], current_data[1], current_data[2], current_data[3],
                           current_data[4], current_data[5], current_data[6], current_data[7]);
       }
-      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num);
+      std::string effective_filter = has_crypt_filter ? crypt_filter_name : "";
+      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num, effective_filter);
       NANOPDF_LOG_TRACE("decode_stream", "After decrypt: %zu bytes", current_data.size());
       if (current_data.size() >= 8) {
         NANOPDF_LOG_TRACE("decode_stream", "Post-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
@@ -3166,17 +3528,54 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   // Start with raw stream data
   std::vector<uint8_t> current_data = stream_obj.stream.data;
 
+  // Check if filter chain includes a Crypt filter (handles encryption via /Name)
+  bool has_crypt_filter = false;
+  std::string crypt_filter_name;
+  {
+    auto flt_it = stream_obj.stream.dict.find("Filter");
+    if (flt_it != stream_obj.stream.dict.end()) {
+      auto check_crypt = [&](const std::string& fname, size_t idx) {
+        if (fname == "Crypt") {
+          has_crypt_filter = true;
+          auto dp_it = stream_obj.stream.dict.find("DecodeParms");
+          if (dp_it != stream_obj.stream.dict.end()) {
+            const Value* dp_val = nullptr;
+            if (dp_it->second.type == Value::DICTIONARY) {
+              dp_val = &dp_it->second;
+            } else if (dp_it->second.type == Value::ARRAY && idx < dp_it->second.array.size()) {
+              dp_val = &dp_it->second.array[idx];
+            }
+            if (dp_val && dp_val->type == Value::DICTIONARY) {
+              auto name_it = dp_val->dict.find("Name");
+              if (name_it != dp_val->dict.end() && name_it->second.type == Value::NAME) {
+                crypt_filter_name = name_it->second.name;
+              }
+            }
+          }
+          if (crypt_filter_name.empty()) crypt_filter_name = "Identity";
+        }
+      };
+      if (flt_it->second.type == Value::NAME) {
+        check_crypt(flt_it->second.name, 0);
+      } else if (flt_it->second.type == Value::ARRAY) {
+        for (size_t fi = 0; fi < flt_it->second.array.size(); ++fi) {
+          if (flt_it->second.array[fi].type == Value::NAME)
+            check_crypt(flt_it->second.array[fi].name, fi);
+        }
+      }
+    }
+  }
+
   // Decrypt stream data if PDF is encrypted
   // Note: Decryption must happen BEFORE decompression
   if (pdf.security.authenticated && !pdf.security.encryption_key.empty()) {
-    // Check if this is a Crypt filter that should not be decrypted
-    // or if this is an XRef stream (XRef streams are not encrypted)
     auto type_it = stream_obj.stream.dict.find("Type");
     bool is_xref = (type_it != stream_obj.stream.dict.end() &&
                     type_it->second.type == Value::NAME &&
                     type_it->second.name == "XRef");
+    bool skip_decrypt = is_xref || (has_crypt_filter && crypt_filter_name == "Identity");
 
-    if (!is_xref) {
+    if (!skip_decrypt) {
       NANOPDF_LOG_TRACE("decode_stream", "Decrypting obj %u %u, before: %zu bytes",
                         obj_num, gen_num, current_data.size());
       if (current_data.size() >= 8) {
@@ -3184,7 +3583,8 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
                           current_data[0], current_data[1], current_data[2], current_data[3],
                           current_data[4], current_data[5], current_data[6], current_data[7]);
       }
-      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num);
+      std::string effective_filter = has_crypt_filter ? crypt_filter_name : "";
+      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num, effective_filter);
       NANOPDF_LOG_TRACE("decode_stream", "After decrypt: %zu bytes", current_data.size());
       if (current_data.size() >= 8) {
         NANOPDF_LOG_TRACE("decode_stream", "Post-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
@@ -5076,6 +5476,9 @@ void Pdf::clear_decoded_stream_cache() const {
 }
 
 bool Pdf::load_document_structure() {
+  // Detect linearization (must be done before other parsing)
+  parse_linearization_dict(data, data_size, &linearization);
+
   if (!object_offsets_built && !object_offsets_failed) {
     if (build_object_offset_cache()) {
       object_offsets_built = true;
@@ -5342,8 +5745,12 @@ bool Pdf::load_document_structure() {
   named_destinations_loaded = true;
   parse_document_info(*this, catalog);
   parse_xmp_metadata(*this, catalog);
+  parse_optional_content(*this, catalog);
+  parse_output_intents(*this, catalog);
+  parse_document_actions(*this, catalog);
   document_info_loaded = true;
   xmp_metadata_loaded = true;
+  optional_content_loaded = true;
 #endif
   return true;
 }
@@ -5414,6 +5821,14 @@ void Pdf::ensure_metadata_loaded() const {
   if (!xmp_metadata_loaded) {
     parse_xmp_metadata(*this, const_cast<DocumentCatalog&>(catalog));
     xmp_metadata_loaded = true;
+  }
+}
+
+void Pdf::ensure_optional_content_loaded() const {
+  if (!optional_content_loaded) {
+    ensure_pages_loaded();
+    parse_optional_content(*this, const_cast<DocumentCatalog&>(catalog));
+    optional_content_loaded = true;
   }
 }
 
@@ -8241,11 +8656,97 @@ void parse_page_annotations(const Pdf& pdf, Page& page, const Dictionary& page_d
     }
 
     if (annot_val.type == Value::DICTIONARY) {
-      auto annotation = parse_annotation(pdf, annot_val);
-      if (annotation) {
-        annotation->page_ref = page.object_number;
-        page.annotations.push_back(std::move(annotation));
+      const Dictionary* annot_dict = &annot_val.dict;
+
+      // Check for Redact subtype
+      auto subtype_it = annot_dict->find("Subtype");
+      std::string subtype;
+      if (subtype_it != annot_dict->end() && subtype_it->second.type == Value::NAME) {
+        subtype = subtype_it->second.name;
       }
+
+      if (subtype == "Redact") {
+        RedactionAnnotation redact;
+
+        // Parse annotation rect
+        auto rect_it = annot_dict->find("Rect");
+        if (rect_it != annot_dict->end() && rect_it->second.type == Value::ARRAY) {
+          for (const auto& val : rect_it->second.array) {
+            if (val.type == Value::NUMBER) {
+              redact.rect.push_back(val.number);
+            }
+          }
+        }
+
+        uint32_t ref_obj = 0;
+        if (annot_ref.type == Value::REFERENCE) {
+          ref_obj = annot_ref.ref_object_number;
+        }
+        redact.object_number = ref_obj;
+
+        // Parse overlay color (/IC entry)
+        auto ic_it = annot_dict->find("IC");
+        if (ic_it != annot_dict->end() && ic_it->second.type == Value::ARRAY) {
+          const auto& ic = ic_it->second.array;
+          if (ic.size() >= 3) {
+            redact.overlay_color_r = ic[0].number;
+            redact.overlay_color_g = ic[1].number;
+            redact.overlay_color_b = ic[2].number;
+            redact.has_overlay_color = true;
+          } else if (ic.empty()) {
+            redact.has_overlay_color = false;
+          }
+        }
+
+        // Parse overlay text (/OverlayText)
+        auto ot_it = annot_dict->find("OverlayText");
+        if (ot_it != annot_dict->end() && ot_it->second.type == Value::STRING) {
+          redact.overlay_text = ot_it->second.str;
+        }
+
+        // Parse repeat flag (/Repeat)
+        auto rp_it = annot_dict->find("Repeat");
+        if (rp_it != annot_dict->end() && rp_it->second.type == Value::BOOLEAN) {
+          redact.repeat = rp_it->second.boolean ? 1 : 0;
+        }
+
+        // Parse QuadPoints
+        auto qp_it = annot_dict->find("QuadPoints");
+        if (qp_it != annot_dict->end() && qp_it->second.type == Value::ARRAY) {
+          const auto& qp = qp_it->second.array;
+          // QuadPoints come in groups of 8 numbers (4 x,y pairs per quad)
+          for (size_t qi = 0; qi + 7 < qp.size(); qi += 8) {
+            std::vector<double> quad;
+            for (int qj = 0; qj < 8; ++qj) {
+              quad.push_back(qp[qi + qj].number);
+            }
+            redact.quad_points.push_back(quad);
+          }
+        }
+
+        page.redaction_annotations.push_back(redact);
+      } else {
+        auto annotation = parse_annotation(pdf, annot_val);
+        if (annotation) {
+          annotation->page_ref = page.object_number;
+          page.annotations.push_back(std::move(annotation));
+        }
+      }
+    }
+  }
+
+  // Parse page-level /AA (Additional Actions)
+  auto aa_it = page_dict.find("AA");
+  if (aa_it != page_dict.end()) {
+    const Value* aa_val = &aa_it->second;
+    ResolvedObject aa_resolved;
+    if (aa_val->type == Value::REFERENCE) {
+      aa_resolved = resolve_reference(pdf, aa_val->ref_object_number,
+                                      aa_val->ref_generation_number);
+      if (aa_resolved.success) aa_val = &aa_resolved.value;
+    }
+    if (aa_val->type == Value::DICTIONARY) {
+      page.additional_actions = parse_additional_actions(pdf, aa_val->dict);
     }
   }
 }
@@ -9019,6 +9520,39 @@ bool XMPMetadata::parse_xml(const std::string& xml) {
     }
   }
 
+  // Find pdfaid:part (PDF/A identification)
+  pos = xml.find("pdfaid:part");
+  if (pos != std::string::npos) {
+    pos = xml.find(">", pos) + 1;
+    size_t end = xml.find("<", pos);
+    if (end != std::string::npos) {
+      std::string part_str = xml.substr(pos, end - pos);
+      // Trim whitespace
+      while (!part_str.empty() && (part_str.front() == ' ' || part_str.front() == '\t'))
+        part_str.erase(part_str.begin());
+      while (!part_str.empty() && (part_str.back() == ' ' || part_str.back() == '\t'))
+        part_str.pop_back();
+      if (!part_str.empty()) {
+        pdfa_part = std::atoi(part_str.c_str());
+      }
+    }
+  }
+
+  // Find pdfaid:conformance (PDF/A conformance level)
+  pos = xml.find("pdfaid:conformance");
+  if (pos != std::string::npos) {
+    pos = xml.find(">", pos) + 1;
+    size_t end = xml.find("<", pos);
+    if (end != std::string::npos) {
+      pdfa_conformance = xml.substr(pos, end - pos);
+      // Trim whitespace
+      while (!pdfa_conformance.empty() && (pdfa_conformance.front() == ' ' || pdfa_conformance.front() == '\t'))
+        pdfa_conformance.erase(pdfa_conformance.begin());
+      while (!pdfa_conformance.empty() && (pdfa_conformance.back() == ' ' || pdfa_conformance.back() == '\t'))
+        pdfa_conformance.pop_back();
+    }
+  }
+
   return true;
 }
 
@@ -9049,6 +9583,254 @@ void parse_xmp_metadata(const Pdf& pdf, DocumentCatalog& catalog) {
         }
       }
     }
+  }
+}
+
+// Parse a PDF action dictionary
+Action parse_action(const Pdf& pdf, const Dictionary& action_dict) {
+  Action action;
+
+  auto s_it = action_dict.find("S");
+  if (s_it == action_dict.end() || s_it->second.type != Value::NAME) return action;
+
+  const std::string& action_name = s_it->second.name;
+
+  if (action_name == "GoTo") {
+    action.type = ActionType::GoTo;
+    auto d_it = action_dict.find("D");
+    if (d_it != action_dict.end()) {
+      const Value* dest_val = &d_it->second;
+      ResolvedObject dest_resolved;
+      if (dest_val->type == Value::REFERENCE) {
+        dest_resolved = resolve_reference(pdf, dest_val->ref_object_number,
+                                          dest_val->ref_generation_number);
+        if (dest_resolved.success) dest_val = &dest_resolved.value;
+      }
+      if (dest_val->type == Value::ARRAY && !dest_val->array.empty()) {
+        // First element is page reference
+        const auto& page_ref = dest_val->array[0];
+        if (page_ref.type == Value::REFERENCE) {
+          // Find page number from object number
+          action.dest_page = page_ref.ref_object_number;
+        } else if (page_ref.type == Value::NUMBER) {
+          action.dest_page = static_cast<uint32_t>(page_ref.number);
+        }
+        // Second element is fit type
+        if (dest_val->array.size() > 1 && dest_val->array[1].type == Value::NAME) {
+          action.dest_fit_type = dest_val->array[1].name;
+        }
+        // Remaining elements are position parameters
+        for (size_t i = 2; i < dest_val->array.size(); ++i) {
+          if (dest_val->array[i].type == Value::NUMBER) {
+            action.dest_position.push_back(dest_val->array[i].number);
+          }
+        }
+      }
+    }
+  } else if (action_name == "GoToR") {
+    action.type = ActionType::GoToR;
+    auto f_it = action_dict.find("F");
+    if (f_it != action_dict.end() && f_it->second.type == Value::STRING) {
+      action.file = f_it->second.str;
+    }
+  } else if (action_name == "Launch") {
+    action.type = ActionType::Launch;
+    auto f_it = action_dict.find("F");
+    if (f_it != action_dict.end() && f_it->second.type == Value::STRING) {
+      action.file = f_it->second.str;
+    }
+  } else if (action_name == "URI") {
+    action.type = ActionType::URI;
+    auto uri_it = action_dict.find("URI");
+    if (uri_it != action_dict.end() && uri_it->second.type == Value::STRING) {
+      action.uri = uri_it->second.str;
+    }
+  } else if (action_name == "Named") {
+    action.type = ActionType::Named;
+    auto n_it = action_dict.find("N");
+    if (n_it != action_dict.end() && n_it->second.type == Value::NAME) {
+      action.named_action = n_it->second.name;
+    }
+  } else if (action_name == "JavaScript") {
+    action.type = ActionType::JavaScript;
+    auto js_it = action_dict.find("JS");
+    if (js_it != action_dict.end()) {
+      if (js_it->second.type == Value::STRING) {
+        action.javascript = js_it->second.str;
+      } else if (js_it->second.type == Value::STREAM) {
+        auto decoded = decode_stream(pdf, js_it->second);
+        if (decoded.success) {
+          action.javascript.assign(decoded.data.begin(), decoded.data.end());
+        }
+      }
+    }
+  }
+
+  return action;
+}
+
+Action parse_action(const Pdf& pdf, const Value& action_val) {
+  if (action_val.type == Value::DICTIONARY) {
+    return parse_action(pdf, action_val.dict);
+  }
+  if (action_val.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, action_val.ref_object_number,
+                                      action_val.ref_generation_number);
+    if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+      return parse_action(pdf, resolved.value.dict);
+    }
+  }
+  return Action{};
+}
+
+// Parse Additional Actions (/AA) dictionary
+AdditionalActions parse_additional_actions(const Pdf& pdf, const Dictionary& aa_dict) {
+  AdditionalActions aa;
+
+  auto parse_entry = [&](const std::string& key) -> Action {
+    auto it = aa_dict.find(key);
+    if (it == aa_dict.end()) return Action{};
+    return parse_action(pdf, it->second);
+  };
+
+  // Page-level actions
+  aa.on_open = parse_entry("O");
+  aa.on_close = parse_entry("C");
+  aa.on_visible = parse_entry("PV");
+  aa.on_invisible = parse_entry("PI");
+
+  // Document-level actions
+  aa.will_close = parse_entry("WC");
+  aa.will_save = parse_entry("WS");
+  aa.did_save = parse_entry("DS");
+  aa.will_print = parse_entry("WP");
+  aa.did_print = parse_entry("DP");
+
+  return aa;
+}
+
+// Parse document-level actions (/OpenAction and /AA)
+void parse_document_actions(const Pdf& pdf, DocumentCatalog& catalog) {
+  auto catalog_obj = resolve_reference(pdf, pdf.root, 0);
+  if (!catalog_obj.success || catalog_obj.value.type != Value::DICTIONARY) return;
+
+  const auto& cat_dict = catalog_obj.value.dict;
+
+  // Parse /OpenAction
+  auto oa_it = cat_dict.find("OpenAction");
+  if (oa_it != cat_dict.end()) {
+    if (oa_it->second.type == Value::DICTIONARY) {
+      catalog.open_action = parse_action(pdf, oa_it->second.dict);
+    } else if (oa_it->second.type == Value::REFERENCE) {
+      catalog.open_action = parse_action(pdf, oa_it->second);
+    } else if (oa_it->second.type == Value::ARRAY) {
+      // Direct destination array (not an action dict)
+      Action action;
+      action.type = ActionType::GoTo;
+      if (!oa_it->second.array.empty()) {
+        const auto& page_ref = oa_it->second.array[0];
+        if (page_ref.type == Value::REFERENCE)
+          action.dest_page = page_ref.ref_object_number;
+        else if (page_ref.type == Value::NUMBER)
+          action.dest_page = static_cast<uint32_t>(page_ref.number);
+        if (oa_it->second.array.size() > 1 && oa_it->second.array[1].type == Value::NAME)
+          action.dest_fit_type = oa_it->second.array[1].name;
+        for (size_t i = 2; i < oa_it->second.array.size(); ++i) {
+          if (oa_it->second.array[i].type == Value::NUMBER)
+            action.dest_position.push_back(oa_it->second.array[i].number);
+        }
+      }
+      catalog.open_action = action;
+    }
+  }
+
+  // Parse /AA (document-level additional actions)
+  auto aa_it = cat_dict.find("AA");
+  if (aa_it != cat_dict.end()) {
+    const Value* aa_val = &aa_it->second;
+    ResolvedObject aa_resolved;
+    if (aa_val->type == Value::REFERENCE) {
+      aa_resolved = resolve_reference(pdf, aa_val->ref_object_number,
+                                      aa_val->ref_generation_number);
+      if (aa_resolved.success) aa_val = &aa_resolved.value;
+    }
+    if (aa_val->type == Value::DICTIONARY) {
+      catalog.additional_actions = parse_additional_actions(pdf, aa_val->dict);
+    }
+  }
+}
+
+// Parse /OutputIntents array from document catalog
+void parse_output_intents(const Pdf& pdf, DocumentCatalog& catalog) {
+  auto catalog_obj = resolve_reference(pdf, pdf.root, 0);
+  if (!catalog_obj.success || catalog_obj.value.type != Value::DICTIONARY) {
+    return;
+  }
+
+  const auto& catalog_dict = catalog_obj.value.dict;
+  auto oi_it = catalog_dict.find("OutputIntents");
+  if (oi_it == catalog_dict.end()) return;
+
+  const Value* oi_val = &oi_it->second;
+  // Resolve reference if needed
+  ResolvedObject oi_resolved;
+  if (oi_val->type == Value::REFERENCE) {
+    oi_resolved = resolve_reference(pdf, oi_val->ref_object_number,
+                                    oi_val->ref_generation_number);
+    if (!oi_resolved.success) return;
+    oi_val = &oi_resolved.value;
+  }
+
+  if (oi_val->type != Value::ARRAY) return;
+
+  for (const auto& item : oi_val->array) {
+    const Value* intent_val = &item;
+    ResolvedObject intent_resolved;
+    if (intent_val->type == Value::REFERENCE) {
+      intent_resolved = resolve_reference(pdf, intent_val->ref_object_number,
+                                          intent_val->ref_generation_number);
+      if (!intent_resolved.success) continue;
+      intent_val = &intent_resolved.value;
+    }
+
+    if (intent_val->type != Value::DICTIONARY) continue;
+    const auto& d = intent_val->dict;
+
+    OutputIntentInfo info;
+    auto s_it = d.find("S");
+    if (s_it != d.end() && s_it->second.type == Value::NAME)
+      info.subtype = s_it->second.name;
+
+    auto oc_it = d.find("OutputCondition");
+    if (oc_it != d.end() && oc_it->second.type == Value::STRING)
+      info.output_condition = oc_it->second.str;
+
+    auto oci_it = d.find("OutputConditionIdentifier");
+    if (oci_it != d.end() && oci_it->second.type == Value::STRING)
+      info.output_condition_id = oci_it->second.str;
+
+    auto rn_it = d.find("RegistryName");
+    if (rn_it != d.end() && rn_it->second.type == Value::STRING)
+      info.registry_name = rn_it->second.str;
+
+    auto info_it = d.find("Info");
+    if (info_it != d.end() && info_it->second.type == Value::STRING)
+      info.info = info_it->second.str;
+
+    // Resolve DestOutputProfile ICC stream
+    auto dop_it = d.find("DestOutputProfile");
+    if (dop_it != d.end() && dop_it->second.type == Value::REFERENCE) {
+      auto dop_obj = resolve_reference(pdf, dop_it->second.ref_object_number,
+                                       dop_it->second.ref_generation_number);
+      if (dop_obj.success && dop_obj.value.type == Value::STREAM) {
+        auto decoded = decode_stream(pdf, dop_obj.value);
+        if (decoded.success) {
+          info.dest_output_profile = std::move(decoded.data);
+        }
+      }
+    }
+
+    catalog.output_intents.push_back(std::move(info));
   }
 }
 
@@ -10159,6 +10941,858 @@ StructureElement* find_structure_element_by_mcid(StructureElement* root, int mci
   }
 
   return nullptr;
+}
+
+// =============================================================================
+// Text Search API
+// =============================================================================
+
+namespace {
+
+// Convert a string to lowercase for case-insensitive comparison
+std::string to_lower_str(const std::string& s) {
+  std::string result = s;
+  for (size_t i = 0; i < result.size(); ++i) {
+    result[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(result[i])));
+  }
+  return result;
+}
+
+// Get surrounding context text around a match position
+std::string get_context(const std::string& text, size_t match_start,
+                        size_t match_length, size_t context_chars = 30) {
+  size_t ctx_start = match_start > context_chars ? match_start - context_chars : 0;
+  size_t ctx_end = std::min(match_start + match_length + context_chars, text.size());
+  return text.substr(ctx_start, ctx_end - ctx_start);
+}
+
+}  // anonymous namespace
+
+std::vector<TextSearchResult> search_text_on_page(const Pdf& pdf,
+                                                  const Page& page,
+                                                  const std::string& query,
+                                                  bool case_sensitive) {
+  std::vector<TextSearchResult> results;
+
+  if (query.empty()) {
+    return results;
+  }
+
+  // Extract the plain text from the page
+  std::string page_text = extract_text_from_page(pdf, page);
+  if (page_text.empty()) {
+    return results;
+  }
+
+  // Prepare text and query for searching
+  std::string search_text_str = case_sensitive ? page_text : to_lower_str(page_text);
+  std::string search_query = case_sensitive ? query : to_lower_str(query);
+
+  // Try to get layout information for position data
+  std::unique_ptr<TextPage> text_page = extract_text_layout(pdf, page);
+
+  // Build a mapping from text character index to TextChar index in the layout.
+  // The plain text from extract_text_from_page may differ from TextPage chars
+  // (line breaks, spaces, etc.), so we use the layout chars to build a
+  // parallel text string and map positions through it.
+  std::string layout_text;
+  bool have_layout = false;
+
+  if (text_page && !text_page->chars.empty()) {
+    // Build text from layout chars in reading order (same order as lines)
+    // Sort lines by reading order
+    std::vector<size_t> line_order(text_page->lines.size());
+    for (size_t i = 0; i < line_order.size(); ++i) {
+      line_order[i] = i;
+    }
+    std::sort(line_order.begin(), line_order.end(),
+              [&](size_t a, size_t b) {
+                return text_page->lines[a].reading_order <
+                       text_page->lines[b].reading_order;
+              });
+
+    // We'll track which TextChar (by global index in text_page->chars) maps
+    // to each byte position. But since chars inside lines are copies, we need
+    // to match by position. Instead, we iterate lines in reading order and
+    // for each character, record a reference back to the line's char.
+    struct CharRef {
+      size_t line_idx;
+      size_t char_in_line;
+    };
+    std::vector<CharRef> char_refs;
+
+    for (size_t li : line_order) {
+      const TextLine& line = text_page->lines[li];
+      for (size_t ci = 0; ci < line.chars.size(); ++ci) {
+        const TextChar& ch = line.chars[ci];
+        // Encode as UTF-8
+        if (ch.unicode < 0x80) {
+          size_t byte_pos = layout_text.size();
+          layout_text += static_cast<char>(ch.unicode);
+          char_refs.push_back({li, ci});
+          (void)byte_pos;
+        } else if (ch.unicode < 0x800) {
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0xC0 | (ch.unicode >> 6));
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0x80 | (ch.unicode & 0x3F));
+        } else if (ch.unicode < 0x10000) {
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0xE0 | (ch.unicode >> 12));
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0x80 | ((ch.unicode >> 6) & 0x3F));
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0x80 | (ch.unicode & 0x3F));
+        } else {
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0xF0 | (ch.unicode >> 18));
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0x80 | ((ch.unicode >> 12) & 0x3F));
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0x80 | ((ch.unicode >> 6) & 0x3F));
+          char_refs.push_back({li, ci});
+          layout_text += static_cast<char>(0x80 | (ch.unicode & 0x3F));
+        }
+      }
+      // Add newline between lines
+      char_refs.push_back({li, line.chars.size()});  // sentinel
+      layout_text += '\n';
+    }
+
+    have_layout = !char_refs.empty();
+
+    // Now search the layout_text for matches and compute bounding boxes
+    if (have_layout) {
+      std::string search_layout =
+          case_sensitive ? layout_text : to_lower_str(layout_text);
+
+      size_t pos = 0;
+      while ((pos = search_layout.find(search_query, pos)) != std::string::npos) {
+        TextSearchResult result;
+        result.page_number = 0;  // caller sets this for multi-page search
+        result.char_index = pos;
+        result.length = query.size();
+        result.context = get_context(layout_text, pos, search_query.size());
+
+        // Compute bounding box from layout chars
+        if (pos < char_refs.size()) {
+          const CharRef& first_ref = char_refs[pos];
+          if (first_ref.line_idx < text_page->lines.size() &&
+              first_ref.char_in_line <
+                  text_page->lines[first_ref.line_idx].chars.size()) {
+            const TextChar& first_ch =
+                text_page->lines[first_ref.line_idx]
+                    .chars[first_ref.char_in_line];
+            result.x = first_ch.x;
+            result.y = first_ch.y;
+            result.height = first_ch.height;
+
+            // Find the last character of the match
+            size_t end_pos = pos + search_query.size() - 1;
+            if (end_pos < char_refs.size()) {
+              const CharRef& last_ref = char_refs[end_pos];
+              if (last_ref.line_idx < text_page->lines.size() &&
+                  last_ref.char_in_line <
+                      text_page->lines[last_ref.line_idx].chars.size()) {
+                const TextChar& last_ch =
+                    text_page->lines[last_ref.line_idx]
+                        .chars[last_ref.char_in_line];
+                result.width = (last_ch.x + last_ch.width) - result.x;
+                result.height =
+                    std::max(result.height, last_ch.height);
+              }
+            }
+          }
+        }
+
+        results.push_back(result);
+        pos += search_query.size();
+      }
+
+      return results;
+    }
+  }
+
+  // Fallback: search plain text without layout position information
+  size_t pos = 0;
+  while ((pos = search_text_str.find(search_query, pos)) != std::string::npos) {
+    TextSearchResult result;
+    result.page_number = 0;
+    result.char_index = pos;
+    result.length = query.size();
+    result.context = get_context(page_text, pos, search_query.size());
+    // x, y, width, height remain 0 since we have no layout data
+
+    results.push_back(result);
+    pos += search_query.size();
+  }
+
+  return results;
+}
+
+std::vector<TextSearchResult> search_text(const Pdf& pdf,
+                                          const std::string& query,
+                                          bool case_sensitive,
+                                          int max_results) {
+  std::vector<TextSearchResult> results;
+
+  if (query.empty()) {
+    return results;
+  }
+
+  for (size_t page_idx = 0; page_idx < pdf.catalog.pages.size();
+       ++page_idx) {
+    const Page& page = pdf.catalog.pages[page_idx];
+    std::vector<TextSearchResult> page_results =
+        search_text_on_page(pdf, page, query, case_sensitive);
+
+    for (auto& r : page_results) {
+      r.page_number = static_cast<uint32_t>(page_idx);
+      results.push_back(std::move(r));
+
+      if (max_results > 0 &&
+          static_cast<int>(results.size()) >= max_results) {
+        return results;
+      }
+    }
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Digital signature validation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// ASN.1 DER tag constants
+static const uint8_t kASN1_SEQUENCE = 0x30;
+static const uint8_t kASN1_SET = 0x31;
+static const uint8_t kASN1_OID = 0x06;
+static const uint8_t kASN1_OCTET_STRING = 0x04;
+static const uint8_t kASN1_UTF8_STRING = 0x0C;
+static const uint8_t kASN1_PRINTABLE_STRING = 0x13;
+static const uint8_t kASN1_IA5_STRING = 0x16;
+static const uint8_t kASN1_T61_STRING = 0x14;
+static const uint8_t kASN1_BMP_STRING = 0x1E;
+static const uint8_t kASN1_UTC_TIME = 0x17;
+static const uint8_t kASN1_GENERALIZED_TIME = 0x18;
+
+// OID for PKCS#7 signedData (1.2.840.113549.1.7.2)
+static const uint8_t kOID_SignedData[] = {
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02};
+
+// OID for messageDigest attribute (1.2.840.113549.1.9.4)
+static const uint8_t kOID_MessageDigest[] = {
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04};
+
+// OID for signingTime attribute (1.2.840.113549.1.9.5)
+static const uint8_t kOID_SigningTime[] = {
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05};
+
+// OID for SHA-256 (2.16.840.1.101.3.4.2.1)
+static const uint8_t kOID_SHA256[] = {
+    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01};
+
+// OID for SHA-1 (1.3.14.3.2.26)
+static const uint8_t kOID_SHA1[] = {0x2B, 0x0E, 0x03, 0x02, 0x1A};
+
+// OID for SHA-384 (2.16.840.1.101.3.4.2.2)
+static const uint8_t kOID_SHA384[] = {
+    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02};
+
+// OID for SHA-512 (2.16.840.1.101.3.4.2.3)
+static const uint8_t kOID_SHA512[] = {
+    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03};
+
+// OID for MD5 (1.2.840.113549.2.5)
+static const uint8_t kOID_MD5[] = {
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05};
+
+// OID for id-at-commonName (2.5.4.3)
+static const uint8_t kOID_CommonName[] = {0x55, 0x04, 0x03};
+
+// A minimal ASN.1 DER element
+struct DERElement {
+  uint8_t tag{0};
+  const uint8_t* content{nullptr};  // pointer into the original data
+  size_t content_length{0};
+  const uint8_t* full_start{nullptr};  // pointer to start of TLV
+  size_t full_length{0};               // total TLV length
+  bool constructed{false};
+
+  bool is_sequence() const { return tag == kASN1_SEQUENCE; }
+  bool is_set() const { return tag == kASN1_SET; }
+  bool is_context(uint8_t n) const { return tag == (0xA0 | n); }
+  bool is_oid() const { return tag == kASN1_OID; }
+  bool is_octet_string() const { return tag == kASN1_OCTET_STRING; }
+
+  bool is_string_type() const {
+    return tag == kASN1_UTF8_STRING || tag == kASN1_PRINTABLE_STRING ||
+           tag == kASN1_IA5_STRING || tag == kASN1_T61_STRING ||
+           tag == kASN1_BMP_STRING;
+  }
+
+  bool is_time_type() const {
+    return tag == kASN1_UTC_TIME || tag == kASN1_GENERALIZED_TIME;
+  }
+
+  // Extract string value from a string-type element
+  std::string to_string() const {
+    if (!content || content_length == 0) return "";
+    if (tag == kASN1_BMP_STRING) {
+      // BMP string is UCS-2 big-endian; convert to ASCII (lossy)
+      std::string result;
+      for (size_t i = 0; i + 1 < content_length; i += 2) {
+        uint16_t ch = (static_cast<uint16_t>(content[i]) << 8) | content[i + 1];
+        if (ch < 0x80) {
+          result.push_back(static_cast<char>(ch));
+        } else {
+          result.push_back('?');
+        }
+      }
+      return result;
+    }
+    return std::string(reinterpret_cast<const char*>(content), content_length);
+  }
+
+  // Check if OID matches
+  bool oid_equals(const uint8_t* oid, size_t oid_len) const {
+    if (tag != kASN1_OID) return false;
+    if (content_length != oid_len) return false;
+    return std::memcmp(content, oid, oid_len) == 0;
+  }
+};
+
+// Parse one DER element from the given position. Returns false on error.
+// On success, advances `pos` past the element.
+bool parse_der_element(const uint8_t* data, size_t data_len, size_t& pos,
+                       DERElement& out) {
+  if (pos >= data_len) return false;
+
+  out.full_start = data + pos;
+  out.tag = data[pos];
+  out.constructed = (out.tag & 0x20) != 0;
+  pos++;
+
+  // Handle high-tag-number form (tag number >= 31)
+  if ((out.tag & 0x1F) == 0x1F) {
+    // Skip subsequent tag bytes (each has bit 7 set except the last)
+    while (pos < data_len && (data[pos] & 0x80)) {
+      pos++;
+    }
+    if (pos >= data_len) return false;
+    pos++;  // skip last tag byte
+  }
+
+  // Parse length
+  if (pos >= data_len) return false;
+  uint8_t len_byte = data[pos];
+  pos++;
+
+  size_t length = 0;
+  if (len_byte < 0x80) {
+    length = len_byte;
+  } else if (len_byte == 0x80) {
+    // Indefinite length - not supported in DER, but handle gracefully
+    return false;
+  } else {
+    size_t num_bytes = len_byte & 0x7F;
+    if (num_bytes > 4 || pos + num_bytes > data_len) return false;
+    for (size_t i = 0; i < num_bytes; i++) {
+      length = (length << 8) | data[pos];
+      pos++;
+    }
+  }
+
+  if (pos + length > data_len) return false;
+
+  out.content = data + pos;
+  out.content_length = length;
+  out.full_length = static_cast<size_t>((data + pos + length) - out.full_start);
+  pos += length;
+  return true;
+}
+
+// Parse all children elements inside a constructed element
+bool parse_der_children(const DERElement& parent,
+                        std::vector<DERElement>& children) {
+  if (!parent.constructed || !parent.content) return false;
+  size_t pos = 0;
+  while (pos < parent.content_length) {
+    DERElement child;
+    if (!parse_der_element(parent.content, parent.content_length, pos,
+                           child)) {
+      return false;
+    }
+    children.push_back(child);
+  }
+  return true;
+}
+
+// Identify the digest algorithm from an AlgorithmIdentifier SEQUENCE
+std::string identify_digest_algorithm(const DERElement& algo_id) {
+  if (!algo_id.is_sequence()) return "";
+  std::vector<DERElement> children;
+  if (!parse_der_children(algo_id, children) || children.empty()) return "";
+  if (!children[0].is_oid()) return "";
+
+  if (children[0].oid_equals(kOID_SHA256, sizeof(kOID_SHA256)))
+    return "SHA-256";
+  if (children[0].oid_equals(kOID_SHA1, sizeof(kOID_SHA1))) return "SHA-1";
+  if (children[0].oid_equals(kOID_SHA384, sizeof(kOID_SHA384)))
+    return "SHA-384";
+  if (children[0].oid_equals(kOID_SHA512, sizeof(kOID_SHA512)))
+    return "SHA-512";
+  if (children[0].oid_equals(kOID_MD5, sizeof(kOID_MD5))) return "MD5";
+
+  return "Unknown";
+}
+
+// Extract Common Name from an X.500 Name (SEQUENCE of SETs of
+// AttributeTypeAndValue)
+std::string extract_common_name(const DERElement& name_seq) {
+  if (!name_seq.is_sequence()) return "";
+
+  std::vector<DERElement> rdns;
+  if (!parse_der_children(name_seq, rdns)) return "";
+
+  for (const auto& rdn : rdns) {
+    if (!rdn.is_set()) continue;
+    std::vector<DERElement> atvs;
+    if (!parse_der_children(rdn, atvs)) continue;
+
+    for (const auto& atv : atvs) {
+      if (!atv.is_sequence()) continue;
+      std::vector<DERElement> atv_children;
+      if (!parse_der_children(atv, atv_children) || atv_children.size() < 2)
+        continue;
+
+      if (atv_children[0].oid_equals(kOID_CommonName,
+                                     sizeof(kOID_CommonName))) {
+        return atv_children[1].to_string();
+      }
+    }
+  }
+  return "";
+}
+
+// Parse UTCTime or GeneralizedTime to a readable string
+std::string parse_asn1_time(const DERElement& time_elem) {
+  if (!time_elem.is_time_type()) return "";
+  std::string raw = time_elem.to_string();
+  if (raw.empty()) return "";
+
+  // UTCTime: YYMMDDHHmmSSZ
+  // GeneralizedTime: YYYYMMDDHHmmSSZ
+  if (time_elem.tag == kASN1_UTC_TIME && raw.size() >= 12) {
+    int yy = std::atoi(raw.substr(0, 2).c_str());
+    int year = (yy >= 50) ? 1900 + yy : 2000 + yy;
+    return std::to_string(year) + "-" + raw.substr(2, 2) + "-" +
+           raw.substr(4, 2) + " " + raw.substr(6, 2) + ":" +
+           raw.substr(8, 2) + ":" + raw.substr(10, 2) + " UTC";
+  }
+
+  if (time_elem.tag == kASN1_GENERALIZED_TIME && raw.size() >= 14) {
+    return raw.substr(0, 4) + "-" + raw.substr(4, 2) + "-" +
+           raw.substr(6, 2) + " " + raw.substr(8, 2) + ":" +
+           raw.substr(10, 2) + ":" + raw.substr(12, 2) + " UTC";
+  }
+
+  return raw;
+}
+
+// Search for a specific OID-keyed attribute in a SET OF Attribute
+// Returns the value element if found.
+bool find_attribute_value(const DERElement& attrs_elem, const uint8_t* oid,
+                          size_t oid_len, DERElement& out_value) {
+  // attrs_elem should be context [0] or SET wrapping attributes
+  std::vector<DERElement> attrs;
+  if (!parse_der_children(attrs_elem, attrs)) return false;
+
+  for (const auto& attr : attrs) {
+    // Each Attribute is a SEQUENCE { OID, SET OF values }
+    if (!attr.is_sequence()) continue;
+    std::vector<DERElement> attr_children;
+    if (!parse_der_children(attr, attr_children) || attr_children.size() < 2)
+      continue;
+
+    if (!attr_children[0].is_oid()) continue;
+    if (!attr_children[0].oid_equals(oid, oid_len)) continue;
+
+    // The value is in a SET
+    if (!attr_children[1].is_set()) continue;
+    std::vector<DERElement> value_set;
+    if (!parse_der_children(attr_children[1], value_set) ||
+        value_set.empty())
+      continue;
+
+    out_value = value_set[0];
+    return true;
+  }
+  return false;
+}
+
+// Extract the raw OCTET STRING bytes of the messageDigest attribute
+bool extract_message_digest(const DERElement& attrs_elem,
+                            std::vector<uint8_t>& digest) {
+  DERElement value_elem;
+  if (!find_attribute_value(attrs_elem, kOID_MessageDigest,
+                            sizeof(kOID_MessageDigest), value_elem)) {
+    return false;
+  }
+
+  if (value_elem.is_octet_string() && value_elem.content &&
+      value_elem.content_length > 0) {
+    digest.assign(value_elem.content,
+                  value_elem.content + value_elem.content_length);
+    return true;
+  }
+  return false;
+}
+
+// Extract the signing time string
+bool extract_signing_time(const DERElement& attrs_elem,
+                          std::string& signing_time) {
+  DERElement value_elem;
+  if (!find_attribute_value(attrs_elem, kOID_SigningTime,
+                            sizeof(kOID_SigningTime), value_elem)) {
+    return false;
+  }
+
+  if (value_elem.is_time_type()) {
+    signing_time = parse_asn1_time(value_elem);
+    return true;
+  }
+  return false;
+}
+
+}  // anonymous namespace
+
+SignatureValidationResult validate_signature(const Pdf& pdf,
+                                             const SignatureField& field) {
+  SignatureValidationResult result;
+
+  // --- Basic precondition checks ---
+  if (!field.signature_present) {
+    result.error = "Signature field is not signed";
+    return result;
+  }
+
+  if (!field.byte_range_valid || field.byte_range.empty()) {
+    result.error = "ByteRange is missing or invalid";
+    return result;
+  }
+
+  if (field.signature_contents.empty()) {
+    result.error = "Signature Contents is empty";
+    return result;
+  }
+
+  if (!pdf.data || pdf.data_size == 0) {
+    result.error = "PDF data is not available";
+    return result;
+  }
+
+  // --- Step (a): Compute SHA-256 hash of byte-range-covered data ---
+  // Reuse the same logic as compute_signature_digest.
+  nanopdf::crypto::SHA256 sha256;
+  bool has_data = false;
+
+  for (size_t i = 0; i < field.byte_range.size(); i += 2) {
+    uint64_t offset = field.byte_range[i];
+    uint64_t length = field.byte_range[i + 1];
+
+    if (length == 0) continue;
+    if (offset > pdf.data_size || length > pdf.data_size) {
+      result.error = "ByteRange offset/length exceeds PDF data size";
+      return result;
+    }
+    if (offset + length < offset || offset + length > pdf.data_size) {
+      result.error = "ByteRange overflow";
+      return result;
+    }
+
+    sha256.update(pdf.data + static_cast<size_t>(offset),
+                  static_cast<size_t>(length));
+    has_data = true;
+  }
+
+  if (!has_data) {
+    result.error = "ByteRange covers no data";
+    return result;
+  }
+
+  sha256.finalize();
+  std::vector<uint8_t> computed_digest(nanopdf::crypto::SHA256::DIGEST_SIZE);
+  sha256.get_digest(computed_digest.data());
+
+  // --- Step (b): Parse the PKCS#7/CMS SignedData from Contents ---
+  const uint8_t* pkcs7_data = field.signature_contents.data();
+  size_t pkcs7_size = field.signature_contents.size();
+
+  // The outermost structure: ContentInfo ::= SEQUENCE { contentType, content }
+  size_t pos = 0;
+  DERElement content_info;
+  if (!parse_der_element(pkcs7_data, pkcs7_size, pos, content_info) ||
+      !content_info.is_sequence()) {
+    result.error = "Failed to parse PKCS#7 ContentInfo outer SEQUENCE";
+    return result;
+  }
+
+  std::vector<DERElement> ci_children;
+  if (!parse_der_children(content_info, ci_children) ||
+      ci_children.size() < 2) {
+    result.error = "PKCS#7 ContentInfo has too few elements";
+    return result;
+  }
+
+  // ci_children[0] should be OID for signedData
+  if (!ci_children[0].oid_equals(kOID_SignedData, sizeof(kOID_SignedData))) {
+    result.error = "ContentInfo is not signedData";
+    return result;
+  }
+
+  // ci_children[1] should be [0] EXPLICIT wrapping the SignedData SEQUENCE
+  if (!ci_children[1].is_context(0)) {
+    result.error = "Missing [0] context wrapper for SignedData";
+    return result;
+  }
+
+  // Inside the [0] context, parse the SignedData SEQUENCE
+  std::vector<DERElement> ctx0_children;
+  if (!parse_der_children(ci_children[1], ctx0_children) ||
+      ctx0_children.empty() || !ctx0_children[0].is_sequence()) {
+    result.error = "Failed to parse SignedData SEQUENCE";
+    return result;
+  }
+
+  const DERElement& signed_data = ctx0_children[0];
+  // SignedData ::= SEQUENCE {
+  //   version          INTEGER,
+  //   digestAlgorithms SET OF AlgorithmIdentifier,
+  //   encapContentInfo EncapsulatedContentInfo,
+  //   certificates     [0] IMPLICIT SET OF Certificate  OPTIONAL,
+  //   crls             [1] IMPLICIT SET OF CRL          OPTIONAL,
+  //   signerInfos      SET OF SignerInfo
+  // }
+  std::vector<DERElement> sd_children;
+  if (!parse_der_children(signed_data, sd_children) ||
+      sd_children.size() < 4) {
+    result.error = "SignedData has too few elements";
+    return result;
+  }
+
+  // sd_children[0] = version (INTEGER)
+  // sd_children[1] = digestAlgorithms (SET)
+  // sd_children[2] = encapContentInfo (SEQUENCE)
+  // Then optional [0] certificates, optional [1] crls
+  // Then signerInfos (SET)
+
+  // Extract digest algorithm from digestAlgorithms SET
+  if (sd_children[1].is_set()) {
+    std::vector<DERElement> digest_algos;
+    if (parse_der_children(sd_children[1], digest_algos) &&
+        !digest_algos.empty()) {
+      result.digest_algorithm = identify_digest_algorithm(digest_algos[0]);
+    }
+  }
+
+  // Find certificates [0] and signerInfos (the last SET in the sequence)
+  const DERElement* certs_elem = nullptr;
+  const DERElement* signer_infos_elem = nullptr;
+
+  for (size_t i = 3; i < sd_children.size(); i++) {
+    if (sd_children[i].is_context(0)) {
+      certs_elem = &sd_children[i];
+    } else if (sd_children[i].is_set()) {
+      // The last SET we encounter is signerInfos
+      signer_infos_elem = &sd_children[i];
+    }
+  }
+
+  // --- Extract signer's Common Name from the first certificate ---
+  if (certs_elem) {
+    std::vector<DERElement> certs;
+    if (parse_der_children(*certs_elem, certs) && !certs.empty()) {
+      // First certificate: SEQUENCE { tbsCertificate, signatureAlgorithm,
+      // signatureValue }
+      const DERElement& cert = certs[0];
+      if (cert.is_sequence()) {
+        std::vector<DERElement> cert_children;
+        if (parse_der_children(cert, cert_children) && !cert_children.empty()) {
+          // tbsCertificate is the first SEQUENCE
+          const DERElement& tbs = cert_children[0];
+          if (tbs.is_sequence()) {
+            std::vector<DERElement> tbs_children;
+            if (parse_der_children(tbs, tbs_children)) {
+              // TBSCertificate: version [0], serial, signature, issuer, validity,
+              // subject, ...
+              // Subject is typically at index 5 (after version, serial,
+              // sigAlgo, issuer, validity)
+              // But version [0] is optional -- if present, subject is at idx 5;
+              // if absent, at idx 4.
+              size_t subject_idx = 5;
+              if (tbs_children.size() > 0 && tbs_children[0].is_context(0)) {
+                subject_idx = 5;
+              } else {
+                subject_idx = 4;
+              }
+              if (subject_idx < tbs_children.size()) {
+                result.signer_name =
+                    extract_common_name(tbs_children[subject_idx]);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // --- Parse SignerInfo to extract authenticated attributes ---
+  if (!signer_infos_elem) {
+    result.error = "No signerInfos found in SignedData";
+    return result;
+  }
+
+  std::vector<DERElement> signer_infos;
+  if (!parse_der_children(*signer_infos_elem, signer_infos) ||
+      signer_infos.empty()) {
+    result.error = "signerInfos SET is empty";
+    return result;
+  }
+
+  // Take the first SignerInfo
+  // SignerInfo ::= SEQUENCE {
+  //   version                  INTEGER,
+  //   sid                      SignerIdentifier,
+  //   digestAlgorithm          AlgorithmIdentifier,
+  //   authenticatedAttributes  [0] IMPLICIT SET OF Attribute  OPTIONAL,
+  //   digestEncryptionAlgorithm AlgorithmIdentifier,
+  //   encryptedDigest          OCTET STRING,
+  //   unauthenticatedAttributes [1] IMPLICIT SET OF Attribute  OPTIONAL
+  // }
+  const DERElement& signer_info = signer_infos[0];
+  if (!signer_info.is_sequence()) {
+    result.error = "SignerInfo is not a SEQUENCE";
+    return result;
+  }
+
+  std::vector<DERElement> si_children;
+  if (!parse_der_children(signer_info, si_children) ||
+      si_children.size() < 4) {
+    result.error = "SignerInfo has too few elements";
+    return result;
+  }
+
+  // si_children[0] = version (INTEGER)
+  // si_children[1] = sid (SEQUENCE for issuerAndSerialNumber or [0] for
+  //                  subjectKeyIdentifier)
+  // si_children[2] = digestAlgorithm (SEQUENCE)
+  // Then possibly [0] authenticatedAttributes
+  // Then digestEncryptionAlgorithm, encryptedDigest, ...
+
+  // Override digest_algorithm from SignerInfo's digestAlgorithm if empty
+  if (result.digest_algorithm.empty() || result.digest_algorithm == "Unknown") {
+    if (si_children.size() > 2 && si_children[2].is_sequence()) {
+      result.digest_algorithm = identify_digest_algorithm(si_children[2]);
+    }
+  }
+
+  // Find authenticatedAttributes [0]
+  const DERElement* auth_attrs = nullptr;
+  for (size_t i = 3; i < si_children.size(); i++) {
+    if (si_children[i].is_context(0)) {
+      auth_attrs = &si_children[i];
+      break;
+    }
+  }
+
+  if (!auth_attrs) {
+    // No authenticated attributes -- in this case the message digest is the
+    // direct hash of the content.  We can still check integrity but cannot
+    // extract signing time.
+    //
+    // Without authenticated attributes the encryptedDigest directly signs the
+    // content hash.  We only verify that the computed digest matches
+    // signed_data_digest stored in the field (already computed at parse time).
+    if (!field.signed_data_digest.empty() &&
+        field.signed_data_digest == computed_digest) {
+      result.integrity_valid = true;
+      result.signature_valid = true;
+      result.success = true;
+    } else {
+      result.error = "No authenticated attributes and digest mismatch";
+    }
+    return result;
+  }
+
+  // --- Extract message digest from authenticated attributes ---
+  std::vector<uint8_t> pkcs7_digest;
+  if (!extract_message_digest(*auth_attrs, pkcs7_digest)) {
+    result.error = "Failed to find messageDigest attribute in SignerInfo";
+    return result;
+  }
+
+  // --- Extract signing time ---
+  extract_signing_time(*auth_attrs, result.signing_time);
+
+  // --- Step (c): Compare the digests ---
+  // The messageDigest attribute should contain the hash of the byte-range data.
+  // We need to compare using the appropriate algorithm.
+  //
+  // The computed_digest above is always SHA-256. If the signature uses a
+  // different algorithm, we need to recompute.
+
+  std::vector<uint8_t> final_computed_digest;
+  if (result.digest_algorithm == "SHA-256" ||
+      result.digest_algorithm.empty()) {
+    final_computed_digest = computed_digest;
+  } else if (result.digest_algorithm == "SHA-1") {
+    // SHA-1 is not implemented in crypto.hh, fall back to noting this
+    result.error =
+        "SHA-1 digest algorithm detected but not implemented; "
+        "cannot verify integrity";
+    // Still set what we found
+    result.signature_valid = true;  // Structure parsed OK
+    return result;
+  } else if (result.digest_algorithm == "MD5") {
+    // Recompute with MD5
+    nanopdf::crypto::MD5 md5;
+    for (size_t i = 0; i < field.byte_range.size(); i += 2) {
+      uint64_t offset = field.byte_range[i];
+      uint64_t length = field.byte_range[i + 1];
+      if (length == 0) continue;
+      md5.update(pdf.data + static_cast<size_t>(offset),
+                 static_cast<size_t>(length));
+    }
+    md5.finalize();
+    final_computed_digest.resize(nanopdf::crypto::MD5::DIGEST_SIZE);
+    md5.get_digest(final_computed_digest.data());
+  } else {
+    result.error = "Unsupported digest algorithm: " + result.digest_algorithm;
+    result.signature_valid = true;  // Structure parsed OK
+    return result;
+  }
+
+  // Compare
+  if (pkcs7_digest.size() == final_computed_digest.size() &&
+      std::memcmp(pkcs7_digest.data(), final_computed_digest.data(),
+                  pkcs7_digest.size()) == 0) {
+    result.integrity_valid = true;
+  } else {
+    result.error = "Message digest mismatch: ByteRange hash does not match "
+                   "messageDigest attribute in PKCS#7";
+  }
+
+  // If integrity is valid, mark signature_valid to indicate the PKCS#7
+  // structure is well-formed.  We do NOT verify the RSA/ECDSA signature
+  // over the authenticated attributes.
+  result.signature_valid = result.integrity_valid;
+  result.success = result.integrity_valid;
+
+  return result;
 }
 
 }  // namespace nanopdf

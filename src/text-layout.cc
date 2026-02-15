@@ -355,6 +355,146 @@ std::string TextPage::get_text() const {
   return result;
 }
 
+std::string TextPage::to_markdown() const {
+  if (lines.empty()) return "";
+
+  // Sort lines by reading order
+  std::vector<const TextLine*> sorted_lines;
+  for (const auto& line : lines) {
+    sorted_lines.push_back(&line);
+  }
+  std::sort(sorted_lines.begin(), sorted_lines.end(),
+            [](const TextLine* a, const TextLine* b) {
+              return a->reading_order < b->reading_order;
+            });
+
+  // Compute body font size as the mode (most common) font size
+  std::map<int, int> size_counts;
+  for (const auto& ch : chars) {
+    if (ch.font_size > 0) {
+      int size_key = static_cast<int>(ch.font_size * 10 + 0.5);  // 0.1pt resolution
+      size_counts[size_key]++;
+    }
+  }
+  double body_font_size = 12.0;
+  int max_count = 0;
+  for (const auto& sc : size_counts) {
+    if (sc.second > max_count) {
+      max_count = sc.second;
+      body_font_size = sc.first / 10.0;
+    }
+  }
+
+  // Compute average line height for paragraph break detection
+  double avg_line_height = 0.0;
+  int line_height_count = 0;
+  for (size_t i = 1; i < sorted_lines.size(); ++i) {
+    double gap = std::abs(sorted_lines[i - 1]->y - sorted_lines[i]->y);
+    if (gap > 0.1 && gap < body_font_size * 5) {
+      avg_line_height += gap;
+      line_height_count++;
+    }
+  }
+  if (line_height_count > 0) avg_line_height /= line_height_count;
+  if (avg_line_height < 1.0) avg_line_height = body_font_size * 1.2;
+
+  std::string result;
+  bool prev_was_blank = false;
+
+  for (size_t i = 0; i < sorted_lines.size(); ++i) {
+    const TextLine* line = sorted_lines[i];
+    std::string text = line->get_text();
+
+    // Trim trailing whitespace
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t'))
+      text.pop_back();
+    if (text.empty()) {
+      if (!prev_was_blank) result += "\n";
+      prev_was_blank = true;
+      continue;
+    }
+    prev_was_blank = false;
+
+    // Determine dominant font size for this line
+    double line_font_size = body_font_size;
+    if (!line->chars.empty()) {
+      // Use the font size of the first non-space character
+      for (const auto& ch : line->chars) {
+        if (ch.font_size > 0 && ch.unicode > 32) {
+          line_font_size = ch.font_size;
+          break;
+        }
+      }
+    }
+
+    // Heading detection: font size ratio relative to body
+    double ratio = line_font_size / body_font_size;
+    if (ratio >= 1.8) {
+      result += "# " + text + "\n\n";
+      continue;
+    } else if (ratio >= 1.4) {
+      result += "## " + text + "\n\n";
+      continue;
+    } else if (ratio >= 1.15) {
+      result += "### " + text + "\n\n";
+      continue;
+    }
+
+    // List detection: check for bullet or number patterns
+    bool is_list = false;
+    if (text.size() >= 2) {
+      // Bullet patterns: "- ", "* ", "o ", bullet char
+      char first = text[0];
+      if ((first == '-' || first == '*') && text[1] == ' ') {
+        is_list = true;
+      }
+      // Number patterns: "1. ", "2) ", "(a) "
+      if (!is_list && std::isdigit(static_cast<unsigned char>(first))) {
+        size_t j = 1;
+        while (j < text.size() && std::isdigit(static_cast<unsigned char>(text[j]))) ++j;
+        if (j < text.size() && (text[j] == '.' || text[j] == ')') &&
+            j + 1 < text.size() && text[j + 1] == ' ') {
+          is_list = true;
+        }
+      }
+      // Unicode bullet (U+2022 = 0xE2 0x80 0xA2 in UTF-8)
+      if (!is_list && text.size() >= 3 &&
+          static_cast<uint8_t>(text[0]) == 0xE2 &&
+          static_cast<uint8_t>(text[1]) == 0x80 &&
+          static_cast<uint8_t>(text[2]) == 0xA2) {
+        is_list = true;
+        text = "- " + text.substr(3);
+        // Trim leading space
+        while (text.size() > 2 && text[2] == ' ') text.erase(2, 1);
+      }
+    }
+
+    if (is_list) {
+      result += text + "\n";
+      continue;
+    }
+
+    // Paragraph break detection: gap > 1.5x average line height
+    if (i > 0) {
+      double gap = std::abs(sorted_lines[i - 1]->y - line->y);
+      if (gap > avg_line_height * 1.5) {
+        // Ensure previous content ends with double newline
+        if (!result.empty() && result.back() != '\n') {
+          result += "\n";
+        }
+        if (result.size() >= 2 && result[result.size() - 2] != '\n') {
+          result += "\n";
+        }
+      }
+    }
+
+    // Regular text line - join words with space
+    result += text + "\n";
+  }
+
+  return result;
+}
+
 std::string TextPage::get_text_in_rect(double x1, double y1, double x2, double y2) const {
   std::string result;
 

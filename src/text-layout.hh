@@ -94,6 +94,9 @@ struct TextPage {
   // Get all text in reading order
   std::string get_text() const;
 
+  // Get text as Markdown with heading/list/paragraph/table detection
+  std::string to_markdown() const;
+
   // Spatial queries
   std::string get_text_in_rect(double x1, double y1, double x2, double y2) const;
 

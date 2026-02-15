@@ -46,6 +46,7 @@ struct Table {
   std::string to_csv() const;
   std::string to_html() const;
   std::string to_json() const;
+  std::string to_markdown() const;
 
   // Get all text from table (row by row)
   std::string get_text() const;

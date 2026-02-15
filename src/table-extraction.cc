@@ -390,6 +390,70 @@ std::string Table::to_json() const {
   return oss.str();
 }
 
+std::string Table::to_markdown() const {
+  if (rows == 0 || cols == 0) return "";
+
+  std::ostringstream oss;
+
+  // Compute max width per column for alignment
+  std::vector<size_t> col_widths(cols, 3);  // Minimum 3 for "---"
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      // Replace pipes in text to avoid breaking markdown tables
+      std::string cell_text = cells[r][c].text;
+      // Trim whitespace
+      while (!cell_text.empty() && (cell_text.back() == ' ' || cell_text.back() == '\n'))
+        cell_text.pop_back();
+      while (!cell_text.empty() && (cell_text.front() == ' ' || cell_text.front() == '\n'))
+        cell_text.erase(cell_text.begin());
+      size_t len = cell_text.size();
+      if (len > col_widths[c]) col_widths[c] = len;
+    }
+  }
+
+  // Helper to output a row
+  auto emit_row = [&](int r) {
+    oss << "|";
+    for (int c = 0; c < cols; ++c) {
+      std::string text = cells[r][c].text;
+      // Trim
+      while (!text.empty() && (text.back() == ' ' || text.back() == '\n'))
+        text.pop_back();
+      while (!text.empty() && (text.front() == ' ' || text.front() == '\n'))
+        text.erase(text.begin());
+      // Escape pipes
+      for (size_t p = 0; p < text.size(); ++p) {
+        if (text[p] == '|') { text.insert(p, "\\"); ++p; }
+      }
+      oss << " " << text;
+      // Pad
+      for (size_t pad = text.size(); pad < col_widths[c]; ++pad)
+        oss << ' ';
+      oss << " |";
+    }
+    oss << "\n";
+  };
+
+  // First row (header)
+  emit_row(0);
+
+  // Separator row
+  oss << "|";
+  for (int c = 0; c < cols; ++c) {
+    oss << " ";
+    for (size_t d = 0; d < col_widths[c]; ++d) oss << '-';
+    oss << " |";
+  }
+  oss << "\n";
+
+  // Data rows
+  for (int r = 1; r < rows; ++r) {
+    emit_row(r);
+  }
+
+  return oss.str();
+}
+
 std::string Table::get_text() const {
   std::ostringstream oss;
 

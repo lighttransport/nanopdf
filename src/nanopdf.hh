@@ -63,6 +63,13 @@ struct XRefSection {
   uint32_t num_objectsid{0};
 };
 
+// Parse options for controlling error recovery behavior
+struct ParseOptions {
+  bool auto_repair{false};           // If true, attempt xref repair on parse failure
+  bool recover_stream_length{false}; // If true, scan for endstream when Length is wrong
+  size_t max_repair_scan{0};         // Max bytes to scan during repair (0 = entire file)
+};
+
 bool parse_from_memory(const uint8_t* addr, const size_t size);
 
 struct StreamValue {
@@ -502,6 +509,21 @@ struct FreeTextAnnotation : public Annotation {
   FreeTextAnnotation() : Annotation(AnnotationType::FreeText) {}
 };
 
+// Redaction annotation
+struct RedactionAnnotation {
+  std::vector<double> rect;           // Annotation rectangle
+  std::vector<std::vector<double>> quad_points;  // Precise redaction areas
+  double overlay_color_r{0.0};        // Overlay color (default black)
+  double overlay_color_g{0.0};
+  double overlay_color_b{0.0};
+  bool has_overlay_color{true};
+  std::string overlay_text;           // Text to show over redacted area
+  std::string overlay_font;           // Font for overlay text
+  double overlay_font_size{12.0};
+  int repeat{0};                      // Whether to repeat overlay text
+  uint32_t object_number{0};          // Source annotation object number
+};
+
 // Widget annotation for form fields
 struct WidgetAnnotation : public Annotation {
   FieldType field_type;
@@ -644,6 +666,17 @@ struct SignatureField {
   std::vector<uint8_t> timestamp_token;    // Raw RFC 3161 timestamp token
 
   SignatureField() = default;
+};
+
+// Result of digital signature validation
+struct SignatureValidationResult {
+  bool success{false};            // Overall validation succeeded
+  bool integrity_valid{false};    // ByteRange hash matches digest in PKCS#7
+  bool signature_valid{false};    // PKCS#7 structure is well-formed (RSA not verified)
+  std::string signer_name;        // Common name from signer certificate
+  std::string signing_time;       // Signing time from authenticated attributes
+  std::string digest_algorithm;   // e.g., "SHA-256", "SHA-1"
+  std::string error;              // Error message if validation failed
 };
 
 // Font descriptor containing metrics and font file data
@@ -802,6 +835,46 @@ struct PageContent {
   std::string error;
 };
 
+// Action types for document/page actions (forward-declared before Page)
+enum class ActionType {
+  None,
+  GoTo,        // Go to destination in this document
+  GoToR,       // Go to destination in another document
+  Launch,      // Launch application
+  URI,         // Open URI
+  Named,       // Execute named action (NextPage, PrevPage, FirstPage, LastPage)
+  JavaScript   // Execute JavaScript
+};
+
+// PDF Action (for /OpenAction, /AA, link annotations, etc.)
+struct Action {
+  ActionType type{ActionType::None};
+  std::string uri;                     // For URI actions
+  std::string named_action;            // For Named actions
+  std::string javascript;              // For JavaScript actions
+  std::string file;                    // For GoToR/Launch
+  uint32_t dest_page{0};               // For GoTo actions
+  std::vector<double> dest_position;   // For GoTo actions [x, y, zoom, ...]
+  std::string dest_fit_type;           // Fit, FitH, FitV, etc.
+
+  bool has_action() const { return type != ActionType::None; }
+};
+
+// Additional actions dictionary (/AA)
+struct AdditionalActions {
+  Action on_open;      // O - Action on page open
+  Action on_close;     // C - Action on page close
+  Action on_visible;   // PV - Action when page becomes visible
+  Action on_invisible; // PI - Action when page becomes invisible
+
+  // Document-level additional actions
+  Action will_close;   // WC - Before closing document
+  Action will_save;    // WS - Before saving document
+  Action did_save;     // DS - After saving document
+  Action will_print;   // WP - Before printing
+  Action did_print;    // DP - After printing
+};
+
 struct Page {
   uint32_t object_number{0};
   uint32_t page_number{0};
@@ -813,6 +886,8 @@ struct Page {
   mutable std::map<std::string, std::unique_ptr<BaseFont>> fonts;  // Font resources
   mutable bool fonts_loaded{false};  // Lazy font loading flag
   std::vector<std::unique_ptr<Annotation>> annotations;  // Page annotations
+  std::vector<RedactionAnnotation> redaction_annotations;  // Redaction annotations
+  AdditionalActions additional_actions;  // /AA (page-level)
 
   PageContent load_contents(const Pdf& pdf) const;
   void ensure_fonts_loaded(const Pdf& pdf) const;  // Lazy font loading
@@ -911,7 +986,30 @@ struct XMPMetadata {
   std::string pdf_producer;
   std::string pdf_version;
 
+  // PDF/A identification (from pdfaid namespace)
+  int pdfa_part{0};                  // pdfaid:part (1, 2, 3, 4)
+  std::string pdfa_conformance;      // pdfaid:conformance ("A", "B", "U")
+
+  // PDF/A helpers
+  bool is_pdfa() const { return pdfa_part > 0; }
+  std::string pdfa_level() const {
+    if (pdfa_part <= 0) return "";
+    std::string level = "PDF/A-" + std::to_string(pdfa_part);
+    if (!pdfa_conformance.empty()) level += pdfa_conformance;
+    return level;
+  }
+
   bool parse_xml(const std::string& xml);
+};
+
+// Output intent information (from /OutputIntents array in catalog)
+struct OutputIntentInfo {
+  std::string subtype;                // /S - e.g., "GTS_PDFA1"
+  std::string output_condition;       // /OutputCondition
+  std::string output_condition_id;    // /OutputConditionIdentifier
+  std::string registry_name;          // /RegistryName
+  std::string info;                   // /Info
+  std::vector<uint8_t> dest_output_profile;  // /DestOutputProfile ICC data
 };
 
 // Forward declarations
@@ -938,6 +1036,14 @@ enum class PermissionFlags : uint32_t {
   PrintHighQuality = 0x00000800      // Bit 12
 };
 
+// Crypt filter entry from CF dictionary
+struct CryptFilterEntry {
+  std::string name;             // Filter name (e.g., "StdCF")
+  std::string cfm;              // Crypt filter method: "None", "V2" (RC4), "AESV2", "AESV3"
+  int length{0};                // Key length in bytes (0 = use default from encrypt dict)
+  std::string auth_event;       // "DocOpen" or "EFOpen"
+};
+
 struct EncryptionDictionary {
   std::string filter;           // Security handler name (usually "Standard")
   int v = 0;                    // Encryption algorithm version (1-5)
@@ -950,8 +1056,11 @@ struct EncryptionDictionary {
 
   // For AES encryption (V=4)
   std::string cf;               // Crypt filter
-  std::string stm_f;            // Stream filter
-  std::string str_f;            // String filter
+  std::string stm_f;            // Stream filter name
+  std::string str_f;            // String filter name
+
+  // Parsed crypt filter entries from CF dictionary
+  std::map<std::string, CryptFilterEntry> crypt_filters;
 
   // For AES-256 (V=5)
   std::string oe;               // Owner encryption key
@@ -972,8 +1081,10 @@ struct SecurityHandler {
   bool authenticate_owner_password(const std::string& password);
 
   // Encryption/decryption
-  std::vector<uint8_t> decrypt_string(const std::string& str, uint32_t obj_num, uint16_t gen_num) const;
-  std::vector<uint8_t> decrypt_stream(const std::vector<uint8_t>& data, uint32_t obj_num, uint16_t gen_num) const;
+  std::vector<uint8_t> decrypt_string(const std::string& str, uint32_t obj_num, uint16_t gen_num,
+                                       const std::string& crypt_filter_name = "") const;
+  std::vector<uint8_t> decrypt_stream(const std::vector<uint8_t>& data, uint32_t obj_num, uint16_t gen_num,
+                                       const std::string& crypt_filter_name = "") const;
   std::vector<uint8_t> encrypt_string(const std::string& str, uint32_t obj_num, uint16_t gen_num);
   std::vector<uint8_t> encrypt_stream(const std::vector<uint8_t>& data, uint32_t obj_num, uint16_t gen_num);
 
@@ -1069,6 +1180,30 @@ struct DocumentCatalog {
 
   // Optional Content Groups (Layers)
   OptionalContentProperties ocg_properties;
+
+  // Output intents (PDF/A, PDF/X)
+  std::vector<OutputIntentInfo> output_intents;
+
+  // Document actions
+  Action open_action;                    // /OpenAction
+  AdditionalActions additional_actions;  // /AA (document-level)
+};
+
+// Linearization parameters (PDF 1.2+, "fast web view")
+struct LinearizationParams {
+  bool is_linearized{false};
+  double version{1.0};       // Linearization version (e.g. 1.0)
+  uint64_t file_length{0};   // /L - File length
+  uint32_t first_page_obj{0}; // /O - Object number of first page's page object
+  uint64_t first_page_end{0}; // /E - Offset of end of first page
+  uint32_t num_pages{0};      // /N - Number of pages
+  uint64_t xref_offset{0};    // /T - Offset of main xref (in non-linearized part)
+  // Hint table offsets: /H array [offset length]
+  uint64_t hint_offset{0};
+  uint64_t hint_length{0};
+  // Optional second hint table entry
+  uint64_t hint_offset2{0};
+  uint64_t hint_length2{0};
 };
 
 // Now we can define Pdf after its dependencies
@@ -1092,6 +1227,7 @@ struct Pdf {
 
   DocumentCatalog catalog;
   SecurityHandler security;
+  LinearizationParams linearization;
   mutable std::map<uint64_t, Value> object_cache;
   mutable std::unordered_map<uint64_t, uint64_t> object_offsets;
   mutable bool object_offsets_built{false};
@@ -1129,6 +1265,7 @@ struct Pdf {
   mutable bool named_destinations_loaded{false};
   mutable bool document_info_loaded{false};
   mutable bool xmp_metadata_loaded{false};
+  mutable bool optional_content_loaded{false};
 
   bool load_document_structure();
 
@@ -1139,6 +1276,7 @@ struct Pdf {
   void ensure_page_labels_loaded() const;
   void ensure_named_destinations_loaded() const;
   void ensure_metadata_loaded() const;
+  void ensure_optional_content_loaded() const;
   const Page* get_page(uint32_t page_number) const;
   ResolvedObject load_object(uint32_t obj_num, uint16_t gen_num) const;
   bool build_object_offset_cache() const;
@@ -1171,6 +1309,11 @@ class Parser;
 
 // Function declarations
 bool parse_from_memory(const uint8_t* addr, const size_t size, Pdf* out_pdf);
+bool parse_from_memory(const uint8_t* addr, const size_t size, Pdf* out_pdf,
+                       const ParseOptions& options);
+bool repair_xref(const uint8_t* data, size_t size, Pdf* out_pdf);
+bool recover_stream_length(const uint8_t* data, size_t size, size_t stream_start,
+                           size_t* out_length);
 ResolvedObject resolve_reference(const Pdf& pdf, uint32_t obj_num,
                                  uint16_t gen_num);
 bool parse_indirect_object(StreamReader& sr, Parser& parser, Value* out_value);
@@ -1192,6 +1335,28 @@ std::map<std::string, ImageXObject> parse_xobject_resources(const Pdf& pdf, cons
 
 // Text extraction functions
 std::string extract_text_from_page(const Pdf& pdf, const Page& page);
+
+// Text search result
+struct TextSearchResult {
+  uint32_t page_number{0};
+  size_t char_index{0};      // Index of first matching character in text
+  size_t length{0};          // Length of match
+  double x{0.0}, y{0.0};    // Position of first character
+  double width{0.0}, height{0.0};  // Bounding box of match
+  std::string context;       // Surrounding text context
+};
+
+// Search text across all pages
+std::vector<TextSearchResult> search_text(const Pdf& pdf,
+                                          const std::string& query,
+                                          bool case_sensitive = false,
+                                          int max_results = -1);
+
+// Search text on a specific page
+std::vector<TextSearchResult> search_text_on_page(const Pdf& pdf,
+                                                  const Page& page,
+                                                  const std::string& query,
+                                                  bool case_sensitive = false);
 
 // Font parsing functions
 std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& font_dict);
@@ -1241,6 +1406,11 @@ void parse_named_destinations(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_document_info(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_xmp_metadata(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_optional_content(const Pdf& pdf, DocumentCatalog& catalog);
+void parse_output_intents(const Pdf& pdf, DocumentCatalog& catalog);
+Action parse_action(const Pdf& pdf, const Dictionary& action_dict);
+Action parse_action(const Pdf& pdf, const Value& action_val);
+AdditionalActions parse_additional_actions(const Pdf& pdf, const Dictionary& aa_dict);
+void parse_document_actions(const Pdf& pdf, DocumentCatalog& catalog);
 
 // Phase 6.2: Advanced Graphics - Transparency and Blending
 
@@ -1574,6 +1744,13 @@ bool is_tagged_pdf(const Pdf& pdf);
 
 // Get structure element for a marked content ID
 StructureElement* find_structure_element_by_mcid(StructureElement* root, int mcid, uint32_t page_ref);
+
+// Digital signature validation
+// Validates the integrity of a PDF digital signature by checking the ByteRange
+// digest against the message digest embedded in the PKCS#7/CMS SignedData
+// structure. Does not perform RSA/ECDSA cryptographic verification.
+SignatureValidationResult validate_signature(const Pdf& pdf,
+                                             const SignatureField& field);
 
 // Stream filter processing namespace declaration remains the same
 namespace filters {

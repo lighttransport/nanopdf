@@ -88,7 +88,39 @@ EncryptionDictionary parse_encryption_dictionary(const Pdf& pdf, const Dictionar
   if (result.v >= 4) {
     auto cf_it = encrypt_dict.find("CF");
     if (cf_it != encrypt_dict.end() && cf_it->second.type == Value::DICTIONARY) {
-      // Parse crypt filters - simplified for now
+      // Parse each crypt filter entry
+      for (const auto& cf_pair : cf_it->second.dict) {
+        const Value* cf_val = &cf_pair.second;
+        // Resolve reference if needed
+        ResolvedObject cf_resolved;
+        if (cf_val->type == Value::REFERENCE) {
+          cf_resolved = resolve_reference(pdf, cf_val->ref_object_number,
+                                          cf_val->ref_generation_number);
+          if (!cf_resolved.success) continue;
+          cf_val = &cf_resolved.value;
+        }
+        if (cf_val->type != Value::DICTIONARY) continue;
+
+        CryptFilterEntry entry;
+        entry.name = cf_pair.first;
+
+        auto cfm_it = cf_val->dict.find("CFM");
+        if (cfm_it != cf_val->dict.end() && cfm_it->second.type == Value::NAME) {
+          entry.cfm = cfm_it->second.name;
+        }
+
+        auto len_it = cf_val->dict.find("Length");
+        if (len_it != cf_val->dict.end() && len_it->second.type == Value::NUMBER) {
+          entry.length = static_cast<int>(len_it->second.number);
+        }
+
+        auto ae_it = cf_val->dict.find("AuthEvent");
+        if (ae_it != cf_val->dict.end() && ae_it->second.type == Value::NAME) {
+          entry.auth_event = ae_it->second.name;
+        }
+
+        result.crypt_filters[entry.name] = entry;
+      }
     }
 
     auto stmf_it = encrypt_dict.find("StmF");
@@ -543,19 +575,33 @@ bool SecurityHandler::authenticate_owner_password(const std::string& password) {
 
 std::vector<uint8_t> SecurityHandler::decrypt_string(const std::string& str,
                                                      uint32_t obj_num,
-                                                     uint16_t gen_num) const {
+                                                     uint16_t gen_num,
+                                                     const std::string& crypt_filter_name) const {
   if (!authenticated || encryption_key.empty()) {
     return std::vector<uint8_t>(str.begin(), str.end());
+  }
+
+  // Determine effective algorithm from crypt filter if specified
+  EncryptionAlgorithm effective_algo = algorithm;
+  if (!crypt_filter_name.empty() && !encrypt_dict.crypt_filters.empty()) {
+    auto cf_it = encrypt_dict.crypt_filters.find(crypt_filter_name);
+    if (cf_it != encrypt_dict.crypt_filters.end()) {
+      const auto& cfm = cf_it->second.cfm;
+      if (cfm == "None") return std::vector<uint8_t>(str.begin(), str.end());
+      if (cfm == "V2") effective_algo = EncryptionAlgorithm::RC4_128;
+      else if (cfm == "AESV2") effective_algo = EncryptionAlgorithm::AES_128;
+      else if (cfm == "AESV3") effective_algo = EncryptionAlgorithm::AES_256;
+    }
   }
 
   std::vector<uint8_t> data(str.begin(), str.end());
   auto obj_key = compute_object_key(obj_num, gen_num);
 
-  if (algorithm == EncryptionAlgorithm::RC4_40 || algorithm == EncryptionAlgorithm::RC4_128) {
+  if (effective_algo == EncryptionAlgorithm::RC4_40 || effective_algo == EncryptionAlgorithm::RC4_128) {
     crypto::RC4 rc4;
     rc4.init(obj_key.data(), obj_key.size());
     rc4.crypt(data.data(), data.size());
-  } else if (algorithm == EncryptionAlgorithm::AES_128) {
+  } else if (effective_algo == EncryptionAlgorithm::AES_128) {
     // For AES, strings are encrypted in CBC mode with a random IV
     if (data.size() < 16) {
       return data; // Invalid encrypted string
@@ -584,19 +630,33 @@ std::vector<uint8_t> SecurityHandler::decrypt_string(const std::string& str,
 
 std::vector<uint8_t> SecurityHandler::decrypt_stream(const std::vector<uint8_t>& data,
                                                      uint32_t obj_num,
-                                                     uint16_t gen_num) const {
+                                                     uint16_t gen_num,
+                                                     const std::string& crypt_filter_name) const {
   if (!authenticated || encryption_key.empty()) {
     return data;
+  }
+
+  // Determine effective algorithm from crypt filter if specified
+  EncryptionAlgorithm effective_algo = algorithm;
+  if (!crypt_filter_name.empty() && !encrypt_dict.crypt_filters.empty()) {
+    auto cf_it = encrypt_dict.crypt_filters.find(crypt_filter_name);
+    if (cf_it != encrypt_dict.crypt_filters.end()) {
+      const auto& cfm = cf_it->second.cfm;
+      if (cfm == "None") return data;
+      if (cfm == "V2") effective_algo = EncryptionAlgorithm::RC4_128;
+      else if (cfm == "AESV2") effective_algo = EncryptionAlgorithm::AES_128;
+      else if (cfm == "AESV3") effective_algo = EncryptionAlgorithm::AES_256;
+    }
   }
 
   std::vector<uint8_t> result = data;
   auto obj_key = compute_object_key(obj_num, gen_num);
 
-  if (algorithm == EncryptionAlgorithm::RC4_40 || algorithm == EncryptionAlgorithm::RC4_128) {
+  if (effective_algo == EncryptionAlgorithm::RC4_40 || effective_algo == EncryptionAlgorithm::RC4_128) {
     crypto::RC4 rc4;
     rc4.init(obj_key.data(), obj_key.size());
     rc4.crypt(result.data(), result.size());
-  } else if (algorithm == EncryptionAlgorithm::AES_128) {
+  } else if (effective_algo == EncryptionAlgorithm::AES_128) {
     // For AES, streams are encrypted in CBC mode with a random IV
     if (result.size() < 16) {
       return result; // Invalid encrypted stream

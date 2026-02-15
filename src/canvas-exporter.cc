@@ -1046,6 +1046,25 @@ void CanvasExporter::emit_svg_image(const std::string& name, const ImageXObject&
   attrs["transform"] = transform.str();
   attrs["preserveAspectRatio"] = "none";
 
+  // Apply transparency: fill/stroke alpha → opacity on image
+  double opacity = std::min(state_.fill_alpha, state_.stroke_alpha);
+  if (std::abs(opacity - 1.0) > 1e-6) {
+    attrs["opacity"] = double_to_string(opacity);
+  }
+
+  // Apply blend mode
+  std::string css_mode = blend_mode_to_css(state_.blend_mode);
+  if (!css_mode.empty()) {
+    std::string style;
+    auto style_it = attrs.find("style");
+    if (style_it != attrs.end()) {
+      style = style_it->second;
+    }
+    if (!style.empty() && style.back() != ';') style += ";";
+    style += "mix-blend-mode:" + css_mode;
+    attrs["style"] = style;
+  }
+
   add_svg_element("image", attrs);
 }
 
@@ -2023,6 +2042,41 @@ void CanvasExporter::parse_content_stream_for_svg_from_tokens(const std::vector<
     } else if (token == "Do") {
       handle_xobject_command_svg(operand_stack);
       is_operator = true;
+    } else if (token == "BDC") {
+      // Begin Marked Content with properties - check for OCG reference
+      bool is_visible = true;
+      if (operand_stack.size() >= 2 && operand_stack[0] == "/OC" && current_pdf_) {
+        // Look up the OCG properties dict name in page resources
+        std::string props_name = operand_stack[1];
+        if (props_name.size() > 0 && props_name[0] == '/')
+          props_name = props_name.substr(1);
+        // Check OCG visibility
+        const_cast<Pdf*>(current_pdf_)->ensure_optional_content_loaded();
+        const auto& ocg_props = current_pdf_->catalog.ocg_properties;
+        for (const auto& ocg : ocg_props.ocgs) {
+          if (ocg.name == props_name && !ocg.visible) {
+            is_visible = false;
+            break;
+          }
+        }
+      }
+      marked_content_visibility_stack_.push_back(is_visible);
+      if (!is_visible)
+        ocg_skip_depth_++;
+      is_operator = true;
+    } else if (token == "BMC") {
+      // Begin Marked Content (simple tag) - always visible
+      marked_content_visibility_stack_.push_back(true);
+      is_operator = true;
+    } else if (token == "EMC") {
+      // End Marked Content
+      if (!marked_content_visibility_stack_.empty()) {
+        bool was_visible = marked_content_visibility_stack_.back();
+        marked_content_visibility_stack_.pop_back();
+        if (!was_visible)
+          ocg_skip_depth_--;
+      }
+      is_operator = true;
     }
 
     if (is_operator) {
@@ -2033,8 +2087,11 @@ void CanvasExporter::parse_content_stream_for_svg_from_tokens(const std::vector<
   }
 }
 
-void CanvasExporter::handle_text_command_svg(const std::string& op, 
+void CanvasExporter::handle_text_command_svg(const std::string& op,
                                             const std::vector<std::string>& operands) {
+  // Skip rendering when inside a hidden OCG layer
+  if (ocg_skip_depth_ > 0) return;
+
   if (op == "BT") {
     state_.in_text_block = true;
     state_.text_x = 0.0;
@@ -2163,8 +2220,11 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
   }
 }
 
-void CanvasExporter::handle_path_command_svg(const std::string& op, 
+void CanvasExporter::handle_path_command_svg(const std::string& op,
                                             const std::vector<std::string>& operands) {
+  // Skip rendering when inside a hidden OCG layer
+  if (ocg_skip_depth_ > 0) return;
+
   if (op == "m" && operands.size() >= 2) {
     try {
       double x = std::stod(operands[0]);
@@ -2604,6 +2664,9 @@ void CanvasExporter::apply_extended_graphics_state(const ExtendedGraphicsState& 
 }
 
 void CanvasExporter::handle_xobject_command_svg(const std::vector<std::string>& operands) {
+  // Skip rendering when inside a hidden OCG layer
+  if (ocg_skip_depth_ > 0) return;
+
   if (operands.empty()) {
     return;
   }
@@ -2613,12 +2676,183 @@ void CanvasExporter::handle_xobject_command_svg(const std::vector<std::string>& 
     name = name.substr(1);
   }
 
+  // Try as Image XObject first
   auto it = image_xobjects_.find(name);
-  if (it == image_xobjects_.end()) {
+  if (it != image_xobjects_.end()) {
+    emit_svg_image(name, it->second);
     return;
   }
 
-  emit_svg_image(name, it->second);
+  // Try as Form XObject (transparency groups, reusable content)
+  if (!current_pdf_) return;
+
+  // Look up the XObject in the page resources
+  // We need to find the Form XObject stream and render its content
+  const auto& pages = current_pdf_->catalog.pages;
+  for (const auto& page : pages) {
+    auto xobj_it = page.resources.find("XObject");
+    if (xobj_it == page.resources.end() || xobj_it->second.type != Value::DICTIONARY) {
+      continue;
+    }
+    auto form_it = xobj_it->second.dict.find(name);
+    if (form_it == xobj_it->second.dict.end()) continue;
+
+    const Value& xobj_ref = form_it->second;
+    Value resolved;
+    if (xobj_ref.type == Value::REFERENCE) {
+      ResolvedObject res = resolve_reference(*current_pdf_, xobj_ref.ref_object_number,
+                                              xobj_ref.ref_generation_number);
+      if (!res.success) continue;
+      resolved = std::move(res.value);
+    } else {
+      resolved = xobj_ref;
+    }
+
+    if (resolved.type != Value::STREAM) continue;
+
+    auto subtype_it = resolved.stream.dict.find("Subtype");
+    if (subtype_it == resolved.stream.dict.end() ||
+        subtype_it->second.type != Value::NAME ||
+        subtype_it->second.name != "Form") {
+      continue;
+    }
+
+    // Decode the Form XObject content stream
+    uint32_t obj_num = (xobj_ref.type == Value::REFERENCE) ? xobj_ref.ref_object_number : 0;
+    uint16_t gen_num = (xobj_ref.type == Value::REFERENCE) ? xobj_ref.ref_generation_number : 0;
+    DecodedStream decoded = decode_stream(*current_pdf_, resolved, obj_num, gen_num);
+    if (!decoded.success || decoded.data.empty()) continue;
+
+    // Build transparency group attributes for wrapping <g>
+    bool has_group = false;
+    bool isolated = false;
+    std::string group_blend;
+    auto group_it = resolved.stream.dict.find("Group");
+    if (group_it != resolved.stream.dict.end()) {
+      const Value* group_val = &group_it->second;
+      Value group_resolved;
+      if (group_val->type == Value::REFERENCE) {
+        ResolvedObject gr = resolve_reference(*current_pdf_, group_val->ref_object_number,
+                                               group_val->ref_generation_number);
+        if (gr.success) {
+          group_resolved = std::move(gr.value);
+          group_val = &group_resolved;
+        }
+      }
+      if (group_val->type == Value::DICTIONARY) {
+        has_group = true;
+        auto iso_it = group_val->dict.find("I");
+        if (iso_it != group_val->dict.end() && iso_it->second.type == Value::BOOLEAN) {
+          isolated = iso_it->second.boolean;
+        }
+      }
+    }
+
+    // Emit a wrapping <g> element with opacity and blend mode
+    std::map<std::string, std::string> g_attrs;
+    double opacity = std::min(state_.fill_alpha, state_.stroke_alpha);
+    if (std::abs(opacity - 1.0) > 1e-6) {
+      g_attrs["opacity"] = double_to_string(opacity);
+    }
+    std::string css_mode = blend_mode_to_css(state_.blend_mode);
+    if (!css_mode.empty()) {
+      std::string style = "mix-blend-mode:" + css_mode;
+      if (isolated || has_group) {
+        style += ";isolation:isolate";
+      }
+      g_attrs["style"] = style;
+    } else if (isolated || has_group) {
+      g_attrs["style"] = "isolation:isolate";
+    }
+
+    // Apply Form XObject matrix if present
+    auto matrix_it = resolved.stream.dict.find("Matrix");
+    if (matrix_it != resolved.stream.dict.end() &&
+        matrix_it->second.type == Value::ARRAY &&
+        matrix_it->second.array.size() >= 6) {
+      const auto& m = matrix_it->second.array;
+      if (m[0].type == Value::NUMBER && m[1].type == Value::NUMBER &&
+          m[2].type == Value::NUMBER && m[3].type == Value::NUMBER &&
+          m[4].type == Value::NUMBER && m[5].type == Value::NUMBER) {
+        std::stringstream ss;
+        ss << "matrix(" << double_to_string(m[0].number) << " "
+           << double_to_string(m[1].number) << " "
+           << double_to_string(m[2].number) << " "
+           << double_to_string(m[3].number) << " "
+           << double_to_string(m[4].number) << " "
+           << double_to_string(m[5].number) << ")";
+        g_attrs["transform"] = ss.str();
+      }
+    }
+
+    if (!g_attrs.empty()) {
+      add_svg_element("g", g_attrs);
+    }
+
+    // Save graphics state and parse the Form XObject content
+    graphics_state_stack_.push_back(state_);
+
+    // Load any resources from the Form XObject
+    auto res_it = resolved.stream.dict.find("Resources");
+    if (res_it != resolved.stream.dict.end()) {
+      const Value* res_val = &res_it->second;
+      Value res_resolved;
+      if (res_val->type == Value::REFERENCE) {
+        ResolvedObject rr = resolve_reference(*current_pdf_, res_val->ref_object_number,
+                                               res_val->ref_generation_number);
+        if (rr.success) {
+          res_resolved = std::move(rr.value);
+          res_val = &res_resolved;
+        }
+      }
+      if (res_val->type == Value::DICTIONARY) {
+        // Load image XObjects from Form's resources
+        auto form_images = parse_xobject_resources(*current_pdf_, res_val->dict);
+        for (auto& img_pair : form_images) {
+          image_xobjects_[img_pair.first] = std::move(img_pair.second);
+        }
+        // Load ExtGState resources
+        auto gs_it = res_val->dict.find("ExtGState");
+        if (gs_it != res_val->dict.end() && gs_it->second.type == Value::DICTIONARY) {
+          for (const auto& gs_entry : gs_it->second.dict) {
+            const Value* gs_val = &gs_entry.second;
+            Value gs_resolved;
+            if (gs_val->type == Value::REFERENCE) {
+              ResolvedObject gr = resolve_reference(*current_pdf_, gs_val->ref_object_number,
+                                                     gs_val->ref_generation_number);
+              if (gr.success) {
+                gs_resolved = std::move(gr.value);
+                gs_val = &gs_resolved;
+              }
+            }
+            if (gs_val->type == Value::DICTIONARY) {
+              ext_gstates_[gs_entry.first] = parse_ext_gstate(*current_pdf_, gs_val->dict);
+            }
+          }
+        }
+      }
+    }
+
+    // Tokenize and parse the content stream
+    TokenizedStream form_stream = tokenize_content_stream(decoded.data);
+    // Store any inline images from the Form XObject
+    for (auto& img : form_stream.inline_images) {
+      inline_images_.push_back(std::move(img));
+    }
+    parse_content_stream_for_svg_from_tokens(form_stream.tokens);
+
+    // Restore graphics state
+    if (!graphics_state_stack_.empty()) {
+      state_ = graphics_state_stack_.back();
+      graphics_state_stack_.pop_back();
+    }
+
+    // Close wrapping <g>
+    if (!g_attrs.empty()) {
+      add_svg_element("/g");
+    }
+    break;
+  }
 }
 
 void CanvasExporter::add_svg_element(const std::string& element_type, 
@@ -2982,7 +3216,6 @@ void CanvasExporter::parse_pattern_resources(const Pdf& pdf, const Dictionary& r
 
 // Create SVG gradient from PDF shading dictionary
 std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const Matrix2D& ctm) {
-  (void)ctm;  // TODO: Apply CTM transform to gradient coordinates
   if (!current_pdf_) return "";
 
   Value shading = shading_val;
@@ -3027,10 +3260,20 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
   const auto& coords = coords_it->second.array;
   if (shading_type == 2 && coords.size() >= 4) {
     // Linear gradient: x0, y0, x1, y1
-    if (coords[0].type == Value::NUMBER) gradient.x1 = coords[0].number;
-    if (coords[1].type == Value::NUMBER) gradient.y1 = page_height_ - coords[1].number;
-    if (coords[2].type == Value::NUMBER) gradient.x2 = coords[2].number;
-    if (coords[3].type == Value::NUMBER) gradient.y2 = page_height_ - coords[3].number;
+    double gx1 = 0, gy1 = 0, gx2 = 0, gy2 = 0;
+    if (coords[0].type == Value::NUMBER) gx1 = coords[0].number;
+    if (coords[1].type == Value::NUMBER) gy1 = coords[1].number;
+    if (coords[2].type == Value::NUMBER) gx2 = coords[2].number;
+    if (coords[3].type == Value::NUMBER) gy2 = coords[3].number;
+
+    // Apply CTM transform to gradient coordinates
+    apply_matrix_to_point(ctm, gx1, gy1);
+    apply_matrix_to_point(ctm, gx2, gy2);
+
+    gradient.x1 = gx1;
+    gradient.y1 = page_height_ - gy1;
+    gradient.x2 = gx2;
+    gradient.y2 = page_height_ - gy2;
   } else if (shading_type == 3 && coords.size() >= 6) {
     // Radial gradient: x0, y0, r0, x1, y1, r1
     double x0 = 0, y0 = 0, r0 = 0, x1 = 0, y1 = 0, r1 = 0;
@@ -3041,10 +3284,19 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
     if (coords[4].type == Value::NUMBER) y1 = coords[4].number;
     if (coords[5].type == Value::NUMBER) r1 = coords[5].number;
 
+    // Apply CTM transform to gradient center and focal points
+    apply_matrix_to_point(ctm, x0, y0);
+    apply_matrix_to_point(ctm, x1, y1);
+
+    // Scale radius by the average scale factor of the CTM
+    double scale_x = std::sqrt(ctm.a * ctm.a + ctm.b * ctm.b);
+    double scale_y = std::sqrt(ctm.c * ctm.c + ctm.d * ctm.d);
+    double scale = (scale_x + scale_y) * 0.5;
+
     // SVG radial gradient uses outer circle (cx, cy, r) and focal point (fx, fy)
     gradient.cx = x1;
     gradient.cy = page_height_ - y1;
-    gradient.r = r1;
+    gradient.r = r1 * scale;
     gradient.fx = x0;
     gradient.fy = page_height_ - y0;
     (void)r0;  // Inner radius not directly supported in SVG
@@ -3139,7 +3391,6 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
 
 // Create SVG pattern from PDF pattern dictionary
 std::string CanvasExporter::create_svg_pattern(const Value& pattern_val, const Matrix2D& ctm) {
-  (void)ctm;  // TODO: Apply CTM transform to pattern
   if (!current_pdf_) return "";
 
   Value pattern = pattern_val;
@@ -3208,22 +3459,38 @@ std::string CanvasExporter::create_svg_pattern(const Value& pattern_val, const M
     svg_pattern.height = std::abs(ystep_it->second.number);
   }
 
-  // Get pattern matrix
+  // Get pattern matrix and combine with CTM
+  Matrix2D pattern_matrix;  // Identity by default
   auto matrix_it = dict.find("Matrix");
   if (matrix_it != dict.end() && matrix_it->second.type == Value::ARRAY &&
       matrix_it->second.array.size() >= 6) {
     const auto& m = matrix_it->second.array;
+    if (m[0].type == Value::NUMBER) pattern_matrix.a = m[0].number;
+    if (m[1].type == Value::NUMBER) pattern_matrix.b = m[1].number;
+    if (m[2].type == Value::NUMBER) pattern_matrix.c = m[2].number;
+    if (m[3].type == Value::NUMBER) pattern_matrix.d = m[3].number;
+    if (m[4].type == Value::NUMBER) pattern_matrix.e = m[4].number;
+    if (m[5].type == Value::NUMBER) pattern_matrix.f = m[5].number;
+  }
+
+  // Combine pattern matrix with CTM: final = CTM * patternMatrix
+  // Then apply PDF-to-SVG Y-flip
+  Matrix2D combined = multiply_matrices(ctm, pattern_matrix);
+  Matrix2D y_flip;
+  y_flip.a = 1.0; y_flip.b = 0.0;
+  y_flip.c = 0.0; y_flip.d = -1.0;
+  y_flip.e = 0.0; y_flip.f = page_height_;
+  combined = multiply_matrices(y_flip, combined);
+
+  {
     std::stringstream transform;
-    transform << "matrix(";
-    for (size_t i = 0; i < 6; i++) {
-      if (i > 0) transform << " ";
-      if (m[i].type == Value::NUMBER) {
-        transform << double_to_string(m[i].number);
-      } else {
-        transform << "1";
-      }
-    }
-    transform << ")";
+    transform << "matrix("
+              << double_to_string(combined.a) << " "
+              << double_to_string(combined.b) << " "
+              << double_to_string(combined.c) << " "
+              << double_to_string(combined.d) << " "
+              << double_to_string(combined.e) << " "
+              << double_to_string(combined.f) << ")";
     svg_pattern.transform = transform.str();
   }
 

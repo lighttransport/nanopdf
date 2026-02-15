@@ -17,6 +17,7 @@
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
 #include "text-layout.hh"
+#include "table-extraction.hh"
 
 #ifdef NANOPDF_USE_BLEND2D
 #include "blend2d-backend.hh"
@@ -2184,6 +2185,308 @@ const char* nanopdf_fonts_get_info(const char* name) {
 }
 
 #endif  // NANOPDF_EMBED_FONTS
+
+// ============================================================
+// Form Fill API (for existing PDFs)
+// ============================================================
+
+// Merge output buffer for form save / incremental writes
+static std::vector<uint8_t> g_form_output;
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_form_set_text(const char* field_name, const char* value) {
+  if (!g_writer || !field_name || !value) {
+    g_last_error = "Writer not initialized or invalid arguments";
+    return 0;
+  }
+  return g_writer->set_field_value(field_name, value) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_form_set_checkbox(const char* field_name, int checked) {
+  if (!g_writer || !field_name) {
+    g_last_error = "Writer not initialized or invalid arguments";
+    return 0;
+  }
+  return g_writer->set_field_checked(field_name, checked != 0) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_form_set_choice(const char* field_name, const char* value) {
+  if (!g_writer || !field_name || !value) {
+    g_last_error = "Writer not initialized or invalid arguments";
+    return 0;
+  }
+  return g_writer->set_field_choice(field_name, value) ? 1 : 0;
+}
+
+// Load existing PDF into writer for form editing
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_form_load(const uint8_t* data, size_t size) {
+  if (!data || size == 0) {
+    g_last_error = "Invalid input data";
+    return 0;
+  }
+
+  if (g_writer) {
+    delete g_writer;
+  }
+  g_writer = new nanopdf::PdfWriter();
+
+  std::vector<uint8_t> pdf_data(data, data + size);
+  std::string error;
+  if (!g_writer->load_existing(pdf_data, &error)) {
+    g_last_error = "Failed to load PDF for editing: " + error;
+    delete g_writer;
+    g_writer = nullptr;
+    return 0;
+  }
+  return 1;
+}
+
+// Save form edits via incremental update
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_form_save() {
+  if (!g_writer) {
+    g_last_error = "Writer not initialized";
+    return 0;
+  }
+
+  g_form_output.clear();
+  auto result = g_writer->write_incremental(g_form_output);
+  if (!result.success) {
+    g_last_error = "Form save failed: " + result.error;
+    return 0;
+  }
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_form_get_buffer() {
+  if (g_form_output.empty()) return nullptr;
+  return g_form_output.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_form_get_size() {
+  return g_form_output.size();
+}
+
+// ============================================================
+// PDF Merge / Split API
+// ============================================================
+
+static std::vector<std::vector<uint8_t>> g_merge_inputs;
+static std::vector<uint8_t> g_merge_output;
+
+EMSCRIPTEN_KEEPALIVE
+void nanopdf_merge_start() {
+  g_merge_inputs.clear();
+  g_merge_output.clear();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_merge_add_pdf(const uint8_t* data, size_t size) {
+  if (!data || size == 0) {
+    g_last_error = "Invalid PDF data for merge";
+    return 0;
+  }
+  g_merge_inputs.emplace_back(data, data + size);
+  return static_cast<int>(g_merge_inputs.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_merge_finish() {
+  if (g_merge_inputs.empty()) {
+    g_last_error = "No PDFs added for merge";
+    return 0;
+  }
+
+  g_merge_output.clear();
+  auto result = nanopdf::PdfWriter::merge_pdfs(g_merge_inputs, g_merge_output);
+  g_merge_inputs.clear();
+
+  if (!result.success) {
+    g_last_error = "Merge failed: " + result.error;
+    return 0;
+  }
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_merge_get_buffer() {
+  if (g_merge_output.empty()) return nullptr;
+  return g_merge_output.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_merge_get_size() {
+  return g_merge_output.size();
+}
+
+// Split pages from a loaded PDF into a new PDF
+// page_indices_json: JSON array of 0-based page indices, e.g. "[0,2,5]"
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_split_pages(const char* page_indices_json) {
+  if (!g_pdf || !page_indices_json) {
+    g_last_error = "No PDF loaded or invalid arguments";
+    return 0;
+  }
+
+  // Simple JSON array parser for integers: [1,2,3]
+  std::vector<int> indices;
+  std::string json(page_indices_json);
+  size_t pos = json.find('[');
+  if (pos == std::string::npos) {
+    g_last_error = "Invalid JSON array format";
+    return 0;
+  }
+  pos++;
+  while (pos < json.size() && json[pos] != ']') {
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ',')) pos++;
+    if (pos < json.size() && json[pos] != ']') {
+      int idx = 0;
+      bool negative = false;
+      if (json[pos] == '-') { negative = true; pos++; }
+      while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+        idx = idx * 10 + (json[pos] - '0');
+        pos++;
+      }
+      if (negative) idx = -idx;
+      indices.push_back(idx);
+    }
+  }
+
+  if (indices.empty()) {
+    g_last_error = "No page indices specified";
+    return 0;
+  }
+
+  g_merge_output.clear();  // Reuse merge output buffer
+  auto result = nanopdf::PdfWriter::split_pages(*g_pdf, indices, g_merge_output);
+  if (!result.success) {
+    g_last_error = "Split failed: " + result.error;
+    return 0;
+  }
+  return 1;
+}
+
+// ============================================================
+// Signature Validation API
+// ============================================================
+
+// Get all signature fields as JSON
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_get_signatures() {
+  if (!g_pdf) {
+    g_text_buffer = "{\"error\":\"No PDF loaded\"}";
+    return g_text_buffer.c_str();
+  }
+
+  // Parse signature fields if not already done
+  if (g_pdf->catalog.signature_fields.empty()) {
+    g_pdf->parse_signature_fields();
+  }
+
+  std::string json = "{\"signatures\":[";
+  for (size_t i = 0; i < g_pdf->catalog.signature_fields.size(); ++i) {
+    const auto& sig = g_pdf->catalog.signature_fields[i];
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"name\":\"" + json_escape(sig.name) + "\"";
+    json += ",\"signed\":" + std::string(sig.is_signed ? "true" : "false");
+    json += ",\"signaturePresent\":" + std::string(sig.signature_present ? "true" : "false");
+    if (!sig.signing_reason.empty())
+      json += ",\"reason\":\"" + json_escape(sig.signing_reason) + "\"";
+    if (!sig.signing_location.empty())
+      json += ",\"location\":\"" + json_escape(sig.signing_location) + "\"";
+    if (!sig.signing_date.empty())
+      json += ",\"date\":\"" + json_escape(sig.signing_date) + "\"";
+    if (!sig.signing_contact_info.empty())
+      json += ",\"contact\":\"" + json_escape(sig.signing_contact_info) + "\"";
+    if (!sig.filter.empty())
+      json += ",\"filter\":\"" + json_escape(sig.filter) + "\"";
+    if (!sig.subfilter.empty())
+      json += ",\"subFilter\":\"" + json_escape(sig.subfilter) + "\"";
+    json += ",\"isCertification\":" + std::string(sig.is_certification_signature ? "true" : "false");
+    json += ",\"hasTimestamp\":" + std::string(sig.has_timestamp ? "true" : "false");
+    if (sig.has_timestamp && !sig.timestamp_date.empty())
+      json += ",\"timestampDate\":\"" + json_escape(sig.timestamp_date) + "\"";
+    if (sig.rect.size() >= 4) {
+      json += ",\"rect\":[" + std::to_string(sig.rect[0]) + ","
+              + std::to_string(sig.rect[1]) + ","
+              + std::to_string(sig.rect[2]) + ","
+              + std::to_string(sig.rect[3]) + "]";
+    }
+    json += "}";
+  }
+  json += "]}";
+
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Validate a specific signature by index
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_validate_signature(int sig_index) {
+  if (!g_pdf) {
+    g_text_buffer = "{\"error\":\"No PDF loaded\"}";
+    return g_text_buffer.c_str();
+  }
+
+  if (g_pdf->catalog.signature_fields.empty()) {
+    g_pdf->parse_signature_fields();
+  }
+
+  if (sig_index < 0 || sig_index >= static_cast<int>(g_pdf->catalog.signature_fields.size())) {
+    g_text_buffer = "{\"error\":\"Invalid signature index\"}";
+    return g_text_buffer.c_str();
+  }
+
+  const auto& sig = g_pdf->catalog.signature_fields[sig_index];
+  auto result = nanopdf::validate_signature(*g_pdf, sig);
+
+  std::string json = "{";
+  json += "\"success\":" + std::string(result.success ? "true" : "false");
+  json += ",\"integrityValid\":" + std::string(result.integrity_valid ? "true" : "false");
+  json += ",\"signatureValid\":" + std::string(result.signature_valid ? "true" : "false");
+  if (!result.signer_name.empty())
+    json += ",\"signerName\":\"" + json_escape(result.signer_name) + "\"";
+  if (!result.signing_time.empty())
+    json += ",\"signingTime\":\"" + json_escape(result.signing_time) + "\"";
+  if (!result.digest_algorithm.empty())
+    json += ",\"digestAlgorithm\":\"" + json_escape(result.digest_algorithm) + "\"";
+  if (!result.error.empty())
+    json += ",\"error\":\"" + json_escape(result.error) + "\"";
+  json += "}";
+
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// ============================================================
+// Markdown Conversion API
+// ============================================================
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_page_to_markdown(int page_index) {
+  if (!g_pdf || page_index < 0 ||
+      page_index >= static_cast<int>(g_pdf->catalog.pages.size())) {
+    g_text_buffer = "";
+    return g_text_buffer.c_str();
+  }
+
+  const auto& page = g_pdf->catalog.pages[page_index];
+  auto text_page = nanopdf::extract_text_layout(*g_pdf, page);
+
+  if (!text_page) {
+    g_text_buffer = "";
+    return g_text_buffer.c_str();
+  }
+
+  g_text_buffer = text_page->to_markdown();
+  return g_text_buffer.c_str();
+}
 
 // ============================================================
 // Memory Management
