@@ -383,7 +383,105 @@ void test_sha256() {
   std::cout << "  SHA-256: PASSED" << std::endl;
 }
 
-// Note: AES256 is declared in crypto.hh but not yet implemented in crypto.cc
+// Test AES-256 encryption
+void test_aes256() {
+  std::cout << "Testing AES-256 encryption..." << std::endl;
+
+  AES256 aes;
+
+  // NIST AES-256 test vector (FIPS 197 Appendix C.3)
+  uint8_t key[32] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+  };
+  uint8_t plaintext[16] = {
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+  };
+  uint8_t expected[16] = {
+    0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf,
+    0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89
+  };
+
+  aes.set_key(key);
+
+  // Test encrypt
+  uint8_t ciphertext[16];
+  aes.encrypt_block(plaintext, ciphertext);
+  assert(memcmp(ciphertext, expected, 16) == 0);
+
+  // Test decrypt (round-trip)
+  uint8_t decrypted[16];
+  aes.decrypt_block(ciphertext, decrypted);
+  assert(memcmp(decrypted, plaintext, 16) == 0);
+
+  std::cout << "  AES-256: PASSED" << std::endl;
+}
+
+// Test AES-256 CBC mode
+void test_aes256_cbc() {
+  std::cout << "Testing AES-256 CBC mode..." << std::endl;
+
+  AES256 aes;
+  uint8_t key[32] = {
+    0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+    0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+    0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+    0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4
+  };
+  uint8_t iv[16] = {0};
+  uint8_t plaintext[32] = {
+    0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+    0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+    0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+    0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51
+  };
+
+  aes.set_key(key);
+
+  // Encrypt CBC
+  uint8_t ciphertext[32];
+  aes.encrypt_cbc(plaintext, ciphertext, 32, iv);
+
+  // Decrypt CBC round-trip
+  uint8_t decrypted[32];
+  aes.decrypt_cbc(ciphertext, decrypted, 32, iv);
+  assert(memcmp(decrypted, plaintext, 32) == 0);
+
+  std::cout << "  AES-256 CBC: PASSED" << std::endl;
+}
+
+// Test SHA-1 hash
+void test_sha1() {
+  std::cout << "Testing SHA-1 hash..." << std::endl;
+
+  // SHA-1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
+  {
+    uint8_t data[] = {'a', 'b', 'c'};
+    uint8_t digest[20];
+    SHA1::hash(data, 3, digest);
+    uint8_t expected[20] = {
+      0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e,
+      0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
+    };
+    assert(memcmp(digest, expected, 20) == 0);
+    std::cout << "  SHA-1(\"abc\"): PASSED" << std::endl;
+  }
+
+  // SHA-1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
+  {
+    uint8_t digest[20];
+    SHA1::hash(nullptr, 0, digest);
+    // SHA-1 of empty string - verify first 4 bytes
+    assert(digest[0] == 0xda && digest[1] == 0x39 &&
+           digest[2] == 0xa3 && digest[3] == 0xee);
+    std::cout << "  SHA-1(\"\"): PASSED" << std::endl;
+  }
+
+  std::cout << "  SHA-1: PASSED" << std::endl;
+}
 
 // Test RC4 with known test vector
 void test_rc4_known_vector() {
@@ -573,7 +671,9 @@ int main() {
   test_rc4_known_vector();
   test_aes128();
   test_aes_cbc();
-  // Note: AES256 declared in crypto.hh but not implemented in crypto.cc
+  test_aes256();
+  test_aes256_cbc();
+  test_sha1();
   test_md5();
   test_md5_vectors();
   test_sha256();
@@ -594,6 +694,9 @@ int main() {
   std::cout << "Summary of implemented Phase 5 features:" << std::endl;
   std::cout << "  ✓ RC4 encryption (40-bit and 128-bit)" << std::endl;
   std::cout << "  ✓ AES-128 encryption with CBC mode" << std::endl;
+  std::cout << "  ✓ AES-256 encryption with CBC mode" << std::endl;
+  std::cout << "  ✓ SHA-1 hash algorithm" << std::endl;
+  std::cout << "  ✓ SHA-256 hash algorithm" << std::endl;
   std::cout << "  ✓ MD5 hash algorithm" << std::endl;
   std::cout << "  ✓ PDF password padding" << std::endl;
   std::cout << "  ✓ Owner and user key computation" << std::endl;
