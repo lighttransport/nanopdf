@@ -499,18 +499,36 @@ endif()
 if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   enable_testing()
 
-  function(add_nanopdf_test target source)
-    add_executable(${target} ${source})
-    target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
-    add_sanitizers(${target})
-    if(ARGC GREATER 2)
-      add_test(NAME ${target} COMMAND ${target} ${ARGN})
-    else()
-      add_test(NAME ${target} COMMAND ${target})
-    endif()
-  endfunction()
+  # ============================================================================
+  # New test infrastructure with doctest framework
+  # ============================================================================
+  option(NANOPDF_BUILD_LEGACY_TESTS "Build legacy phase tests" ON)
 
-  add_nanopdf_test(${TEST_TARGET} src/test-nanopdf.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
+  # Add new test infrastructure (doctest-based, feature-organized)
+  add_subdirectory(tests)
+
+  # ============================================================================
+  # Legacy test infrastructure (to be phased out after migration)
+  # ============================================================================
+  if(NANOPDF_BUILD_LEGACY_TESTS)
+    message(STATUS "Building legacy phase tests (can be disabled with -DNANOPDF_BUILD_LEGACY_TESTS=OFF)")
+  endif()
+
+  if(NANOPDF_BUILD_LEGACY_TESTS)
+    function(add_nanopdf_test target source)
+      add_executable(${target} ${source})
+      target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
+      add_sanitizers(${target})
+      if(ARGC GREATER 2)
+        add_test(NAME ${target} COMMAND ${target} ${ARGN})
+      else()
+        add_test(NAME ${target} COMMAND ${target})
+      endif()
+      # Mark legacy tests with label for filtering
+      set_tests_properties(${target} PROPERTIES LABELS "legacy")
+    endfunction()
+
+    add_nanopdf_test(${TEST_TARGET} src/test-nanopdf.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
 
   set(_NANOPDF_PHASE_TEST_SPECS
     "test_phase1|src/test-phase1-features.cc"
@@ -578,6 +596,12 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     add_nanopdf_test(test_blend2d src/test-blend2d-backend.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
     target_link_libraries(test_blend2d PRIVATE blend2d::blend2d)
   endif()
+
+  endif()  # NANOPDF_BUILD_LEGACY_TESTS
+
+  # ============================================================================
+  # Tools and benchmarks (not tests)
+  # ============================================================================
 
   # Benchmark executable (not a test, just a tool)
   add_executable(benchmark src/benchmark.cc)
