@@ -57,7 +57,7 @@ struct RenderOptions {
   // DPI scaling factor (72 = 1x, 144 = 2x, etc.)
   float dpi{72.0f};
 
-  // Anti-aliasing (for future use)
+  // Anti-aliasing (Blend2D always applies AA internally)
   bool antialias{true};
 
   // Background color (RGBA)

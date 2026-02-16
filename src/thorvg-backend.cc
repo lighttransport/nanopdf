@@ -4946,6 +4946,12 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
     page_height = static_cast<float>(page.media_box[3] - page.media_box[1]);
   }
 
+  // Store antialias option (ThorVG always applies AA internally)
+  antialias_ = options.antialias;
+  if (!antialias_) {
+    NANOPDF_LOG_DEBUG("ThorVG", "antialias=false requested, but ThorVG's built-in AA cannot be disabled");
+  }
+
   // Calculate scale based on DPI (72 DPI is standard PDF resolution)
   float dpi_scale = options.dpi / 72.0f;
 

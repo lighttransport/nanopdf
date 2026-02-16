@@ -57,7 +57,7 @@ struct ThorVGRenderOptions {
   // DPI scaling factor (72 = 1x, 144 = 2x, etc.)
   float dpi{72.0f};
 
-  // Anti-aliasing (for future use)
+  // Anti-aliasing (ThorVG always applies AA internally)
   bool antialias{true};
 
   // Background color (RGBA)
@@ -286,6 +286,7 @@ private:
   std::vector<uint32_t> buffer_;
   uint32_t width_{0};
   uint32_t height_{0};
+  bool antialias_{true};
   bool initialized_{false};
   GraphicsState state_;
 
