@@ -34,7 +34,7 @@ class CJBig2_GRDProc {
       JBig2ArithCtx* gbContexts,
       int context_size);
 
-  // Decode MMR-coded generic region (stubbed for now)
+  // Decode MMR-coded generic region (CCITT Group 4)
   std::unique_ptr<CJBig2_Image> DecodeMMR(CJBig2_BitStream* pStream);
 
   // Public parameters (set before calling Decode)

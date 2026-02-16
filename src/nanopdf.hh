@@ -1793,7 +1793,7 @@ DecodedStream decode_asciihex(const uint8_t* data, size_t size,
 DecodedStream decode_lzw(const uint8_t* data, size_t size,
                          const DecodeParams& params);
 DecodedStream decode_jbig2(const uint8_t* data, size_t size,
-                           const DecodeParams& params);  // JBIG2 stub
+                           const DecodeParams& params);
 DecodedStream decode_runlength(const uint8_t* data, size_t size,
                                const DecodeParams& params);
 DecodedStream decode_dct(const uint8_t* data, size_t size,
