@@ -226,6 +226,8 @@ private:
     std::vector<uint8_t> font_data;  // Raw font file data
     stbtt_fontinfo font_info;
     bool initialized{false};
+    bool is_embedded{false};  // true when loaded from PDF-embedded font stream
+    std::vector<uint16_t> cid_to_gid;  // CFF charset CID→GID map (empty = identity)
   };
 
   // Draw a single glyph using stb_truetype outlines (by Unicode codepoint)
@@ -253,6 +255,9 @@ private:
 
   // Calculate text width using font metrics (returns width in text space units)
   float calculate_text_width(const std::string& text, float font_size);
+
+  // Calculate vertical advance using W2/DW2 metrics (for vertical writing mode)
+  float calculate_vertical_advance(const std::string& text, float font_size);
 
   // Draw an image XObject
   // fill_r/g/b: current non-stroking color, used to paint image mask pixels
