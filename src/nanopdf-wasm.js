@@ -757,6 +757,47 @@ class NanoPDF {
     URL.revokeObjectURL(url);
     return true;
   }
+
+  // ============================================================
+  // CJK Font API
+  // ============================================================
+
+  /**
+   * Load a CJK font from a URL (async fetch → blob registration)
+   * @param {string} url - URL to the font file (.otf, .ttf, .ttc)
+   * @param {number} [category=4] - Font category: 4 = CJK sans, 5 = CJK serif
+   * @returns {Promise<boolean>} True if font was loaded and registered
+   */
+  async loadCJKFontFromURL(url, category = 4) {
+    const response = await fetch(url);
+    if (!response.ok) return false;
+    const buffer = await response.arrayBuffer();
+    return this.registerCJKFont(new Uint8Array(buffer), category);
+  }
+
+  /**
+   * Register a CJK font from an ArrayBuffer or Uint8Array
+   * @param {ArrayBuffer|Uint8Array} data - Font file data
+   * @param {number} [category=4] - Font category: 4 = CJK sans, 5 = CJK serif
+   * @returns {boolean} True if font was registered
+   */
+  registerCJKFont(data, category = 4) {
+    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+    const ptr = this._module._malloc(bytes.length);
+    if (!ptr) return false;
+    this._module.HEAPU8.set(bytes, ptr);
+    const result = this._module._nanopdf_register_cjk_font(ptr, bytes.length, category);
+    this._module._free(ptr);
+    return result === 1;
+  }
+
+  /**
+   * Check if CJK fonts are available (registered or embedded)
+   * @returns {boolean} True if CJK fonts are ready for use
+   */
+  hasCJKFonts() {
+    return this._module._nanopdf_cjk_fonts_ready() === 1;
+  }
 }
 
 /**

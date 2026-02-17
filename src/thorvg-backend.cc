@@ -10,6 +10,12 @@
 
 #include "nanopdf-log.hh"
 #include "color-transform.hh"
+#include "cff-wrapper.hh"
+#include "font-provider.hh"
+
+#ifdef NANOPDF_EMBED_CJK_FONTS
+#include "embedded-cjk-fonts.hh"
+#endif
 
 // For PNG saving - implementation in stb_image_write_impl.cc
 #include "stb_image_write.h"
@@ -1606,12 +1612,17 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
     nullptr
   };
 
-  // CJK fonts (Japanese, Chinese, Korean)
-  static const char* cjk_fonts[] = {
-    // Japanese
+  // CJK sans (Gothic) fonts
+  static const char* cjk_sans_fonts[] = {
+    // Bundled Noto Sans JP (relative to project root)
+    "fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+    "../fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+    // System-installed Noto
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansJP-Regular.ttf",
+    // Other Japanese Gothic fonts
     "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
     "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
     "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",
@@ -1636,10 +1647,91 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
     nullptr
   };
 
-  static const char** font_lists[] = { sans_fonts, mono_fonts, serif_fonts, symbol_fonts, cjk_fonts };
+  // CJK serif (Mincho) fonts
+  static const char* cjk_serif_fonts[] = {
+    // Bundled Noto Serif JP (relative to project root)
+    "fonts/noto-serif-jp/NotoSerifJP-Regular.otf",
+    "../fonts/noto-serif-jp/NotoSerifJP-Regular.otf",
+    // System-installed Noto Serif
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifJP-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSerifJP-Regular.ttf",
+    // Japanese Mincho fonts
+    "/usr/share/fonts/opentype/ipafont-mincho/ipamp.ttf",
+    "/usr/share/fonts/truetype/sazanami/sazanami-mincho.ttf",
+    // Fallback to sans CJK if no serif available
+    "fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+    "../fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    // macOS
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/Library/Fonts/Osaka.ttf",
+    // Windows
+    "C:\\Windows\\Fonts\\msmincho.ttc",
+    "C:\\Windows\\Fonts\\YuMincho.ttc",
+    "C:\\Windows\\Fonts\\simsun.ttc",
+    nullptr
+  };
+
+  static const char** font_lists[] = { sans_fonts, mono_fonts, serif_fonts, symbol_fonts, cjk_sans_fonts };
+
+  // For CJK, select serif (Mincho) or sans (Gothic) list based on font name
+  const char** font_list = font_lists[category];
+  if (category == 4) {
+    std::string lower;
+    for (char c : font_name)
+      lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find("mincho") != std::string::npos ||
+        lower.find("ming") != std::string::npos ||
+        lower.find("serif") != std::string::npos ||
+        lower.find("songti") != std::string::npos) {
+      font_list = cjk_serif_fonts;
+    }
+  }
+
+  // Check font provider first (for runtime-registered CJK fonts)
+  if (category == 4) {
+    auto& provider = FontProvider::instance();
+    FontCategory pcat = (font_list == cjk_serif_fonts)
+        ? FontCategory::kCJKSerif : FontCategory::kCJKSans;
+    const ProvidedFont* pf = provider.find_by_category(pcat);
+    if (!pf) pf = provider.find_by_category(FontCategory::kCJKSans);
+    if (pf && !pf->data.empty()) {
+      FontCache cache;
+      cache.font_data = pf->data;
+      int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+        cache.initialized = true;
+        font_cache_[font_name] = std::move(cache);
+        NANOPDF_LOG_DEBUG("ThorVG", "Using FontProvider font: %s for '%s'", pf->name.c_str(), font_name.c_str());
+        return true;
+      }
+    }
+  }
+
+#ifdef NANOPDF_EMBED_CJK_FONTS
+  // Check embedded CJK fonts
+  if (category == 4) {
+    const char* target = (font_list == cjk_serif_fonts)
+        ? "NotoSerifJP-Regular" : "NotoSansJP-Regular";
+    auto* entry = embedded_cjk_fonts::find_font(target);
+    if (entry) {
+      FontCache cache;
+      if (embedded_cjk_fonts::decompress_font(entry, cache.font_data)) {
+        int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+          cache.initialized = true;
+          font_cache_[font_name] = std::move(cache);
+          NANOPDF_LOG_DEBUG("ThorVG", "Using embedded CJK font: %s for '%s'", target, font_name.c_str());
+          return true;
+        }
+      }
+    }
+  }
+#endif
 
   // Try fonts in the matching category first
-  const char** font_list = font_lists[category];
   for (const char** path = font_list; *path; ++path) {
     FontCache cache;
     if (load_font_file(*path, cache.font_data)) {
@@ -1710,20 +1802,16 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
     return load_fallback_font_with_hint(font_name, font);
   }
 
-  // Check if this is a CFF font (stb_truetype doesn't support CFF)
-  bool is_cff = false;
-  if (decoded.data.size() >= 4) {
-    // CFF fonts start with specific signature or have OTTO header
-    if ((decoded.data[0] == 0x01 && decoded.data[1] == 0x00) ||  // CFF
-        (decoded.data[0] == 'O' && decoded.data[1] == 'T' &&
-         decoded.data[2] == 'T' && decoded.data[3] == 'O')) {    // OpenType CFF
-      is_cff = true;
+  // Check for raw CFF data (stb_truetype can't parse raw CFF directly,
+  // but DOES support OpenType-CFF with OTTO header natively)
+  if (cff_wrapper::is_raw_cff(decoded.data.data(), decoded.data.size())) {
+    auto wrapped = cff_wrapper::wrap_cff_in_opentype(decoded.data);
+    if (wrapped.empty()) {
+      return load_fallback_font_with_hint(font_name, font);
     }
-  }
-
-  if (is_cff) {
-    // CFF/OpenType CFF fonts not supported by stb_truetype, use fallback
-    return load_fallback_font_with_hint(font_name, font);
+    decoded.data = std::move(wrapped);
+    NANOPDF_LOG_INFO("ThorVG", "Wrapped raw CFF font '%s' in OpenType container",
+                     font_name.c_str());
   }
 
   // Initialize stb_truetype with the font data

@@ -132,6 +132,8 @@ set(NANOPDF_SOURCES
   src/jbig2/JBig2_Context.cc
   src/jbig2/JBig2_SddProc.cc
   src/jbig2/JBig2_TrdProc.cc
+  # Font provider (runtime font registration)
+  src/font-provider.cc
 )
 
 if(NANOPDF_USE_THORVG)
@@ -197,6 +199,40 @@ if(NANOPDF_EMBED_FONTS)
   endif()
 endif()
 
+# Separate CJK font embedding (Noto Sans/Serif JP, ~61 MB compressed)
+option(NANOPDF_EMBED_CJK_FONTS "Embed CJK fonts (Noto Sans/Serif JP) as binary data" OFF)
+
+if(NANOPDF_EMBED_CJK_FONTS)
+  # CJK embedding requires base font embedding
+  if(NOT NANOPDF_EMBED_FONTS)
+    message(FATAL_ERROR "NANOPDF_EMBED_CJK_FONTS requires NANOPDF_EMBED_FONTS=ON")
+  endif()
+
+  set(EMBEDDED_CJK_FONTS_HEADER ${CMAKE_BINARY_DIR}/embedded-cjk-fonts.hh)
+  file(GLOB_RECURSE CJK_FONT_FILES
+    "${FONTS_DIR}/noto-sans-jp/*.otf"
+    "${FONTS_DIR}/noto-serif-jp/*.otf"
+  )
+
+  if(CJK_FONT_FILES)
+    add_custom_command(
+      OUTPUT ${EMBEDDED_CJK_FONTS_HEADER}
+      COMMAND ${CMAKE_COMMAND}
+        -DFONTS_DIR=${FONTS_DIR}
+        -DOUTPUT_FILE=${EMBEDDED_CJK_FONTS_HEADER}
+        -P ${CMAKE_SOURCE_DIR}/cmake/embed_cjk_fonts.cmake
+      DEPENDS ${CJK_FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_cjk_fonts.cmake
+      COMMENT "Generating embedded CJK fonts header"
+    )
+    add_custom_target(generate_embedded_cjk_fonts DEPENDS ${EMBEDDED_CJK_FONTS_HEADER})
+    set_source_files_properties(${EMBEDDED_CJK_FONTS_HEADER} PROPERTIES GENERATED TRUE)
+    message(STATUS "CJK font embedding enabled (${FONTS_DIR}/noto-sans-jp, ${FONTS_DIR}/noto-serif-jp)")
+  else()
+    message(WARNING "CJK font embedding enabled but no CJK fonts found in ${FONTS_DIR}/noto-sans-jp or ${FONTS_DIR}/noto-serif-jp")
+    set(NANOPDF_EMBED_CJK_FONTS OFF)
+  endif()
+endif()
+
 if(NANOPDF_BUILD_WASM)
   add_executable(${BUILD_TARGET} ${NANOPDF_SOURCES})
 else()
@@ -214,6 +250,12 @@ if(NANOPDF_EMBED_FONTS)
 
   # Define macro to enable embedded fonts in the code
   target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_EMBED_FONTS=1")
+endif()
+
+# Add embedded CJK fonts support
+if(NANOPDF_EMBED_CJK_FONTS AND CJK_FONT_FILES)
+  add_dependencies(${BUILD_TARGET} generate_embedded_cjk_fonts)
+  target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_EMBED_CJK_FONTS=1")
 endif()
 
 # Link with zlib (or use embedded miniz)

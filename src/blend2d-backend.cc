@@ -14,6 +14,12 @@
 
 // For PNG saving
 #include "stb_image_write.h"
+#include "cff-wrapper.hh"
+#include "font-provider.hh"
+
+#ifdef NANOPDF_EMBED_CJK_FONTS
+#include "embedded-cjk-fonts.hh"
+#endif
 
 // External C variable for PNG compression level
 extern "C" int stbi_write_png_compression_level;
@@ -1204,12 +1210,17 @@ bool Blend2DBackend::load_fallback_font_with_hint(const std::string& font_name, 
       "/System/Library/Fonts/Symbol.ttf",
       "C:\\Windows\\Fonts\\symbol.ttf"
     },
-    // CJK fonts (Japanese, Chinese, Korean)
+    // CJK sans (Gothic) fonts - default
     {
-      // Japanese
+      // Bundled Noto Sans JP (relative to project root)
+      "fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+      "../fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+      // System-installed Noto
       "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
       "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
       "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+      "/usr/share/fonts/truetype/noto/NotoSansJP-Regular.ttf",
+      // Other Japanese Gothic fonts
       "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
       "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
       "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",
@@ -1224,7 +1235,7 @@ bool Blend2DBackend::load_fallback_font_with_hint(const std::string& font_name, 
       "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
       // macOS
       "/System/Library/Fonts/Hiragino Sans GB.ttc",
-      "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+      "/System/Library/Fonts/\xe3\x83\x92\xe3\x83\xa9\xe3\x82\xae\xe3\x83\x8e\xe8\xa7\x92\xe3\x82\xb4\xe3\x82\xb7\xe3\x83\x83\xe3\x82\xaf W3.ttc",
       "/Library/Fonts/Osaka.ttf",
       // Windows
       "C:\\Windows\\Fonts\\msgothic.ttc",
@@ -1235,8 +1246,87 @@ bool Blend2DBackend::load_fallback_font_with_hint(const std::string& font_name, 
     }
   };
 
+  // CJK serif (Mincho) font paths for serif CJK selection
+  static const std::vector<std::string> cjk_serif_paths = {
+    // Bundled Noto Serif JP (relative to project root)
+    "fonts/noto-serif-jp/NotoSerifJP-Regular.otf",
+    "../fonts/noto-serif-jp/NotoSerifJP-Regular.otf",
+    // System-installed Noto Serif
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifJP-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSerifJP-Regular.ttf",
+    // Japanese Mincho fonts
+    "/usr/share/fonts/opentype/ipafont-mincho/ipamp.ttf",
+    "/usr/share/fonts/truetype/sazanami/sazanami-mincho.ttf",
+    // Fallback to sans CJK if no serif available
+    "fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+    "../fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    // macOS
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/Library/Fonts/Osaka.ttf",
+    // Windows
+    "C:\\Windows\\Fonts\\msmincho.ttc",
+    "C:\\Windows\\Fonts\\YuMincho.ttc",
+    "C:\\Windows\\Fonts\\simsun.ttc"
+  };
+
+  // For CJK, select serif (Mincho) or sans (Gothic) based on font name
+  const std::vector<std::string>* preferred_ptr = &font_paths_by_category[category];
+  if (category == 4) {
+    std::string lower;
+    for (char c : font_name)
+      lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find("mincho") != std::string::npos ||
+        lower.find("ming") != std::string::npos ||
+        lower.find("serif") != std::string::npos ||
+        lower.find("songti") != std::string::npos) {
+      preferred_ptr = &cjk_serif_paths;
+    }
+  }
+
+  // Check font provider first (for runtime-registered CJK fonts)
+  if (category == 4) {
+    auto& provider = FontProvider::instance();
+    FontCategory pcat = (preferred_ptr == &cjk_serif_paths)
+        ? FontCategory::kCJKSerif : FontCategory::kCJKSans;
+    const ProvidedFont* pf = provider.find_by_category(pcat);
+    if (!pf) pf = provider.find_by_category(FontCategory::kCJKSans);
+    if (pf && !pf->data.empty()) {
+      FontCache& cache = font_cache_[font_name];
+      cache.font_data = pf->data;
+      int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+      if (off < 0) off = 0;
+      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+        cache.initialized = true;
+        return true;
+      }
+    }
+  }
+
+#ifdef NANOPDF_EMBED_CJK_FONTS
+  // Check embedded CJK fonts
+  if (category == 4) {
+    const char* target = (preferred_ptr == &cjk_serif_paths)
+        ? "NotoSerifJP-Regular" : "NotoSansJP-Regular";
+    auto* entry = embedded_cjk_fonts::find_font(target);
+    if (entry) {
+      FontCache& cache = font_cache_[font_name];
+      if (embedded_cjk_fonts::decompress_font(entry, cache.font_data)) {
+        int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+        if (off < 0) off = 0;
+        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+          cache.initialized = true;
+          return true;
+        }
+      }
+    }
+  }
+#endif
+
   // Try fonts in the matching category first
-  const auto& preferred_paths = font_paths_by_category[category];
+  const auto& preferred_paths = *preferred_ptr;
   for (const auto& path : preferred_paths) {
     std::ifstream file(path, std::ios::binary);
     if (file) {
@@ -1334,20 +1424,14 @@ bool Blend2DBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     if (font_file_val.type == Value::STREAM) {
       auto decoded = decode_stream(pdf, font_file_val);
       if (decoded.success && !decoded.data.empty()) {
-        // Check if this is a CFF font (stb_truetype doesn't support CFF)
-        bool is_cff = false;
-        if (decoded.data.size() >= 4) {
-          // CFF fonts start with specific signature or have OTTO header
-          if ((decoded.data[0] == 0x01 && decoded.data[1] == 0x00) ||  // CFF
-              (decoded.data[0] == 'O' && decoded.data[1] == 'T' &&
-               decoded.data[2] == 'T' && decoded.data[3] == 'O')) {    // OpenType CFF
-            is_cff = true;
+        // Check for raw CFF data and wrap it in an OpenType container.
+        // OpenType-CFF (OTTO header) is supported natively by stb_truetype.
+        if (cff_wrapper::is_raw_cff(decoded.data.data(), decoded.data.size())) {
+          auto wrapped = cff_wrapper::wrap_cff_in_opentype(decoded.data);
+          if (wrapped.empty()) {
+            return load_fallback_font_with_hint(font_name, font);
           }
-        }
-
-        if (is_cff) {
-          // CFF/OpenType CFF fonts not supported by stb_truetype, use fallback
-          return load_fallback_font_with_hint(font_name, font);
+          decoded.data = std::move(wrapped);
         }
 
         FontCache& cache = font_cache_[font_name];

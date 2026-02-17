@@ -15,8 +15,11 @@ find_package(Python3 COMPONENTS Interpreter)
 
 if(Python3_FOUND)
   # Use Python script for fast processing
+  # Exclude CJK font directories — those are handled by embed_cjk_fonts.cmake
   execute_process(
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/embed_fonts.py ${FONTS_DIR} ${OUTPUT_FILE}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/embed_fonts.py
+      ${FONTS_DIR} ${OUTPUT_FILE}
+      --exclude-dirs=noto-sans-jp,noto-serif-jp
     RESULT_VARIABLE RESULT
     OUTPUT_VARIABLE OUTPUT
     ERROR_VARIABLE ERROR

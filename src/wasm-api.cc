@@ -31,6 +31,12 @@
 #include "embedded-fonts.hh"
 #endif
 
+#ifdef NANOPDF_EMBED_CJK_FONTS
+#include "embedded-cjk-fonts.hh"
+#endif
+
+#include "font-provider.hh"
+
 // ============================================================
 // Global state for PDF reading
 // ============================================================
@@ -2185,6 +2191,104 @@ const char* nanopdf_fonts_get_info(const char* name) {
 }
 
 #endif  // NANOPDF_EMBED_FONTS
+
+// ============================================================
+// CJK Font Registration API (always available)
+// ============================================================
+
+// Register a CJK font from a memory blob
+// category: 4 = CJK sans, 5 = CJK serif
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_register_cjk_font(const uint8_t* data, size_t size, int category) {
+  if (!data || size == 0) return 0;
+  nanopdf::FontCategory cat;
+  if (category == 5) {
+    cat = nanopdf::FontCategory::kCJKSerif;
+  } else {
+    cat = nanopdf::FontCategory::kCJKSans;
+  }
+  const char* name = (category == 5) ? "CJKSerif-Runtime" : "CJKSans-Runtime";
+  return nanopdf::FontProvider::instance().register_font_blob(name, cat, data, size) ? 1 : 0;
+}
+
+// Check if CJK fonts are available (registered via FontProvider or embedded)
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_cjk_fonts_ready() {
+  if (nanopdf::FontProvider::instance().has_cjk_fonts()) {
+    return 1;
+  }
+#ifdef NANOPDF_EMBED_CJK_FONTS
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+#ifdef NANOPDF_EMBED_CJK_FONTS
+
+// Check if embedded CJK fonts are compiled in
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_cjk_embedded_fonts_available() {
+  return 1;
+}
+
+// Get list of embedded CJK fonts as JSON
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_cjk_fonts_list() {
+  std::string json = "{\"fonts\":[";
+
+  for (size_t i = 0; i < nanopdf::embedded_cjk_fonts::font_count; ++i) {
+    const auto& font = nanopdf::embedded_cjk_fonts::font_registry[i];
+    if (i > 0) json += ",";
+    json += "{\"name\":\"" + std::string(font.base_name) + "\"";
+    json += ",\"filename\":\"" + std::string(font.filename) + "\"";
+    json += ",\"originalSize\":" + std::to_string(font.original_size);
+    json += ",\"compressedSize\":" + std::to_string(font.compressed_size);
+    json += "}";
+  }
+
+  json += "],\"count\":" + std::to_string(nanopdf::embedded_cjk_fonts::font_count) + "}";
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Load an embedded CJK font by name, returns pointer to decompressed data
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_cjk_fonts_load(const char* name) {
+  if (!name) return nullptr;
+  const auto* font = nanopdf::embedded_cjk_fonts::find_font(name);
+  if (!font) {
+    g_last_error = std::string("CJK font not found: ") + name;
+    return nullptr;
+  }
+  g_font_buffer.clear();
+  if (!nanopdf::embedded_cjk_fonts::decompress_font(font, g_font_buffer)) {
+    g_last_error = std::string("Failed to decompress CJK font: ") + name;
+    return nullptr;
+  }
+  return g_font_buffer.data();
+}
+
+#else  // !NANOPDF_EMBED_CJK_FONTS
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_cjk_embedded_fonts_available() {
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_cjk_fonts_list() {
+  g_text_buffer = "{\"fonts\":[],\"count\":0}";
+  return g_text_buffer.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_cjk_fonts_load(const char* /*name*/) {
+  g_last_error = "CJK fonts not embedded in this build";
+  return nullptr;
+}
+
+#endif  // NANOPDF_EMBED_CJK_FONTS
 
 // ============================================================
 // Form Fill API (for existing PDFs)
