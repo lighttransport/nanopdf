@@ -4697,6 +4697,15 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   // Calculate scale factor
   float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
 
+  // Compute rotation from text matrix for rotated text (e.g., [0 -8 8 0])
+  float font_scale_tm = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                  state_.text_matrix.b * state_.text_matrix.b);
+  float cos_theta = 1.0f, sin_theta = 0.0f;
+  if (font_scale_tm > 0.01f) {
+    cos_theta = state_.text_matrix.a / font_scale_tm;
+    sin_theta = state_.text_matrix.b / font_scale_tm;
+  }
+
   // Build ThorVG path from stb_truetype vertices
   auto shape = tvg::Shape::gen();
   if (!shape) {
@@ -4704,13 +4713,24 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     return false;
   }
 
+  // Helper lambda to transform glyph-local coordinates with rotation
+  // In PDF coords (y-up), glyph point (gx, gy) rotates to:
+  //   dx = gx*cos - gy*sin, dy = gx*sin + gy*cos
+  // In canvas coords (y-down): vx = x + dx, vy = y - dy
+  auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
+    float gx = gx_raw * scale;
+    float gy = gy_raw * scale;
+    out_x = x + gx * cos_theta - gy * sin_theta;
+    out_y = y - (gx * sin_theta + gy * cos_theta);
+  };
+
   // Track current position for quadratic-to-cubic conversion
   float curr_x = x, curr_y = y;
 
   for (int i = 0; i < num_verts; i++) {
     stbtt_vertex* v = &vertices[i];
-    float vx = x + v->x * scale;
-    float vy = y - v->y * scale;  // Flip Y for screen coordinates
+    float vx, vy;
+    transform_vertex(v->x, v->y, vx, vy);
 
     switch (v->type) {
       case STBTT_vmove:
@@ -4725,11 +4745,8 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
         break;
       case STBTT_vcurve: {
         // Quadratic bezier - convert to cubic for ThorVG
-        // Control point (P1)
-        float cx = x + v->cx * scale;
-        float cy = y - v->cy * scale;
-        // End point (P2) is (vx, vy)
-        // Start point (P0) is (curr_x, curr_y)
+        float cx, cy;
+        transform_vertex(v->cx, v->cy, cx, cy);
 
         // Convert quadratic to cubic bezier:
         // CP1 = P0 + 2/3 * (P1 - P0)
@@ -4745,10 +4762,9 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
         break;
       }
       case STBTT_vcubic: {
-        float cx1 = x + v->cx * scale;
-        float cy1 = y - v->cy * scale;
-        float cx2 = x + v->cx1 * scale;
-        float cy2 = y - v->cy1 * scale;
+        float cx1, cy1, cx2, cy2;
+        transform_vertex(v->cx, v->cy, cx1, cy1);
+        transform_vertex(v->cx1, v->cy1, cx2, cy2);
         shape->cubicTo(cx1, cy1, cx2, cy2, vx, vy);
         curr_x = vx;
         curr_y = vy;
@@ -4775,8 +4791,8 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     float curr_x_clip = x, curr_y_clip = y;
     for (int i = 0; i < num_verts; i++) {
       stbtt_vertex* v = &vertices[i];
-      float vx = x + v->x * scale;
-      float vy = y - v->y * scale;
+      float vx, vy;
+      transform_vertex(v->x, v->y, vx, vy);
 
       switch (v->type) {
         case STBTT_vmove:
@@ -4792,8 +4808,8 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
           curr_y_clip = vy;
           break;
         case STBTT_vcurve: {
-          float cx = x + v->cx * scale;
-          float cy = y - v->cy * scale;
+          float cx, cy;
+          transform_vertex(v->cx, v->cy, cx, cy);
           float cp1x = curr_x_clip + (2.0f / 3.0f) * (cx - curr_x_clip);
           float cp1y = curr_y_clip + (2.0f / 3.0f) * (cy - curr_y_clip);
           float cp2x = vx + (2.0f / 3.0f) * (cx - vx);
@@ -4807,10 +4823,9 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
           break;
         }
         case STBTT_vcubic: {
-          float cx1 = x + v->cx * scale;
-          float cy1 = y - v->cy * scale;
-          float cx2 = x + v->cx1 * scale;
-          float cy2 = y - v->cy1 * scale;
+          float cx1, cy1, cx2, cy2;
+          transform_vertex(v->cx, v->cy, cx1, cy1);
+          transform_vertex(v->cx1, v->cy1, cx2, cy2);
           state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
           state_.text_clip_points.push_back({cx1, cy1});
           state_.text_clip_points.push_back({cx2, cy2});
@@ -4896,6 +4911,23 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
   // Calculate scale factor
   float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
 
+  // Compute rotation from text matrix for rotated text (e.g., [0 -8 8 0])
+  float font_scale_tm = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                  state_.text_matrix.b * state_.text_matrix.b);
+  float cos_theta = 1.0f, sin_theta = 0.0f;
+  if (font_scale_tm > 0.01f) {
+    cos_theta = state_.text_matrix.a / font_scale_tm;
+    sin_theta = state_.text_matrix.b / font_scale_tm;
+  }
+
+  // Helper lambda to transform glyph-local coordinates with rotation
+  auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
+    float gx = gx_raw * scale;
+    float gy = gy_raw * scale;
+    out_x = x + gx * cos_theta - gy * sin_theta;
+    out_y = y - (gx * sin_theta + gy * cos_theta);
+  };
+
   // Build ThorVG path from stb_truetype vertices
   auto shape = tvg::Shape::gen();
   if (!shape) {
@@ -4908,8 +4940,8 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
 
   for (int i = 0; i < num_verts; i++) {
     stbtt_vertex* v = &vertices[i];
-    float vx = x + v->x * scale;
-    float vy = y - v->y * scale;  // Flip Y for screen coordinates
+    float vx, vy;
+    transform_vertex(v->x, v->y, vx, vy);
 
     switch (v->type) {
       case STBTT_vmove:
@@ -4923,16 +4955,9 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
         curr_y = vy;
         break;
       case STBTT_vcurve: {
-        // Quadratic bezier - convert to cubic for ThorVG
-        // Control point (P1)
-        float cx = x + v->cx * scale;
-        float cy = y - v->cy * scale;
-        // End point (P2) is (vx, vy)
-        // Start point (P0) is (curr_x, curr_y)
+        float cx, cy;
+        transform_vertex(v->cx, v->cy, cx, cy);
 
-        // Convert quadratic to cubic bezier:
-        // CP1 = P0 + 2/3 * (P1 - P0)
-        // CP2 = P2 + 2/3 * (P1 - P2)
         float cp1x = curr_x + (2.0f / 3.0f) * (cx - curr_x);
         float cp1y = curr_y + (2.0f / 3.0f) * (cy - curr_y);
         float cp2x = vx + (2.0f / 3.0f) * (cx - vx);
@@ -4944,10 +4969,9 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
         break;
       }
       case STBTT_vcubic: {
-        float cx1 = x + v->cx * scale;
-        float cy1 = y - v->cy * scale;
-        float cx2 = x + v->cx1 * scale;
-        float cy2 = y - v->cy1 * scale;
+        float cx1, cy1, cx2, cy2;
+        transform_vertex(v->cx, v->cy, cx1, cy1);
+        transform_vertex(v->cx1, v->cy1, cx2, cy2);
         shape->cubicTo(cx1, cy1, cx2, cy2, vx, vy);
         curr_x = vx;
         curr_y = vy;
@@ -4974,8 +4998,8 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
     float curr_x_clip = x, curr_y_clip = y;
     for (int i = 0; i < num_verts; i++) {
       stbtt_vertex* v = &vertices[i];
-      float vx_c = x + v->x * scale;
-      float vy_c = y - v->y * scale;
+      float vx_c, vy_c;
+      transform_vertex(v->x, v->y, vx_c, vy_c);
 
       switch (v->type) {
         case STBTT_vmove:
@@ -4991,8 +5015,8 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
           curr_y_clip = vy_c;
           break;
         case STBTT_vcurve: {
-          float cx_c = x + v->cx * scale;
-          float cy_c = y - v->cy * scale;
+          float cx_c, cy_c;
+          transform_vertex(v->cx, v->cy, cx_c, cy_c);
           float cp1x = curr_x_clip + (2.0f / 3.0f) * (cx_c - curr_x_clip);
           float cp1y = curr_y_clip + (2.0f / 3.0f) * (cy_c - curr_y_clip);
           float cp2x = vx_c + (2.0f / 3.0f) * (cx_c - vx_c);
@@ -5006,10 +5030,9 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
           break;
         }
         case STBTT_vcubic: {
-          float cx1 = x + v->cx * scale;
-          float cy1 = y - v->cy * scale;
-          float cx2 = x + v->cx1 * scale;
-          float cy2 = y - v->cy1 * scale;
+          float cx1, cy1, cx2, cy2;
+          transform_vertex(v->cx, v->cy, cx1, cy1);
+          transform_vertex(v->cx1, v->cy1, cx2, cy2);
           state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
           state_.text_clip_points.push_back({cx1, cy1});
           state_.text_clip_points.push_back({cx2, cy2});
@@ -6368,7 +6391,10 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           float canvas_y = (state_.page_height - text_y) * state_.scale;
 
           // Calculate effective font size (considering text matrix scale)
-          float font_scale = std::abs(state_.text_matrix.d);
+          // Use sqrt(a²+b²) to handle rotated text matrices (e.g., [0 -8 8 0])
+          float font_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                       state_.text_matrix.b * state_.text_matrix.b);
+          if (font_scale < 0.01f) font_scale = std::abs(state_.text_matrix.d);
           if (font_scale < 0.01f) font_scale = 1.0f;
           float scaled_size = state_.font_size * font_scale * state_.scale;
 
@@ -6427,7 +6453,9 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                 float text_y = state_.text_matrix.f;
                 float canvas_x = text_x * state_.scale;
                 float canvas_y = (state_.page_height - text_y) * state_.scale;
-                float font_scale = std::abs(state_.text_matrix.d);
+                float font_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                             state_.text_matrix.b * state_.text_matrix.b);
+                if (font_scale < 0.01f) font_scale = std::abs(state_.text_matrix.d);
                 if (font_scale < 0.01f) font_scale = 1.0f;
                 float scaled_size = state_.font_size * font_scale * state_.scale;
 
@@ -6499,7 +6527,9 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           float text_y = state_.text_matrix.f;
           float canvas_x = text_x * state_.scale;
           float canvas_y = (state_.page_height - text_y) * state_.scale;
-          float font_scale = std::abs(state_.text_matrix.d);
+          float font_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                       state_.text_matrix.b * state_.text_matrix.b);
+          if (font_scale < 0.01f) font_scale = std::abs(state_.text_matrix.d);
           if (font_scale < 0.01f) font_scale = 1.0f;
           float scaled_size = state_.font_size * font_scale * state_.scale;
 
