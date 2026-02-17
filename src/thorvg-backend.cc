@@ -6257,20 +6257,21 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         if (operands.size() >= 2 && state_.in_text_block) {
           float tx = std::stof(operands[0]);
           float ty = std::stof(operands[1]);
-          // Td translates the text matrix
-          state_.text_matrix.e += tx * state_.text_matrix.a + ty * state_.text_matrix.c;
-          state_.text_matrix.f += tx * state_.text_matrix.b + ty * state_.text_matrix.d;
-          state_.text_line_matrix = state_.text_matrix;
+          // Td translates from the text LINE matrix (not current text matrix)
+          // per PDF spec: text_line_matrix = Translate(tx,ty) * text_line_matrix
+          state_.text_line_matrix.e += tx * state_.text_line_matrix.a + ty * state_.text_line_matrix.c;
+          state_.text_line_matrix.f += tx * state_.text_line_matrix.b + ty * state_.text_line_matrix.d;
+          state_.text_matrix = state_.text_line_matrix;
         }
       } else if (token == "TD") {  // Move text position and set leading
         if (operands.size() >= 2 && state_.in_text_block) {
           float tx = std::stof(operands[0]);
           float ty = std::stof(operands[1]);
           state_.text_leading = -ty;  // TL = -ty
-          // Same as Td
-          state_.text_matrix.e += tx * state_.text_matrix.a + ty * state_.text_matrix.c;
-          state_.text_matrix.f += tx * state_.text_matrix.b + ty * state_.text_matrix.d;
-          state_.text_line_matrix = state_.text_matrix;
+          // Same as Td: translate from text line matrix
+          state_.text_line_matrix.e += tx * state_.text_line_matrix.a + ty * state_.text_line_matrix.c;
+          state_.text_line_matrix.f += tx * state_.text_line_matrix.b + ty * state_.text_line_matrix.d;
+          state_.text_matrix = state_.text_line_matrix;
         }
       } else if (token == "Tm") {  // Set text matrix
         if (operands.size() >= 6 && state_.in_text_block) {
@@ -6286,15 +6287,13 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
       } else if (token == "T*") {  // Move to start of next line
         if (state_.in_text_block) {
           // Equivalent to: 0 -TL Td
-          // T* moves to the start of the next line using text_leading
           float leading = state_.text_leading;
-          if (leading == 0) leading = state_.font_size;  // Default leading
-
-          // Move down by leading (in PDF, Y increases upward, so subtract)
-          // For identity matrix: e stays same (x), f decreases (y)
-          state_.text_matrix.e = state_.text_line_matrix.e;  // Reset to line start X
-          state_.text_matrix.f = state_.text_line_matrix.f - leading;  // Move down by leading
-          state_.text_line_matrix = state_.text_matrix;
+          if (leading == 0) leading = state_.font_size;
+          float ty = -leading;
+          // Apply as Td: translate from text line matrix, scaled by matrix
+          state_.text_line_matrix.e += ty * state_.text_line_matrix.c;
+          state_.text_line_matrix.f += ty * state_.text_line_matrix.d;
+          state_.text_matrix = state_.text_line_matrix;
         }
       } else if (token == "TL") {  // Set text leading
         if (operands.size() >= 1) {
