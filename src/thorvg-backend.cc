@@ -1262,11 +1262,23 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
     return false;
   }
 
+  // Compute text direction from text matrix for rotated text positioning
+  // For normal text [8,0,0,8], cos_tm=1, sin_tm=0 (advance right)
+  // For rotated [0,-8,8,0], cos_tm=0, sin_tm=-1 (advance down in canvas)
+  float tm_scale_outer = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                   state_.text_matrix.b * state_.text_matrix.b);
+  float cos_tm_outer = 1.0f, sin_tm_outer = 0.0f;
+  if (tm_scale_outer > 0.01f) {
+    cos_tm_outer = state_.text_matrix.a / tm_scale_outer;
+    sin_tm_outer = state_.text_matrix.b / tm_scale_outer;
+  }
+
   // Check for Type 3 font (user-defined glyphs)
   auto* type3_font = dynamic_cast<const Type3Font*>(current_font_);
   if (type3_font) {
     // Type 3 fonts: render each glyph using its CharProc content stream
     float cursor_x = x;
+    float cursor_y = y;
 
     for (size_t i = 0; i < text.length(); ++i) {
       uint8_t char_code = static_cast<uint8_t>(text[i]);
@@ -1282,16 +1294,18 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         auto shape = tvg::Shape::gen();
         if (shape) {
           float glyph_width = size * 0.5f;
-          shape->appendRect(cursor_x, y - size, glyph_width, size, 0, 0);
+          shape->appendRect(cursor_x, cursor_y - size, glyph_width, size, 0, 0);
           shape->fill(r, g, b, static_cast<uint8_t>(a * 0.2f));
           push_with_clip(shape);
         }
-        cursor_x += size * 0.6f;
+        float adv = size * 0.6f;
+        cursor_x += adv * cos_tm_outer;
+        cursor_y -= adv * sin_tm_outer;
         continue;
       }
 
       // Render the Type 3 glyph
-      render_type3_glyph(type3_font, glyph_name, cursor_x, y, size, r, g, b, a);
+      render_type3_glyph(type3_font, glyph_name, cursor_x, cursor_y, size, r, g, b, a);
 
       // Get advance width from Widths array if available
       float advance = size * 0.6f;  // Default advance
@@ -1301,7 +1315,8 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         advance = static_cast<float>(type3_font->widths[char_code] * fm_a * size);
       }
 
-      cursor_x += advance;
+      cursor_x += advance * cos_tm_outer;
+      cursor_y -= advance * sin_tm_outer;
     }
     return true;
   }
@@ -1313,6 +1328,10 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
     // Render each character using glyph outlines
     float cursor_x = x;
     float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+
+    // Use outer text direction variables for cursor advance
+    float cos_tm = cos_tm_outer;
+    float sin_tm = sin_tm_outer;
 
     // Check if this is a Type0/CID font that uses two-byte encoding
     auto* type0_font = dynamic_cast<const Type0Font*>(current_font_);
@@ -1366,9 +1385,11 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
       if (type0_font) {
         bool using_embedded = font->is_embedded;
 
-        // For vertical mode, compute glyph draw position with v_x centering
+        // Compute glyph draw position
+        // For vertical mode: uses cursor_y with v_x centering
+        // For rotated text: cursor_y tracks vertical advance from rotation
         float draw_x = cursor_x;
-        float draw_y = is_vertical ? cursor_y : y;
+        float draw_y = cursor_y;
         if (is_vertical) {
           // Shift glyph left by v_x to center on the vertical text line
           auto vm_it = type0_font->cid_vertical_metrics.find(char_code);
@@ -1424,11 +1445,13 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
           // w1_y is negative (e.g., -1000); negate for canvas y-down coords
           cursor_y += static_cast<float>(-w1_y) / 1000.0f * size;
         } else {
-          // Horizontal mode: advance cursor_x using horizontal widths
+          // Horizontal mode: advance cursor in text direction using horizontal widths
           auto width_it = type0_font->cid_widths.find(char_code);
           int w = (width_it != type0_font->cid_widths.end())
               ? width_it->second : type0_font->default_width;
-          cursor_x += w / 1000.0f * size;
+          float adv = w / 1000.0f * size;
+          cursor_x += adv * cos_tm;
+          cursor_y -= adv * sin_tm;  // canvas y = -(PDF y), so subtract sin
         }
         i += bytes_consumed;
         continue;
@@ -1442,10 +1465,12 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
       stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(codepoint), &advance_width, &left_bearing);
 
       // Draw the glyph
-      draw_glyph(static_cast<int>(codepoint), cursor_x, y, size, r, g, b, a);
+      draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
 
-      // Advance cursor
-      cursor_x += advance_width * scale;
+      // Advance cursor in text direction
+      float adv = advance_width * scale;
+      cursor_x += adv * cos_tm;
+      cursor_y -= adv * sin_tm;
 
       // Add kerning if there's a next character
       if (i + bytes_consumed < text.length()) {
@@ -1454,7 +1479,9 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         int kern = stbtt_GetCodepointKernAdvance(&font->font_info,
                                                   static_cast<int>(codepoint),
                                                   static_cast<int>(next_codepoint));
-        cursor_x += kern * scale;
+        float kern_adv = kern * scale;
+        cursor_x += kern_adv * cos_tm;
+        cursor_y -= kern_adv * sin_tm;
       }
 
       i += bytes_consumed;
