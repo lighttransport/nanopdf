@@ -10,6 +10,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <unordered_map>
 
 // stb_truetype for glyph outline extraction
 #include "stb_truetype.h"
@@ -230,6 +231,32 @@ private:
     std::vector<uint16_t> cid_to_gid;  // CFF charset CID→GID map (empty = identity)
   };
 
+  // Glyph bitmap cache key: font_name + glyph_id + quantized_size
+  struct GlyphBitmapKey {
+    std::string font_name;
+    int glyph_id;
+    uint16_t size_q;  // size * 4, quantized to quarter-pixel
+    bool operator==(const GlyphBitmapKey& o) const {
+      return font_name == o.font_name && glyph_id == o.glyph_id &&
+             size_q == o.size_q;
+    }
+  };
+
+  struct GlyphBitmapKeyHash {
+    size_t operator()(const GlyphBitmapKey& k) const {
+      size_t h = std::hash<std::string>{}(k.font_name);
+      h ^= std::hash<int>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<uint16_t>{}(k.size_q) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+
+  struct GlyphBitmapEntry {
+    std::vector<uint8_t> bitmap;  // grayscale alpha
+    int width, height;
+    float xoff, yoff;  // offset from glyph origin (float for 2x precision)
+  };
+
   // Draw a single glyph using stb_truetype outlines (by Unicode codepoint)
   bool draw_glyph(int codepoint, float x, float y, float size,
                   uint8_t r, uint8_t g, uint8_t b, uint8_t a);
@@ -237,6 +264,12 @@ private:
   // Draw a single glyph using stb_truetype outlines (by glyph index - for CID fonts)
   bool draw_glyph_by_index(int glyph_index, float x, float y, float size,
                            uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+
+  // Draw a glyph using stb_truetype bitmap rasterizer (higher quality for fill text)
+  bool draw_glyph_bitmap(int codepoint, float x, float y, float size,
+                         uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+  bool draw_glyph_bitmap_by_index(int glyph_index, float x, float y, float size,
+                                  uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
   // Render a Type 3 font glyph by executing its CharProc content stream
   bool render_type3_glyph(const Type3Font* type3_font, const std::string& glyph_name,
@@ -297,6 +330,11 @@ private:
 
   // Font cache - maps font names to loaded font data
   std::map<std::string, FontCache> font_cache_;
+
+  // Glyph bitmap cache for stb_truetype bitmap rasterizer
+  std::unordered_map<GlyphBitmapKey, GlyphBitmapEntry, GlyphBitmapKeyHash>
+      glyph_bitmap_cache_;
+  static constexpr size_t kMaxGlyphCacheEntries = 4096;
 
   // Current font for text rendering
   std::string current_font_name_;

@@ -4750,6 +4750,25 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     return true;
   }
 
+  // Use bitmap rendering for fill-only, non-rotated text (common case)
+  {
+    bool fill_only = (state_.text_render_mode == 0);
+    float font_scale_tm =
+        std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                  state_.text_matrix.b * state_.text_matrix.b);
+    float sin_theta_abs = 0.0f;
+    if (font_scale_tm > 0.01f) {
+      sin_theta_abs = std::abs(state_.text_matrix.b / font_scale_tm);
+    }
+    bool is_rotated = (sin_theta_abs > 0.01f);
+    if (fill_only && !is_rotated) {
+      if (draw_glyph_bitmap(codepoint, x, y, size, r, g, b, a)) {
+        return true;
+      }
+      // Fall through to outline path if bitmap rendering failed
+    }
+  }
+
   // Get glyph outline from stb_truetype
   stbtt_vertex* vertices = nullptr;
   int num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
@@ -4964,6 +4983,25 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
     return true;
   }
 
+  // Use bitmap rendering for fill-only, non-rotated text (common case)
+  {
+    bool fill_only = (state_.text_render_mode == 0);
+    float font_scale_tm =
+        std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                  state_.text_matrix.b * state_.text_matrix.b);
+    float sin_theta_abs = 0.0f;
+    if (font_scale_tm > 0.01f) {
+      sin_theta_abs = std::abs(state_.text_matrix.b / font_scale_tm);
+    }
+    bool is_rotated = (sin_theta_abs > 0.01f);
+    if (fill_only && !is_rotated) {
+      if (draw_glyph_bitmap_by_index(glyph_index, x, y, size, r, g, b, a)) {
+        return true;
+      }
+      // Fall through to outline path if bitmap rendering failed
+    }
+  }
+
   // Get glyph outline from stb_truetype using glyph index directly
   stbtt_vertex* vertices = nullptr;
   int num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
@@ -5152,6 +5190,156 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
   return push_with_clip(shape);
 }
 
+bool ThorVGBackend::draw_glyph_bitmap(int codepoint, float x, float y,
+                                      float size, uint8_t r, uint8_t g,
+                                      uint8_t b, uint8_t a) {
+  FontCache* font = get_font(current_font_name_);
+  if (!font) return false;
+  int glyph_index = stbtt_FindGlyphIndex(&font->font_info, codepoint);
+  if (glyph_index == 0) return false;
+  return draw_glyph_bitmap_by_index(glyph_index, x, y, size, r, g, b, a);
+}
+
+bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
+                                                float y, float size,
+                                                uint8_t r, uint8_t g,
+                                                uint8_t b, uint8_t a) {
+  FontCache* font = get_font(current_font_name_);
+  if (!font || !scene_) return false;
+
+  // Quantize size for cache lookup (quarter-pixel granularity)
+  uint16_t size_q = static_cast<uint16_t>(size * 4.0f + 0.5f);
+  GlyphBitmapKey key{current_font_name_, glyph_index, size_q};
+
+  const GlyphBitmapEntry* entry = nullptr;
+  auto cache_it = glyph_bitmap_cache_.find(key);
+
+  if (cache_it != glyph_bitmap_cache_.end()) {
+    entry = &cache_it->second;
+  } else {
+    // Evict if cache is full
+    if (glyph_bitmap_cache_.size() >= kMaxGlyphCacheEntries) {
+      glyph_bitmap_cache_.clear();
+    }
+
+    // Render glyph bitmap with 2x oversampling for better edge quality
+    static const float kOversample = 2.0f;
+    float scale_2x =
+        stbtt_ScaleForPixelHeight(&font->font_info, size * kOversample);
+    int w2x, h2x, xoff2x, yoff2x;
+    unsigned char* bmp2x = stbtt_GetGlyphBitmapSubpixel(
+        &font->font_info, scale_2x, scale_2x, 0, 0, glyph_index, &w2x, &h2x,
+        &xoff2x, &yoff2x);
+
+    auto& e = glyph_bitmap_cache_[key];
+    if (!bmp2x || w2x <= 0 || h2x <= 0) {
+      // Empty glyph (space etc.)
+      e.width = 0;
+      e.height = 0;
+      e.xoff = 0;
+      e.yoff = 0;
+      if (bmp2x) stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
+      entry = &e;
+    } else {
+      // Downsample 2x -> 1x with box filter
+      int w1x = (w2x + 1) / 2;
+      int h1x = (h2x + 1) / 2;
+      e.bitmap.resize(w1x * h1x);
+      for (int iy = 0; iy < h1x; iy++) {
+        for (int ix = 0; ix < w1x; ix++) {
+          int sum = 0, count = 0;
+          for (int dy = 0; dy < 2; dy++) {
+            for (int dx = 0; dx < 2; dx++) {
+              int sy = iy * 2 + dy, sx = ix * 2 + dx;
+              if (sy < h2x && sx < w2x) {
+                sum += bmp2x[sy * w2x + sx];
+                count++;
+              }
+            }
+          }
+          e.bitmap[iy * w1x + ix] = static_cast<uint8_t>(sum / count);
+        }
+      }
+      e.width = w1x;
+      e.height = h1x;
+      e.xoff = xoff2x / kOversample;
+      e.yoff = yoff2x / kOversample;
+      stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
+      entry = &e;
+    }
+  }
+
+  if (!entry || entry->width <= 0 || entry->height <= 0) {
+    return true;  // empty glyph (e.g. space)
+  }
+
+  // Create ARGB8888 bitmap with glyph color + alpha from bitmap
+  int gw = entry->width;
+  int gh = entry->height;
+  auto* argb = new uint32_t[gw * gh];
+  for (int i = 0; i < gw * gh; i++) {
+    uint8_t alpha = static_cast<uint8_t>(
+        (static_cast<uint16_t>(entry->bitmap[i]) * a) / 255);
+    // ARGB8888: A in high byte, straight alpha
+    argb[i] = (static_cast<uint32_t>(alpha) << 24) |
+              (static_cast<uint32_t>(r) << 16) |
+              (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+  }
+
+  // Create ThorVG Picture and position it
+  auto picture = tvg::Picture::gen();
+  if (!picture) {
+    delete[] argb;
+    return false;
+  }
+
+  if (picture->load(argb, gw, gh, tvg::ColorSpace::ARGB8888S, true) !=
+      tvg::Result::Success) {
+    delete[] argb;
+    return false;
+  }
+
+  // Position: glyph origin (x, y) + bitmap offset
+  float px = x + entry->xoff;
+  float py = y + entry->yoff;
+  tvg::Matrix m;
+  m.e11 = 1.0f;
+  m.e12 = 0.0f;
+  m.e13 = px;
+  m.e21 = 0.0f;
+  m.e22 = 1.0f;
+  m.e23 = py;
+  m.e31 = 0.0f;
+  m.e32 = 0.0f;
+  m.e33 = 1.0f;
+  picture->transform(m);
+
+  // Apply blend mode
+  if (state_.blend_mode != 0) {
+    picture->blend(static_cast<tvg::BlendMethod>(state_.blend_mode));
+  }
+
+  // Apply clipping if active
+  if (state_.has_clip && !state_.clip_commands.empty()) {
+    auto clipper = tvg::Shape::gen();
+    clipper->appendPath(state_.clip_commands.data(),
+                        state_.clip_commands.size(),
+                        state_.clip_points.data(),
+                        state_.clip_points.size());
+    if (state_.clip_even_odd) {
+      clipper->fillRule(tvg::FillRule::EvenOdd);
+    } else {
+      clipper->fillRule(tvg::FillRule::NonZero);
+    }
+    if (picture->clip(clipper) != tvg::Result::Success) {
+      tvg::Paint::rel(clipper);
+    }
+  }
+
+  scene_->add(picture);
+  return true;
+}
+
 ThorVGRenderResult ThorVGBackend::get_buffer() {
   ThorVGRenderResult result;
 
@@ -5280,6 +5468,9 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
   current_pdf_ = &pdf;
   current_page_ = &page;
   page.ensure_fonts_loaded(pdf);
+
+  // Clear glyph bitmap cache for fresh page
+  glyph_bitmap_cache_.clear();
 
   // Draw background
   draw_rectangle(0, 0, width_, height_, options.bg_r, options.bg_g, options.bg_b, options.bg_a);
@@ -5418,6 +5609,9 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
 
   // Ensure page fonts are loaded
   page.ensure_fonts_loaded(pdf);
+
+  // Clear glyph bitmap cache for fresh page
+  glyph_bitmap_cache_.clear();
 
   // Draw white background
   draw_rectangle(0, 0, width_, height_, 255, 255, 255, 255);
