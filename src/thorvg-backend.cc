@@ -5208,9 +5208,9 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
   // Calculate scale based on DPI (72 DPI is standard PDF resolution)
   float dpi_scale = options.dpi / 72.0f;
 
-  // Resize canvas if needed for DPI scaling
-  uint32_t target_width = static_cast<uint32_t>(page_width * dpi_scale);
-  uint32_t target_height = static_cast<uint32_t>(page_height * dpi_scale);
+  // Resize canvas if needed for DPI scaling (ceiling to ensure full page fits)
+  uint32_t target_width = static_cast<uint32_t>(std::ceil(page_width * dpi_scale));
+  uint32_t target_height = static_cast<uint32_t>(std::ceil(page_height * dpi_scale));
 
   if (target_width != width_ || target_height != height_) {
     if (!initialize(target_width, target_height)) {
@@ -5224,10 +5224,8 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
     return result;
   }
 
-  // Calculate scale to fit in canvas
-  float scale_x = static_cast<float>(width_) / page_width;
-  float scale_y = static_cast<float>(height_) / page_height;
-  float scale = std::min(scale_x, scale_y);
+  // Use exact DPI scale factor to avoid rounding errors from canvas dimensions
+  float scale = dpi_scale;
 
   // Initialize graphics state
   state_ = GraphicsState();
@@ -5237,6 +5235,7 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
 
   current_pdf_ = &pdf;
   current_page_ = &page;
+  page.ensure_fonts_loaded(pdf);
 
   // Draw background
   draw_rectangle(0, 0, width_, height_, options.bg_r, options.bg_g, options.bg_b, options.bg_a);
