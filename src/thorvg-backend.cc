@@ -1391,19 +1391,26 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         float draw_x = cursor_x;
         float draw_y = cursor_y;
         if (is_vertical) {
-          // Shift glyph left by v_x to center on the vertical text line
+          // Apply vertical origin displacement (v_x, v_y)
+          // In vertical writing, the text position is the vertical origin.
+          // The glyph's horizontal origin (baseline) is displaced by -v from
+          // the vertical origin. v_y shifts the baseline below the text position.
           auto vm_it = type0_font->cid_vertical_metrics.find(char_code);
-          float v_x_offset;
+          float v_x_offset, v_y_offset;
           if (vm_it != type0_font->cid_vertical_metrics.end()) {
             v_x_offset = static_cast<float>(vm_it->second.v_x) / 1000.0f * size;
+            v_y_offset = static_cast<float>(vm_it->second.v_y) / 1000.0f * size;
           } else {
             // Default v_x = w0/2 (half the horizontal width)
             auto w_it = type0_font->cid_widths.find(char_code);
             int w0 = (w_it != type0_font->cid_widths.end())
                 ? w_it->second : type0_font->default_width;
             v_x_offset = w0 / 2000.0f * size;
+            v_y_offset = static_cast<float>(type0_font->default_v_y) / 1000.0f * size;
           }
           draw_x = cursor_x - v_x_offset;
+          // In canvas coords (y-down), v_y moves baseline below the vertical origin
+          draw_y = cursor_y + v_y_offset;
         }
 
         if (using_embedded) {
@@ -1433,6 +1440,13 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
           draw_glyph(static_cast<int>(unicode), draw_x, draw_y, size, r, g, b, a);
         }
 
+        // Compute character spacing (Tc) in canvas space
+        // Tc is in text space; canvas = Tc * font_scale * scale = Tc * size / Tfs
+        float tc_canvas = 0.0f;
+        if (std::abs(state_.font_size) > 0.001f) {
+          tc_canvas = state_.char_spacing * size / state_.font_size;
+        }
+
         if (is_vertical) {
           // Vertical mode: advance cursor_y downward using vertical metrics
           auto vm_it = type0_font->cid_vertical_metrics.find(char_code);
@@ -1443,13 +1457,13 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
             w1_y = type0_font->default_w1_y;  // default: -1000
           }
           // w1_y is negative (e.g., -1000); negate for canvas y-down coords
-          cursor_y += static_cast<float>(-w1_y) / 1000.0f * size;
+          cursor_y += static_cast<float>(-w1_y) / 1000.0f * size + tc_canvas;
         } else {
           // Horizontal mode: advance cursor in text direction using horizontal widths
           auto width_it = type0_font->cid_widths.find(char_code);
           int w = (width_it != type0_font->cid_widths.end())
               ? width_it->second : type0_font->default_width;
-          float adv = w / 1000.0f * size;
+          float adv = w / 1000.0f * size + tc_canvas;
           cursor_x += adv * cos_tm;
           cursor_y -= adv * sin_tm;  // canvas y = -(PDF y), so subtract sin
         }
@@ -1468,7 +1482,17 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
       draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
 
       // Advance cursor in text direction
-      float adv = advance_width * scale;
+      // Add character spacing (Tc) in canvas space
+      float tc_canvas2 = 0.0f;
+      if (std::abs(state_.font_size) > 0.001f) {
+        tc_canvas2 = state_.char_spacing * size / state_.font_size;
+      }
+      // Add word spacing (Tw) for single-byte space character (code 32)
+      float tw_canvas = 0.0f;
+      if (char_code == 32 && std::abs(state_.font_size) > 0.001f) {
+        tw_canvas = state_.word_spacing * size / state_.font_size;
+      }
+      float adv = advance_width * scale + tc_canvas2 + tw_canvas;
       cursor_x += adv * cos_tm;
       cursor_y -= adv * sin_tm;
 
@@ -1955,6 +1979,7 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
     }
 
     float width = 0.0f;
+    int num_chars = 0;
     for (size_t i = 0; i < text.length(); ) {
       uint32_t char_code;
       size_t bytes_consumed = 1;
@@ -1978,14 +2003,18 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
         // Use default width
         width += type0_font->default_width / 1000.0f * font_size;
       }
+      num_chars++;
       i += bytes_consumed;
     }
+    // Add character spacing (Tc) for each character
+    width += num_chars * state_.char_spacing;
     return width;
   }
 
   // Check if BaseFont has width information
   if (current_font_ && !current_font_->widths.empty()) {
     float width = 0.0f;
+    int num_chars = 0;
     for (size_t i = 0; i < text.length(); i++) {
       uint32_t char_code = static_cast<unsigned char>(text[i]);
       int first_char = current_font_->first_char;
@@ -1997,12 +2026,19 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
         if (idx < current_font_->widths.size()) {
           // PDF widths are in 1/1000 of text space unit
           width += current_font_->widths[idx] / 1000.0f * font_size;
+          // Add word spacing (Tw) for single-byte space (code 32)
+          if (char_code == 32) width += state_.word_spacing;
+          num_chars++;
           continue;
         }
       }
       // Default width for missing glyphs
       width += font_size * 0.5f;
+      if (char_code == 32) width += state_.word_spacing;
+      num_chars++;
     }
+    // Add character spacing (Tc) for each character
+    width += num_chars * state_.char_spacing;
     return width;
   }
 
@@ -2045,12 +2081,16 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
                                                 static_cast<int>(next_codepoint));
       width += kern * scale;
     }
+    // Add word spacing (Tw) for single-byte space (code 32)
+    if (char_code == 32) width += state_.word_spacing * scale;
   }
 
   // Convert from pixel width back to text space units
   if (scale > 0) {
-    return width / scale;
+    width = width / scale;
   }
+  // Add character spacing (Tc) for each character
+  width += static_cast<float>(text.length()) * state_.char_spacing;
   return width;
 }
 
@@ -2076,6 +2116,7 @@ float ThorVGBackend::calculate_vertical_advance(const std::string& text, float f
   }
 
   float advance = 0.0f;
+  int num_chars = 0;
   for (size_t i = 0; i < text.length(); ) {
     uint32_t char_code;
     size_t bytes_consumed = 1;
@@ -2095,8 +2136,11 @@ float ThorVGBackend::calculate_vertical_advance(const std::string& text, float f
         ? vm_it->second.w1_y : type0_font->default_w1_y;
     // w1_y is negative; return positive total advance magnitude
     advance += static_cast<float>(-w1_y) / 1000.0f * font_size;
+    num_chars++;
     i += bytes_consumed;
   }
+  // Add character spacing (Tc) for each character
+  advance += num_chars * state_.char_spacing;
   return advance;
 }
 
@@ -5278,7 +5322,68 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
   current_pdf_ = nullptr;
   current_page_ = nullptr;
 
-  return get_buffer();
+  result = get_buffer();
+
+  // Apply page rotation if specified
+  int rotation = static_cast<int>(page.rotate) % 360;
+  if (rotation < 0) rotation += 360;
+  if (rotation != 0 && result.success && !result.pixels.empty()) {
+    uint32_t src_w = result.width;
+    uint32_t src_h = result.height;
+    const auto& src = result.pixels;
+
+    if (rotation == 90) {
+      // 90° CW: new(x,y) = old(y, src_w-1-x), new size = src_h × src_w
+      uint32_t dst_w = src_h, dst_h = src_w;
+      std::vector<uint8_t> dst(dst_w * dst_h * 4);
+      for (uint32_t dy = 0; dy < dst_h; dy++) {
+        for (uint32_t dx = 0; dx < dst_w; dx++) {
+          uint32_t sx = dy;               // old x = new y
+          uint32_t sy = dst_w - 1 - dx;   // old y = dst_w - 1 - new x
+          size_t si = (sy * src_w + sx) * 4;
+          size_t di = (dy * dst_w + dx) * 4;
+          dst[di] = src[si]; dst[di+1] = src[si+1];
+          dst[di+2] = src[si+2]; dst[di+3] = src[si+3];
+        }
+      }
+      result.pixels = std::move(dst);
+      result.width = dst_w;
+      result.height = dst_h;
+    } else if (rotation == 180) {
+      // 180°: new(x,y) = old(src_w-1-x, src_h-1-y), same size
+      std::vector<uint8_t> dst(src_w * src_h * 4);
+      for (uint32_t dy = 0; dy < src_h; dy++) {
+        for (uint32_t dx = 0; dx < src_w; dx++) {
+          uint32_t sx = src_w - 1 - dx;
+          uint32_t sy = src_h - 1 - dy;
+          size_t si = (sy * src_w + sx) * 4;
+          size_t di = (dy * src_w + dx) * 4;
+          dst[di] = src[si]; dst[di+1] = src[si+1];
+          dst[di+2] = src[si+2]; dst[di+3] = src[si+3];
+        }
+      }
+      result.pixels = std::move(dst);
+    } else if (rotation == 270) {
+      // 270° CW: new(x,y) = old(src_w-1-y, x), new size = src_h × src_w
+      uint32_t dst_w = src_h, dst_h = src_w;
+      std::vector<uint8_t> dst(dst_w * dst_h * 4);
+      for (uint32_t dy = 0; dy < dst_h; dy++) {
+        for (uint32_t dx = 0; dx < dst_w; dx++) {
+          uint32_t sx = src_w - 1 - dy;   // old x = src_w - 1 - new y
+          uint32_t sy = dx;                // old y = new x
+          size_t si = (sy * src_w + sx) * 4;
+          size_t di = (dy * dst_w + dx) * 4;
+          dst[di] = src[si]; dst[di+1] = src[si+1];
+          dst[di+2] = src[si+2]; dst[di+3] = src[si+3];
+        }
+      }
+      result.pixels = std::move(dst);
+      result.width = dst_w;
+      result.height = dst_h;
+    }
+  }
+
+  return result;
 }
 
 ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) {
