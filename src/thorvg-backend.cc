@@ -5562,11 +5562,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           float x = std::stof(operands[0]);
           float y = std::stof(operands[1]);
 
-          // Apply transformation
+          // Apply CTM then scale to canvas coordinates with Y-flip
           state_.transform.transform(x, y);
 
-          state_.current_x = x;
-          state_.current_y = height_ - y;  // Flip Y coordinate
+          state_.current_x = x * state_.scale;
+          state_.current_y = (state_.page_height - y) * state_.scale;
           state_.path_commands.push_back(tvg::PathCommand::MoveTo);
           state_.path_points.push_back({state_.current_x, state_.current_y});
           state_.in_path = true;
@@ -5576,11 +5576,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           float x = std::stof(operands[0]);
           float y = std::stof(operands[1]);
 
-          // Apply transformation
+          // Apply CTM then scale to canvas coordinates with Y-flip
           state_.transform.transform(x, y);
 
-          state_.current_x = x;
-          state_.current_y = height_ - y;  // Flip Y coordinate
+          state_.current_x = x * state_.scale;
+          state_.current_y = (state_.page_height - y) * state_.scale;
           state_.path_commands.push_back(tvg::PathCommand::LineTo);
           state_.path_points.push_back({state_.current_x, state_.current_y});
         }
@@ -5593,15 +5593,14 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           float x3 = std::stof(operands[4]);
           float y3 = std::stof(operands[5]);
 
-          // Apply transformation
+          // Apply CTM then scale to canvas coordinates with Y-flip
           state_.transform.transform(x1, y1);
           state_.transform.transform(x2, y2);
           state_.transform.transform(x3, y3);
 
-          // Flip Y coordinates
-          y1 = height_ - y1;
-          y2 = height_ - y2;
-          y3 = height_ - y3;
+          x1 *= state_.scale; y1 = (state_.page_height - y1) * state_.scale;
+          x2 *= state_.scale; y2 = (state_.page_height - y2) * state_.scale;
+          x3 *= state_.scale; y3 = (state_.page_height - y3) * state_.scale;
 
           state_.path_commands.push_back(tvg::PathCommand::CubicTo);
           state_.path_points.push_back({x1, y1});
@@ -5613,9 +5612,17 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
       } else if (token == "v") {  // curveTo variant (first control point = current point)
         if (operands.size() >= 4) {
           float x2 = std::stof(operands[0]);
-          float y2 = height_ - std::stof(operands[1]);
+          float y2 = std::stof(operands[1]);
           float x3 = std::stof(operands[2]);
-          float y3 = height_ - std::stof(operands[3]);
+          float y3 = std::stof(operands[3]);
+
+          // Apply CTM then scale to canvas coordinates with Y-flip
+          state_.transform.transform(x2, y2);
+          state_.transform.transform(x3, y3);
+
+          x2 *= state_.scale; y2 = (state_.page_height - y2) * state_.scale;
+          x3 *= state_.scale; y3 = (state_.page_height - y3) * state_.scale;
+
           state_.path_commands.push_back(tvg::PathCommand::CubicTo);
           state_.path_points.push_back({state_.current_x, state_.current_y});
           state_.path_points.push_back({x2, y2});
@@ -5626,9 +5633,17 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
       } else if (token == "y") {  // curveTo variant (second control point = end point)
         if (operands.size() >= 4) {
           float x1 = std::stof(operands[0]);
-          float y1 = height_ - std::stof(operands[1]);
+          float y1 = std::stof(operands[1]);
           float x3 = std::stof(operands[2]);
-          float y3 = height_ - std::stof(operands[3]);
+          float y3 = std::stof(operands[3]);
+
+          // Apply CTM then scale to canvas coordinates with Y-flip
+          state_.transform.transform(x1, y1);
+          state_.transform.transform(x3, y3);
+
+          x1 *= state_.scale; y1 = (state_.page_height - y1) * state_.scale;
+          x3 *= state_.scale; y3 = (state_.page_height - y3) * state_.scale;
+
           state_.path_commands.push_back(tvg::PathCommand::CubicTo);
           state_.path_points.push_back({x1, y1});
           state_.path_points.push_back({x3, y3});
@@ -5638,27 +5653,33 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         }
       } else if (token == "re") {  // rectangle
         if (operands.size() >= 4) {
-          float x = std::stof(operands[0]);
-          float y_pdf = std::stof(operands[1]);
-          float w = std::stof(operands[2]);
-          float h = std::stof(operands[3]);
+          float rx = std::stof(operands[0]);
+          float ry = std::stof(operands[1]);
+          float rw = std::stof(operands[2]);
+          float rh = std::stof(operands[3]);
 
-          // Convert to canvas coordinates: flip Y using page height, then scale
-          float y = (state_.page_height - y_pdf - h) * state_.scale;  // Flip Y and adjust for height
-          x = x * state_.scale;
-          w = w * state_.scale;
-          h = h * state_.scale;
+          // Build 4 corners in user space, transform through CTM, scale and Y-flip
+          float corners[4][2] = {
+            {rx, ry}, {rx + rw, ry}, {rx + rw, ry + rh}, {rx, ry + rh}
+          };
+          for (int i = 0; i < 4; i++) {
+            state_.transform.transform(corners[i][0], corners[i][1]);
+            corners[i][0] *= state_.scale;
+            corners[i][1] = (state_.page_height - corners[i][1]) * state_.scale;
+          }
 
-          // Add rectangle to path
+          // Add rectangle path from transformed corners
           state_.path_commands.push_back(tvg::PathCommand::MoveTo);
-          state_.path_points.push_back({x, y});
+          state_.path_points.push_back({corners[0][0], corners[0][1]});
           state_.path_commands.push_back(tvg::PathCommand::LineTo);
-          state_.path_points.push_back({x + w, y});
+          state_.path_points.push_back({corners[1][0], corners[1][1]});
           state_.path_commands.push_back(tvg::PathCommand::LineTo);
-          state_.path_points.push_back({x + w, y + h});
+          state_.path_points.push_back({corners[2][0], corners[2][1]});
           state_.path_commands.push_back(tvg::PathCommand::LineTo);
-          state_.path_points.push_back({x, y + h});
+          state_.path_points.push_back({corners[3][0], corners[3][1]});
           state_.path_commands.push_back(tvg::PathCommand::Close);
+          state_.current_x = corners[0][0];
+          state_.current_y = corners[0][1];
           state_.in_path = true;
         }
       } else if (token == "h") {  // Close path
