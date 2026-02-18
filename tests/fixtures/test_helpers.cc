@@ -1,9 +1,12 @@
 #include "test_helpers.hh"
+#include "nanopdf.hh"
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
+#include <algorithm>
 #include <sys/stat.h>
+#include <dirent.h>
 
 namespace nanopdf {
 namespace test {
@@ -245,6 +248,154 @@ std::vector<uint8_t> create_test_data(size_t size, bool compressible) {
         }
     }
     return result;
+}
+
+// ============================================================================
+// Corpus Testing Utilities
+// ============================================================================
+
+std::string get_corpora_dir() {
+    return get_test_data_dir() + "/corpora";
+}
+
+std::string get_corpus_path(const std::string& name) {
+    return get_corpora_dir() + "/" + name;
+}
+
+bool corpus_available(const std::string& name) {
+    std::string path = get_corpus_path(name);
+    DIR* dir = opendir(path.c_str());
+    if (!dir) return false;
+    bool has_files = false;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] != '.') {
+            has_files = true;
+            break;
+        }
+    }
+    closedir(dir);
+    return has_files;
+}
+
+static bool ends_with_ci(const std::string& str, const std::string& suffix) {
+    if (str.size() < suffix.size()) return false;
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        char a = str[str.size() - suffix.size() + i];
+        char b = suffix[i];
+        if (std::tolower(static_cast<unsigned char>(a)) !=
+            std::tolower(static_cast<unsigned char>(b)))
+            return false;
+    }
+    return true;
+}
+
+std::vector<std::string> list_pdf_files(const std::string& dir) {
+    std::vector<std::string> result;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return result;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name(entry->d_name);
+        if (ends_with_ci(name, ".pdf")) {
+            result.push_back(dir + "/" + name);
+        }
+    }
+    closedir(d);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+static void list_pdf_files_recursive_impl(const std::string& dir,
+                                           std::vector<std::string>& out) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name == "." || name == "..") continue;
+        std::string full_path = dir + "/" + name;
+        struct stat st;
+        if (stat(full_path.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            list_pdf_files_recursive_impl(full_path, out);
+        } else if (ends_with_ci(name, ".pdf")) {
+            out.push_back(full_path);
+        }
+    }
+    closedir(d);
+}
+
+std::vector<std::string> list_pdf_files_recursive(const std::string& dir) {
+    std::vector<std::string> result;
+    list_pdf_files_recursive_impl(dir, result);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+std::vector<std::string> list_tsv_files(const std::string& dir) {
+    std::vector<std::string> result;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return result;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name(entry->d_name);
+        if (ends_with_ci(name, ".tsv")) {
+            result.push_back(dir + "/" + name);
+        }
+    }
+    closedir(d);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+bool parse_pdf_file(const std::string& filepath, nanopdf::Pdf& out_pdf) {
+    std::vector<uint8_t> data;
+    if (!read_file(filepath, data)) return false;
+    if (data.empty()) return false;
+    nanopdf::ParseOptions opts;
+    opts.auto_repair = true;
+    opts.recover_stream_length = true;
+    opts.max_repair_scan = 0;
+    return nanopdf::parse_from_memory(data.data(), data.size(), &out_pdf, opts);
+}
+
+void CorpusTestStats::print_summary(const std::string& corpus_name) const {
+    std::cout << "\n[corpus] " << corpus_name << " results:\n";
+    std::cout << "  Total:   " << total << "\n";
+    std::cout << "  OK:      " << ok << "\n";
+    std::cout << "  Failed:  " << failed << "\n";
+    std::cout << "  Crashed: " << crashed << "\n";
+    if (total > 0) {
+        double pct = 100.0 * ok / total;
+        std::cout << "  Success: " << pct << "%\n";
+    }
+}
+
+CorpusTestStats test_parse_directory(const std::string& dir, int max_files,
+                                     bool recursive) {
+    CorpusTestStats stats;
+    std::vector<std::string> files =
+        recursive ? list_pdf_files_recursive(dir) : list_pdf_files(dir);
+
+    if (max_files > 0 && static_cast<int>(files.size()) > max_files) {
+        files.resize(static_cast<size_t>(max_files));
+    }
+
+    for (const auto& filepath : files) {
+        stats.total++;
+        try {
+            nanopdf::Pdf pdf;
+            if (parse_pdf_file(filepath, pdf)) {
+                stats.ok++;
+            } else {
+                stats.failed++;
+            }
+        } catch (...) {
+            stats.crashed++;
+        }
+    }
+    return stats;
 }
 
 }  // namespace test

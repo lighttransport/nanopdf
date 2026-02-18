@@ -50,6 +50,9 @@ svg_output.*
 data/ccitt/
 data/visual_refs/
 
+# Downloaded test corpora
+tests/data/corpora/
+
 # Emscripten
 *.wasm
 *.js.map

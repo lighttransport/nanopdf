@@ -275,6 +275,17 @@ struct TestRegistrar {
                                     #lhs, #rhs, "!=", __FILE__, __LINE__, false); \
     } while (false)
 
+// SKIP_IF: Skip test gracefully when preconditions are not met
+// Prints a skip message and returns (does not count as failure)
+#define SKIP_IF(condition, message) \
+    do { \
+        if (condition) { \
+            std::cout << "[nanotest] SKIP: " << message << "\n"; \
+            nanotest::global_stats.test_cases_total--; \
+            return; \
+        } \
+    } while (false)
+
 // For doctest compatibility
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN  // Ignored, we use main()
 

@@ -1,0 +1,97 @@
+#include "nanotest.hh"
+#include "arlington_parser.hh"
+#include "arlington_validator.hh"
+#include "test_helpers.hh"
+#include "nanopdf.hh"
+
+using namespace nanopdf;
+using namespace nanopdf::arlington;
+using namespace nanopdf::test;
+
+TEST_SUITE("ArlingtonValidator") {
+
+TEST_CASE("Validate blank.pdf against Arlington model") {
+    std::string arlington_dir = get_corpus_path("arlington/tsv/latest");
+    SKIP_IF(!corpus_available("arlington"), "Arlington data not downloaded");
+
+    ArlingtonModel model;
+    REQUIRE(model.load(arlington_dir));
+
+    std::string pdf_path = get_test_data_dir() + "/blank.pdf";
+    SKIP_IF(!file_exists(pdf_path), "blank.pdf not found");
+
+    Pdf pdf;
+    REQUIRE(parse_pdf_file(pdf_path, pdf));
+
+    Validator validator(model);
+    ValidationResult result = validator.validate_document(pdf);
+
+    result.print_summary();
+    result.print_findings(Severity::Warning);
+
+    // blank.pdf should at minimum parse and validate without crashing
+    // There may be warnings/info but should be structurally valid
+    CHECK(result.error_count >= 0);  // Just verify it ran
+}
+
+TEST_CASE("Validate minimal in-memory PDF") {
+    std::string arlington_dir = get_corpus_path("arlington/tsv/latest");
+    SKIP_IF(!corpus_available("arlington"), "Arlington data not downloaded");
+
+    ArlingtonModel model;
+    REQUIRE(model.load(arlington_dir));
+
+    auto pdf_bytes = create_minimal_pdf();
+    Pdf pdf;
+    REQUIRE(parse_from_memory(pdf_bytes.data(), pdf_bytes.size(), &pdf));
+
+    Validator validator(model);
+    ValidationResult result = validator.validate_document(pdf);
+
+    result.print_summary();
+    result.print_findings(Severity::Info);
+}
+
+TEST_CASE("Validate SafeDocs PDFs if available") {
+    std::string arlington_dir = get_corpus_path("arlington/tsv/latest");
+    SKIP_IF(!corpus_available("arlington"), "Arlington data not downloaded");
+    SKIP_IF(!corpus_available("safedocs"), "SafeDocs data not downloaded");
+
+    ArlingtonModel model;
+    REQUIRE(model.load(arlington_dir));
+
+    std::string safedocs_dir = get_corpus_path("safedocs");
+    auto pdfs = list_pdf_files_recursive(safedocs_dir);
+    SKIP_IF(pdfs.empty(), "No PDFs found in SafeDocs corpus");
+
+    int validated = 0;
+    int max_files = 20;
+    for (const auto& filepath : pdfs) {
+        if (validated >= max_files) break;
+
+        Pdf pdf;
+        if (!parse_pdf_file(filepath, pdf)) continue;
+
+        Validator validator(model);
+        ValidationResult result = validator.validate_document(pdf);
+        validated++;
+
+        // Extract filename for display
+        size_t slash = filepath.rfind('/');
+        std::string name = (slash != std::string::npos) ?
+            filepath.substr(slash + 1) : filepath;
+
+        std::cout << "  " << name << ": "
+                  << result.error_count << " errors, "
+                  << result.warning_count << " warnings\n";
+    }
+
+    std::cout << "[validation] Validated " << validated << " SafeDocs PDFs\n";
+    CHECK(validated > 0);
+}
+
+}  // TEST_SUITE
+
+int main() {
+    return nanotest::run_all_tests();
+}

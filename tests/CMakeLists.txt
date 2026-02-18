@@ -87,6 +87,12 @@ endif()
 # Integration tests
 add_subdirectory(integration)
 
+# Validation tests (PDF specification compliance)
+option(NANOPDF_BUILD_VALIDATION_TESTS "Build validation test harness" ON)
+if(NANOPDF_BUILD_VALIDATION_TESTS)
+    add_subdirectory(validation)
+endif()
+
 # Custom targets for selective testing
 add_custom_target(test_unit
     COMMAND ${CMAKE_CTEST_COMMAND} -L unit --output-on-failure
@@ -105,4 +111,11 @@ add_custom_target(test_all
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running all tests"
+)
+
+# Target to run validation tests only
+add_custom_target(test_validation
+    COMMAND ${CMAKE_CTEST_COMMAND} -L validation --output-on-failure
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running validation tests"
 )

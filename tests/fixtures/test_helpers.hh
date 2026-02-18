@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <iostream>
+#include "nanopdf.hh"
 
 namespace nanopdf {
 namespace test {
@@ -120,6 +122,61 @@ std::vector<uint8_t> create_pattern_data(const uint8_t* pattern,
 /// @param compressible If true, generate highly compressible data
 /// @return Vector containing test data
 std::vector<uint8_t> create_test_data(size_t size, bool compressible = true);
+
+// ============================================================================
+// Corpus Testing Utilities
+// ============================================================================
+
+/// Get the path to the corpora directory
+std::string get_corpora_dir();
+
+/// Get the path to a specific corpus
+/// @param name Corpus name (e.g., "arlington", "safedocs")
+std::string get_corpus_path(const std::string& name);
+
+/// Check if a corpus is downloaded and available
+/// @param name Corpus name
+/// @return true if the corpus directory exists and is non-empty
+bool corpus_available(const std::string& name);
+
+/// List PDF files in a directory (non-recursive)
+/// @param dir Directory path
+/// @return Vector of full file paths ending in .pdf (case-insensitive)
+std::vector<std::string> list_pdf_files(const std::string& dir);
+
+/// List PDF files recursively
+/// @param dir Root directory path
+/// @return Vector of full file paths ending in .pdf (case-insensitive)
+std::vector<std::string> list_pdf_files_recursive(const std::string& dir);
+
+/// List TSV files in a directory (non-recursive)
+/// @param dir Directory path
+/// @return Vector of full file paths ending in .tsv
+std::vector<std::string> list_tsv_files(const std::string& dir);
+
+/// Parse a PDF file using nanopdf
+/// @param filepath Path to PDF file
+/// @param out_pdf Output Pdf struct
+/// @return true if parsing succeeded
+bool parse_pdf_file(const std::string& filepath, nanopdf::Pdf& out_pdf);
+
+/// Statistics for corpus parsing tests
+struct CorpusTestStats {
+    int total = 0;
+    int ok = 0;
+    int failed = 0;
+    int crashed = 0;
+
+    void print_summary(const std::string& corpus_name) const;
+};
+
+/// Parse all PDFs in a directory and collect statistics
+/// @param dir Directory containing PDF files
+/// @param max_files Maximum number of files to parse (0 = unlimited)
+/// @param recursive Whether to search recursively
+/// @return Statistics about parsing results
+CorpusTestStats test_parse_directory(const std::string& dir, int max_files = 0,
+                                     bool recursive = false);
 
 }  // namespace test
 }  // namespace nanopdf
