@@ -1256,7 +1256,7 @@ void dump_signatures(OutputWriter& writer, const nanopdf::Pdf& pdf,
 
         // MDP (Modification Detection and Prevention) / Certification signature
         if (sig.is_certification_signature) {
-          writer.write_array_item_kv("type", "certification");
+          writer.write_array_item_kv("type", std::string("certification"));
 
           // DocMDP permissions
           if (sig.mdp_permissions > 0) {
@@ -1271,10 +1271,10 @@ void dump_signatures(OutputWriter& writer, const nanopdf::Pdf& pdf,
             writer.write_array_item_kv("allowed_changes", perm_desc);
           }
         } else if (!sig.transform_method.empty()) {
-          writer.write_array_item_kv("type", "approval");
+          writer.write_array_item_kv("type", std::string("approval"));
           writer.write_array_item_kv("transform_method", sig.transform_method);
         } else {
-          writer.write_array_item_kv("type", "approval");
+          writer.write_array_item_kv("type", std::string("approval"));
         }
 
         // Locked fields (for FieldMDP)
@@ -1294,9 +1294,9 @@ void dump_signatures(OutputWriter& writer, const nanopdf::Pdf& pdf,
           writer.write_array_item_kv("has_timestamp", true);
 
           if (sig.is_document_timestamp) {
-            writer.write_array_item_kv("timestamp_type", "document_timestamp");
+            writer.write_array_item_kv("timestamp_type", std::string("document_timestamp"));
           } else {
-            writer.write_array_item_kv("timestamp_type", "embedded");
+            writer.write_array_item_kv("timestamp_type", std::string("embedded"));
           }
 
           if (!sig.timestamp_hash_algorithm.empty()) {
@@ -1332,6 +1332,25 @@ void dump_signatures(OutputWriter& writer, const nanopdf::Pdf& pdf,
         // Integrity check
         std::string integrity = check_signature_integrity(pdf_data, sig);
         writer.write_array_item_kv("integrity", integrity);
+
+        // PKCS#7/CMS validation: extract signer name, signing time, verify digest
+        nanopdf::SignatureValidationResult validation =
+            nanopdf::validate_signature(pdf, sig);
+
+        if (!validation.signer_name.empty()) {
+          writer.write_array_item_kv("signer_name", validation.signer_name);
+        }
+        if (!validation.signing_time.empty()) {
+          writer.write_array_item_kv("signing_time", validation.signing_time);
+        }
+        if (!validation.digest_algorithm.empty()) {
+          writer.write_array_item_kv("digest_algorithm", validation.digest_algorithm);
+        }
+        writer.write_array_item_kv("integrity_valid", validation.integrity_valid);
+        writer.write_array_item_kv("pkcs7_valid", validation.signature_valid);
+        if (!validation.error.empty()) {
+          writer.write_array_item_kv("validation_error", validation.error);
+        }
 
         if (options.verbose) {
           // Page reference
@@ -1626,7 +1645,8 @@ int main(int argc, char* argv[]) {
   // Include forms summary
   dump_forms(writer, pdf, options);
 
-  // Include digital signatures
+  // Parse and include digital signatures
+  const_cast<nanopdf::Pdf&>(pdf).parse_signature_fields();
   dump_signatures(writer, pdf, pdf_data, options);
 
   // Include outlines/bookmarks summary

@@ -5532,6 +5532,20 @@ bool Pdf::load_document_structure() {
     catalog.version = version_it->second.name;
   }
 
+  // Extract AcroForm dictionary from catalog
+  auto acroform_it = root_dict.find("AcroForm");
+  if (acroform_it != root_dict.end()) {
+    if (acroform_it->second.type == Value::DICTIONARY) {
+      catalog.acro_form = acroform_it->second.dict;
+    } else if (acroform_it->second.type == Value::REFERENCE) {
+      ResolvedObject af_obj = load_object(acroform_it->second.ref_object_number,
+                                          acroform_it->second.ref_generation_number);
+      if (af_obj.success && af_obj.value.type == Value::DICTIONARY) {
+        catalog.acro_form = std::move(af_obj.value.dict);
+      }
+    }
+  }
+
   struct InheritedProps {
     Dictionary resources;
     bool has_resources{false};
