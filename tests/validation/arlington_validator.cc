@@ -156,6 +156,7 @@ void Validator::validate_object(const Pdf& pdf, const Value& val,
                     "Definition '" + def_name + "' not found in model", "");
         return;
     }
+    definitions_matched_++;
 
     if (resolved->type == Value::DICTIONARY || resolved->type == Value::STREAM) {
         const Dictionary& dict = (resolved->type == Value::STREAM) ?
@@ -188,6 +189,11 @@ void Validator::validate_dict_keys(const Pdf& pdf, const Dictionary& dict,
 
         bool required = evaluate_required(key_def.required_expr, dict);
         if (required && dict.find(key_def.key) == dict.end()) {
+            // For inheritable keys, check if the key is available via
+            // page tree inheritance before reporting it as missing
+            if (key_def.inheritable && has_inherited_key(pdf, dict, key_def.key)) {
+                continue;  // Key is inherited, not actually missing
+            }
             result_.add(Severity::Error, path, key_def.key,
                         "Required key missing", obj_def.name);
         }
@@ -326,8 +332,12 @@ void Validator::follow_links(const Pdf& pdf, const Value& val,
         }
     } else if (check_val->type == Value::ARRAY) {
         std::string def_name;
-        if (!group.alternatives.empty()) {
+        if (group.alternatives.size() == 1) {
             def_name = extract_def_name(group.alternatives[0]);
+        } else {
+            // Discriminate by array index 0 value
+            def_name = choose_array_definition(pdf, check_val->array,
+                                                group.alternatives);
         }
         if (!def_name.empty()) {
             validate_object(pdf, val, def_name, path, depth);
@@ -413,6 +423,65 @@ std::string Validator::choose_definition(
     return best_name.empty() ? def_names[0] : best_name;
 }
 
+std::string Validator::choose_array_definition(
+        const Pdf& pdf, const std::vector<Value>& arr,
+        const std::vector<std::string>& alternatives) {
+    // Extract bare definition names
+    std::vector<std::string> def_names;
+    for (const auto& alt : alternatives) {
+        std::string name = extract_def_name(alt);
+        if (!name.empty()) def_names.push_back(name);
+    }
+
+    if (def_names.empty()) return "";
+    if (def_names.size() == 1) return def_names[0];
+
+    // If array is empty, fall back to first definition
+    if (arr.empty()) return def_names[0];
+
+    // Resolve first element to get discriminator value
+    Value first = resolve(pdf, arr[0]);
+    std::string first_name;
+    if (first.type == Value::NAME) first_name = first.name;
+
+    if (first_name.empty()) return def_names[0];
+
+    // Score each candidate by matching arr[0] against possible_values of key "0"
+    int best_score = -1;
+    std::string best_name;
+
+    for (const auto& name : def_names) {
+        const ObjectDefinition* obj_def = model_.get_object_def(name);
+        if (!obj_def) continue;
+
+        int score = 0;
+        const KeyDefinition* key0 = obj_def->get_key("0");
+        if (key0) {
+            for (const auto& pv : key0->possible_values) {
+                std::string concrete = pv;
+                // Unwrap fn:SinceVersion/fn:IsPDFVersion if needed
+                auto fn_result = extract_fn_value(pv);
+                if (!fn_result.first.empty()) concrete = fn_result.first;
+
+                if (concrete == first_name) { score += 10; break; }
+            }
+        }
+
+        // Also score by total key overlap
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (obj_def->get_key(std::to_string(i))) score++;
+        }
+        if (obj_def->get_key("*")) score++;
+
+        if (score > best_score) {
+            best_score = score;
+            best_name = name;
+        }
+    }
+
+    return best_name.empty() ? def_names[0] : best_name;
+}
+
 std::string Validator::extract_def_name(const std::string& link_entry) {
     if (link_entry.empty()) return "";
 
@@ -466,6 +535,49 @@ std::string Validator::extract_def_name(const std::string& link_entry) {
     return link_entry;
 }
 
+std::pair<std::string, PdfVersion> Validator::extract_fn_value(
+    const std::string& expr) {
+    // Handle fn:SinceVersion(ver,Value) and fn:IsPDFVersion(ver,Value)
+    if (expr.find("fn:SinceVersion(") == 0 ||
+        expr.find("fn:IsPDFVersion(") == 0) {
+        // Find the last comma at paren depth 1, extract value after it
+        int paren_depth = 0;
+        size_t last_comma = std::string::npos;
+        size_t first_paren = std::string::npos;
+        for (size_t i = 0; i < expr.size(); ++i) {
+            if (expr[i] == '(') {
+                if (first_paren == std::string::npos) first_paren = i;
+                paren_depth++;
+            } else if (expr[i] == ')') {
+                paren_depth--;
+            } else if (expr[i] == ',' && paren_depth == 1) {
+                last_comma = i;
+            }
+        }
+        if (last_comma != std::string::npos && first_paren != std::string::npos) {
+            // Extract version from between first '(' and first ','
+            std::string ver_str = expr.substr(first_paren + 1,
+                                               last_comma - first_paren - 1);
+            // Trim whitespace
+            while (!ver_str.empty() && ver_str.front() == ' ')
+                ver_str.erase(ver_str.begin());
+            while (!ver_str.empty() && ver_str.back() == ' ')
+                ver_str.pop_back();
+
+            // Extract value after last comma
+            std::string value = expr.substr(last_comma + 1);
+            while (!value.empty() && value.back() == ')') value.pop_back();
+            while (!value.empty() && value.front() == ' ')
+                value.erase(value.begin());
+            while (!value.empty() && value.back() == ' ') value.pop_back();
+
+            PdfVersion ver = PdfVersion::parse(ver_str);
+            return {value, ver};
+        }
+    }
+    return {"", PdfVersion(0, 0)};
+}
+
 int Validator::find_type_index(const Value& val,
                                 const std::vector<ArlingtonType>& types) {
     ArlingtonType vtype = value_type_to_arlington(val.type);
@@ -493,6 +605,40 @@ int Validator::find_type_index(const Value& val,
             vtype == ArlingtonType::Dictionary) return static_cast<int>(i);
     }
     return -1;
+}
+
+// ============================================================================
+// Inheritance Support
+// ============================================================================
+
+bool Validator::has_inherited_key(const Pdf& pdf, const Dictionary& dict,
+                                   const std::string& key) const {
+    const Dictionary* current = &dict;
+    Value parent_storage;
+    for (int depth = 0; depth < 32; ++depth) {
+        auto parent_it = current->find("Parent");
+        if (parent_it == current->end()) return false;
+
+        // Resolve parent reference
+        const Value& parent_val = parent_it->second;
+        if (parent_val.type == Value::REFERENCE) {
+            auto resolved = resolve_reference(pdf, parent_val.ref_object_number,
+                                               parent_val.ref_generation_number);
+            if (!resolved.success) return false;
+            parent_storage = std::move(resolved.value);
+        } else if (parent_val.type == Value::DICTIONARY) {
+            parent_storage = parent_val;
+        } else {
+            return false;
+        }
+
+        const Dictionary& parent_dict = (parent_storage.type == Value::STREAM) ?
+            parent_storage.stream.dict : parent_storage.dict;
+
+        if (parent_dict.find(key) != parent_dict.end()) return true;
+        current = &parent_dict;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -549,6 +695,118 @@ bool Validator::evaluate_required(const std::string& expr,
         }
     }
 
+    // Version-gated required expressions:
+    // fn:IsRequired(fn:SinceVersion(VER))
+    // fn:IsRequired(fn:SinceVersion(VER,fn:IsPresent(KEY)))
+    // fn:IsRequired(fn:SinceVersion(VER) || fn:IsPresent(KEY))
+    // fn:IsRequired(fn:SinceVersion(VER) || fn:NotStandard14Font())
+    // fn:IsRequired(fn:IsPDFVersion(VER))
+    if (expr.find("fn:IsRequired(") == 0) {
+        // Look for fn:SinceVersion(...) inside the expression
+        size_t sv_pos = expr.find("fn:SinceVersion(");
+        if (sv_pos != std::string::npos) {
+            size_t sv_open = sv_pos + 15;  // position of '(' in fn:SinceVersion(
+            // Find matching ')' using paren-depth tracking
+            int pd = 0;
+            size_t sv_close = std::string::npos;
+            size_t first_comma = std::string::npos;
+            for (size_t i = sv_open; i < expr.size(); ++i) {
+                if (expr[i] == '(') pd++;
+                else if (expr[i] == ')') {
+                    pd--;
+                    if (pd == 0) { sv_close = i; break; }
+                } else if (expr[i] == ',' && pd == 1 &&
+                           first_comma == std::string::npos) {
+                    first_comma = i;
+                }
+            }
+
+            if (sv_close != std::string::npos && first_comma != std::string::npos) {
+                // Extract version (between opening paren and first comma at depth 1)
+                std::string ver_str = expr.substr(sv_open + 1,
+                                                   first_comma - sv_open - 1);
+                // Trim whitespace
+                while (!ver_str.empty() && ver_str.front() == ' ')
+                    ver_str.erase(ver_str.begin());
+                while (!ver_str.empty() && ver_str.back() == ' ')
+                    ver_str.pop_back();
+                PdfVersion gate = PdfVersion::parse(ver_str);
+
+                // Extract second argument (between first comma and matching paren)
+                std::string second_arg = expr.substr(first_comma + 1,
+                                                      sv_close - first_comma - 1);
+                while (!second_arg.empty() && second_arg.front() == ' ')
+                    second_arg.erase(second_arg.begin());
+                while (!second_arg.empty() && second_arg.back() == ' ')
+                    second_arg.pop_back();
+
+                if (second_arg.find("fn:") == std::string::npos) {
+                    // Single-arg: fn:SinceVersion(VER) — just a version check
+                    // (second_arg is empty or a bare definition name)
+                    if (version_ >= gate) return true;
+                } else if (second_arg.find("fn:IsPresent(") == 0) {
+                    // Two-arg: fn:SinceVersion(VER,fn:IsPresent(KEY))
+                    // Required only if version >= gate AND key is present
+                    if (version_ >= gate) {
+                        size_t kstart = 13;  // strlen("fn:IsPresent(")
+                        size_t kend = second_arg.find(')', kstart);
+                        if (kend != std::string::npos) {
+                            std::string key = second_arg.substr(kstart,
+                                                                 kend - kstart);
+                            return context_dict.find(key) != context_dict.end();
+                        }
+                    }
+                    // version < gate → not required
+                } else {
+                    // Two-arg with complex inner expr → conservative: only
+                    // check version gate
+                    if (version_ >= gate) return false;
+                }
+            } else if (sv_close != std::string::npos) {
+                // No comma found: single-arg fn:SinceVersion(VER)
+                std::string ver_str = expr.substr(sv_open + 1,
+                                                   sv_close - sv_open - 1);
+                while (!ver_str.empty() && ver_str.front() == ' ')
+                    ver_str.erase(ver_str.begin());
+                while (!ver_str.empty() && ver_str.back() == ' ')
+                    ver_str.pop_back();
+                PdfVersion gate = PdfVersion::parse(ver_str);
+                if (version_ >= gate) return true;
+            }
+
+            // Check for top-level || with fn:IsPresent (outside fn:SinceVersion)
+            // e.g., fn:IsRequired(fn:SinceVersion(VER) || fn:IsPresent(KEY))
+            if (sv_close != std::string::npos) {
+                size_t or_pos = expr.find("||", sv_close);
+                if (or_pos != std::string::npos) {
+                    size_t present_pos = expr.find("fn:IsPresent(", or_pos);
+                    if (present_pos != std::string::npos) {
+                        size_t key_start = present_pos + 13;
+                        size_t key_end = expr.find(')', key_start);
+                        if (key_end != std::string::npos) {
+                            std::string key = expr.substr(key_start,
+                                                           key_end - key_start);
+                            if (context_dict.find(key) != context_dict.end())
+                                return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Look for fn:IsPDFVersion(VER)
+        size_t ipv_pos = expr.find("fn:IsPDFVersion(");
+        if (ipv_pos != std::string::npos) {
+            size_t ver_start = ipv_pos + 16;  // strlen("fn:IsPDFVersion(")
+            size_t ver_end = expr.find(')', ver_start);
+            if (ver_end != std::string::npos) {
+                std::string ver_str = expr.substr(ver_start, ver_end - ver_start);
+                PdfVersion gate = PdfVersion::parse(ver_str);
+                if (version_ == gate) return true;
+            }
+        }
+    }
+
     // Complex expressions → conservatively not required
     return false;
 }
@@ -588,7 +846,26 @@ void Validator::check_indirect_reference(const Value& original_val,
         return;
     }
 
-    // Conditional or positional expressions → skip
+    // fn:MustBeIndirect(fn:BeforeVersion(VER))
+    if (expr.find("fn:MustBeIndirect(fn:BeforeVersion(") == 0) {
+        size_t ver_start = 35;  // strlen("fn:MustBeIndirect(fn:BeforeVersion(")
+        size_t ver_end = expr.find(')', ver_start);
+        if (ver_end != std::string::npos) {
+            std::string ver_str = expr.substr(ver_start, ver_end - ver_start);
+            PdfVersion gate = PdfVersion::parse(ver_str);
+            if (version_ < gate && !is_ref) {
+                result_.add(Severity::Warning, path, key,
+                            "Must be an indirect reference (before version " +
+                            ver_str + ")", def_name);
+            }
+        }
+        return;
+    }
+
+    // fn:MustBeDirect(fn:IsPresent(KEY)) — skip (would need context dict)
+    if (expr.find("fn:MustBeDirect(") == 0) return;
+
+    // Other conditional or positional expressions → skip
 }
 
 void Validator::check_possible_values(const Value& val,
@@ -598,11 +875,23 @@ void Validator::check_possible_values(const Value& val,
                                        const std::string& def_name) {
     if (possible_values.empty()) return;
 
-    // Filter out fn: expressions
+    // Build concrete values list, unwrapping version-gated fn: expressions
     std::vector<std::string> concrete_values;
     for (const auto& pv : possible_values) {
         if (pv.find("fn:") == std::string::npos) {
             concrete_values.push_back(pv);
+        } else {
+            auto result = extract_fn_value(pv);
+            if (!result.first.empty()) {
+                // For fn:SinceVersion: include if version >= gate
+                // For fn:IsPDFVersion: include if version == gate
+                bool is_exact = (pv.find("fn:IsPDFVersion(") == 0);
+                if (is_exact ? (version_ == result.second)
+                             : (version_ >= result.second)) {
+                    concrete_values.push_back(result.first);
+                }
+            }
+            // fn:Eval() and other unrecognized fn: patterns are still skipped
         }
     }
     if (concrete_values.empty()) return;
@@ -640,18 +929,34 @@ void Validator::check_possible_values(const Value& val,
 ValidationResult Validator::validate_document(const Pdf& pdf) {
     result_ = ValidationResult();
     visited_.clear();
+    definitions_matched_ = 0;
     version_ = PdfVersion(pdf.version_major, pdf.version_minor);
 
     result_.add(Severity::Info, "", "",
                 "Validating PDF " + std::to_string(version_.major) + "." +
                 std::to_string(version_.minor), "");
 
-    // Wrap trailer dictionary as a Value and validate recursively
+    // Wrap trailer dictionary as a Value and validate recursively.
+    // Detect XRef streams: if trailer has Type=XRef, use XRefStream definition.
     Value trailer_val;
     trailer_val.type = Value::DICTIONARY;
     trailer_val.dict = pdf.trailer;
 
-    validate_object(pdf, trailer_val, "FileTrailer", "Trailer", 0);
+    std::string trailer_def = "FileTrailer";
+    auto type_it = pdf.trailer.find("Type");
+    if (type_it != pdf.trailer.end() && type_it->second.type == Value::NAME &&
+        type_it->second.name == "XRef") {
+        trailer_def = "XRefStream";
+    }
+
+    validate_object(pdf, trailer_val, trailer_def, "Trailer", 0);
+
+    // Add traversal statistics
+    result_.add(Severity::Info, "", "",
+                "Traversal stats: " +
+                std::to_string(visited_.size()) + " objects visited, " +
+                std::to_string(definitions_matched_) + " definitions matched",
+                "");
 
     return result_;
 }

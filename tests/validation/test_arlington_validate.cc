@@ -30,9 +30,9 @@ TEST_CASE("Validate blank.pdf against Arlington model") {
     result.print_summary();
     result.print_findings(Severity::Warning);
 
-    // blank.pdf should at minimum parse and validate without crashing
-    // There may be warnings/info but should be structurally valid
-    CHECK(result.error_count >= 0);  // Just verify it ran
+    // blank.pdf should validate cleanly: no errors and no warnings
+    CHECK_EQ(result.error_count, 0);
+    CHECK_EQ(result.warning_count, 0);
 }
 
 TEST_CASE("Validate minimal in-memory PDF") {
@@ -51,6 +51,21 @@ TEST_CASE("Validate minimal in-memory PDF") {
 
     result.print_summary();
     result.print_findings(Severity::Info);
+
+    // Check that the Info false positive is gone:
+    // fn:IsRequired(fn:SinceVersion(VER,fn:IsPresent(Info))) should not fire
+    // when Info key is absent from the trailer
+    for (const auto& f : result.findings) {
+        if (f.severity == Severity::Error) {
+            CHECK_FALSE(f.key == "Info" && f.message == "Required key missing");
+        }
+    }
+
+    // Resources is required=TRUE, inheritable=TRUE on PageObject.
+    // The minimal PDF has no Resources anywhere in the page tree,
+    // so it's legitimately missing. Verify the error count is exactly 1
+    // (only the Resources error).
+    CHECK_EQ(result.error_count, 1);
 }
 
 TEST_CASE("Validate SafeDocs PDFs if available") {

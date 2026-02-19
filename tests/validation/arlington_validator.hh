@@ -100,8 +100,20 @@ private:
     std::string choose_definition(const Pdf& pdf, const Dictionary& dict,
                                    const std::vector<std::string>& alternatives);
 
+    /// Discriminate among multiple array definition alternatives by checking
+    /// arr[0] against possible_values of key "0" in each candidate
+    std::string choose_array_definition(
+        const Pdf& pdf, const std::vector<Value>& arr,
+        const std::vector<std::string>& alternatives);
+
     /// Unwrap fn:SinceVersion/fn:Extension to get bare definition name
     static std::string extract_def_name(const std::string& link_entry);
+
+    /// Extract bare value and version from fn:SinceVersion(ver,Val) or
+    /// fn:IsPDFVersion(ver,Val) expressions.
+    /// Returns {"Val", {major,minor}} or {"", {0,0}} if unrecognized.
+    static std::pair<std::string, PdfVersion> extract_fn_value(
+        const std::string& expr);
 
     /// Map value type to positional index in types list
     static int find_type_index(const Value& val,
@@ -110,8 +122,12 @@ private:
     // ---- Validation helpers ----
 
     /// Evaluate required expression against context dictionary
-    static bool evaluate_required(const std::string& expr,
-                                   const Dictionary& context_dict);
+    bool evaluate_required(const std::string& expr,
+                           const Dictionary& context_dict);
+
+    /// Check if a key is available via page tree inheritance (Parent chain)
+    bool has_inherited_key(const Pdf& pdf, const Dictionary& dict,
+                           const std::string& key) const;
 
     /// Check indirect/direct reference requirements
     void check_indirect_reference(const Value& original_val,
@@ -134,6 +150,7 @@ private:
     ValidationResult result_;
     PdfVersion version_;
     std::set<uint32_t> visited_;  // Visited object numbers (cycle detection)
+    int definitions_matched_;     // Count of definitions found during traversal
 };
 
 }  // namespace arlington

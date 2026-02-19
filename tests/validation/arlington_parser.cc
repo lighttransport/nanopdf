@@ -101,13 +101,33 @@ std::vector<ArlingtonType> ArlingtonModel::parse_types(const std::string& type_s
         size_t next = s.find(';', pos);
         if (next == std::string::npos) next = s.size();
         std::string token = s.substr(pos, next - pos);
-        // Strip fn: prefix if present (Arlington uses fn:SinceVersion(...) etc.)
+
         if (token.find("fn:") == std::string::npos) {
+            // Plain type token
             ArlingtonType t = parse_type(token);
             if (t != ArlingtonType::Unknown || !token.empty()) {
                 result.push_back(t);
             }
+        } else if (token.find("fn:SinceVersion(") == 0 ||
+                   token.find("fn:IsPDFVersion(") == 0) {
+            // Extract inner type from fn:SinceVersion(ver,type) or
+            // fn:IsPDFVersion(ver,type)
+            size_t last_comma = token.rfind(',');
+            if (last_comma != std::string::npos) {
+                std::string inner = token.substr(last_comma + 1);
+                while (!inner.empty() && inner.back() == ')') inner.pop_back();
+                while (!inner.empty() && inner.front() == ' ')
+                    inner.erase(inner.begin());
+                while (!inner.empty() && inner.back() == ' ')
+                    inner.pop_back();
+                ArlingtonType t = parse_type(inner);
+                if (t != ArlingtonType::Unknown) {
+                    result.push_back(t);
+                }
+            }
         }
+        // Other fn: expressions are skipped
+
         pos = next + 1;
     }
     return result;
