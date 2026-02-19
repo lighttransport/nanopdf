@@ -1060,8 +1060,9 @@ std::string save_image_to_file(const nanopdf::ImageXObject& img,
                                const std::string& name) {
   using nanopdf::ColorSpaceType;
 
-  // JPEG passthrough: raw_data is already a valid JPEG
-  if (img.filter == "DCTDecode" && !img.raw_data.empty()) {
+  // JPEG passthrough: raw_data is already a valid JPEG if it starts with FFD8
+  if (img.filter == "DCTDecode" && img.raw_data.size() >= 2 &&
+      img.raw_data[0] == 0xFF && img.raw_data[1] == 0xD8) {
     std::string path = dir + "/page" + std::to_string(page_num) + "_" + name + ".jpg";
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) return "";
