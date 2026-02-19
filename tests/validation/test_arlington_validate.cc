@@ -20,8 +20,9 @@ TEST_CASE("Validate blank.pdf against Arlington model") {
     std::string pdf_path = get_test_data_dir() + "/blank.pdf";
     SKIP_IF(!file_exists(pdf_path), "blank.pdf not found");
 
+    std::vector<uint8_t> pdf_data;
     Pdf pdf;
-    REQUIRE(parse_pdf_file(pdf_path, pdf));
+    REQUIRE(parse_pdf_file(pdf_path, pdf_data, pdf));
 
     Validator validator(model);
     ValidationResult result = validator.validate_document(pdf);
@@ -69,8 +70,9 @@ TEST_CASE("Validate SafeDocs PDFs if available") {
     for (const auto& filepath : pdfs) {
         if (validated >= max_files) break;
 
+        std::vector<uint8_t> pdf_data;
         Pdf pdf;
-        if (!parse_pdf_file(filepath, pdf)) continue;
+        if (!parse_pdf_file(filepath, pdf_data, pdf)) continue;
 
         Validator validator(model);
         ValidationResult result = validator.validate_document(pdf);

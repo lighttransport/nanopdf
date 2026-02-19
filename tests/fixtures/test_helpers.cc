@@ -349,15 +349,16 @@ std::vector<std::string> list_tsv_files(const std::string& dir) {
     return result;
 }
 
-bool parse_pdf_file(const std::string& filepath, nanopdf::Pdf& out_pdf) {
-    std::vector<uint8_t> data;
-    if (!read_file(filepath, data)) return false;
-    if (data.empty()) return false;
+bool parse_pdf_file(const std::string& filepath,
+                    std::vector<uint8_t>& out_data, nanopdf::Pdf& out_pdf) {
+    if (!read_file(filepath, out_data)) return false;
+    if (out_data.empty()) return false;
     nanopdf::ParseOptions opts;
     opts.auto_repair = true;
     opts.recover_stream_length = true;
     opts.max_repair_scan = 0;
-    return nanopdf::parse_from_memory(data.data(), data.size(), &out_pdf, opts);
+    return nanopdf::parse_from_memory(out_data.data(), out_data.size(),
+                                      &out_pdf, opts);
 }
 
 void CorpusTestStats::print_summary(const std::string& corpus_name) const {
@@ -385,8 +386,9 @@ CorpusTestStats test_parse_directory(const std::string& dir, int max_files,
     for (const auto& filepath : files) {
         stats.total++;
         try {
+            std::vector<uint8_t> data;
             nanopdf::Pdf pdf;
-            if (parse_pdf_file(filepath, pdf)) {
+            if (parse_pdf_file(filepath, data, pdf)) {
                 stats.ok++;
             } else {
                 stats.failed++;

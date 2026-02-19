@@ -16,6 +16,9 @@ target_include_directories(test_fixtures PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(test_fixtures PRIVATE
+    NANOPDF_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+)
 
 # Helper function for creating unit tests
 # Creates one executable per test file for fast incremental builds

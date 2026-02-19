@@ -156,9 +156,11 @@ std::vector<std::string> list_tsv_files(const std::string& dir);
 
 /// Parse a PDF file using nanopdf
 /// @param filepath Path to PDF file
+/// @param out_data Output buffer (must outlive out_pdf since Pdf holds raw pointers)
 /// @param out_pdf Output Pdf struct
 /// @return true if parsing succeeded
-bool parse_pdf_file(const std::string& filepath, nanopdf::Pdf& out_pdf);
+bool parse_pdf_file(const std::string& filepath,
+                    std::vector<uint8_t>& out_data, nanopdf::Pdf& out_pdf);
 
 /// Statistics for corpus parsing tests
 struct CorpusTestStats {

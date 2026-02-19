@@ -29,8 +29,9 @@ TEST_CASE("Parse SafeDocs CompactedSyntax") {
     for (const auto& filepath : pdfs) {
         stats.total++;
         try {
+            std::vector<uint8_t> pdf_data;
             Pdf pdf;
-            if (parse_pdf_file(filepath, pdf)) {
+            if (parse_pdf_file(filepath, pdf_data, pdf)) {
                 stats.ok++;
             } else {
                 stats.failed++;
