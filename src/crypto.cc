@@ -522,21 +522,20 @@ void MD5::update(const uint8_t* data, size_t len) {
   count += len * 8;
 
   size_t part_len = 64 - index;
+  size_t i = 0;
 
   if (len >= part_len) {
     memcpy(&buffer[index], data, part_len);
     transform(buffer);
 
-    for (size_t i = part_len; i + 63 < len; i += 64) {
+    for (i = part_len; i + 63 < len; i += 64) {
       transform(&data[i]);
     }
 
     index = 0;
-  } else {
-    part_len = 0;
   }
 
-  memcpy(&buffer[index], &data[part_len], len - part_len);
+  memcpy(&buffer[index], &data[i], len - i);
 }
 
 void MD5::finalize() {

@@ -30,6 +30,7 @@
 #include <cmath>
 
 #include "../../src/nanopdf.hh"
+#include "../../src/crypto.hh"
 #include "../../src/stb_image_write.h"
 
 #include <sys/stat.h>
@@ -211,6 +212,11 @@ struct RevisionInfo {
   std::set<uint32_t> modified_objects;
   std::set<uint32_t> added_objects;
   std::set<uint32_t> deleted_objects;  // Objects marked as free
+
+  // Signature correlation
+  std::string associated_signature;  // Signature field name covering this revision
+  std::string signer_name;
+  std::string signing_time;
 };
 
 // Convert bytes to hex string
@@ -285,9 +291,10 @@ size_t find_startxref_before(const uint8_t* data, size_t eof_offset) {
   return 0;
 }
 
-// Parse xref table to get object entries for a revision
+// Parse xref table or xref stream to get object entries for a revision
 std::map<uint32_t, std::pair<uint64_t, bool>> parse_xref_entries(
-    const uint8_t* data, size_t size, size_t xref_offset) {
+    const nanopdf::Pdf& pdf, const uint8_t* data, size_t size,
+    size_t xref_offset) {
   std::map<uint32_t, std::pair<uint64_t, bool>> entries;  // obj_num -> (offset, in_use)
 
   if (xref_offset >= size) return entries;
@@ -365,15 +372,164 @@ std::map<uint32_t, std::pair<uint64_t, bool>> parse_xref_entries(
         entries[start_obj + i] = std::make_pair(offset, in_use);
       }
     }
+  } else if (xref_offset < size && data[xref_offset] >= '0' &&
+             data[xref_offset] <= '9') {
+    // Xref stream: starts with object number (e.g. "15 0 obj")
+    size_t pos = xref_offset;
+    uint32_t obj_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      obj_num = obj_num * 10 + (data[pos] - '0');
+      pos++;
+    }
+    while (pos < size && (data[pos] == ' ' || data[pos] == '\t')) pos++;
+    uint16_t gen_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      gen_num = static_cast<uint16_t>(gen_num * 10 + (data[pos] - '0'));
+      pos++;
+    }
+
+    // Resolve the xref stream object via the already-parsed Pdf
+    nanopdf::ResolvedObject resolved =
+        nanopdf::resolve_reference(pdf, obj_num, gen_num);
+    if (!resolved.success ||
+        resolved.value.type != nanopdf::Value::STREAM) {
+      return entries;
+    }
+
+    // Verify it's an XRef stream
+    auto type_it = resolved.value.stream.dict.find("Type");
+    if (type_it != resolved.value.stream.dict.end()) {
+      if (type_it->second.type != nanopdf::Value::NAME ||
+          type_it->second.name != "XRef") {
+        return entries;
+      }
+    }
+
+    // Parse /W array (3 integers: field widths)
+    auto w_it = resolved.value.stream.dict.find("W");
+    if (w_it == resolved.value.stream.dict.end() ||
+        w_it->second.type != nanopdf::Value::ARRAY ||
+        w_it->second.array.size() != 3) {
+      return entries;
+    }
+
+    int w[3] = {0, 0, 0};
+    for (size_t i = 0; i < 3; ++i) {
+      const auto& item = w_it->second.array[i];
+      if (item.type != nanopdf::Value::NUMBER) return entries;
+      int width = static_cast<int>(item.number);
+      if (width < 0 || width > 8) return entries;
+      w[i] = width;
+    }
+
+    // Parse /Size
+    auto size_it = resolved.value.stream.dict.find("Size");
+    if (size_it == resolved.value.stream.dict.end() ||
+        size_it->second.type != nanopdf::Value::NUMBER) {
+      return entries;
+    }
+    uint64_t doc_size = static_cast<uint64_t>(size_it->second.number);
+
+    // Parse /Index array (optional, default [0 Size])
+    std::vector<uint64_t> index_pairs;
+    auto index_it = resolved.value.stream.dict.find("Index");
+    if (index_it != resolved.value.stream.dict.end() &&
+        index_it->second.type == nanopdf::Value::ARRAY) {
+      const auto& arr = index_it->second.array;
+      if (arr.size() % 2 != 0) return entries;
+      for (const auto& v : arr) {
+        if (v.type != nanopdf::Value::NUMBER) return entries;
+        index_pairs.push_back(static_cast<uint64_t>(v.number));
+      }
+    } else {
+      index_pairs = {0, doc_size};
+    }
+
+    // Decode stream data
+    nanopdf::DecodedStream decoded =
+        nanopdf::decode_stream(pdf, resolved.value);
+    if (!decoded.success) return entries;
+
+    // Parse xref entries from decoded data
+    size_t spos = 0;
+    const auto& bytes = decoded.data;
+
+    auto read_field = [&](int width) -> uint64_t {
+      uint64_t value = 0;
+      for (int i = 0; i < width; ++i) {
+        if (spos >= bytes.size()) return 0;
+        value = (value << 8) | static_cast<uint64_t>(bytes[spos++]);
+      }
+      return value;
+    };
+
+    for (size_t i = 0; i + 1 < index_pairs.size(); i += 2) {
+      uint64_t obj = index_pairs[i];
+      uint64_t count = index_pairs[i + 1];
+
+      if (count > doc_size) break;
+
+      for (uint64_t j = 0; j < count; ++j, ++obj) {
+        if (spos > bytes.size()) break;
+
+        uint64_t type_field = w[0] ? read_field(w[0]) : 1;
+        uint64_t field2 = w[1] ? read_field(w[1]) : 0;
+        uint64_t field3 = w[2] ? read_field(w[2]) : 0;
+
+        if (type_field == 0) {
+          // Free object
+          entries[static_cast<uint32_t>(obj)] = std::make_pair(field2, false);
+        } else if (type_field == 1) {
+          // Normal object at offset field2
+          entries[static_cast<uint32_t>(obj)] = std::make_pair(field2, true);
+        } else if (type_field == 2) {
+          // Compressed object in object stream field2, index field3
+          // Mark as in-use with a synthetic offset
+          entries[static_cast<uint32_t>(obj)] =
+              std::make_pair((field2 << 16) | field3, true);
+        }
+      }
+    }
   }
-  // Note: xref streams would need separate handling
 
   return entries;
 }
 
-// Find Prev pointer in trailer
-size_t find_prev_in_trailer(const uint8_t* data, size_t size, size_t xref_offset) {
-  // Find trailer after xref
+// Find Prev pointer in trailer or xref stream dictionary
+size_t find_prev_in_trailer(const nanopdf::Pdf& pdf, const uint8_t* data,
+                            size_t size, size_t xref_offset) {
+  if (xref_offset >= size) return 0;
+
+  // Check if this is an xref stream (starts with a digit)
+  if (data[xref_offset] >= '0' && data[xref_offset] <= '9') {
+    // Xref stream: parse object number and resolve to get /Prev from dict
+    size_t pos = xref_offset;
+    uint32_t obj_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      obj_num = obj_num * 10 + (data[pos] - '0');
+      pos++;
+    }
+    while (pos < size && (data[pos] == ' ' || data[pos] == '\t')) pos++;
+    uint16_t gen_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      gen_num = static_cast<uint16_t>(gen_num * 10 + (data[pos] - '0'));
+      pos++;
+    }
+
+    nanopdf::ResolvedObject resolved =
+        nanopdf::resolve_reference(pdf, obj_num, gen_num);
+    if (resolved.success &&
+        resolved.value.type == nanopdf::Value::STREAM) {
+      auto prev_it = resolved.value.stream.dict.find("Prev");
+      if (prev_it != resolved.value.stream.dict.end() &&
+          prev_it->second.type == nanopdf::Value::NUMBER) {
+        return static_cast<size_t>(prev_it->second.number);
+      }
+    }
+    return 0;
+  }
+
+  // Traditional xref table: find trailer keyword after xref
   const char* trailer_keyword = "trailer";
   size_t trailer_pos = 0;
 
@@ -417,32 +573,21 @@ size_t find_prev_in_trailer(const uint8_t* data, size_t size, size_t xref_offset
   return 0;
 }
 
-// Simple hash computation without using external crypto library
-// Using inline implementation to avoid potential ABI issues
-namespace {
-// Simple FNV-1a hash for quick fingerprinting
-uint64_t fnv1a_hash(const uint8_t* data, size_t len) {
-  const uint64_t FNV_PRIME = 0x100000001b3ULL;
-  const uint64_t FNV_OFFSET = 0xcbf29ce484222325ULL;
-  uint64_t hash = FNV_OFFSET;
-  for (size_t i = 0; i < len; ++i) {
-    hash ^= data[i];
-    hash *= FNV_PRIME;
-  }
-  return hash;
+std::string compute_md5(const uint8_t* data, size_t len) {
+  uint8_t digest[16];
+  nanopdf::crypto::MD5::hash(data, len, digest);
+  return bytes_to_hex(digest, 16);
 }
 
-std::string compute_simple_hash(const uint8_t* data, size_t len) {
-  uint64_t h1 = fnv1a_hash(data, len);
-  uint64_t h2 = fnv1a_hash(data, len / 2);  // Hash of first half
-  std::ostringstream ss;
-  ss << std::hex << std::setfill('0') << std::setw(16) << h1 << std::setw(16) << h2;
-  return ss.str();
-}
+std::string compute_sha256(const uint8_t* data, size_t len) {
+  uint8_t digest[32];
+  nanopdf::crypto::SHA256::hash(data, len, digest);
+  return bytes_to_hex(digest, 32);
 }
 
 // Detect revisions in PDF
-std::vector<RevisionInfo> detect_revisions(const uint8_t* data, size_t size) {
+std::vector<RevisionInfo> detect_revisions(const nanopdf::Pdf& pdf,
+                                           const uint8_t* data, size_t size) {
   std::vector<RevisionInfo> revisions;
 
   if (data == nullptr || size == 0) {
@@ -469,9 +614,8 @@ std::vector<RevisionInfo> detect_revisions(const uint8_t* data, size_t size) {
 
     // Calculate hash for cumulative data up to this revision
     if (rev.end_offset > 0 && rev.end_offset <= size) {
-      // Use simple hash - external crypto might have ABI issues
-      rev.md5_hash = compute_simple_hash(data, rev.end_offset);
-      rev.sha256_hash = rev.md5_hash;  // Use same hash for now
+      rev.md5_hash = compute_md5(data, rev.end_offset);
+      rev.sha256_hash = compute_sha256(data, rev.end_offset);
     }
 
     // Find xref offset for this revision (eof_markers[i] points after %%EOF)
@@ -481,12 +625,12 @@ std::vector<RevisionInfo> detect_revisions(const uint8_t* data, size_t size) {
 
     // Find Prev pointer
     if (rev.xref_offset > 0 && rev.xref_offset < size) {
-      rev.prev_xref_offset = find_prev_in_trailer(data, size, rev.xref_offset);
+      rev.prev_xref_offset = find_prev_in_trailer(pdf, data, size, rev.xref_offset);
     }
 
     // Parse xref entries for this revision
     if (rev.xref_offset > 0 && rev.xref_offset < size) {
-      auto new_entries = parse_xref_entries(data, size, rev.xref_offset);
+      auto new_entries = parse_xref_entries(pdf, data, size, rev.xref_offset);
 
       // Determine added/modified/deleted objects
       for (const auto& entry : new_entries) {
@@ -1751,6 +1895,17 @@ void dump_revisions(OutputWriter& writer, const std::vector<RevisionInfo>& revis
       writer.write_array_item_kv("deleted_objects", ss.str());
     }
 
+    // Signature correlation
+    if (!rev.associated_signature.empty()) {
+      writer.write_array_item_kv("associated_signature", rev.associated_signature);
+    }
+    if (!rev.signer_name.empty()) {
+      writer.write_array_item_kv("signer_name", rev.signer_name);
+    }
+    if (!rev.signing_time.empty()) {
+      writer.write_array_item_kv("signing_time", rev.signing_time);
+    }
+
     writer.end_array_item();
   }
 
@@ -1946,7 +2101,45 @@ int main(int argc, char* argv[]) {
   dump_outlines(writer, pdf, options);
 
   // Detect and dump revision history
-  std::vector<RevisionInfo> revisions = detect_revisions(pdf_data.data(), pdf_data.size());
+  std::vector<RevisionInfo> revisions =
+      detect_revisions(pdf, pdf_data.data(), pdf_data.size());
+
+  // Correlate signatures with revisions
+  for (const auto& sig : pdf.catalog.signature_fields) {
+    if ((!sig.is_signed && !sig.signature_present) ||
+        sig.byte_range.size() != 4) {
+      continue;
+    }
+
+    uint64_t coverage_end = sig.byte_range[2] + sig.byte_range[3];
+
+    // Find revision whose end_offset matches or is closest >= coverage_end
+    RevisionInfo* best = nullptr;
+    for (auto& rev : revisions) {
+      if (rev.end_offset >= coverage_end) {
+        if (!best || rev.end_offset < best->end_offset) {
+          best = &rev;
+        }
+      }
+    }
+
+    if (best) {
+      best->associated_signature = sig.name;
+
+      // Validate to get signer info
+      nanopdf::SignatureValidationResult validation =
+          nanopdf::validate_signature(pdf, sig);
+      if (!validation.signer_name.empty()) {
+        best->signer_name = validation.signer_name;
+      }
+      if (!validation.signing_time.empty()) {
+        best->signing_time = validation.signing_time;
+      } else if (!sig.signing_date.empty()) {
+        best->signing_time = sig.signing_date;
+      }
+    }
+  }
+
   dump_revisions(writer, revisions, options);
 
   writer.end_document();
