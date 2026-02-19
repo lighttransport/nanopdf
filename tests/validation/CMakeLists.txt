@@ -25,6 +25,7 @@ function(add_nanopdf_validation_test test_name test_source)
 
     target_compile_definitions(${test_name} PRIVATE
         NANOPDF_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data"
+        NANOPDF_PROJECT_DIR="${PROJECT_SOURCE_DIR}"
     )
 
     if(COMMAND add_sanitizers)
