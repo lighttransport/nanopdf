@@ -144,7 +144,13 @@ std::string get_font_embedding_type(const nanopdf::BaseFont& font) {
   if (!font.descriptor) return "not_embedded";
   if (font.descriptor->font_file.type != nanopdf::Value::UNDEFINED &&
       font.descriptor->font_file.type != nanopdf::Value::NULL_OBJ) {
-    // FontFile = Type1, FontFile2 = TrueType, FontFile3 = CFF/OpenType
+    switch (font.descriptor->font_file_type) {
+      case nanopdf::FontFileType::FontFile: return "Type1 (FontFile)";
+      case nanopdf::FontFileType::FontFile2: return "TrueType (FontFile2)";
+      case nanopdf::FontFileType::FontFile3: return "CFF/OpenType (FontFile3)";
+      default: break;
+    }
+    // Fallback: infer from subtype
     if (font.subtype == "Type1" || font.subtype == "MMType1") {
       return "Type1";
     } else if (font.subtype == "TrueType" || font.subtype == "CIDFontType2") {
@@ -155,6 +161,28 @@ std::string get_font_embedding_type(const nanopdf::BaseFont& font) {
     return "embedded";
   }
   return "not_embedded";
+}
+
+// Decode font descriptor flags into a human-readable string
+std::string font_flags_to_string(int flags) {
+  if (flags == 0) return "";
+  std::ostringstream ss;
+  bool first = true;
+  auto add = [&](const char* name) {
+    if (!first) ss << ",";
+    ss << name;
+    first = false;
+  };
+  if (flags & (1 << 0))  add("FixedPitch");
+  if (flags & (1 << 1))  add("Serif");
+  if (flags & (1 << 2))  add("Symbolic");
+  if (flags & (1 << 3))  add("Script");
+  if (flags & (1 << 5))  add("Nonsymbolic");
+  if (flags & (1 << 6))  add("Italic");
+  if (flags & (1 << 16)) add("AllCap");
+  if (flags & (1 << 17)) add("SmallCap");
+  if (flags & (1 << 18)) add("ForceBold");
+  return ss.str();
 }
 
 // ============================================================================
@@ -810,8 +838,9 @@ void dump_fonts(OutputWriter& writer, const nanopdf::Pdf& pdf,
                 const DumpOptions& options) {
   writer.begin_section("fonts");
 
-  // Collect all unique fonts across all pages
+  // Collect all unique fonts across all pages, and track which pages use each font
   std::map<std::string, const nanopdf::BaseFont*> all_fonts;
+  std::map<std::string, std::vector<int>> font_pages;  // font name -> page numbers
 
   int page_num = 0;
   for (const auto& page : pdf.catalog.pages) {
@@ -826,8 +855,11 @@ void dump_fonts(OutputWriter& writer, const nanopdf::Pdf& pdf,
     page.ensure_fonts_loaded(pdf);
 
     for (const auto& font_pair : page.fonts) {
-      if (font_pair.second && all_fonts.find(font_pair.first) == all_fonts.end()) {
-        all_fonts[font_pair.first] = font_pair.second.get();
+      if (font_pair.second) {
+        if (all_fonts.find(font_pair.first) == all_fonts.end()) {
+          all_fonts[font_pair.first] = font_pair.second.get();
+        }
+        font_pages[font_pair.first].push_back(page_num);
       }
     }
   }
@@ -854,18 +886,73 @@ void dump_fonts(OutputWriter& writer, const nanopdf::Pdf& pdf,
 
     if (embedded) {
       writer.write_array_item_kv("embedding_type", get_font_embedding_type(*font));
+      if (font->descriptor && font->descriptor->font_file_length > 0) {
+        writer.write_array_item_kv("font_file_size",
+                                   static_cast<int>(font->descriptor->font_file_length));
+      }
     }
 
-    // Font metrics (if available and verbose)
-    if (options.verbose && font->descriptor) {
-      if (font->descriptor->ascent != 0.0) {
-        writer.write_array_item_kv("ascent", font->descriptor->ascent);
+    // ToUnicode CMap presence
+    if (!font->to_unicode_cmap.code_to_unicode.empty() ||
+        !font->to_unicode_cmap.range_mappings.empty()) {
+      writer.write_array_item_kv("has_tounicode", true);
+    }
+
+    // Type0 (CID) font details
+    const auto* type0 = dynamic_cast<const nanopdf::Type0Font*>(font);
+    if (type0) {
+      if (!type0->registry.empty()) {
+        std::string cid_info = type0->registry + "-" + type0->ordering +
+                               "-" + std::to_string(type0->supplement);
+        writer.write_array_item_kv("cid_system", cid_info);
       }
-      if (font->descriptor->descent != 0.0) {
-        writer.write_array_item_kv("descent", font->descriptor->descent);
+      if (type0->descendant_font) {
+        writer.write_array_item_kv("descendant_type", type0->descendant_font->subtype);
       }
-      if (!font->descriptor->font_family.empty()) {
-        writer.write_array_item_kv("family", font->descriptor->font_family);
+    }
+
+    // Font descriptor details
+    if (font->descriptor) {
+      if (font->descriptor->flags != 0) {
+        writer.write_array_item_kv("flags", font_flags_to_string(font->descriptor->flags));
+      }
+      if (options.verbose) {
+        if (font->descriptor->ascent != 0.0) {
+          writer.write_array_item_kv("ascent", font->descriptor->ascent);
+        }
+        if (font->descriptor->descent != 0.0) {
+          writer.write_array_item_kv("descent", font->descriptor->descent);
+        }
+        if (!font->descriptor->font_family.empty()) {
+          writer.write_array_item_kv("family", font->descriptor->font_family);
+        }
+        if (font->descriptor->italic_angle != 0.0) {
+          writer.write_array_item_kv("italic_angle", font->descriptor->italic_angle);
+        }
+        if (font->descriptor->stem_v != 0.0) {
+          writer.write_array_item_kv("stem_v", font->descriptor->stem_v);
+        }
+      }
+    }
+
+    // Widths range
+    if (!font->widths.empty()) {
+      writer.write_array_item_kv("first_char", font->first_char);
+      writer.write_array_item_kv("last_char", font->last_char);
+    }
+
+    // Pages this font appears on
+    if (options.verbose) {
+      auto it = font_pages.find(font_pair.first);
+      if (it != font_pages.end() && !it->second.empty()) {
+        std::ostringstream pages_ss;
+        bool first = true;
+        for (int pg : it->second) {
+          if (!first) pages_ss << ",";
+          pages_ss << pg;
+          first = false;
+        }
+        writer.write_array_item_kv("pages", pages_ss.str());
       }
     }
 

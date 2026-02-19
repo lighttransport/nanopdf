@@ -55,6 +55,36 @@ When embedded in builds, fonts are **compressed with zlib** (level 9) to reduce 
 - **Files**:
   - `noto-symbols/NotoSansSymbols-Regular.ttf`
 
+### Noto Sans JP (CJK Sans-Serif / Gothic)
+- **License**: SIL Open Font License 1.1
+- **Purpose**: Japanese CJK fallback font (sans-serif / Gothic style)
+- **Source**: [notofonts/noto-cjk](https://github.com/notofonts/noto-cjk) Sans2.004
+- **Features**: Full Japanese character coverage including kanji, hiragana, katakana
+- **Total Size**: ~31 MB (7 weights)
+- **Files** (OpenType-CFF format):
+  - `noto-sans-jp/NotoSansJP-Thin.otf` (4.0 MB)
+  - `noto-sans-jp/NotoSansJP-Light.otf` (4.3 MB)
+  - `noto-sans-jp/NotoSansJP-DemiLight.otf` (4.3 MB)
+  - `noto-sans-jp/NotoSansJP-Regular.otf` (4.3 MB)
+  - `noto-sans-jp/NotoSansJP-Medium.otf` (4.3 MB)
+  - `noto-sans-jp/NotoSansJP-Bold.otf` (4.4 MB)
+  - `noto-sans-jp/NotoSansJP-Black.otf` (4.6 MB)
+
+### Noto Serif JP (CJK Serif / Mincho)
+- **License**: SIL Open Font License 1.1
+- **Purpose**: Japanese CJK fallback font (serif / Mincho style)
+- **Source**: [notofonts/noto-cjk](https://github.com/notofonts/noto-cjk) Serif2.003 (SubsetOTF)
+- **Features**: Full Japanese character coverage in serif style
+- **Total Size**: ~43 MB (7 weights)
+- **Files** (OpenType-CFF format):
+  - `noto-serif-jp/NotoSerifJP-ExtraLight.otf` (5.4 MB)
+  - `noto-serif-jp/NotoSerifJP-Light.otf` (5.9 MB)
+  - `noto-serif-jp/NotoSerifJP-Regular.otf` (5.9 MB)
+  - `noto-serif-jp/NotoSerifJP-Medium.otf` (6.0 MB)
+  - `noto-serif-jp/NotoSerifJP-SemiBold.otf` (6.0 MB)
+  - `noto-serif-jp/NotoSerifJP-Bold.otf` (6.2 MB)
+  - `noto-serif-jp/NotoSerifJP-Black.otf` (6.0 MB)
+
 ## Compression Summary
 
 When embedded in binaries with `NANOPDF_EMBED_FONTS=ON`, all fonts are compressed:
@@ -72,7 +102,7 @@ When embedded in binaries with `NANOPDF_EMBED_FONTS=ON`, all fonts are compresse
 
 All fonts in this directory are licensed under permissive open-source licenses:
 - **Apache License 2.0**: Arimo, Tinos, Cousine (12 fonts)
-- **SIL Open Font License 1.1**: STIX Two Math, Noto Sans Symbols (2 fonts)
+- **SIL Open Font License 1.1**: STIX Two Math, Noto Sans Symbols, Noto Sans JP, Noto Serif JP (16 fonts)
 
 Both licenses allow:
 - ✓ Commercial use
@@ -87,6 +117,7 @@ See individual `LICENSE.txt` or `OFL.txt` files in each subdirectory for full li
 - **Arimo, Tinos, Cousine**: Google Fonts (https://fonts.google.com/)
 - **STIX Two Math**: STI Pub (https://github.com/stipub/stixfonts)
 - **Noto Sans Symbols**: Google Noto Fonts (https://github.com/notofonts/symbols)
+- **Noto Sans JP, Noto Serif JP**: Google Noto CJK (https://github.com/notofonts/noto-cjk)
 
 ## Usage in nanopdf
 

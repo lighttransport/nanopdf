@@ -383,11 +383,110 @@ bool verify_owner_password(const std::string& password,
   return verify_user_password(user_password, encrypt_dict, file_id);
 }
 
+// Algorithm 2.B from PDF 2.0 spec (ISO 32000-2:2020) for R=6
+// Computes the hash used for user/owner password validation and key derivation
+static std::vector<uint8_t> compute_hash_r6(const std::string& password,
+                                             const uint8_t* salt, size_t salt_len,
+                                             const uint8_t* u_data, size_t u_data_len) {
+  // Initial hash: SHA-256(password + salt + u_data)
+  std::vector<uint8_t> input;
+  input.insert(input.end(), password.begin(), password.end());
+  input.insert(input.end(), salt, salt + salt_len);
+  if (u_data && u_data_len > 0) {
+    input.insert(input.end(), u_data, u_data + u_data_len);
+  }
+
+  uint8_t K[64];  // Large enough for SHA-512
+  size_t K_len = 32;
+  crypto::SHA256::hash(input.data(), input.size(), K);
+
+  int round = 0;
+  for (;;) {
+    // K1 = (password + K[0..K_len-1] + u_data) repeated 64 times
+    std::vector<uint8_t> K1_single;
+    K1_single.insert(K1_single.end(), password.begin(), password.end());
+    K1_single.insert(K1_single.end(), K, K + K_len);
+    if (u_data && u_data_len > 0) {
+      K1_single.insert(K1_single.end(), u_data, u_data + u_data_len);
+    }
+
+    std::vector<uint8_t> K1;
+    K1.reserve(K1_single.size() * 64);
+    for (int i = 0; i < 64; i++) {
+      K1.insert(K1.end(), K1_single.begin(), K1_single.end());
+    }
+
+    // E = AES-128-CBC-encrypt(key=K[0:16], iv=K[16:32], data=K1)
+    crypto::AES128 aes;
+    aes.set_key(K);  // K[0:16]
+    std::vector<uint8_t> E(K1.size());
+    aes.encrypt_cbc(K1.data(), E.data(), K1.size(), K + 16);  // iv=K[16:32]
+
+    // mod = (sum of first 16 bytes of E as unsigned) % 3
+    unsigned int sum = 0;
+    for (int i = 0; i < 16; i++) {
+      sum += E[i];
+    }
+    int mod = sum % 3;
+
+    if (mod == 0) {
+      crypto::SHA256::hash(E.data(), E.size(), K);
+      K_len = 32;
+    } else if (mod == 1) {
+      crypto::SHA384::hash(E.data(), E.size(), K);
+      K_len = 48;
+    } else {
+      crypto::SHA512::hash(E.data(), E.size(), K);
+      K_len = 64;
+    }
+
+    round++;
+    if (round >= 64 && static_cast<unsigned>(E.back()) <= static_cast<unsigned>(round - 32)) {
+      break;
+    }
+  }
+
+  return std::vector<uint8_t>(K, K + 32);
+}
+
 // SecurityHandler implementation
 
 void SecurityHandler::compute_encryption_key(const std::string& password, bool is_owner_password) {
   if (encrypt_dict.v == 0 || encrypt_dict.v > 5) {
     return; // Unsupported version
+  }
+
+  // R=6 (AES-256): derive file encryption key using Algorithm 2.A
+  if (encrypt_dict.r >= 6) {
+    std::string pwd = password.substr(0, 127);
+
+    if (is_owner_password) {
+      // Owner key: OE decrypted with hash from O key salt + U
+      if (encrypt_dict.o.size() < 48 || encrypt_dict.oe.size() < 32) return;
+      const uint8_t* o_bytes = reinterpret_cast<const uint8_t*>(encrypt_dict.o.data());
+      const uint8_t* u_bytes = reinterpret_cast<const uint8_t*>(encrypt_dict.u.data());
+      auto key_hash = compute_hash_r6(pwd, o_bytes + 40, 8,
+                                       u_bytes, 48);
+      uint8_t zero_iv[16] = {0};
+      crypto::AES256 aes;
+      aes.set_key(key_hash.data());
+      encryption_key.resize(32);
+      aes.decrypt_cbc(reinterpret_cast<const uint8_t*>(encrypt_dict.oe.data()),
+                       encryption_key.data(), 32, zero_iv);
+    } else {
+      // User key: UE decrypted with hash from U key salt
+      if (encrypt_dict.u.size() < 48 || encrypt_dict.ue.size() < 32) return;
+      const uint8_t* u_bytes = reinterpret_cast<const uint8_t*>(encrypt_dict.u.data());
+      auto key_hash = compute_hash_r6(pwd, u_bytes + 40, 8,
+                                       nullptr, 0);
+      uint8_t zero_iv[16] = {0};
+      crypto::AES256 aes;
+      aes.set_key(key_hash.data());
+      encryption_key.resize(32);
+      aes.decrypt_cbc(reinterpret_cast<const uint8_t*>(encrypt_dict.ue.data()),
+                       encryption_key.data(), 32, zero_iv);
+    }
+    return;
   }
 
   std::string actual_password = password;
@@ -495,6 +594,11 @@ std::vector<uint8_t> SecurityHandler::compute_object_key(uint32_t obj_num, uint1
     return std::vector<uint8_t>();
   }
 
+  // AES-256 (V=5) uses the file encryption key directly, no per-object derivation
+  if (algorithm == EncryptionAlgorithm::AES_256) {
+    return encryption_key;
+  }
+
   // Derive per-object key (required for all encryption versions per PDF spec §7.6.2)
   std::vector<uint8_t> hash_data;
   hash_data.insert(hash_data.end(), encryption_key.begin(), encryption_key.end());
@@ -530,6 +634,26 @@ bool SecurityHandler::authenticate_user_password(const std::string& password) {
     authenticated = true;
     is_owner = false;
     return true;
+  }
+
+  // R=6 (AES-256): Algorithm 2.A user password validation
+  if (encrypt_dict.r >= 6) {
+    if (encrypt_dict.u.size() < 48) {
+      authenticated = false;
+      return false;
+    }
+    std::string pwd = password.substr(0, 127);
+    const uint8_t* u_bytes = reinterpret_cast<const uint8_t*>(encrypt_dict.u.data());
+    // Validation salt = U[32:40]
+    auto hash = compute_hash_r6(pwd, u_bytes + 32, 8, nullptr, 0);
+    if (hash.size() >= 32 && memcmp(hash.data(), u_bytes, 32) == 0) {
+      compute_encryption_key(pwd, false);
+      authenticated = true;
+      is_owner = false;
+      return true;
+    }
+    authenticated = false;
+    return false;
   }
 
   // For AES encryption (V=4, R=4), we use the standard PDF authentication
@@ -623,6 +747,24 @@ std::vector<uint8_t> SecurityHandler::decrypt_string(const std::string& str,
     decrypted.resize(unpadded_len);
 
     return decrypted;
+  } else if (effective_algo == EncryptionAlgorithm::AES_256) {
+    if (data.size() < 16) {
+      return data;
+    }
+
+    uint8_t iv[16];
+    memcpy(iv, data.data(), 16);
+
+    crypto::AES256 aes;
+    aes.set_key(encryption_key.data());
+
+    std::vector<uint8_t> decrypted(data.size() - 16);
+    aes.decrypt_cbc(data.data() + 16, decrypted.data(), data.size() - 16, iv);
+
+    size_t unpadded_len = crypto::unpad_pkcs7(decrypted.data(), decrypted.size());
+    decrypted.resize(unpadded_len);
+
+    return decrypted;
   }
 
   return data;
@@ -674,6 +816,24 @@ std::vector<uint8_t> SecurityHandler::decrypt_stream(const std::vector<uint8_t>&
     aes.decrypt_cbc(result.data() + 16, decrypted.data(), result.size() - 16, iv);
 
     // Remove padding
+    size_t unpadded_len = crypto::unpad_pkcs7(decrypted.data(), decrypted.size());
+    decrypted.resize(unpadded_len);
+
+    return decrypted;
+  } else if (effective_algo == EncryptionAlgorithm::AES_256) {
+    if (result.size() < 16) {
+      return result;
+    }
+
+    uint8_t iv[16];
+    memcpy(iv, result.data(), 16);
+
+    crypto::AES256 aes;
+    aes.set_key(encryption_key.data());
+
+    std::vector<uint8_t> decrypted(result.size() - 16);
+    aes.decrypt_cbc(result.data() + 16, decrypted.data(), result.size() - 16, iv);
+
     size_t unpadded_len = crypto::unpad_pkcs7(decrypted.data(), decrypted.size());
     decrypted.resize(unpadded_len);
 

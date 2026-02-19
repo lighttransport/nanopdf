@@ -171,6 +171,64 @@ private:
   static uint32_t rotl(uint32_t x, uint32_t n);
 };
 
+// SHA-512 hash function
+class SHA512 {
+public:
+  static const size_t DIGEST_SIZE = 64;
+
+  SHA512();
+  void update(const uint8_t* data, size_t len);
+  void finalize();
+  void get_digest(uint8_t* digest) const;
+
+  static void hash(const uint8_t* data, size_t len, uint8_t* digest);
+
+private:
+  uint64_t state[8];
+  uint64_t count;
+  uint8_t buffer[128];
+  uint8_t digest[64];
+  bool finalized;
+
+  void transform(const uint8_t* block);
+  static uint64_t rotr64(uint64_t x, uint64_t n);
+  static uint64_t ch64(uint64_t x, uint64_t y, uint64_t z);
+  static uint64_t maj64(uint64_t x, uint64_t y, uint64_t z);
+  static uint64_t ep0_64(uint64_t x);
+  static uint64_t ep1_64(uint64_t x);
+  static uint64_t sig0_64(uint64_t x);
+  static uint64_t sig1_64(uint64_t x);
+};
+
+// SHA-384 hash function (SHA-512 with different IV, truncated to 48 bytes)
+class SHA384 {
+public:
+  static const size_t DIGEST_SIZE = 48;
+
+  SHA384();
+  void update(const uint8_t* data, size_t len);
+  void finalize();
+  void get_digest(uint8_t* digest) const;
+
+  static void hash(const uint8_t* data, size_t len, uint8_t* digest);
+
+private:
+  uint64_t state[8];
+  uint64_t count;
+  uint8_t buffer[128];
+  uint8_t digest[48];
+  bool finalized;
+
+  void transform(const uint8_t* block);
+  static uint64_t rotr64(uint64_t x, uint64_t n);
+  static uint64_t ch64(uint64_t x, uint64_t y, uint64_t z);
+  static uint64_t maj64(uint64_t x, uint64_t y, uint64_t z);
+  static uint64_t ep0_64(uint64_t x);
+  static uint64_t ep1_64(uint64_t x);
+  static uint64_t sig0_64(uint64_t x);
+  static uint64_t sig1_64(uint64_t x);
+};
+
 // Utility functions
 void xor_bytes(uint8_t* dest, const uint8_t* src, size_t len);
 void pad_pkcs7(std::vector<uint8_t>& data, size_t block_size);
