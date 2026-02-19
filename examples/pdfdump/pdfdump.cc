@@ -27,8 +27,12 @@
 #include <iomanip>
 #include <set>
 #include <algorithm>
+#include <cmath>
 
 #include "../../src/nanopdf.hh"
+#include "../../src/stb_image_write.h"
+
+#include <sys/stat.h>
 
 namespace {
 
@@ -46,6 +50,7 @@ struct DumpOptions {
   bool include_fonts = true;
   bool include_images = true;
   bool verbose = false;
+  std::string save_images_dir;  // empty = don't save, non-empty = output directory
 };
 
 // JSON string escaping
@@ -963,6 +968,269 @@ void dump_fonts(OutputWriter& writer, const nanopdf::Pdf& pdf,
   writer.end_section();
 }
 
+// Expand low bits-per-component grayscale to 8-bit
+bool expand_low_bpc_gray(const nanopdf::ImageXObject& image,
+                         std::vector<uint8_t>& out) {
+  int bits = image.bits_per_component;
+  if (!(bits == 1 || bits == 2 || bits == 4)) {
+    return false;
+  }
+
+  size_t bytes_per_row = static_cast<size_t>((image.width * bits + 7) / 8);
+  size_t expected = bytes_per_row * image.height;
+  if (image.data.size() < expected) {
+    return false;
+  }
+
+  out.resize(static_cast<size_t>(image.width) * image.height);
+  size_t src_index = 0;
+  size_t dst_index = 0;
+  int mask = (1 << bits) - 1;
+
+  for (int y = 0; y < image.height; ++y) {
+    int bit_offset = 0;
+    uint8_t current_byte = 0;
+    for (int x = 0; x < image.width; ++x) {
+      if (bit_offset == 0) {
+        if (src_index >= image.data.size()) {
+          return false;
+        }
+        current_byte = image.data[src_index++];
+      }
+      int shift = 8 - bits - bit_offset;
+      if (shift < 0) shift = 0;
+      uint8_t value = static_cast<uint8_t>((current_byte >> shift) & mask);
+      double scaled = static_cast<double>(value) / static_cast<double>(mask);
+      out[dst_index++] = static_cast<uint8_t>(std::round(scaled * 255.0));
+      bit_offset += bits;
+      if (bit_offset >= 8) {
+        bit_offset = 0;
+      }
+    }
+    if (bit_offset != 0) {
+      bit_offset = 0;
+    }
+  }
+  return true;
+}
+
+// Expand index buffer for sub-byte indexed images
+bool expand_index_buffer(const std::vector<uint8_t>& data, int width, int height,
+                         int bits, std::vector<uint8_t>& indices) {
+  size_t bytes_per_row = static_cast<size_t>((width * bits + 7) / 8);
+  size_t expected = bytes_per_row * height;
+  if (data.size() < expected) {
+    return false;
+  }
+
+  indices.resize(static_cast<size_t>(width) * height);
+  size_t src_index = 0;
+  size_t dst_index = 0;
+  int mask = (1 << bits) - 1;
+
+  for (int y = 0; y < height; ++y) {
+    int bit_offset = 0;
+    uint8_t current_byte = 0;
+    for (int x = 0; x < width; ++x) {
+      if (bit_offset == 0) {
+        if (src_index >= data.size()) {
+          return false;
+        }
+        current_byte = data[src_index++];
+      }
+      int shift = 8 - bits - bit_offset;
+      if (shift < 0) shift = 0;
+      indices[dst_index++] = static_cast<uint8_t>((current_byte >> shift) & mask);
+      bit_offset += bits;
+      if (bit_offset >= 8) {
+        bit_offset = 0;
+      }
+    }
+    if (bit_offset != 0) {
+      bit_offset = 0;
+    }
+  }
+  return true;
+}
+
+// Save an image to disk as PNG (or JPEG passthrough for DCTDecode images).
+// Returns the saved file path on success, or empty string on failure.
+std::string save_image_to_file(const nanopdf::ImageXObject& img,
+                               const std::string& dir, int page_num,
+                               const std::string& name) {
+  using nanopdf::ColorSpaceType;
+
+  // JPEG passthrough: raw_data is already a valid JPEG
+  if (img.filter == "DCTDecode" && !img.raw_data.empty()) {
+    std::string path = dir + "/page" + std::to_string(page_num) + "_" + name + ".jpg";
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) return "";
+    ofs.write(reinterpret_cast<const char*>(img.raw_data.data()),
+              static_cast<std::streamsize>(img.raw_data.size()));
+    return ofs.good() ? path : "";
+  }
+
+  if (img.data.empty() || img.width <= 0 || img.height <= 0) {
+    return "";
+  }
+
+  std::vector<uint8_t> pixels;
+  int components = 0;
+
+  switch (img.color_space.type) {
+    case ColorSpaceType::DeviceGray:
+    case ColorSpaceType::CalGray: {
+      if (img.bits_per_component == 8) {
+        size_t expected = static_cast<size_t>(img.width) * img.height;
+        if (img.data.size() < expected) return "";
+        pixels.assign(img.data.begin(), img.data.begin() + expected);
+        components = 1;
+      } else if (img.bits_per_component == 1 || img.bits_per_component == 2 ||
+                 img.bits_per_component == 4) {
+        if (!expand_low_bpc_gray(img, pixels)) return "";
+        components = 1;
+      } else {
+        return "";
+      }
+      break;
+    }
+
+    case ColorSpaceType::DeviceRGB:
+    case ColorSpaceType::CalRGB: {
+      if (img.bits_per_component != 8) return "";
+      size_t expected = static_cast<size_t>(img.width) * img.height * 3;
+      if (img.data.size() < expected) return "";
+      pixels.assign(img.data.begin(), img.data.begin() + expected);
+      components = 3;
+      break;
+    }
+
+    case ColorSpaceType::DeviceCMYK: {
+      if (img.bits_per_component != 8) return "";
+      size_t expected = static_cast<size_t>(img.width) * img.height * 4;
+      if (img.data.size() < expected) return "";
+      pixels.resize(static_cast<size_t>(img.width) * img.height * 3);
+      for (size_t i = 0, j = 0; i + 3 < expected; i += 4) {
+        double c = static_cast<double>(img.data[i]) / 255.0;
+        double m = static_cast<double>(img.data[i + 1]) / 255.0;
+        double y = static_cast<double>(img.data[i + 2]) / 255.0;
+        double k = static_cast<double>(img.data[i + 3]) / 255.0;
+        pixels[j++] = static_cast<uint8_t>(std::round((1.0 - std::min(1.0, c + k)) * 255.0));
+        pixels[j++] = static_cast<uint8_t>(std::round((1.0 - std::min(1.0, m + k)) * 255.0));
+        pixels[j++] = static_cast<uint8_t>(std::round((1.0 - std::min(1.0, y + k)) * 255.0));
+      }
+      components = 3;
+      break;
+    }
+
+    case ColorSpaceType::ICCBased: {
+      if (img.bits_per_component != 8) return "";
+      int nc = img.color_space.num_components;
+      if (nc == 1) {
+        size_t expected = static_cast<size_t>(img.width) * img.height;
+        if (img.data.size() < expected) return "";
+        pixels.assign(img.data.begin(), img.data.begin() + expected);
+        components = 1;
+      } else if (nc == 3) {
+        size_t expected = static_cast<size_t>(img.width) * img.height * 3;
+        if (img.data.size() < expected) return "";
+        pixels.assign(img.data.begin(), img.data.begin() + expected);
+        components = 3;
+      } else if (nc == 4) {
+        // Treat as CMYK
+        size_t expected = static_cast<size_t>(img.width) * img.height * 4;
+        if (img.data.size() < expected) return "";
+        pixels.resize(static_cast<size_t>(img.width) * img.height * 3);
+        for (size_t i = 0, j = 0; i + 3 < expected; i += 4) {
+          double c_v = static_cast<double>(img.data[i]) / 255.0;
+          double m_v = static_cast<double>(img.data[i + 1]) / 255.0;
+          double y_v = static_cast<double>(img.data[i + 2]) / 255.0;
+          double k_v = static_cast<double>(img.data[i + 3]) / 255.0;
+          pixels[j++] = static_cast<uint8_t>(std::round((1.0 - std::min(1.0, c_v + k_v)) * 255.0));
+          pixels[j++] = static_cast<uint8_t>(std::round((1.0 - std::min(1.0, m_v + k_v)) * 255.0));
+          pixels[j++] = static_cast<uint8_t>(std::round((1.0 - std::min(1.0, y_v + k_v)) * 255.0));
+        }
+        components = 3;
+      } else {
+        return "";
+      }
+      break;
+    }
+
+    case ColorSpaceType::Indexed: {
+      if (!img.color_space.base_color_space) return "";
+      int bits = img.bits_per_component;
+      if (bits <= 0 || bits > 8) return "";
+
+      int base_components = 0;
+      bool base_is_gray = false;
+      switch (img.color_space.base_color_space->type) {
+        case ColorSpaceType::DeviceRGB:
+        case ColorSpaceType::CalRGB:
+          base_components = 3;
+          break;
+        case ColorSpaceType::DeviceGray:
+        case ColorSpaceType::CalGray:
+          base_components = 1;
+          base_is_gray = true;
+          break;
+        default:
+          return "";
+      }
+
+      if (img.color_space.lookup_table.empty()) return "";
+
+      std::vector<uint8_t> indices;
+      if (bits == 8) {
+        size_t expected = static_cast<size_t>(img.width) * img.height;
+        if (img.data.size() < expected) return "";
+        indices.assign(img.data.begin(), img.data.begin() + expected);
+      } else {
+        if (!expand_index_buffer(img.data, img.width, img.height, bits, indices)) return "";
+      }
+
+      size_t palette_stride = static_cast<size_t>(base_components);
+      size_t palette_entries = img.color_space.lookup_table.size() / palette_stride;
+      if (palette_entries == 0) return "";
+
+      components = 3;
+      pixels.resize(static_cast<size_t>(img.width) * img.height * 3);
+      size_t dst = 0;
+      size_t max_index = img.color_space.hival;
+      for (uint8_t idx : indices) {
+        size_t clamped = std::min<size_t>(idx, std::min(max_index, palette_entries - 1));
+        size_t pi = clamped * palette_stride;
+        if (pi + palette_stride > img.color_space.lookup_table.size()) {
+          pi = (palette_entries - 1) * palette_stride;
+        }
+        if (base_is_gray) {
+          uint8_t gray = img.color_space.lookup_table[pi];
+          pixels[dst++] = gray;
+          pixels[dst++] = gray;
+          pixels[dst++] = gray;
+        } else {
+          pixels[dst++] = img.color_space.lookup_table[pi];
+          pixels[dst++] = img.color_space.lookup_table[pi + 1];
+          pixels[dst++] = img.color_space.lookup_table[pi + 2];
+        }
+      }
+      break;
+    }
+
+    default:
+      // Unsupported color space
+      return "";
+  }
+
+  if (pixels.empty() || components == 0) return "";
+
+  std::string path = dir + "/page" + std::to_string(page_num) + "_" + name + ".png";
+  int stride = img.width * components;
+  int ret = stbi_write_png(path.c_str(), img.width, img.height, components,
+                           pixels.data(), stride);
+  return (ret != 0) ? path : "";
+}
+
 void dump_images(OutputWriter& writer, const nanopdf::Pdf& pdf,
                  const DumpOptions& options) {
   writer.begin_section("images");
@@ -1024,6 +1292,17 @@ void dump_images(OutputWriter& writer, const nanopdf::Pdf& pdf,
       // Decoded data size
       if (!img.data.empty()) {
         writer.write_array_item_kv("decoded_size_bytes", static_cast<int>(img.data.size()));
+      }
+    }
+
+    // Save image to file if requested
+    if (!options.save_images_dir.empty() && !img.image_mask) {
+      std::string saved = save_image_to_file(img, options.save_images_dir, pg_num, name);
+      if (!saved.empty()) {
+        writer.write_array_item_kv("saved_to", saved);
+      } else {
+        writer.write_array_item_kv("save_error",
+            std::string("unsupported color space or empty data"));
       }
     }
 
@@ -1489,6 +1768,7 @@ void print_usage(const char* program_name) {
   std::cout << "  -p, --page <n>            Dump specific page only (1-based)\n";
   std::cout << "  --no-fonts                Skip font information\n";
   std::cout << "  --no-images               Skip image information\n";
+  std::cout << "  --save-images <dir>       Extract and save images to directory\n";
   std::cout << "  --verbose                 Include additional details\n";
   std::cout << "  --help                    Show this help message\n";
   std::cout << "\n";
@@ -1531,6 +1811,8 @@ bool parse_arguments(int argc, char* argv[], DumpOptions& options) {
       options.include_fonts = false;
     } else if (arg == "--no-images") {
       options.include_images = false;
+    } else if (arg == "--save-images" && i + 1 < argc) {
+      options.save_images_dir = argv[++i];
     } else if (arg == "--verbose" || arg == "-v") {
       options.verbose = true;
     } else if (arg[0] == '-') {
@@ -1560,6 +1842,16 @@ int main(int argc, char* argv[]) {
   if (!parse_arguments(argc, argv, options)) {
     print_usage(argv[0]);
     return 1;
+  }
+
+  // Create image output directory if requested
+  if (!options.save_images_dir.empty()) {
+    mkdir(options.save_images_dir.c_str(), 0755);
+    struct stat st;
+    if (stat(options.save_images_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+      std::cerr << "Error: Failed to create directory: " << options.save_images_dir << "\n";
+      return 1;
+    }
   }
 
   // Read PDF file
