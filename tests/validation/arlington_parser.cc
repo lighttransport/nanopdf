@@ -36,12 +36,14 @@ ArlingtonType parse_type(const std::string& type_str) {
     if (s == "string-byte") return ArlingtonType::String;
     if (s == "string-ascii") return ArlingtonType::String;
     if (s == "string-text") return ArlingtonType::String;
+    if (s == "bitmask")     return ArlingtonType::Bitmask;
     return ArlingtonType::Unknown;
 }
 
 const char* type_to_string(ArlingtonType type) {
     switch (type) {
         case ArlingtonType::Array:      return "array";
+        case ArlingtonType::Bitmask:    return "bitmask";
         case ArlingtonType::Boolean:    return "boolean";
         case ArlingtonType::Dictionary: return "dictionary";
         case ArlingtonType::Integer:    return "integer";
@@ -115,77 +117,148 @@ std::vector<std::string> ArlingtonModel::parse_value_list(const std::string& str
     std::vector<std::string> result;
     if (str.empty()) return result;
 
-    std::string s = str;
-    // Strip brackets if present
-    if (s.front() == '[') s = s.substr(1);
-    if (!s.empty() && s.back() == ']') s.pop_back();
+    // Split into positional groups by ';' outside brackets/parens
+    std::vector<std::string> groups;
+    std::string current;
+    int bracket_depth = 0;
+    int paren_depth = 0;
 
-    size_t pos = 0;
-    while (pos < s.size()) {
-        size_t next = s.find(',', pos);
-        if (next == std::string::npos) next = s.size();
-        std::string val = s.substr(pos, next - pos);
-        // Trim
+    for (char c : str) {
+        if (c == '[') bracket_depth++;
+        else if (c == ']') bracket_depth--;
+        else if (c == '(') paren_depth++;
+        else if (c == ')') paren_depth--;
+
+        if (c == ';' && bracket_depth == 0 && paren_depth == 0) {
+            groups.push_back(current);
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty()) groups.push_back(current);
+
+    // Process each group
+    for (auto& g : groups) {
+        // Strip outer brackets
+        if (!g.empty() && g.front() == '[') g = g.substr(1);
+        if (!g.empty() && g.back() == ']') g.pop_back();
+        if (g.empty()) continue;
+
+        // Split by ',' respecting parentheses
+        std::string val;
+        int pd = 0;
+        for (char c : g) {
+            if (c == '(') pd++;
+            else if (c == ')') pd--;
+
+            if (c == ',' && pd == 0) {
+                while (!val.empty() && val.front() == ' ') val.erase(val.begin());
+                while (!val.empty() && val.back() == ' ') val.pop_back();
+                if (!val.empty()) result.push_back(val);
+                val.clear();
+            } else {
+                val += c;
+            }
+        }
         while (!val.empty() && val.front() == ' ') val.erase(val.begin());
         while (!val.empty() && val.back() == ' ') val.pop_back();
-        if (!val.empty()) {
-            result.push_back(val);
-        }
-        pos = next + 1;
+        if (!val.empty()) result.push_back(val);
     }
     return result;
 }
 
-std::vector<std::string> ArlingtonModel::parse_links(const std::string& str) {
-    std::vector<std::string> result;
-    if (str.empty()) return result;
+std::vector<LinkGroup> ArlingtonModel::parse_link_groups(const std::string& str) {
+    std::vector<LinkGroup> groups;
+    if (str.empty()) return groups;
 
-    std::string s = str;
-    // Strip brackets
-    if (s.front() == '[') s = s.substr(1);
-    if (!s.empty() && s.back() == ']') s.pop_back();
+    // Split into positional groups by ';' outside brackets/parens
+    std::vector<std::string> group_strs;
+    std::string current;
+    int bracket_depth = 0;
+    int paren_depth = 0;
 
-    size_t pos = 0;
-    while (pos < s.size()) {
-        size_t next = s.find(';', pos);
-        if (next == std::string::npos) next = s.size();
-        std::string val = s.substr(pos, next - pos);
-        while (!val.empty() && val.front() == ' ') val.erase(val.begin());
-        while (!val.empty() && val.back() == ' ') val.pop_back();
-        if (!val.empty()) {
-            result.push_back(val);
+    for (char c : str) {
+        if (c == '[') bracket_depth++;
+        else if (c == ']') bracket_depth--;
+        else if (c == '(') paren_depth++;
+        else if (c == ')') paren_depth--;
+
+        if (c == ';' && bracket_depth == 0 && paren_depth == 0) {
+            group_strs.push_back(current);
+            current.clear();
+        } else {
+            current += c;
         }
-        pos = next + 1;
     }
-    return result;
+    if (!current.empty()) group_strs.push_back(current);
+
+    // Process each group
+    for (auto& gs : group_strs) {
+        LinkGroup group;
+
+        // Strip outer brackets
+        if (!gs.empty() && gs.front() == '[') gs = gs.substr(1);
+        if (!gs.empty() && gs.back() == ']') gs.pop_back();
+
+        if (gs.empty()) {
+            groups.push_back(group);
+            continue;
+        }
+
+        // Split on ',' respecting parentheses
+        std::string alt;
+        int pd = 0;
+        for (char c : gs) {
+            if (c == '(') pd++;
+            else if (c == ')') pd--;
+
+            if (c == ',' && pd == 0) {
+                while (!alt.empty() && alt.front() == ' ') alt.erase(alt.begin());
+                while (!alt.empty() && alt.back() == ' ') alt.pop_back();
+                if (!alt.empty()) group.alternatives.push_back(alt);
+                alt.clear();
+            } else {
+                alt += c;
+            }
+        }
+        while (!alt.empty() && alt.front() == ' ') alt.erase(alt.begin());
+        while (!alt.empty() && alt.back() == ' ') alt.pop_back();
+        if (!alt.empty()) group.alternatives.push_back(alt);
+
+        groups.push_back(group);
+    }
+    return groups;
 }
 
 KeyDefinition ArlingtonModel::parse_tsv_line(const std::string& line) {
     KeyDefinition def;
     auto fields = split_tsv(line);
 
+    // Column mapping (12-column Arlington TSV format):
+    //  0: Key   1: Type   2: SinceVersion   3: DeprecatedIn
+    //  4: Required   5: IndirectReference   6: Inheritable
+    //  7: DefaultValue   8: PossibleValues   9: SpecialCase
+    // 10: Link   11: Note
+
     if (fields.size() > 0) def.key = fields[0];
     if (fields.size() > 1) def.types = parse_types(fields[1]);
     if (fields.size() > 2) def.since_version = fields[2];
     if (fields.size() > 3) def.deprecated_in = fields[3];
-    if (fields.size() > 4) {
-        std::string req = fields[4];
-        // Handle fn: expressions - treat as conditional (not strictly required)
-        if (req == "TRUE" || req == "true" || req == "1") {
-            def.required = true;
-        } else {
-            def.required = false;
-        }
-    }
+    if (fields.size() > 4) def.required_expr = fields[4];
     if (fields.size() > 5) def.indirect_reference = fields[5];
-    if (fields.size() > 6) def.default_value = fields[6];
-    if (fields.size() > 7) def.possible_values = parse_value_list(fields[7]);
-    if (fields.size() > 8) def.special_case = fields[8];
-    if (fields.size() > 9) def.links = parse_links(fields[9]);
-    if (fields.size() > 10) {
+    if (fields.size() > 6) {
+        std::string inh = fields[6];
+        def.inheritable = (inh == "TRUE" || inh == "true" || inh == "1");
+    }
+    if (fields.size() > 7) def.default_value = fields[7];
+    if (fields.size() > 8) def.possible_values = parse_value_list(fields[8]);
+    if (fields.size() > 9) def.special_case = fields[9];
+    if (fields.size() > 10) def.link_groups = parse_link_groups(fields[10]);
+    if (fields.size() > 11) {
         // Join remaining fields as notes
         std::string notes;
-        for (size_t i = 10; i < fields.size(); ++i) {
+        for (size_t i = 11; i < fields.size(); ++i) {
             if (!notes.empty()) notes += "\t";
             notes += fields[i];
         }

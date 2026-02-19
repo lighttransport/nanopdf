@@ -90,7 +90,7 @@ TEST_CASE("Load Catalog.tsv from Arlington data") {
     const KeyDefinition* pages_key = catalog->get_key("Pages");
     CHECK(pages_key != nullptr);
     if (pages_key) {
-        CHECK(pages_key->required);
+        CHECK(pages_key->is_unconditionally_required());
     }
 }
 

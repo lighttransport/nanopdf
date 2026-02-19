@@ -14,6 +14,7 @@ namespace arlington {
 
 enum class ArlingtonType {
     Array,
+    Bitmask,
     Boolean,
     Dictionary,
     Integer,
@@ -37,6 +38,14 @@ ArlingtonType parse_type(const std::string& type_str);
 const char* type_to_string(ArlingtonType type);
 
 // ============================================================================
+// Link Group (positional per type alternative)
+// ============================================================================
+
+struct LinkGroup {
+    std::vector<std::string> alternatives;
+};
+
+// ============================================================================
 // Key Definition (one row from a TSV file)
 // ============================================================================
 
@@ -45,13 +54,20 @@ struct KeyDefinition {
     std::vector<ArlingtonType> types;      // Column 1: Allowed types (semicolon-separated)
     std::string since_version;             // Column 2: Since PDF version (e.g., "1.0")
     std::string deprecated_in;             // Column 3: Deprecated in version
-    bool required;                         // Column 4: Is this key required?
+    std::string required_expr;             // Column 4: Required expression (raw)
     std::string indirect_reference;        // Column 5: Must be indirect reference?
-    std::string default_value;             // Column 6: Default value
-    std::vector<std::string> possible_values; // Column 7: Possible values
-    std::string special_case;              // Column 8: Special case notes
-    std::vector<std::string> links;        // Column 9: Links to other TSV definitions
-    std::string notes;                     // Column 10+: Additional notes
+    bool inheritable{false};               // Column 6: Inheritable
+    std::string default_value;             // Column 7: Default value
+    std::vector<std::string> possible_values; // Column 8: Possible values
+    std::string special_case;              // Column 9: Special case
+    std::vector<LinkGroup> link_groups;    // Column 10: Links (positional per type)
+    std::string notes;                     // Column 11+: Additional notes
+
+    /// Check if unconditionally required (TRUE)
+    bool is_unconditionally_required() const {
+        return required_expr == "TRUE" || required_expr == "true" ||
+               required_expr == "1";
+    }
 };
 
 // ============================================================================
@@ -104,11 +120,11 @@ private:
     /// Parse semicolon-separated type list
     static std::vector<ArlingtonType> parse_types(const std::string& type_str);
 
-    /// Parse bracket-delimited or semicolon-separated value list
+    /// Parse bracket-delimited value list with positional groups
     static std::vector<std::string> parse_value_list(const std::string& str);
 
-    /// Parse semicolon-separated link list
-    static std::vector<std::string> parse_links(const std::string& str);
+    /// Parse link groups (positional per type alternative)
+    static std::vector<LinkGroup> parse_link_groups(const std::string& str);
 
     /// Extract object name from file path
     static std::string extract_name(const std::string& filepath);
