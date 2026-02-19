@@ -1457,7 +1457,9 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
             w1_y = type0_font->default_w1_y;  // default: -1000
           }
           // w1_y is negative (e.g., -1000); negate for canvas y-down coords
-          cursor_y += static_cast<float>(-w1_y) / 1000.0f * size + tc_canvas;
+          // PDF spec: ty = w1/1000 * Tfs + Tc (Tc reduces downward displacement)
+          // Since we work with magnitude (-w1_y), subtract tc_canvas
+          cursor_y += static_cast<float>(-w1_y) / 1000.0f * size - tc_canvas;
         } else {
           // Horizontal mode: advance cursor in text direction using horizontal widths
           auto width_it = type0_font->cid_widths.find(char_code);
@@ -2139,8 +2141,10 @@ float ThorVGBackend::calculate_vertical_advance(const std::string& text, float f
     num_chars++;
     i += bytes_consumed;
   }
-  // Add character spacing (Tc) for each character
-  advance += num_chars * state_.char_spacing;
+  // Subtract character spacing (Tc): PDF spec ty = w1/1000*Tfs + Tc.
+  // Since w1 is negative and we return positive magnitude, Tc reduces it.
+  advance -= num_chars * state_.char_spacing;
+  if (advance < 0.0f) advance = 0.0f;
   return advance;
 }
 
@@ -5278,8 +5282,11 @@ bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   int gh = entry->height;
   auto* argb = new uint32_t[gw * gh];
   for (int i = 0; i < gw * gh; i++) {
-    uint8_t alpha = static_cast<uint8_t>(
-        (static_cast<uint16_t>(entry->bitmap[i]) * a) / 255);
+    // Apply gamma correction (gamma=1.4) to tighten AA fringe:
+    // pushes intermediate alpha values toward 0, reducing dark halo
+    float normalized = entry->bitmap[i] / 255.0f;
+    float corrected = std::pow(normalized, 1.4f);
+    uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
     // ARGB8888: A in high byte, straight alpha
     argb[i] = (static_cast<uint32_t>(alpha) << 24) |
               (static_cast<uint32_t>(r) << 16) |
@@ -5966,6 +5973,17 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             corners[i][1] = (state_.page_height - corners[i][1]) * state_.scale;
           }
 
+          // Snap axis-aligned rectangles to pixel grid
+          bool is_axis_aligned =
+              (std::abs(corners[0][1] - corners[1][1]) < 0.5f) &&
+              (std::abs(corners[1][0] - corners[2][0]) < 0.5f);
+          if (is_axis_aligned) {
+            for (int ci = 0; ci < 4; ci++) {
+              corners[ci][0] = std::round(corners[ci][0]);
+              corners[ci][1] = std::round(corners[ci][1]);
+            }
+          }
+
           // Add rectangle path from transformed corners
           state_.path_commands.push_back(tvg::PathCommand::MoveTo);
           state_.path_points.push_back({corners[0][0], corners[0][1]});
@@ -6022,6 +6040,35 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
       }
       if (token == "S" || token == "s") {  // stroke
         if (!state_.path_commands.empty()) {
+          // Snap thin axis-aligned lines to pixel grid to avoid AA fringe
+          float stroke_w_px = state_.stroke_width * state_.scale;
+          if (stroke_w_px <= 2.0f && stroke_w_px > 0.0f) {
+            bool snap_to_half =
+                (static_cast<int>(std::round(stroke_w_px)) % 2 == 1);
+            for (size_t i = 0; i + 1 < state_.path_points.size(); i++) {
+              auto& p0 = state_.path_points[i];
+              auto& p1 = state_.path_points[i + 1];
+              // Only snap LineTo segments
+              if (i + 1 < state_.path_commands.size() &&
+                  state_.path_commands[i + 1] == tvg::PathCommand::LineTo) {
+                float dx = std::abs(p1.x - p0.x);
+                float dy = std::abs(p1.y - p0.y);
+                if (dy < 0.5f && dx > 1.0f) {
+                  // Horizontal line: snap Y coordinates
+                  float snapped_y = snap_to_half ? std::floor(p0.y) + 0.5f
+                                                 : std::round(p0.y);
+                  p0.y = snapped_y;
+                  p1.y = snapped_y;
+                } else if (dx < 0.5f && dy > 1.0f) {
+                  // Vertical line: snap X coordinates
+                  float snapped_x = snap_to_half ? std::floor(p0.x) + 0.5f
+                                                 : std::round(p0.x);
+                  p0.x = snapped_x;
+                  p1.x = snapped_x;
+                }
+              }
+            }
+          }
           // Create stroked shape
           auto shape = tvg::Shape::gen();
           if (shape) {
