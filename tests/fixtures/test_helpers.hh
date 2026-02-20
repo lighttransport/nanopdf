@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstdint>
 #include <iostream>
+#include <functional>
 #include "nanopdf.hh"
 
 namespace nanopdf {
@@ -179,6 +180,23 @@ struct CorpusTestStats {
 /// @return Statistics about parsing results
 CorpusTestStats test_parse_directory(const std::string& dir, int max_files = 0,
                                      bool recursive = false);
+
+/// Parse a single PDF file in a forked subprocess for crash isolation.
+/// Returns: 0 = parse failed, 1 = parsed ok, -1 = crashed/timeout
+int parse_in_subprocess(const std::string& filepath);
+
+/// Parse all PDFs in a directory using fork-based isolation per file.
+/// Each PDF is parsed in a separate subprocess so that parser crashes
+/// (heap corruption, segfaults) don't kill the test process.
+/// @param dir Directory containing PDF files
+/// @param max_files Maximum number of files to parse (0 = unlimited)
+/// @param recursive Whether to search recursively
+/// @param verbose Print per-file crash details
+/// @return Statistics about parsing results
+CorpusTestStats test_parse_directory_isolated(const std::string& dir,
+                                              int max_files = 0,
+                                              bool recursive = false,
+                                              bool verbose = true);
 
 }  // namespace test
 }  // namespace nanopdf

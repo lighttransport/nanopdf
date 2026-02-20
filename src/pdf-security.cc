@@ -170,7 +170,7 @@ std::vector<uint8_t> compute_owner_key(const std::string& owner_password,
   // For revision 3 and above, do additional MD5 iterations
   if (revision >= 3) {
     for (int i = 0; i < 50; i++) {
-      crypto::MD5::hash(digest, key_length / 8, digest);
+      crypto::MD5::hash(digest, std::min(key_length / 8, 16), digest);
     }
   }
 
@@ -241,7 +241,7 @@ std::vector<uint8_t> compute_user_key(const std::string& user_password,
   // For revision 3 and above, do additional MD5 iterations
   if (revision >= 3) {
     for (int i = 0; i < 50; i++) {
-      crypto::MD5::hash(digest, key_length / 8, digest);
+      crypto::MD5::hash(digest, std::min(key_length / 8, 16), digest);
     }
   }
 
@@ -331,7 +331,7 @@ bool verify_owner_password(const std::string& password,
   // For revision 3 and above, do additional MD5 iterations
   if (encrypt_dict.r >= 3) {
     for (int i = 0; i < 50; i++) {
-      crypto::MD5::hash(digest, encrypt_dict.length / 8, digest);
+      crypto::MD5::hash(digest, std::min(encrypt_dict.length / 8, 16), digest);
     }
   }
 
@@ -503,7 +503,7 @@ void SecurityHandler::compute_encryption_key(const std::string& password, bool i
     // For revision 3 and above, do additional MD5 iterations
     if (encrypt_dict.r >= 3) {
       for (int i = 0; i < 50; i++) {
-        crypto::MD5::hash(digest, encrypt_dict.length / 8, digest);
+        crypto::MD5::hash(digest, std::min(encrypt_dict.length / 8, 16), digest);
       }
     }
 
@@ -580,7 +580,7 @@ void SecurityHandler::compute_encryption_key(const std::string& password, bool i
   // For revision 3 and above, do additional MD5 iterations
   if (encrypt_dict.r >= 3) {
     for (int i = 0; i < 50; i++) {
-      crypto::MD5::hash(digest, encrypt_dict.length / 8, digest);
+      crypto::MD5::hash(digest, std::min(encrypt_dict.length / 8, 16), digest);
     }
   }
 
@@ -727,8 +727,13 @@ std::vector<uint8_t> SecurityHandler::decrypt_string(const std::string& str,
     rc4.crypt(data.data(), data.size());
   } else if (effective_algo == EncryptionAlgorithm::AES_128) {
     // For AES, strings are encrypted in CBC mode with a random IV
-    if (data.size() < 16) {
-      return data; // Invalid encrypted string
+    if (data.size() < 32) {
+      return data; // Need at least IV (16) + one block (16)
+    }
+
+    size_t encrypted_len = data.size() - 16;
+    if (encrypted_len % 16 != 0) {
+      return data; // Malformed: AES-CBC requires block-aligned input
     }
 
     // First 16 bytes are the IV
@@ -739,8 +744,8 @@ std::vector<uint8_t> SecurityHandler::decrypt_string(const std::string& str,
     crypto::AES128 aes;
     aes.set_key(obj_key.data());
 
-    std::vector<uint8_t> decrypted(data.size() - 16);
-    aes.decrypt_cbc(data.data() + 16, decrypted.data(), data.size() - 16, iv);
+    std::vector<uint8_t> decrypted(encrypted_len);
+    aes.decrypt_cbc(data.data() + 16, decrypted.data(), encrypted_len, iv);
 
     // Remove padding
     size_t unpadded_len = crypto::unpad_pkcs7(decrypted.data(), decrypted.size());
@@ -800,8 +805,13 @@ std::vector<uint8_t> SecurityHandler::decrypt_stream(const std::vector<uint8_t>&
     rc4.crypt(result.data(), result.size());
   } else if (effective_algo == EncryptionAlgorithm::AES_128) {
     // For AES, streams are encrypted in CBC mode with a random IV
-    if (result.size() < 16) {
-      return result; // Invalid encrypted stream
+    if (result.size() < 32) {
+      return result; // Need at least IV (16) + one block (16)
+    }
+
+    size_t encrypted_len = result.size() - 16;
+    if (encrypted_len % 16 != 0) {
+      return result; // Malformed: AES-CBC requires block-aligned input
     }
 
     // First 16 bytes are the IV
@@ -812,8 +822,8 @@ std::vector<uint8_t> SecurityHandler::decrypt_stream(const std::vector<uint8_t>&
     crypto::AES128 aes;
     aes.set_key(obj_key.data());
 
-    std::vector<uint8_t> decrypted(result.size() - 16);
-    aes.decrypt_cbc(result.data() + 16, decrypted.data(), result.size() - 16, iv);
+    std::vector<uint8_t> decrypted(encrypted_len);
+    aes.decrypt_cbc(result.data() + 16, decrypted.data(), encrypted_len, iv);
 
     // Remove padding
     size_t unpadded_len = crypto::unpad_pkcs7(decrypted.data(), decrypted.size());

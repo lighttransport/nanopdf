@@ -6,6 +6,8 @@
 #include <cstring>
 #include <algorithm>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <dirent.h>
 
 namespace nanopdf {
@@ -395,6 +397,80 @@ CorpusTestStats test_parse_directory(const std::string& dir, int max_files,
             }
         } catch (...) {
             stats.crashed++;
+        }
+    }
+    return stats;
+}
+
+int parse_in_subprocess(const std::string& filepath) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
+
+    if (pid == 0) {
+        // Child process
+        close(pipefd[0]);  // Close read end
+
+        int result = 0;  // 0=parse_fail, 1=ok
+        std::vector<uint8_t> data;
+        nanopdf::Pdf pdf;
+        if (parse_pdf_file(filepath, data, pdf)) {
+            result = 1;
+        }
+
+        ssize_t written = write(pipefd[1], &result, sizeof(result));
+        (void)written;
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    // Parent process
+    close(pipefd[1]);  // Close write end
+
+    int result = -1;
+    int wstatus;
+    pid_t wpid = waitpid(pid, &wstatus, 0);
+
+    if (wpid == pid && WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0) {
+        ssize_t n = read(pipefd[0], &result, sizeof(result));
+        if (n != sizeof(result)) result = -1;
+    }
+    // else: child crashed or was signaled -> result stays -1
+
+    close(pipefd[0]);
+    return result;
+}
+
+CorpusTestStats test_parse_directory_isolated(const std::string& dir,
+                                              int max_files,
+                                              bool recursive,
+                                              bool verbose) {
+    CorpusTestStats stats;
+    std::vector<std::string> files =
+        recursive ? list_pdf_files_recursive(dir) : list_pdf_files(dir);
+
+    if (max_files > 0 && static_cast<int>(files.size()) > max_files) {
+        files.resize(static_cast<size_t>(max_files));
+    }
+
+    for (const auto& filepath : files) {
+        stats.total++;
+        int result = parse_in_subprocess(filepath);
+
+        if (result == 1) {
+            stats.ok++;
+        } else if (result == 0) {
+            stats.failed++;
+        } else {
+            stats.crashed++;
+            if (verbose) {
+                size_t slash = filepath.rfind('/');
+                std::string name = (slash != std::string::npos) ?
+                    filepath.substr(slash + 1) : filepath;
+                std::cout << "  CRASH: " << name << "\n";
+            }
         }
     }
     return stats;

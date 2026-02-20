@@ -264,12 +264,17 @@ bool parse_stream(StreamReader &sr, Parser &parser, Value *out_value) {
   // Consume "stream" keyword
   if (!parser.consume_keyword(sr, "stream")) return false;
 
-  // Expect either CR+LF or just LF
+  // Expect CR+LF, just LF, or just CR (many real-world PDFs use CR-only)
   char c;
   if (!sr.read1(&c)) return false;
   if (c == '\r') {
+    // Peek at next byte: consume LF if present (CR+LF), otherwise CR-only
     char next;
-    if (!sr.read1(&next) || next != '\n') return false;
+    if (sr.read1(&next)) {
+      if (next != '\n') {
+        sr.seek_set(sr.tell() - 1);  // Put back non-LF byte
+      }
+    }
   } else if (c != '\n') {
     return false;
   }
@@ -800,18 +805,35 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
     return false;
   }
 
-  out_pdf->data = addr;
-  out_pdf->data_size = size;
-  out_pdf->swap_endian = !is_system_little_endian();
-
-  // Parse PDF version from header
-  if ((addr[0] != '%') || (addr[1] != 'P') || (addr[2] != 'D') ||
-      (addr[3] != 'F') || (addr[4] != '-') || (addr[6] != '.')) {
-    return false;
+  // Find %PDF header — PDF spec allows up to 1024 bytes before it;
+  // we scan up to 4096 to handle web-crawled files with prepended junk.
+  size_t pdf_offset = 0;
+  if (addr[0] == '%' && addr[1] == 'P' && addr[2] == 'D' && addr[3] == 'F' &&
+      addr[4] == '-' && addr[6] == '.') {
+    pdf_offset = 0;
+  } else {
+    size_t scan_limit = size < 4096 ? size : 4096;
+    bool found = false;
+    for (size_t i = 1; i + 7 < scan_limit; ++i) {
+      if (addr[i] == '%' && addr[i+1] == 'P' && addr[i+2] == 'D' &&
+          addr[i+3] == 'F' && addr[i+4] == '-' && addr[i+6] == '.') {
+        pdf_offset = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
   }
 
-  out_pdf->version_major = static_cast<int>(addr[5] - '0');
-  out_pdf->version_minor = static_cast<int>(addr[7] - '0');
+  // Adjust data pointer to start at %PDF header so xref offsets are correct
+  out_pdf->data = addr + pdf_offset;
+  out_pdf->data_size = size - pdf_offset;
+  out_pdf->swap_endian = !is_system_little_endian();
+
+  out_pdf->version_major = static_cast<int>(out_pdf->data[5] - '0');
+  out_pdf->version_minor = static_cast<int>(out_pdf->data[7] - '0');
 
   return out_pdf->load_document_structure();
 }
@@ -978,6 +1000,64 @@ next_iter:
       break;
     }
     if (pos == 0) break;
+  }
+
+  // If no trailer keyword was found (XRef-stream-only PDFs), search for /Root
+  // in object dictionaries (XRef stream objects contain trailer-equivalent data)
+  if (out_pdf->root == 0) {
+    // Search for /Root in any object dictionary
+    const char* root_kw = "/Root";
+    const size_t root_len = 5;
+    for (size_t pos = 0; pos + root_len < size; ++pos) {
+      if (std::memcmp(begin + pos, root_kw, root_len) == 0) {
+        // Found /Root — try to parse the value after it
+        const char* p = begin + pos + root_len;
+        // Skip whitespace
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+          p++;
+        // Parse "N G R" reference
+        if (p < end && std::isdigit(static_cast<unsigned char>(*p))) {
+          uint32_t obj = 0;
+          while (p < end && std::isdigit(static_cast<unsigned char>(*p))) {
+            obj = obj * 10 + static_cast<uint32_t>(*p - '0');
+            p++;
+          }
+          if (p < end && *p == ' ') {
+            p++;
+            // Skip generation number
+            while (p < end && std::isdigit(static_cast<unsigned char>(*p))) p++;
+            if (p < end && *p == ' ') p++;
+            if (p < end && *p == 'R') {
+              out_pdf->root = obj;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Last resort: search for /Type/Catalog or /Type /Catalog to find root
+  if (out_pdf->root == 0) {
+    const char* patterns[] = {"/Type/Catalog", "/Type /Catalog"};
+    const size_t pat_lens[] = {13, 14};
+    for (int pi = 0; pi < 2 && out_pdf->root == 0; ++pi) {
+      for (size_t pos = 0; pos + pat_lens[pi] <= size; ++pos) {
+        if (std::memcmp(begin + pos, patterns[pi], pat_lens[pi]) == 0) {
+          // Find which object contains this offset
+          const auto& xrefs = out_pdf->xref_sections.back().xrefs;
+          for (size_t oi = 0; oi < xrefs.size(); ++oi) {
+            if (!xrefs[oi].use) continue;
+            uint64_t obj_off = xrefs[oi].offset;
+            if (obj_off <= pos && pos - obj_off < 4096) {
+              out_pdf->root = static_cast<uint32_t>(oi);
+              break;
+            }
+          }
+          if (out_pdf->root != 0) break;
+        }
+      }
+    }
   }
 
   if (out_pdf->root == 0) return false;
@@ -4814,26 +4894,48 @@ bool Pdf::build_object_offset_cache() const {
 
   auto update_trailer = [&](const Dictionary& dict) {
     Pdf* self = const_cast<Pdf*>(this);
-    self->trailer = dict;
 
+    // Merge trailer dict: first-seen keys win (most recent trailer, from
+    // startxref, is processed first and takes precedence per PDF spec 7.5.5).
+    if (self->trailer.empty()) {
+      self->trailer = dict;
+    } else {
+      for (const auto& kv : dict) {
+        if (self->trailer.find(kv.first) == self->trailer.end()) {
+          self->trailer[kv.first] = kv.second;
+        }
+      }
+    }
+
+    // Size: use the maximum seen across all trailers
     auto size_it_local = dict.find("Size");
     if (size_it_local != dict.end() && size_it_local->second.type == Value::NUMBER) {
-      self->size = static_cast<uint32_t>(size_it_local->second.number);
+      uint32_t new_size = static_cast<uint32_t>(size_it_local->second.number);
+      if (new_size > self->size) {
+        self->size = new_size;
+      }
     }
 
-    auto root_it = dict.find("Root");
-    if (root_it != dict.end() && root_it->second.type == Value::REFERENCE) {
-      self->root = root_it->second.ref_object_number;
+    // Root, Info, Encrypt, ID: first-seen wins (most recent trailer)
+    if (self->root == 0) {
+      auto root_it = dict.find("Root");
+      if (root_it != dict.end() && root_it->second.type == Value::REFERENCE) {
+        self->root = root_it->second.ref_object_number;
+      }
     }
 
-    auto info_it = dict.find("Info");
-    if (info_it != dict.end() && info_it->second.type == Value::REFERENCE) {
-      self->info = info_it->second.ref_object_number;
+    if (self->info == 0) {
+      auto info_it = dict.find("Info");
+      if (info_it != dict.end() && info_it->second.type == Value::REFERENCE) {
+        self->info = info_it->second.ref_object_number;
+      }
     }
 
-    auto encrypt_it = dict.find("Encrypt");
-    if (encrypt_it != dict.end() && encrypt_it->second.type == Value::REFERENCE) {
-      self->encrypt = encrypt_it->second.ref_object_number;
+    if (self->encrypt == 0) {
+      auto encrypt_it = dict.find("Encrypt");
+      if (encrypt_it != dict.end() && encrypt_it->second.type == Value::REFERENCE) {
+        self->encrypt = encrypt_it->second.ref_object_number;
+      }
     }
 
     auto prev_it_root = dict.find("Prev");
@@ -4841,11 +4943,13 @@ bool Pdf::build_object_offset_cache() const {
       self->prev = static_cast<uint32_t>(prev_it_root->second.number);
     }
 
-    auto id_it = dict.find("ID");
-    if (id_it != dict.end() && id_it->second.type == Value::ARRAY &&
-        !id_it->second.array.empty() &&
-        id_it->second.array[0].type == Value::STRING) {
-      self->id = id_it->second.array[0].str;
+    if (self->id.empty()) {
+      auto id_it = dict.find("ID");
+      if (id_it != dict.end() && id_it->second.type == Value::ARRAY &&
+          !id_it->second.array.empty() &&
+          id_it->second.array[0].type == Value::STRING) {
+        self->id = id_it->second.array[0].str;
+      }
     }
   };
 
