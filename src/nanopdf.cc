@@ -1060,6 +1060,31 @@ next_iter:
     }
   }
 
+  // Last-ditch: look for a dict containing /Pages (catalog-like object)
+  if (out_pdf->root == 0 && !out_pdf->xref_sections.empty()) {
+    const char* pages_kw = "/Pages";
+    const size_t pages_len = 6;
+    for (size_t pos = 0; pos + pages_len < size; ++pos) {
+      if (std::memcmp(begin + pos, pages_kw, pages_len) != 0) continue;
+      // Check that next char is whitespace or value (not a longer key like /PagesMode)
+      char next = (pos + pages_len < size) ? begin[pos + pages_len] : ' ';
+      if (next != ' ' && next != '\n' && next != '\r' && next != '\t' &&
+          !std::isdigit(static_cast<unsigned char>(next)))
+        continue;
+      // Find which object contains this offset
+      const auto& xrefs = out_pdf->xref_sections.back().xrefs;
+      for (size_t oi = 0; oi < xrefs.size(); ++oi) {
+        if (!xrefs[oi].use) continue;
+        uint64_t obj_off = xrefs[oi].offset;
+        if (obj_off <= pos && pos - obj_off < 4096) {
+          out_pdf->root = static_cast<uint32_t>(oi);
+          break;
+        }
+      }
+      if (out_pdf->root != 0) break;
+    }
+  }
+
   if (out_pdf->root == 0) return false;
 
   // Try loading document structure
@@ -4857,6 +4882,65 @@ bool Pdf::build_object_offset_cache() const {
   }
   if (!has_digit || initial_xref >= data_size) {
     return false;
+  }
+
+  // Handle truncated linearized PDFs: when startxref is 0, the file is likely
+  // a partial download of a linearized PDF. The first xref stream is located
+  // near the beginning of the file (after the linearization dict object).
+  // Scan for /Type /XRef to find it.
+  if (initial_xref == 0) {
+    // Check if this is a linearized PDF
+    size_t scan_limit = data_size < 4096 ? data_size : 4096;
+    bool is_linearized = false;
+    for (size_t i = 0; i + 12 < scan_limit; ++i) {
+      if (std::memcmp(begin + i, "/Linearized", 11) == 0) {
+        is_linearized = true;
+        break;
+      }
+    }
+
+    if (is_linearized) {
+      // Scan for the first xref stream object: look for /Type /XRef or
+      // /Type/XRef within the first portion of the file
+      size_t xref_scan_limit = data_size < 65536 ? data_size : 65536;
+      for (size_t i = 0; i + 10 < xref_scan_limit; ++i) {
+        if (std::memcmp(begin + i, "/Type", 5) != 0) continue;
+        size_t j = i + 5;
+        // Skip optional whitespace
+        while (j < xref_scan_limit && (begin[j] == ' ' || begin[j] == '\t' ||
+               begin[j] == '\n' || begin[j] == '\r'))
+          j++;
+        if (j + 4 >= xref_scan_limit) continue;
+        if (std::memcmp(begin + j, "/XRef", 5) != 0) continue;
+
+        // Found /Type /XRef — now find the "N G obj" that contains it by
+        // scanning backwards for a digit sequence matching "N G obj"
+        for (size_t k = i; k > 0; --k) {
+          if (begin[k] == 'o' && k + 2 < data_size &&
+              begin[k + 1] == 'b' && begin[k + 2] == 'j') {
+            // Walk back to find the start of "N G obj"
+            size_t obj_start = k;
+            if (obj_start > 0 && begin[obj_start - 1] == ' ') {
+              obj_start--;
+              // Skip generation number backwards
+              while (obj_start > 0 &&
+                     std::isdigit(static_cast<unsigned char>(begin[obj_start - 1])))
+                obj_start--;
+              if (obj_start > 0 && begin[obj_start - 1] == ' ') {
+                obj_start--;
+                // Skip object number backwards
+                while (obj_start > 0 &&
+                       std::isdigit(static_cast<unsigned char>(begin[obj_start - 1])))
+                  obj_start--;
+              }
+            }
+            initial_xref = obj_start;
+            break;
+          }
+        }
+        break;
+      }
+    }
   }
 
   auto skip_ws_ptr = [&](const char*& p) {
