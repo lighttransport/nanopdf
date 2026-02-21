@@ -5,7 +5,7 @@
 using namespace nanopdf;
 using namespace nanopdf::test;
 
-static const int kDefaultMaxFiles = 10000;
+static const int kDefaultMaxFiles = 100000;
 
 TEST_SUITE("CorpusParsing") {
 
