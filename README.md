@@ -1,6 +1,6 @@
 # NanoPDF
 
-NanoPDF is a lightweight C++11 library for parsing and inspecting PDF files. It focuses on
+NanoPDF is a lightweight C++14 library for parsing and inspecting PDF files. It focuses on
 read-only workflows such as structure inspection, text extraction, annotations, and form
 metadata. The codebase is self-contained and ships with optional miniature STL replacements
 for constrained environments.
@@ -9,8 +9,10 @@ for constrained environments.
 
 ### Core Parsing
 - Document structure parsing (catalog, pages, outlines, named destinations)
-- Cross-reference tables (linear and compressed object streams)
-- Fallback xref scanning for malformed PDFs
+- Cross-reference tables (traditional and compressed object streams)
+- Linearized PDF support (including truncated partial downloads)
+- Robust xref repair for malformed/corrupted PDFs
+- Trailer chain merging for incremental updates
 
 ### Stream Filters
 - FlateDecode (zlib/deflate)
@@ -18,33 +20,41 @@ for constrained environments.
 - LZWDecode, RunLengthDecode
 - DCTDecode (JPEG via stb_image)
 - CCITTFaxDecode (Group 3/4 fax, 1D and 2D modes)
-- JBIG2Decode (partial)
+- JBIG2Decode (monochrome bitmap compression)
+- Filter chains (multiple filters applied in sequence)
 
 ### Fonts
 - Type1, TrueType, Type0 (CID), Type3 fonts
+- CFF (Compact Font Format) and PostScript Type 1 parsing
 - Font descriptors and metrics
 - CMap and ToUnicode mappings
 - StandardEncoding with glyph-name fallback via Adobe Glyph List
 - Font substitution for Standard 14 fonts
+- Optional embedded fonts (Arimo/Tinos/Cousine metric-compatible replacements)
+- CJK font embedding support
 
 ### Text Extraction
 - Text positioning operators (Td, TD, Tm, T*)
 - Text matrix transformations and rendering modes
 - Character/word spacing support
 - Automatic line break injection
+- Table structure detection
 
 ### Graphics
 - Color spaces: DeviceGray, DeviceRGB, DeviceCMYK, CalRGB, CalGray, Lab, ICCBased, Indexed, Separation, DeviceN
 - Image XObjects with decode arrays and masks
 - Extended graphics state (transparency, blend modes)
 - Pattern and shading parsing
+- Color space transformations
 
 ### Interactive Features
 - Annotations: Text, Link, Markup, FreeText, Stamp, Ink, Line, Shape, Widget
 - Form fields: Text, Button, Choice, Signature (AcroForm)
+- Form manipulation (fill, flatten)
 - Appearance streams (Normal, Rollover, Down states)
 - Bookmarks/outlines with destinations
 - Page labels and named destinations
+- File attachments
 
 ### Security
 - Standard security handler (RC4/AES-128/AES-256)
@@ -52,15 +62,16 @@ for constrained environments.
 - Permission flags
 - Pure C++ crypto implementation (no external libraries)
 
-## Recent Updates
+### Rendering Backends
+- Canvas export (HTML5 Canvas commands)
+- SVG export
+- ThorVG vector graphics backend (optional)
+- Blend2D rasterization backend (optional)
 
-- Lazy loading for fonts (loaded on first text extraction per page)
-- Filter chain support (multiple filters applied in sequence)
-- Improved error reporting with detailed messages and bounds checking
-- CCITTFaxDecode filter with Group 3/4 support (1D and 2D modes)
-- ASCIIHexDecode filter
-- CI workflow with AddressSanitizer, UBSan, and ThreadSanitizer builds
-- Fallback xref scanning for corrupted or non-standard PDFs
+### Other
+- PDF writing/generation
+- MCP (Model Context Protocol) server for AI integration
+- WebAssembly/Emscripten support
 
 ## Building
 
@@ -73,72 +84,87 @@ cmake --build build
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `NANOPDF_USE_CCACHE` | `ON` | Enable ccache when available to speed up incremental builds. |
-| `NANOPDF_USE_NANOSTL` | `OFF` | Use the bundled `nanostl` headers instead of the system STL (handy for restricted platforms). |
-| `NANOPDF_USE_STB_TRUETYPE` | `ON` | Include `stb_truetype` to parse embedded TrueType fonts. Disable if you ship your own font loader. |
-| `NANOPDF_USE_THORVG` | `OFF` | Build the ThorVG raster backend. Requires the ThorVG headers/libraries on your system. |
-| `NANOPDF_BUILD_TESTS` | `ON` (honours `BUILD_TESTING`) | Build the phase executables under `src/test-*.cc`. |
-| `NANOPDF_BUILD_WASM` | `OFF` | Target WebAssembly (requires configuring with Emscripten's toolchain). |
-| `NANOPDF_LAZY_METADATA` | `OFF` | Enable lazy loading of metadata (forms, outlines, labels). |
-
-Pass any flag with `-DNAME=VALUE` while configuring via CMake.
+| `NANOPDF_USE_CCACHE` | `ON` | Use ccache for faster incremental builds |
+| `NANOPDF_USE_NANOSTL` | `OFF` | Use bundled nanostl instead of system STL |
+| `NANOPDF_USE_STB_TRUETYPE` | `ON` | Include stb_truetype for TrueType font parsing |
+| `NANOPDF_USE_THORVG` | `OFF` | Build the ThorVG raster backend |
+| `NANOPDF_USE_BLEND2D` | `OFF` | Build the Blend2D raster backend |
+| `NANOPDF_BUILD_TESTS` | `ON` | Build test executables |
+| `NANOPDF_BUILD_VALIDATION_TESTS` | `ON` | Build PDF spec validation tests |
+| `NANOPDF_BUILD_LEGACY_TESTS` | `ON` | Build legacy phase test executables |
+| `NANOPDF_BUILD_WASM` | `OFF` | Target WebAssembly (requires Emscripten) |
+| `NANOPDF_EMBED_FONTS` | `OFF` | Embed Standard 14 font replacements |
+| `NANOPDF_EMBED_CJK_FONTS` | `OFF` | Embed CJK fonts (~61 MB) |
+| `NANOPDF_LAZY_METADATA` | `OFF` | Lazy loading of metadata (forms, outlines, labels) |
+| `SANITIZE_ADDRESS` | `OFF` | Enable AddressSanitizer |
 
 ## Tests
 
-Phase executables live under `build/` after configuration. Typical runs:
+### Unit and validation tests
 
 ```bash
-cmake --build build --target test_phase3
-./build/test_phase3 data/HelloWorld_xr.pdf
+cmake --build build
+ctest --test-dir build                     # Run all tests
+ctest --test-dir build -L unit             # Unit tests only
+ctest --test-dir build -L validation       # Validation tests only
 ```
 
-A small harness (`build/manual_extract.cc`) can be compiled against the static library to
-exercise StandardEncoding text extraction.
+### Corpus testing
+
+Download real-world PDF corpora for large-scale parser validation:
+
+```bash
+scripts/download-corpora.sh
+```
+
+Run corpus parsing tests (requires downloaded corpora):
+
+```bash
+NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/test_corpus_parsing
+```
+
+Supported corpora:
+- **CC-MAIN-2021** — 100k+ real-world PDFs from Common Crawl (99.66% parse rate, 0 crashes)
+- **UNSAFE-DOCS** — 14k+ synthetically malformed PDFs from DARPA SafeDocs (98.18% parse rate, 0 crashes)
+- **SafeDocs** — hand-crafted edge-case PDFs (100% parse rate)
+- **GovDocs1**, **veraPDF**, **pdf.js**, **pdfium**, **Tika** — additional corpora
+
+### Arlington PDF model validation
+
+Validate parsed PDF structure against the Arlington PDF model (machine-readable PDF spec):
+
+```bash
+NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/test_arlington_validate
+```
 
 ### CI helper
-
-Run the full Release + Debug test sweep with CMake:
 
 ```bash
 cmake -P scripts/run-ci.cmake
 ```
 
-If you have an existing build tree, the helper is also exposed as `cmake --build build --target ci`.
-Set `NANOPDF_CI_CMAKE_ARGS` (e.g. `-DNANOPDF_USE_THORVG=ON`) to forward extra configure flags, and
-`NANOPDF_CI_CONFIGS` to override the configuration list.
-
-GitHub Actions runs this helper on `ubuntu-latest` and `macos-latest` for every push and pull request, plus dedicated AddressSanitizer, UndefinedBehaviorSanitizer, and ThreadSanitizer Debug builds on `ubuntu-latest`. Each job uploads the generated CMake and ctest logs as artifacts for debugging failures.
-
 ### Maintaining the glyph list
 
-`src/adobe_glyph_list.inc` is auto-generated from Adobe’s canonical glyph list. If the upstream
-data changes, refresh the header with:
+`src/adobe_glyph_list.inc` is auto-generated from Adobe's canonical glyph list:
 
 ```bash
 scripts/update-glyph-list-inc.py
 ```
 
-The script reads `data/adobe_glyph_list.txt` and rewrites the generated header in-place.
-
-### Sample PDFs
-
-`data/standardencoding/` contains real PDFs collected from PDF Association, SAS Global Forum, and
-NIST publications. They exercise StandardEncoding glyph differences in the wild—handy when you need
-to sanity-check text extraction regressions.
-
 ## Limitations
 
 - JPXDecode (JPEG2000) filter not implemented
 - Advanced transparency, blending, and pattern rendering are parsed but not fully rendered
-- No writing support (read-only library)
+- Tagged PDF / accessibility structure trees not yet supported
+- PDF writing support is experimental
 
 ## Contributing
 
 1. Keep headers self-contained (`#pragma once`) and prefer STL over custom containers unless building with `NANOSTL`
-2. Add targeted regression tests (phase executables) for new parser features
-3. Document any new data fixtures under `data/`
-4. Run the relevant `test_phase*` executables before submitting changes
+2. Add unit tests under `tests/` for new features
+3. Run `ctest` and corpus tests before submitting changes
+4. Format code with `clang-format -i` (Google style, 2-space indent)
 
 ## License
 
-Apache 2.0 © 2024–present Light Transport Entertainment Inc.
+Apache 2.0 © 2024-present Light Transport Entertainment Inc.
