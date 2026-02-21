@@ -734,8 +734,8 @@ struct CellStyle {
   double border_r = 0, border_g = 0, border_b = 0;
 };
 
-/// Table cell
-struct TableCell {
+/// Table cell for PDF writing
+struct WriterTableCell {
   std::string text;                // Cell text content
   int colspan = 1;                 // Number of columns to span
   int rowspan = 1;                 // Number of rows to span
@@ -744,7 +744,7 @@ struct TableCell {
 
 /// Table row
 struct TableRow {
-  std::vector<TableCell> cells;
+  std::vector<WriterTableCell> cells;
   double height = 0;               // 0 = auto height based on content
   CellStyle row_style;             // Row-specific style (applies to all cells)
 };
@@ -816,7 +816,7 @@ class TableBuilder {
   void add_row(const std::vector<std::string>& cells);
 
   /// Add a data row with cell styles
-  void add_row(const std::vector<TableCell>& cells);
+  void add_row(const std::vector<WriterTableCell>& cells);
 
   /// Add a styled row
   void add_row(const TableRow& row);

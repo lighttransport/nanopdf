@@ -1498,7 +1498,7 @@ void TableBuilder::add_header_row(const std::vector<std::string>& cells) {
   TableRow row;
   row.row_style = config_.header_style;
   for (const auto& text : cells) {
-    TableCell cell;
+    WriterTableCell cell;
     cell.text = text;
     row.cells.push_back(cell);
   }
@@ -1513,14 +1513,14 @@ void TableBuilder::add_header_row(const std::vector<std::string>& cells) {
 void TableBuilder::add_row(const std::vector<std::string>& cells) {
   TableRow row;
   for (const auto& text : cells) {
-    TableCell cell;
+    WriterTableCell cell;
     cell.text = text;
     row.cells.push_back(cell);
   }
   rows_.push_back(row);
 }
 
-void TableBuilder::add_row(const std::vector<TableCell>& cells) {
+void TableBuilder::add_row(const std::vector<WriterTableCell>& cells) {
   TableRow row;
   row.cells = cells;
   rows_.push_back(row);
