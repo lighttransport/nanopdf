@@ -2042,31 +2042,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     return result;
   }
 
-#ifdef NANOPDF_USE_POPPLER_CCITT
-  // Use Poppler's CCITT decoder if available (highest priority - GPL licensed)
-  {
-    NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using Poppler decoder");
-    extern std::vector<uint8_t> decode_ccitt_poppler_wrapper(
-        const uint8_t* data, size_t size,
-        int encoding, bool endOfLine, bool byteAlign,
-        int columns, int rows, bool endOfBlock, bool blackIs1);
-
-    auto decoded = decode_ccitt_poppler_wrapper(
-        data, size,
-        params.k,
-        params.end_of_line,
-        params.encoded_byte_align,
-        params.columns,
-        params.rows,
-        params.end_of_block,
-        params.black_is_1
-    );
-    result.data = std::move(decoded);
-    result.success = true;
-    NANOPDF_LOG_INFO("CCITTFaxDecode", "Poppler decoded %zu bytes", result.data.size());
-    return result;
-  }
-#elif defined(NANOPDF_USE_LIBTIFF)
+#if defined(NANOPDF_USE_LIBTIFF)
   // Use libtiff for CCITT decoding if available
   NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using libtiff decoder");
   return decode_ccittfax_libtiff(data, size, params);
@@ -3324,7 +3300,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   }
   result.success = true;
   return result;
-#endif  // NANOPDF_USE_POPPLER_CCITT || NANOPDF_USE_LIBTIFF || NANOPDF_USE_BUILTIN_CCITT
+#endif  // NANOPDF_USE_LIBTIFF || NANOPDF_USE_BUILTIN_CCITT
 }
 
 }  // namespace filters

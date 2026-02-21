@@ -15,7 +15,6 @@ option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
-option(NANOPDF_USE_POPPLER_CCITT "Use Poppler for CCITT/Fax decoding (GPL)" OFF)
 option(NANOPDF_USE_BUILTIN_CCITT "Use built-in CCITT decoder instead of PDFium-based" OFF)
 
 # Log level: 0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
@@ -431,53 +430,6 @@ if (NANOPDF_USE_BUILTIN_CCITT)
   target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_BUILTIN_CCITT")
   message(STATUS "Built-in CCITT decoder enabled (fallback)")
 endif ()
-
-# Poppler CCITT decoder support (GPL-licensed)
-if (NANOPDF_USE_POPPLER_CCITT)
-  message(STATUS "")
-  message(WARNING "NANOPDF_USE_POPPLER_CCITT is enabled. This links against GPL-licensed Poppler.")
-  message(WARNING "Your binary will be subject to GPL-2.0 licensing requirements.")
-  message(STATUS "")
-
-  # Try to find poppler in ref/poppler first
-  set(POPPLER_REF_DIR ${CMAKE_SOURCE_DIR}/ref/poppler)
-  if(EXISTS ${POPPLER_REF_DIR}/poppler/Stream.h)
-    set(POPPLER_FOUND TRUE)
-    set(POPPLER_INCLUDE_DIRS ${POPPLER_REF_DIR} ${POPPLER_REF_DIR}/poppler)
-    # Try to find built library
-    find_library(POPPLER_LIBRARY NAMES poppler
-      PATHS ${POPPLER_REF_DIR}/build
-      NO_DEFAULT_PATH)
-    if(POPPLER_LIBRARY)
-      set(POPPLER_LIBRARIES ${POPPLER_LIBRARY})
-      message(STATUS "Found Poppler in ref/: ${POPPLER_LIBRARY}")
-    else()
-      set(POPPLER_FOUND FALSE)
-      message(STATUS "Poppler headers found in ref/ but library not built")
-      message(STATUS "Build poppler: cd ref/poppler/build && cmake .. && make")
-    endif()
-  endif()
-
-  if (POPPLER_FOUND)
-    # Poppler requires C++17, so upgrade project standard
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    message(STATUS "Upgraded to C++17 for Poppler compatibility")
-
-    # Add poppler wrapper to build
-    target_sources(${BUILD_TARGET} PRIVATE src/poppler-ccitt-wrapper.cc)
-    # Include both source and build directories (for poppler-config.h)
-    target_include_directories(${BUILD_TARGET} PRIVATE
-      ${POPPLER_INCLUDE_DIRS}
-      ${POPPLER_REF_DIR}/build
-      ${POPPLER_REF_DIR}/build/poppler)
-    target_link_libraries(${BUILD_TARGET} PRIVATE ${POPPLER_LIBRARIES})
-    target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_POPPLER_CCITT")
-    message(STATUS "Poppler CCITT decoder enabled (GPL)")
-  else()
-    message(WARNING "Poppler not found. Please build from ref/poppler or disable NANOPDF_USE_POPPLER_CCITT")
-  endif()
-endif()
 
 # Blend2D support
 if (NANOPDF_USE_BLEND2D)
