@@ -97,7 +97,6 @@ set(NANOPDF_EXT_LIBRARIES_PUBLIC "")
 
 set(NANOPDF_SOURCES
   src/nanopdf.cc
-  src/jbig2-decoder.cc
   src/jpx-decoder.cc
   src/type1-parser.cc
   src/cff-parser.cc

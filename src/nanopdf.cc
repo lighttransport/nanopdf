@@ -3519,6 +3519,43 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     params_list.push_back(filters::DecodeParams{});
   }
 
+  // Extract JBIG2Globals from DecodeParms for JBIG2Decode filters
+  for (size_t i = 0; i < filter_names.size(); ++i) {
+    if (filter_names[i] == "JBIG2Decode") {
+      // Access raw DecodeParms to find JBIG2Globals indirect reference
+      if (params_it != stream_obj.stream.dict.end()) {
+        const Value *dp_entry = nullptr;
+        if (params_it->second.type == Value::DICTIONARY) {
+          dp_entry = &params_it->second;
+        } else if (params_it->second.type == Value::ARRAY &&
+                   i < params_it->second.array.size() &&
+                   params_it->second.array[i].type == Value::DICTIONARY) {
+          dp_entry = &params_it->second.array[i];
+        }
+        if (dp_entry) {
+          auto globals_it = dp_entry->dict.find("JBIG2Globals");
+          if (globals_it != dp_entry->dict.end() &&
+              globals_it->second.type == Value::REFERENCE) {
+            ResolvedObject resolved = resolve_reference(
+                pdf, globals_it->second.ref_object_number,
+                globals_it->second.ref_generation_number);
+            if (resolved.success &&
+                resolved.value.type == Value::STREAM) {
+              DecodedStream globals_decoded = decode_stream(
+                  pdf, resolved.value,
+                  globals_it->second.ref_object_number,
+                  globals_it->second.ref_generation_number);
+              if (globals_decoded.success) {
+                params_list[i].jbig2_globals =
+                    std::move(globals_decoded.data);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Apply filters in sequence
   for (size_t i = 0; i < filter_names.size(); ++i) {
     const std::string &filter_name = filter_names[i];
@@ -3753,6 +3790,42 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
         NANOPDF_LOG_DEBUG("decode_stream",
                          "CCITT: Using image width %d for missing Columns param",
                          image_width);
+      }
+    }
+  }
+
+  // Extract JBIG2Globals from DecodeParms for JBIG2Decode filters
+  for (size_t i = 0; i < filter_names.size(); ++i) {
+    if (filter_names[i] == "JBIG2Decode") {
+      if (params_it != stream_obj.stream.dict.end()) {
+        const Value *dp_entry = nullptr;
+        if (params_it->second.type == Value::DICTIONARY) {
+          dp_entry = &params_it->second;
+        } else if (params_it->second.type == Value::ARRAY &&
+                   i < params_it->second.array.size() &&
+                   params_it->second.array[i].type == Value::DICTIONARY) {
+          dp_entry = &params_it->second.array[i];
+        }
+        if (dp_entry) {
+          auto globals_it = dp_entry->dict.find("JBIG2Globals");
+          if (globals_it != dp_entry->dict.end() &&
+              globals_it->second.type == Value::REFERENCE) {
+            ResolvedObject resolved = resolve_reference(
+                pdf, globals_it->second.ref_object_number,
+                globals_it->second.ref_generation_number);
+            if (resolved.success &&
+                resolved.value.type == Value::STREAM) {
+              DecodedStream globals_decoded = decode_stream(
+                  pdf, resolved.value,
+                  globals_it->second.ref_object_number,
+                  globals_it->second.ref_generation_number);
+              if (globals_decoded.success) {
+                params_list[i].jbig2_globals =
+                    std::move(globals_decoded.data);
+              }
+            }
+          }
+        }
       }
     }
   }
