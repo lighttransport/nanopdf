@@ -128,7 +128,6 @@ private:
     float fill_opacity{1.0f};    // ca - fill alpha (0-1)
     float stroke_opacity{1.0f};  // CA - stroke alpha (0-1)
     int blend_mode{0};           // BM - blend mode (0=Normal)
-    std::string nonsep_blend_name;  // Non-separable blend mode name (if any)
 
     // Extended graphics state parameters
     bool alpha_is_shape{false};     // AIS - alpha source (false=opacity, true=shape)
@@ -310,6 +309,9 @@ private:
 
   // Apply clipping path and push shape to scene
   bool push_with_clip(tvg::Shape* shape);
+
+  // Apply soft mask opacity to a paint object (shape or picture)
+  void apply_soft_mask_opacity(tvg::Paint* paint);
 
   // Parse and render inline image (BI/ID/EI operators)
   bool parse_inline_image(const std::string& content, size_t& pos);

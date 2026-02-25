@@ -31,129 +31,6 @@ constexpr T clamp14(const T& v, const T& lo, const T& hi) {
   return (v < lo) ? lo : (hi < v) ? hi : v;
 }
 
-// ---- Non-separable blend mode helpers (PDF spec Section 11.3.5) ----
-// These operate on [0,1] RGB values.
-
-static inline float lum(float r, float g, float b) {
-  return 0.2126f * r + 0.7152f * g + 0.0722f * b;
-}
-
-static inline float sat(float r, float g, float b) {
-  return std::max({r, g, b}) - std::min({r, g, b});
-}
-
-static inline void clip_color(float& r, float& g, float& b) {
-  float l = lum(r, g, b);
-  float mn = std::min({r, g, b});
-  float mx = std::max({r, g, b});
-  if (mn < 0.0f) {
-    float d = l - mn;
-    if (d > 0.0001f) {
-      r = l + (r - l) * l / d;
-      g = l + (g - l) * l / d;
-      b = l + (b - l) * l / d;
-    }
-  }
-  if (mx > 1.0f) {
-    float d = mx - l;
-    if (d > 0.0001f) {
-      r = l + (r - l) * (1.0f - l) / d;
-      g = l + (g - l) * (1.0f - l) / d;
-      b = l + (b - l) * (1.0f - l) / d;
-    }
-  }
-}
-
-static inline void set_lum(float& r, float& g, float& b, float target_l) {
-  float delta = target_l - lum(r, g, b);
-  r += delta; g += delta; b += delta;
-  clip_color(r, g, b);
-}
-
-// Set saturation: rearranges channels so that max-min = target_s
-static inline void set_sat(float& r, float& g, float& b, float target_s) {
-  // Sort channels
-  float* channels[3] = {&r, &g, &b};
-  if (*channels[0] > *channels[1]) std::swap(channels[0], channels[1]);
-  if (*channels[1] > *channels[2]) std::swap(channels[1], channels[2]);
-  if (*channels[0] > *channels[1]) std::swap(channels[0], channels[1]);
-  // channels[0]=min, channels[1]=mid, channels[2]=max
-  if (*channels[2] > *channels[0]) {
-    *channels[1] = ((*channels[1] - *channels[0]) * target_s) /
-                   (*channels[2] - *channels[0]);
-    *channels[2] = target_s;
-  } else {
-    *channels[1] = 0.0f;
-    *channels[2] = 0.0f;
-  }
-  *channels[0] = 0.0f;
-}
-
-// Apply non-separable blend mode to a pixel buffer against a backdrop.
-// Both buffers are ARGB8888 (premultiplied).
-// blend_name: "Hue", "Saturation", "Color", "Luminosity"
-static void apply_nonseparable_blend(uint32_t* result, const uint32_t* src,
-                                     const uint32_t* backdrop,
-                                     size_t pixel_count,
-                                     const std::string& blend_name) {
-  for (size_t i = 0; i < pixel_count; ++i) {
-    // Unpack ARGB
-    uint8_t sa = (src[i] >> 24) & 0xFF;
-    uint8_t sr = (src[i] >> 16) & 0xFF;
-    uint8_t sg = (src[i] >> 8) & 0xFF;
-    uint8_t sb = src[i] & 0xFF;
-
-    uint8_t ba = (backdrop[i] >> 24) & 0xFF;
-    uint8_t br = (backdrop[i] >> 16) & 0xFF;
-    uint8_t bg = (backdrop[i] >> 8) & 0xFF;
-    uint8_t bb = backdrop[i] & 0xFF;
-
-    if (sa == 0) { result[i] = backdrop[i]; continue; }
-    if (ba == 0) { result[i] = src[i]; continue; }
-
-    // Un-premultiply
-    float sf = 1.0f / (sa / 255.0f);
-    float srf = (sr / 255.0f) * sf;
-    float sgf = (sg / 255.0f) * sf;
-    float sbf = (sb / 255.0f) * sf;
-
-    float bf = 1.0f / (ba / 255.0f);
-    float brf = (br / 255.0f) * bf;
-    float bgf = (bg / 255.0f) * bf;
-    float bbf = (bb / 255.0f) * bf;
-
-    float rr = brf, rg = bgf, rb = bbf;
-
-    if (blend_name == "Hue") {
-      rr = srf; rg = sgf; rb = sbf;
-      set_sat(rr, rg, rb, sat(brf, bgf, bbf));
-      set_lum(rr, rg, rb, lum(brf, bgf, bbf));
-    } else if (blend_name == "Saturation") {
-      rr = brf; rg = bgf; rb = bbf;
-      set_sat(rr, rg, rb, sat(srf, sgf, sbf));
-      set_lum(rr, rg, rb, lum(brf, bgf, bbf));
-    } else if (blend_name == "Color") {
-      rr = srf; rg = sgf; rb = sbf;
-      set_lum(rr, rg, rb, lum(brf, bgf, bbf));
-    } else if (blend_name == "Luminosity") {
-      rr = brf; rg = bgf; rb = bbf;
-      set_lum(rr, rg, rb, lum(srf, sgf, sbf));
-    }
-
-    // Alpha compositing: result_a = sa + ba - sa*ba
-    float saf = sa / 255.0f;
-    float baf = ba / 255.0f;
-    float ra = saf + baf - saf * baf;
-
-    // Pre-multiply and pack
-    uint8_t out_a = static_cast<uint8_t>(ra * 255 + 0.5f);
-    uint8_t out_r = static_cast<uint8_t>(clamp14(rr * ra, 0.0f, 1.0f) * 255 + 0.5f);
-    uint8_t out_g = static_cast<uint8_t>(clamp14(rg * ra, 0.0f, 1.0f) * 255 + 0.5f);
-    uint8_t out_b = static_cast<uint8_t>(clamp14(rb * ra, 0.0f, 1.0f) * 255 + 0.5f);
-    result[i] = (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
-  }
-}
-
 // Improved CMYK to RGB conversion using Ghostscript-style under-color removal.
 // The naive formula R=(1-C)*(1-K) loses shadow detail. The additive formula
 // R=1-min(1,C+K) preserves more detail in dark regions.
@@ -2286,6 +2163,32 @@ float ThorVGBackend::calculate_vertical_advance(const std::string& text, float f
   return advance;
 }
 
+// Apply soft mask opacity to a paint object (shape or picture).
+// Samples the center region of the soft mask for an average opacity value.
+void ThorVGBackend::apply_soft_mask_opacity(tvg::Paint* paint) {
+  if (!paint || !state_.has_soft_mask || state_.soft_mask_data.empty()) return;
+  if (state_.soft_mask_width == 0 || state_.soft_mask_height == 0) return;
+
+  // Sample center 50% region for average opacity
+  uint32_t x0 = state_.soft_mask_width / 4;
+  uint32_t x1 = state_.soft_mask_width * 3 / 4;
+  uint32_t y0 = state_.soft_mask_height / 4;
+  uint32_t y1 = state_.soft_mask_height * 3 / 4;
+  if (x1 <= x0) x1 = x0 + 1;
+  if (y1 <= y0) y1 = y0 + 1;
+
+  uint64_t sum = 0;
+  uint32_t count = 0;
+  for (uint32_t y = y0; y < y1 && y < state_.soft_mask_height; ++y) {
+    for (uint32_t x = x0; x < x1 && x < state_.soft_mask_width; ++x) {
+      sum += state_.soft_mask_data[y * state_.soft_mask_width + x];
+      ++count;
+    }
+  }
+  uint8_t mask_opacity = count > 0 ? static_cast<uint8_t>(sum / count) : 255;
+  paint->opacity(mask_opacity);
+}
+
 bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
   if (!scene_ || !shape) {
     return false;
@@ -2295,6 +2198,9 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
   if (state_.blend_mode != 0) {
     shape->blend(static_cast<tvg::BlendMethod>(state_.blend_mode));
   }
+
+  // Apply soft mask opacity
+  apply_soft_mask_opacity(shape);
 
   // If there's a clipping path, apply it
   if (state_.has_clip && !state_.clip_commands.empty()) {
@@ -2656,6 +2562,7 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   picture->transform(m);
 
   // Push to scene
+  apply_soft_mask_opacity(picture);
   auto push_result = scene_->push(picture);
   NANOPDF_LOG_DEBUG("ThorVG", "draw_image: pushed to scene, result=%d", static_cast<int>(push_result));
 
@@ -3796,6 +3703,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
           m.e31 = 0.0f; m.e32 = 0.0f; m.e33 = 1.0f;
           picture->transform(m);
 
+          apply_soft_mask_opacity(picture);
           scene_->push(picture);
           delete shape;  // Don't need the shape anymore
           return true;
@@ -3985,6 +3893,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     }
 
     picture->translate(x, y);
+    apply_soft_mask_opacity(picture);
     scene_->push(picture);
     delete shape;  // Don't need shape wrapper
     return true;
@@ -4137,6 +4046,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     }
 
     picture->translate(x, y);
+    apply_soft_mask_opacity(picture);
     scene_->push(picture);
     delete shape;
     return true;
@@ -4821,6 +4731,7 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
           picture->clip(clip_shape);
         }
 
+        apply_soft_mask_opacity(picture);
         scene_->push(picture);
         return true;
       } else {
@@ -5471,6 +5382,7 @@ bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
     }
   }
 
+  apply_soft_mask_opacity(picture);
   scene_->push(picture);
   return true;
 }
@@ -6613,43 +6525,41 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                     bm_name = bm_it->second.array[0].name;
                   }
                 }
-                // Map PDF blend mode to ThorVG blend method
-                // ThorVG BlendMethod: Normal=0, Add=1, Screen=2, Multiply=3, Overlay=4,
-                //   Difference=5, Exclusion=6, SrcOver=7, Darken=8, Lighten=9, ColorDodge=10,
-                //   ColorBurn=11, HardLight=12, SoftLight=13
-                state_.nonsep_blend_name.clear();  // Clear for separable modes
+                // Map PDF blend mode to ThorVG BlendMethod enum
                 if (bm_name == "Normal" || bm_name == "Compatible") {
-                  state_.blend_mode = 0;  // Normal
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Normal);
                 } else if (bm_name == "Multiply") {
-                  state_.blend_mode = 3;  // Multiply
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Multiply);
                 } else if (bm_name == "Screen") {
-                  state_.blend_mode = 2;  // Screen
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Screen);
                 } else if (bm_name == "Overlay") {
-                  state_.blend_mode = 4;  // Overlay
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Overlay);
                 } else if (bm_name == "Darken") {
-                  state_.blend_mode = 8;  // Darken
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Darken);
                 } else if (bm_name == "Lighten") {
-                  state_.blend_mode = 9;  // Lighten
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Lighten);
                 } else if (bm_name == "ColorDodge") {
-                  state_.blend_mode = 10;  // ColorDodge
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::ColorDodge);
                 } else if (bm_name == "ColorBurn") {
-                  state_.blend_mode = 11;  // ColorBurn
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::ColorBurn);
                 } else if (bm_name == "HardLight") {
-                  state_.blend_mode = 12;  // HardLight
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::HardLight);
                 } else if (bm_name == "SoftLight") {
-                  state_.blend_mode = 13;  // SoftLight
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::SoftLight);
                 } else if (bm_name == "Difference") {
-                  state_.blend_mode = 5;  // Difference
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Difference);
                 } else if (bm_name == "Exclusion") {
-                  state_.blend_mode = 6;  // Exclusion
-                } else if (bm_name == "Hue" || bm_name == "Saturation" ||
-                           bm_name == "Color" || bm_name == "Luminosity") {
-                  // Non-separable blend modes - handled via custom per-pixel blending
-                  // Use Normal for ThorVG rendering, then post-process
-                  state_.blend_mode = 0;
-                  state_.nonsep_blend_name = bm_name;
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Exclusion);
+                } else if (bm_name == "Hue") {
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Hue);
+                } else if (bm_name == "Saturation") {
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Saturation);
+                } else if (bm_name == "Color") {
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Color);
+                } else if (bm_name == "Luminosity") {
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Luminosity);
                 } else {
-                  state_.blend_mode = 0;  // Default to Normal
+                  state_.blend_mode = static_cast<int>(tvg::BlendMethod::Normal);
                 }
               }
               // LW - line width
