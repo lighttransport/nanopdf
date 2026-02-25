@@ -52,6 +52,7 @@ data/visual_refs/
 
 # Downloaded test corpora
 tests/data/corpora/
+data/external/
 
 # Emscripten
 *.wasm

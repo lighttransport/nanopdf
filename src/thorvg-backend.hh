@@ -128,6 +128,7 @@ private:
     float fill_opacity{1.0f};    // ca - fill alpha (0-1)
     float stroke_opacity{1.0f};  // CA - stroke alpha (0-1)
     int blend_mode{0};           // BM - blend mode (0=Normal)
+    std::string nonsep_blend_name;  // Non-separable blend mode name (if any)
 
     // Extended graphics state parameters
     bool alpha_is_shape{false};     // AIS - alpha source (false=opacity, true=shape)
@@ -318,6 +319,10 @@ private:
 
   // Apply soft mask to current rendering (if active)
   void apply_soft_mask_to_context();
+
+  // Per-pixel soft mask compositing on a rendered buffer
+  void apply_soft_mask_to_pixels(uint8_t* pixels, uint32_t width,
+                                  uint32_t height);
 
   tvg::SwCanvas* canvas_{nullptr};
   tvg::Scene* scene_{nullptr};

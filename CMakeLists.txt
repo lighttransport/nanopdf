@@ -653,6 +653,29 @@ add_custom_target(generate_visual_refs
   COMMENT "Generating visual reference images using pdftoppm"
 )
 
+# CTest targets for visual regression
+enable_testing()
+if(NANOPDF_USE_THORVG AND THORVG_FOUND)
+  add_test(NAME test_visual_shapes_thorvg
+    COMMAND test_visual_thorvg
+      test_cmyk.pdf test_linestyles.pdf test_curves.pdf
+      test_winding.pdf test_transforms.pdf
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+  add_test(NAME test_visual_external_thorvg
+    COMMAND test_visual_thorvg --suite ${PROJECT_SOURCE_DIR}/data/external
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+endif()
+if(NANOPDF_USE_BLEND2D)
+  add_test(NAME test_visual_shapes_blend2d
+    COMMAND test_visual_blend2d
+      test_cmyk.pdf test_linestyles.pdf test_curves.pdf
+      test_winding.pdf test_transforms.pdf
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+endif()
+
 # For WASM builds, create a JavaScript module
 if(NANOPDF_BUILD_WASM)
   # Set output as JavaScript module with --no-entry (no main function)

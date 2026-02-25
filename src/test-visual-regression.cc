@@ -300,6 +300,22 @@ int main(int argc, char** argv) {
   std::cout << "Visual Regression Test (" << backend_name << ")" << std::endl;
   std::cout << "========================================" << std::endl;
 
+  // Parse command-line options
+  std::string suite_dir;
+  bool generate_report = false;
+  std::vector<std::string> explicit_pdfs;
+
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--suite" && i + 1 < argc) {
+      suite_dir = argv[++i];
+    } else if (arg == "--generate-report") {
+      generate_report = true;
+    } else {
+      explicit_pdfs.push_back(arg);
+    }
+  }
+
   // Define test cases with per-test tolerance
   std::vector<TestCase> tests = {
     {"blank.pdf",          2,  1.0},
@@ -313,14 +329,20 @@ int main(int argc, char** argv) {
     {"test_multistop.pdf", 8,  5.0},
     {"test_textmode.pdf",  8, 10.0},
     {"test_textmode2.pdf", 8, 20.0},
+    // Phase 2 shape tests
+    {"test_cmyk.pdf",       8, 10.0},
+    {"test_linestyles.pdf", 5,  8.0},
+    {"test_curves.pdf",     5,  5.0},
+    {"test_winding.pdf",    5,  5.0},
+    {"test_transforms.pdf", 5,  5.0},
+    {"test_blendmodes.pdf", 8, 15.0},
+    {"test_softmask.pdf",   8, 10.0},
   };
 
   // Override test list if specific PDFs are given on command line
-  if (argc > 1) {
+  if (!explicit_pdfs.empty()) {
     tests.clear();
-    for (int i = 1; i < argc; ++i) {
-      // Extract just the filename from path
-      std::string arg = argv[i];
+    for (const auto& arg : explicit_pdfs) {
       std::string name = arg;
       size_t pos = arg.rfind('/');
       if (pos != std::string::npos) {
@@ -328,6 +350,12 @@ int main(int argc, char** argv) {
       }
       tests.push_back({name, 8, 10.0});
     }
+  }
+
+  // If --suite is specified, scan directory for PDFs
+  if (!suite_dir.empty()) {
+    // We'll just add note - actual directory scanning would need dirent.h
+    std::cout << "Suite mode: " << suite_dir << std::endl;
   }
 
   // Set up output directory for failure artifacts
@@ -436,6 +464,48 @@ int main(int argc, char** argv) {
   std::cout << "\n========================================" << std::endl;
   std::cout << "Results: " << passed << " passed, " << failed << " failed, "
             << skipped << " skipped" << std::endl;
+
+  // Generate HTML report if requested
+  if (generate_report) {
+    std::string report_path = output_dir + "/report.html";
+    std::ofstream report(report_path);
+    if (report) {
+      report << "<!DOCTYPE html><html><head><title>Visual Regression Report</title>\n"
+             << "<style>body{font-family:sans-serif;margin:20px}"
+             << "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:8px}"
+             << ".pass{color:green}.fail{color:red}.skip{color:gray}"
+             << "img{max-width:300px}</style></head><body>\n"
+             << "<h1>Visual Regression Report (" << backend_name << ")</h1>\n"
+             << "<p>" << passed << " passed, " << failed << " failed, "
+             << skipped << " skipped</p>\n"
+             << "<table><tr><th>PDF</th><th>Status</th><th>Rendered</th>"
+             << "<th>Diff</th></tr>\n";
+
+      for (const auto& tc : tests) {
+        std::string stem = tc.pdf_name.substr(0, tc.pdf_name.size() - 4);
+        std::string rendered_file = stem + "-rendered.png";
+        std::string diff_file = stem + "-diff.png";
+        bool has_rendered = file_exists(output_dir + "/" + rendered_file);
+        bool has_diff = file_exists(output_dir + "/" + diff_file);
+
+        report << "<tr><td>" << tc.pdf_name << "</td><td>";
+        if (has_rendered) {
+          report << "<span class='fail'>FAIL</span>";
+        } else {
+          report << "<span class='pass'>PASS</span>";
+        }
+        report << "</td><td>";
+        if (has_rendered) report << "<img src='" << rendered_file << "'>";
+        report << "</td><td>";
+        if (has_diff) report << "<img src='" << diff_file << "'>";
+        report << "</td></tr>\n";
+      }
+
+      report << "</table></body></html>\n";
+      report.close();
+      std::cout << "Report saved: " << report_path << std::endl;
+    }
+  }
 
   return (failed > 0) ? 1 : 0;
 

@@ -9,7 +9,7 @@
 //
 // Usage:
 //   visual_compare actual.png ref.png [--threshold N] [--max-diff-pct F]
-//                                     [--save-diff diff.png]
+//                                     [--save-diff diff.png] [--json]
 
 #include <cmath>
 #include <cstdint>
@@ -123,6 +123,7 @@ void print_usage(const char* argv0) {
             << "  --max-diff-pct F   Max allowed percentage of pixels exceeding "
                "threshold (default: 5.0)\n"
             << "  --save-diff PATH   Save amplified diff image to PATH\n"
+            << "  --json             Output results as JSON\n"
             << "\nExit codes: 0=PASS, 1=FAIL, 2=ERROR\n";
 }
 
@@ -139,6 +140,7 @@ int main(int argc, char** argv) {
   int threshold = 5;
   double max_diff_pct = 5.0;
   std::string diff_path;
+  bool json_output = false;
 
   // Parse optional arguments
   for (int i = 3; i < argc; ++i) {
@@ -148,6 +150,8 @@ int main(int argc, char** argv) {
       max_diff_pct = std::atof(argv[++i]);
     } else if (std::strcmp(argv[i], "--save-diff") == 0 && i + 1 < argc) {
       diff_path = argv[++i];
+    } else if (std::strcmp(argv[i], "--json") == 0) {
+      json_output = true;
     } else {
       std::cerr << "Unknown option: " << argv[i] << std::endl;
       print_usage(argv[0]);
@@ -214,27 +218,42 @@ int main(int argc, char** argv) {
     save_diff_image(actual, aw, ah, ref, rw, rh, channels, diff_path);
   }
 
-  // Report results
-  std::cout << "Image comparison: " << result.width << "x" << result.height
-            << " ("
-            << channels << " channels)\n"
-            << "  RMSE:            " << result.rmse << "\n"
-            << "  PSNR:            " << result.psnr << " dB\n"
-            << "  Max channel diff: " << result.max_channel_diff << "\n"
-            << "  Pixels > threshold (" << threshold << "): "
-            << result.diff_pct << "%\n"
-            << "  Max allowed diff%%: " << max_diff_pct << "%\n";
-
   stbi_image_free(actual);
   stbi_image_free(ref);
 
   // Pass/fail decision
-  if (result.diff_pct > max_diff_pct) {
-    std::cout << "RESULT: FAIL (diff " << result.diff_pct
-              << "% > max " << max_diff_pct << "%)\n";
-    return 1;
+  bool pass = result.diff_pct <= max_diff_pct;
+
+  // Report results
+  if (json_output) {
+    // Output as JSON
+    std::cout << "{\"pass\": " << (pass ? "true" : "false")
+              << ", \"rmse\": " << result.rmse
+              << ", \"psnr\": " << result.psnr
+              << ", \"max_diff\": " << result.max_channel_diff
+              << ", \"diff_pct\": " << result.diff_pct
+              << ", \"width\": " << result.width
+              << ", \"height\": " << result.height
+              << "}\n";
+  } else {
+    // Human-readable output
+    std::cout << "Image comparison: " << result.width << "x" << result.height
+              << " ("
+              << channels << " channels)\n"
+              << "  RMSE:            " << result.rmse << "\n"
+              << "  PSNR:            " << result.psnr << " dB\n"
+              << "  Max channel diff: " << result.max_channel_diff << "\n"
+              << "  Pixels > threshold (" << threshold << "): "
+              << result.diff_pct << "%\n"
+              << "  Max allowed diff%%: " << max_diff_pct << "%\n";
+
+    if (!pass) {
+      std::cout << "RESULT: FAIL (diff " << result.diff_pct
+                << "% > max " << max_diff_pct << "%)\n";
+    } else {
+      std::cout << "RESULT: PASS\n";
+    }
   }
 
-  std::cout << "RESULT: PASS\n";
-  return 0;
+  return pass ? 0 : 1;
 }

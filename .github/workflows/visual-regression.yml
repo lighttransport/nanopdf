@@ -1,0 +1,49 @@
+name: Visual Regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  visual-regression:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config zlib1g-dev poppler-utils
+          # Install ThorVG from source
+          sudo apt-get install -y meson ninja-build
+          git clone --depth 1 https://github.com/thorvg/thorvg.git /tmp/thorvg
+          cd /tmp/thorvg
+          meson setup build -Ddefault_library=static --prefix=/usr/local
+          ninja -C build
+          sudo ninja -C build install
+          sudo ldconfig
+
+      - name: Build with ThorVG
+        run: |
+          mkdir build && cd build
+          cmake .. -DNANOPDF_USE_THORVG=ON -DNANOPDF_BUILD_TESTS=ON
+          make -j$(nproc)
+
+      - name: Generate reference images
+        run: |
+          ./scripts/generate-visual-refs.sh
+
+      - name: Run visual regression tests
+        run: |
+          cd build
+          ./test_visual_thorvg --generate-report
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-diffs
+          path: build/visual_regression_output/
+          retention-days: 14
