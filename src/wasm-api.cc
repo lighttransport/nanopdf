@@ -2193,7 +2193,35 @@ const char* nanopdf_fonts_get_info(const char* name) {
 #endif  // NANOPDF_EMBED_FONTS
 
 // ============================================================
-// CJK Font Registration API (always available)
+// Generic Font Registration API (always available)
+// ============================================================
+
+// Register any font from a memory blob
+// category: 0=sans, 1=mono, 2=serif, 3=symbol, 4=cjk_sans, 5=cjk_serif
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_register_font(const uint8_t* data, size_t size, int category) {
+  if (!data || size == 0) return 0;
+  nanopdf::FontCategory cat;
+  switch (category) {
+    case 0: cat = nanopdf::FontCategory::kSans; break;
+    case 1: cat = nanopdf::FontCategory::kMono; break;
+    case 2: cat = nanopdf::FontCategory::kSerif; break;
+    case 3: cat = nanopdf::FontCategory::kSymbol; break;
+    case 4: cat = nanopdf::FontCategory::kCJKSans; break;
+    case 5: cat = nanopdf::FontCategory::kCJKSerif; break;
+    default: cat = nanopdf::FontCategory::kSans; break;
+  }
+  static const char* cat_names[] = {
+    "Sans-Runtime", "Mono-Runtime", "Serif-Runtime",
+    "Symbol-Runtime", "CJKSans-Runtime", "CJKSerif-Runtime"
+  };
+  int idx = (category >= 0 && category <= 5) ? category : 0;
+  return nanopdf::FontProvider::instance().register_font_blob(
+      cat_names[idx], cat, data, size) ? 1 : 0;
+}
+
+// ============================================================
+// CJK Font Registration API (always available, legacy wrapper)
 // ============================================================
 
 // Register a CJK font from a memory blob

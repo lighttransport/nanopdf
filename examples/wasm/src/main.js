@@ -1,6 +1,7 @@
 import './style.css';
 import createModule from 'nanopdf-wasm';
 import wasmUrl from 'nanopdf-wasm-bin';
+import { loadStandardFonts, loadCJKFonts } from './font-loader.js';
 
 // State
 let Module = null;
@@ -1178,6 +1179,31 @@ async function init() {
     }
 
     hasRendering = Module._nanopdf_has_rendering() === 1;
+
+    // Load external fonts if embedded fonts are not available
+    const embeddedFontsAvailable = Module._nanopdf_fonts_available() === 1;
+    if (!embeddedFontsAvailable) {
+      try {
+        showLoading('Loading fonts...');
+        const stdCount = await loadStandardFonts(Module, '/fonts', (ratio, name) => {
+          loadingText.textContent = `Loading font: ${name} (${Math.round(ratio * 100)}%)`;
+        });
+        console.log(`Loaded ${stdCount} standard fonts from external files`);
+
+        // Load CJK fonts in the background (they're large)
+        loadCJKFonts(Module, '/fonts', (ratio, name) => {
+          console.log(`CJK font: ${name} (${Math.round(ratio * 100)}%)`);
+        }).then(cjkCount => {
+          if (cjkCount > 0) {
+            console.log(`Loaded ${cjkCount} CJK fonts from external files`);
+          }
+        }).catch(e => {
+          console.log('CJK fonts not available:', e.message);
+        });
+      } catch (e) {
+        console.log('External fonts not available:', e.message);
+      }
+    }
 
     hideLoading();
 

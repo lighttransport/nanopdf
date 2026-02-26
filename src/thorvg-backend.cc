@@ -1809,13 +1809,26 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
     }
   }
 
-  // Check font provider first (for runtime-registered CJK fonts)
-  if (category == 4) {
+  // Check font provider first (for runtime-registered fonts, all categories)
+  {
     auto& provider = FontProvider::instance();
-    FontCategory pcat = (font_list == cjk_serif_fonts)
-        ? FontCategory::kCJKSerif : FontCategory::kCJKSans;
+    FontCategory pcat;
+    if (category == 4) {
+      // CJK: select serif or sans based on font_list
+      pcat = (font_list == cjk_serif_fonts)
+          ? FontCategory::kCJKSerif : FontCategory::kCJKSans;
+    } else {
+      switch (category) {
+        case 0: pcat = FontCategory::kSans; break;
+        case 1: pcat = FontCategory::kMono; break;
+        case 2: pcat = FontCategory::kSerif; break;
+        case 3: pcat = FontCategory::kSymbol; break;
+        default: pcat = FontCategory::kSans; break;
+      }
+    }
     const ProvidedFont* pf = provider.find_by_category(pcat);
-    if (!pf) pf = provider.find_by_category(FontCategory::kCJKSans);
+    // For CJK, fall back to CJK sans if specific variant not found
+    if (!pf && category == 4) pf = provider.find_by_category(FontCategory::kCJKSans);
     if (pf && !pf->data.empty()) {
       FontCache cache;
       cache.font_data = pf->data;
@@ -6785,6 +6798,10 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             if (font_it != current_page_->fonts.end()) {
               current_font_ = font_it->second.get();
               load_font(*current_pdf_, font_name, current_font_);
+            } else {
+              // Font not in page dictionary — attempt fallback using name hint
+              NANOPDF_LOG_DEBUG("ThorVG", "Font '%s' not in page resources, trying fallback", font_name.c_str());
+              load_fallback_font_with_hint(font_name, nullptr);
             }
           }
         }

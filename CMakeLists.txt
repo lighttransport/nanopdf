@@ -16,6 +16,7 @@ option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
 option(NANOPDF_USE_BUILTIN_CCITT "Use built-in CCITT decoder instead of PDFium-based" OFF)
+option(NANOPDF_EXTERNAL_FONTS "Load fonts from external files instead of embedding" OFF)
 
 # Log level: 0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
 set(NANOPDF_LOG_LEVEL "3" CACHE STRING "Log level (0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace)")
@@ -154,8 +155,8 @@ endif()
 # Generate embedded fonts header for WASM and rasterize builds
 option(NANOPDF_EMBED_FONTS "Embed PDF Standard 14 alternative fonts as binary data" OFF)
 
-# Auto-enable font embedding for WASM builds
-if(NANOPDF_BUILD_WASM)
+# Auto-enable font embedding for WASM builds (unless external fonts mode)
+if(NANOPDF_BUILD_WASM AND NOT NANOPDF_EXTERNAL_FONTS)
   set(NANOPDF_EMBED_FONTS ON CACHE BOOL "Embed fonts for WASM build" FORCE)
 endif()
 
