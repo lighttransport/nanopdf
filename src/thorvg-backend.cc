@@ -6685,7 +6685,9 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           m.d = std::stof(operands[3]);
           m.e = std::stof(operands[4]);
           m.f = std::stof(operands[5]);
-          state_.transform = state_.transform * m;
+          // Per PDF spec, cm concatenates as: CTM' = M × CTM_current
+          // M transforms from new user space to previous user space
+          state_.transform = m * state_.transform;
         }
       }
       // Text operators
@@ -6822,9 +6824,10 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             }
           }
 
-          // Get text position from text matrix
+          // Get text position from text matrix and apply CTM
           float text_x = state_.text_matrix.e;
           float text_y = state_.text_matrix.f;
+          state_.transform.transform(text_x, text_y);
 
           // Transform from PDF coordinates to canvas coordinates
           float canvas_x = text_x * state_.scale;
@@ -6836,7 +6839,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                                        state_.text_matrix.b * state_.text_matrix.b);
           if (font_scale < 0.01f) font_scale = std::abs(state_.text_matrix.d);
           if (font_scale < 0.01f) font_scale = 1.0f;
-          float scaled_size = state_.font_size * font_scale * state_.scale;
+          // Also account for CTM scaling
+          float ctm_scale = std::sqrt(state_.transform.a * state_.transform.a +
+                                      state_.transform.b * state_.transform.b);
+          if (ctm_scale < 0.01f) ctm_scale = 1.0f;
+          float scaled_size = state_.font_size * font_scale * ctm_scale * state_.scale;
 
           draw_text(canvas_x, canvas_y, text, scaled_size,
                    state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a);
@@ -6891,13 +6898,17 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
               if (!text.empty()) {
                 float text_x = state_.text_matrix.e;
                 float text_y = state_.text_matrix.f;
+                state_.transform.transform(text_x, text_y);
                 float canvas_x = text_x * state_.scale;
                 float canvas_y = (state_.page_height - text_y) * state_.scale;
                 float font_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
                                              state_.text_matrix.b * state_.text_matrix.b);
                 if (font_scale < 0.01f) font_scale = std::abs(state_.text_matrix.d);
                 if (font_scale < 0.01f) font_scale = 1.0f;
-                float scaled_size = state_.font_size * font_scale * state_.scale;
+                float ctm_scale = std::sqrt(state_.transform.a * state_.transform.a +
+                                            state_.transform.b * state_.transform.b);
+                if (ctm_scale < 0.01f) ctm_scale = 1.0f;
+                float scaled_size = state_.font_size * font_scale * ctm_scale * state_.scale;
 
                 draw_text(canvas_x, canvas_y, text, scaled_size,
                          state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a);
@@ -6963,15 +6974,21 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             }
           }
 
+          // Get text position from text matrix and apply CTM
           float text_x = state_.text_matrix.e;
           float text_y = state_.text_matrix.f;
+          state_.transform.transform(text_x, text_y);
           float canvas_x = text_x * state_.scale;
           float canvas_y = (state_.page_height - text_y) * state_.scale;
           float font_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
                                        state_.text_matrix.b * state_.text_matrix.b);
           if (font_scale < 0.01f) font_scale = std::abs(state_.text_matrix.d);
           if (font_scale < 0.01f) font_scale = 1.0f;
-          float scaled_size = state_.font_size * font_scale * state_.scale;
+          // Also account for CTM scaling
+          float ctm_scale = std::sqrt(state_.transform.a * state_.transform.a +
+                                      state_.transform.b * state_.transform.b);
+          if (ctm_scale < 0.01f) ctm_scale = 1.0f;
+          float scaled_size = state_.font_size * font_scale * ctm_scale * state_.scale;
 
           draw_text(canvas_x, canvas_y, text, scaled_size,
                    state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a);
@@ -7175,7 +7192,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                           form_matrix.d = static_cast<float>(matrix_it->second.array[3].number);
                           form_matrix.e = static_cast<float>(matrix_it->second.array[4].number);
                           form_matrix.f = static_cast<float>(matrix_it->second.array[5].number);
-                          state_.transform = state_.transform * form_matrix;
+                          state_.transform = form_matrix * state_.transform;
                         }
 
                         // Parse the Form's content stream
@@ -7274,7 +7291,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                         form_matrix.d = static_cast<float>(matrix_it->second.array[3].number);
                         form_matrix.e = static_cast<float>(matrix_it->second.array[4].number);
                         form_matrix.f = static_cast<float>(matrix_it->second.array[5].number);
-                        state_.transform = state_.transform * form_matrix;
+                        state_.transform = form_matrix * state_.transform;
                       }
 
                       // Parse the Form's content stream
