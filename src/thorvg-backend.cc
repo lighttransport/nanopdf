@@ -1086,7 +1086,7 @@ bool ThorVGBackend::end_scene() {
   }
 
   // Push scene to canvas (v1.0+ API takes raw Paint*, canvas owns it)
-  if (canvas_->push(scene_) != tvg::Result::Success) {
+  if (canvas_->add(scene_) != tvg::Result::Success) {
     // Don't delete scene_ - ThorVG manages memory
     scene_ = nullptr;
     return false;
@@ -1124,7 +1124,7 @@ bool ThorVGBackend::draw_rectangle(float x, float y, float width, float height,
   shape->fill(r, g, b, a);
 
   // Add to scene (v1.0+ API takes raw Paint*, scene owns it after push)
-  if (scene_->push(shape) != tvg::Result::Success) {
+  if (scene_->add(shape) != tvg::Result::Success) {
     // ThorVG manages memory - don't delete
     return false;
   }
@@ -1150,7 +1150,7 @@ bool ThorVGBackend::draw_circle(float cx, float cy, float radius,
   shape->fill(r, g, b, a);
 
   // Add to scene (v1.0+ API takes raw Paint*, scene owns it after push)
-  if (scene_->push(shape) != tvg::Result::Success) {
+  if (scene_->add(shape) != tvg::Result::Success) {
     return false;
   }
 
@@ -1541,7 +1541,7 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
     shape->appendRect(x, y - text_height, text_width, text_height, 0, 0);
     shape->fill(r, g, b, a);
 
-    if (scene_->push(shape) != tvg::Result::Success) {
+    if (scene_->add(shape) != tvg::Result::Success) {
       return false;
     }
   }
@@ -1570,7 +1570,7 @@ bool ThorVGBackend::draw_line(float x1, float y1, float x2, float y2, float stro
   shape->strokeCap(tvg::StrokeCap::Round);
 
   // Add to scene (v1.0+ API takes raw Paint*, scene owns it after push)
-  if (scene_->push(shape) != tvg::Result::Success) {
+  if (scene_->add(shape) != tvg::Result::Success) {
     return false;
   }
 
@@ -2222,13 +2222,13 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
     // Apply clip to the shape (clip() takes ownership of clipper)
     if (shape->clip(clipper) != tvg::Result::Success) {
       // Clipping failed, release clipper and push shape without clip
-      delete clipper;
-      scene_->push(shape);
+      clipper->unref();
+      scene_->add(shape);
       return true;
     }
   }
 
-  scene_->push(shape);
+  scene_->add(shape);
   return true;
 }
 
@@ -2563,7 +2563,7 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
 
   // Push to scene
   apply_soft_mask_opacity(picture);
-  auto push_result = scene_->push(picture);
+  auto push_result = scene_->add(picture);
   NANOPDF_LOG_DEBUG("ThorVG", "draw_image: pushed to scene, result=%d", static_cast<int>(push_result));
 
   return true;
@@ -3605,7 +3605,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Linear gradient
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -3632,7 +3632,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Radial gradient
     auto gradient = tvg::RadialGradient::gen();
     if (!gradient) {
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -3704,8 +3704,8 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
           picture->transform(m);
 
           apply_soft_mask_opacity(picture);
-          scene_->push(picture);
-          delete shape;  // Don't need the shape anymore
+          scene_->add(picture);
+          shape->unref();  // Don't need the shape anymore
           return true;
         } else {
           delete[] data_copy;
@@ -3719,7 +3719,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #endif
     auto gradient = tvg::LinearGradient::gen();
     if (!gradient) {
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -3758,7 +3758,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid mesh data - skipping\n");
 #endif
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -3769,7 +3769,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -3870,7 +3870,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -3888,14 +3888,14 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      delete shape;
+      shape->unref();
       return false;
     }
 
     picture->translate(x, y);
     apply_soft_mask_opacity(picture);
-    scene_->push(picture);
-    delete shape;  // Don't need shape wrapper
+    scene_->add(picture);
+    shape->unref();  // Don't need shape wrapper
     return true;
   }
   else if (shading->type == ShadingType::CoonsPatchMesh ||
@@ -3919,7 +3919,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid patch data - skipping\n");
 #endif
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -3930,7 +3930,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #if NANOPDF_DEBUG_PRINT
       printf("DEBUG: Invalid bitmap size - skipping\n");
 #endif
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -4023,7 +4023,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Convert bitmap to ThorVG Picture
     auto picture = tvg::Picture::gen();
     if (!picture) {
-      delete shape;
+      shape->unref();
       return false;
     }
 
@@ -4041,14 +4041,14 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
-      delete shape;
+      shape->unref();
       return false;
     }
 
     picture->translate(x, y);
     apply_soft_mask_opacity(picture);
-    scene_->push(picture);
-    delete shape;
+    scene_->add(picture);
+    shape->unref();
     return true;
   }
   else {
@@ -4615,7 +4615,7 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     }
 
     // Finalize tile rendering
-    if (tile_canvas->push(tile_scene) == tvg::Result::Success) {
+    if (tile_canvas->add(tile_scene) == tvg::Result::Success) {
       tile_canvas->draw(true);
       tile_canvas->sync();
     }
@@ -4732,7 +4732,7 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
         }
 
         apply_soft_mask_opacity(picture);
-        scene_->push(picture);
+        scene_->add(picture);
         return true;
       } else {
         delete[] data_copy;
@@ -5378,12 +5378,12 @@ bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
       clipper->fillRule(tvg::FillRule::NonZero);
     }
     if (picture->clip(clipper) != tvg::Result::Success) {
-      delete clipper;
+      clipper->unref();
     }
   }
 
   apply_soft_mask_opacity(picture);
-  scene_->push(picture);
+  scene_->add(picture);
   return true;
 }
 
@@ -5761,7 +5761,7 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
         shape->strokeWidth(1.0f);
         shape->strokeFill(128, 128, 128, 255);
 
-        scene_->push(shape);
+        scene_->add(shape);
       }
 
       // Render field value for text fields
@@ -5793,7 +5793,7 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
             check->strokeCap(tvg::StrokeCap::Round);
             check->strokeJoin(tvg::StrokeJoin::Round);
 
-            scene_->push(check);
+            scene_->add(check);
           }
         }
       }
@@ -7424,7 +7424,7 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
   parse_pdf_content(decoded.data);
 
   // Finalize rendering
-  if (mask_canvas->push(mask_scene) == tvg::Result::Success) {
+  if (mask_canvas->add(mask_scene) == tvg::Result::Success) {
     mask_canvas->draw(true);
     mask_canvas->sync();
   }
