@@ -66,7 +66,7 @@ After adding the configuration, restart Claude Desktop for the changes to take e
 
 ## Available Tools
 
-The nanopdf MCP server provides 10 tools for PDF interaction:
+The nanopdf MCP server provides 14 tools for PDF interaction:
 
 ### 1. load_pdf
 
@@ -259,6 +259,100 @@ Close the current PDF
 
 **Returns:**
 - `success`: true
+
+### 11. query_region
+
+Extract PDF object info for a specified coordinate region. Returns text spans with bounding boxes, font metadata, text direction/rotation, and line grouping. Useful for correlating image recognition results with PDF text data.
+
+**Parameters:**
+- `page` (required): Page number (0-indexed)
+- `x1` (required): Left X coordinate in PDF points
+- `y1` (required): Bottom Y coordinate in PDF points
+- `x2` (required): Right X coordinate in PDF points
+- `y2` (required): Top Y coordinate in PDF points
+
+**Example:**
+```
+Query region (100, 700, 400, 750) on page 0
+```
+
+**Returns:**
+- `page`: Page number
+- `queryRect`: The queried rectangle `{x1, y1, x2, y2}`
+- `pageWidth`, `pageHeight`: Page dimensions in PDF points
+- `textSpans`: Array of text spans found in the region, each containing:
+  - `text`: The text content
+  - `fontName`: Font name
+  - `fontSize`: Font size in points
+  - `rotation`: Rotation angle in degrees
+  - `direction`: Text direction string (`ltr-horizontal`, `vertical-up`, `vertical-down`, `rtl-horizontal`, or `rotated-N`)
+  - `bbox`: Bounding box `{x, y, width, height}` in PDF points
+  - `lineIndex`: Line group index (if detected)
+- `textSpanCount`: Number of text spans
+- `charCount`: Number of individual characters in the region
+- `pageImages`: Array of image XObjects on the page (name, width, height, colorSpace)
+
+**Note:** Each text span also includes a `writingMode` field (`"horizontal"` or `"vertical"`) based on whether the font has vertical metrics (Type0 CJK fonts with vertical writing).
+
+### 12. get_page_structure
+
+Get structured text layout (lines and words) for a page. Lighter than `extract_text_layout` which returns per-character data.
+
+**Parameters:**
+- `page` (number, required): Page number (0-indexed)
+
+**Returns:**
+- `page`: Page number
+- `pageWidth`, `pageHeight`: Page dimensions
+- `numColumns`: Detected number of text columns
+- `lines`: Array of line objects with:
+  - `text`: Line text content
+  - `bbox`: Bounding box `{x, y, width, height}`
+  - `readingOrder`: Sequence in reading order
+  - `rotation`: Rotation angle in degrees
+  - `isRtl`: Whether the line is right-to-left
+  - `baseline`: Y-coordinate of the text baseline
+- `words`: Array of word objects with:
+  - `text`: Word text content
+  - `bbox`: Bounding box `{x, y, width, height}`
+  - `lineIndex`: Index of the line this word belongs to
+
+### 13. query_annotations
+
+List annotations on a page, optionally filtered by a coordinate region.
+
+**Parameters:**
+- `page` (number, required): Page number (0-indexed)
+- `x1`, `y1`, `x2`, `y2` (number, optional): Region to filter annotations by overlap
+
+**Returns:**
+- `page`: Page number
+- `annotationCount`: Number of annotations returned
+- `annotations`: Array of annotation objects with:
+  - `type`: Annotation type (Text, Link, FreeText, Highlight, Widget, etc.)
+  - `rect`: Bounding rectangle `{x1, y1, x2, y2}`
+  - `contents`: Text content (if any)
+  - `name`: Annotation name (if any)
+  - For Link annotations: `actionType`, `uri`
+  - For Widget annotations: `fieldType`, `fieldName`, `fieldValue`
+  - For FreeText annotations: `defaultAppearance`
+
+### 14. get_image_placements
+
+Get placement information for all images on a page, including position, display size, and the full CTM (current transformation matrix).
+
+**Parameters:**
+- `page` (number, required): Page number (0-indexed)
+
+**Returns:**
+- `page`: Page number
+- `count`: Number of image placements
+- `imagePlacements`: Array of placement objects with:
+  - `name`: Image XObject resource name
+  - `imageWidth`, `imageHeight`: Native image dimensions in pixels
+  - `ctm`: 6-element array `[a, b, c, d, e, f]` (current transformation matrix)
+  - `x`, `y`: Display position in PDF points (from CTM translation)
+  - `displayWidth`, `displayHeight`: Display dimensions in PDF points (from CTM scaling)
 
 ## Usage Examples
 

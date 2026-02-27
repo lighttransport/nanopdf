@@ -7,6 +7,7 @@
 #include "text-layout.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -610,6 +611,662 @@ ToolResult close_pdf_tool(const JsonValue& args) {
   return ToolResult::ok(result);
 }
 
+ToolResult query_region_tool(const JsonValue& args) {
+  if (!g_pdf_state.pdf) {
+    return ToolResult::error("No PDF loaded. Call load_pdf first.");
+  }
+
+  if (!args.has("page")) {
+    return ToolResult::error("Missing required parameter: 'page'");
+  }
+  if (!args.has("x1") || !args.has("y1") || !args.has("x2") || !args.has("y2")) {
+    return ToolResult::error("Missing required parameters: 'x1', 'y1', 'x2', 'y2'");
+  }
+
+  int page_num = args["page"].get_int();
+  if (page_num < 0 || page_num >= static_cast<int>(g_pdf_state.pdf->catalog.pages.size())) {
+    return ToolResult::error("Page index out of range: " + std::to_string(page_num));
+  }
+
+  double x1 = args["x1"].get_number();
+  double y1 = args["y1"].get_number();
+  double x2 = args["x2"].get_number();
+  double y2 = args["y2"].get_number();
+
+  // Normalize rectangle
+  if (x1 > x2) std::swap(x1, x2);
+  if (y1 > y2) std::swap(y1, y2);
+
+  const auto& page = g_pdf_state.pdf->catalog.pages[page_num];
+
+  // Extract text layout
+  auto text_page = extract_text_layout(*g_pdf_state.pdf, page);
+  if (!text_page) {
+    return ToolResult::error("Failed to extract text layout");
+  }
+
+  // Collect characters in the region
+  // Group by line for structured output
+  struct CharInfo {
+    uint32_t unicode;
+    double x, y, w, h;
+    double font_size;
+    std::string font_name;
+    double rotation;
+    double matrix[6];
+    int line_index;
+  };
+
+  std::vector<CharInfo> hits;
+  for (const auto& ch : text_page->chars) {
+    // Check if character center is within the query rectangle
+    double cx = ch.x + ch.width * 0.5;
+    double cy = ch.y + ch.height * 0.5;
+    if (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) {
+      CharInfo ci;
+      ci.unicode = ch.unicode;
+      ci.x = ch.x;
+      ci.y = ch.y;
+      ci.w = ch.width;
+      ci.h = ch.height;
+      ci.font_size = ch.font_size;
+      ci.font_name = ch.font_name;
+      ci.rotation = ch.rotation;
+      for (int i = 0; i < 6; i++) ci.matrix[i] = ch.matrix[i];
+      ci.line_index = ch.line_index;
+      hits.push_back(ci);
+    }
+  }
+
+  // Build text spans grouped by line_index and font
+  // Sort by line_index then x position
+  std::sort(hits.begin(), hits.end(), [](const CharInfo& a, const CharInfo& b) {
+    if (a.line_index != b.line_index) return a.line_index < b.line_index;
+    return a.x < b.x;
+  });
+
+  // Group into text spans (contiguous chars with same line + font + rotation)
+  JsonValue spans = JsonValue::array();
+  size_t i = 0;
+  while (i < hits.size()) {
+    JsonValue span = JsonValue::object();
+    std::string text;
+    double span_x = hits[i].x;
+    double span_y = hits[i].y;
+    double span_x2 = hits[i].x + hits[i].w;
+    double span_y2 = hits[i].y + hits[i].h;
+    double rotation = hits[i].rotation;
+    std::string font_name = hits[i].font_name;
+    double font_size = hits[i].font_size;
+    int line_idx = hits[i].line_index;
+
+    // Collect contiguous chars in same line with same font/rotation
+    while (i < hits.size() &&
+           hits[i].line_index == line_idx &&
+           hits[i].font_name == font_name &&
+           std::abs(hits[i].rotation - rotation) < 0.1) {
+      // Append character
+      if (hits[i].unicode < 0x80) {
+        text += static_cast<char>(hits[i].unicode);
+      } else {
+        text += unicode_to_utf8(hits[i].unicode);
+      }
+      // Expand bounding box
+      if (hits[i].x < span_x) span_x = hits[i].x;
+      if (hits[i].y < span_y) span_y = hits[i].y;
+      if (hits[i].x + hits[i].w > span_x2) span_x2 = hits[i].x + hits[i].w;
+      if (hits[i].y + hits[i].h > span_y2) span_y2 = hits[i].y + hits[i].h;
+      font_size = hits[i].font_size;  // use last (they should be same)
+      i++;
+    }
+
+    span["text"] = JsonValue(text);
+    span["fontName"] = JsonValue(font_name);
+    span["fontSize"] = JsonValue(font_size);
+    span["rotation"] = JsonValue(rotation);
+
+    // Determine text direction from rotation
+    std::string direction;
+    double rot = std::fmod(rotation, 360.0);
+    if (rot < 0) rot += 360.0;
+    if (rot < 5.0 || rot > 355.0) {
+      direction = "ltr-horizontal";
+    } else if (std::abs(rot - 90.0) < 5.0) {
+      direction = "vertical-up";
+    } else if (std::abs(rot - 180.0) < 5.0) {
+      direction = "rtl-horizontal";
+    } else if (std::abs(rot - 270.0) < 5.0) {
+      direction = "vertical-down";
+    } else {
+      direction = "rotated-" + std::to_string(static_cast<int>(rot));
+    }
+    span["direction"] = JsonValue(direction);
+
+    // Writing mode: check if font is Type0 with vertical metrics
+    {
+      auto& mutable_page = const_cast<Page&>(page);
+      mutable_page.ensure_fonts_loaded(*g_pdf_state.pdf);
+      const BaseFont* bf = mutable_page.get_font(font_name, *g_pdf_state.pdf);
+      std::string writing_mode = "horizontal";
+      if (bf) {
+        const Type0Font* t0 = dynamic_cast<const Type0Font*>(bf);
+        if (t0 && t0->has_vertical_metrics) {
+          writing_mode = "vertical";
+        }
+      }
+      span["writingMode"] = JsonValue(writing_mode);
+    }
+
+    // Bounding box [x, y, width, height]
+    JsonValue bbox = JsonValue::object();
+    bbox["x"] = JsonValue(span_x);
+    bbox["y"] = JsonValue(span_y);
+    bbox["width"] = JsonValue(span_x2 - span_x);
+    bbox["height"] = JsonValue(span_y2 - span_y);
+    span["bbox"] = bbox;
+
+    if (line_idx >= 0) {
+      span["lineIndex"] = JsonValue(line_idx);
+    }
+
+    spans.push_back(span);
+  }
+
+  // Also list image XObjects on the page (names + dimensions, no placement info)
+  auto image_xobjects = parse_xobject_resources(*g_pdf_state.pdf, page.resources);
+  JsonValue images = JsonValue::array();
+  for (const auto& kv : image_xobjects) {
+    JsonValue img = JsonValue::object();
+    img["name"] = JsonValue(kv.first);
+    img["width"] = JsonValue(kv.second.width);
+    img["height"] = JsonValue(kv.second.height);
+    if (kv.second.color_space.type == ColorSpaceType::DeviceGray)
+      img["colorSpace"] = JsonValue("DeviceGray");
+    else if (kv.second.color_space.type == ColorSpaceType::DeviceRGB)
+      img["colorSpace"] = JsonValue("DeviceRGB");
+    else if (kv.second.color_space.type == ColorSpaceType::DeviceCMYK)
+      img["colorSpace"] = JsonValue("DeviceCMYK");
+    else if (kv.second.color_space.type == ColorSpaceType::Indexed)
+      img["colorSpace"] = JsonValue("Indexed");
+    images.push_back(img);
+  }
+
+  // Build result
+  JsonValue result = JsonValue::object();
+  result["page"] = JsonValue(page_num);
+
+  JsonValue query_rect = JsonValue::object();
+  query_rect["x1"] = JsonValue(x1);
+  query_rect["y1"] = JsonValue(y1);
+  query_rect["x2"] = JsonValue(x2);
+  query_rect["y2"] = JsonValue(y2);
+  result["queryRect"] = query_rect;
+
+  result["pageWidth"] = JsonValue(text_page->page_width);
+  result["pageHeight"] = JsonValue(text_page->page_height);
+  result["textSpans"] = spans;
+  result["textSpanCount"] = JsonValue(static_cast<int>(spans.size()));
+  result["charCount"] = JsonValue(static_cast<int>(hits.size()));
+  result["pageImages"] = images;
+
+  return ToolResult::ok(result);
+}
+
+// ============================================================
+// get_page_structure tool
+// ============================================================
+
+ToolResult get_page_structure_tool(const JsonValue& args) {
+  if (!g_pdf_state.pdf) {
+    return ToolResult::error("No PDF loaded. Call load_pdf first.");
+  }
+  if (!args.has("page")) {
+    return ToolResult::error("Missing required parameter: 'page'");
+  }
+
+  int page_num = args["page"].get_int();
+  if (page_num < 0 || page_num >= static_cast<int>(g_pdf_state.pdf->catalog.pages.size())) {
+    return ToolResult::error("Page index out of range: " + std::to_string(page_num));
+  }
+
+  const auto& page = g_pdf_state.pdf->catalog.pages[page_num];
+  auto text_page = extract_text_layout(*g_pdf_state.pdf, page);
+  if (!text_page) {
+    return ToolResult::error("Failed to extract text layout");
+  }
+
+  JsonValue result = JsonValue::object();
+  result["page"] = JsonValue(page_num);
+  result["pageWidth"] = JsonValue(text_page->page_width);
+  result["pageHeight"] = JsonValue(text_page->page_height);
+  result["numColumns"] = JsonValue(text_page->num_columns);
+
+  // Lines
+  JsonValue lines_arr = JsonValue::array();
+  for (size_t i = 0; i < text_page->lines.size(); i++) {
+    const auto& line = text_page->lines[i];
+    JsonValue lo = JsonValue::object();
+    lo["text"] = JsonValue(line.get_text());
+    JsonValue bbox = JsonValue::object();
+    bbox["x"] = JsonValue(line.x);
+    bbox["y"] = JsonValue(line.y);
+    bbox["width"] = JsonValue(line.width);
+    bbox["height"] = JsonValue(line.height);
+    lo["bbox"] = bbox;
+    lo["readingOrder"] = JsonValue(line.reading_order);
+    lo["rotation"] = JsonValue(line.rotation);
+    lo["isRtl"] = JsonValue(line.is_rtl);
+    lo["baseline"] = JsonValue(line.baseline);
+    lines_arr.push_back(lo);
+  }
+  result["lines"] = lines_arr;
+
+  // Words
+  JsonValue words_arr = JsonValue::array();
+  for (const auto& word : text_page->words) {
+    JsonValue wo = JsonValue::object();
+    wo["text"] = JsonValue(word.get_text());
+    JsonValue bbox = JsonValue::object();
+    bbox["x"] = JsonValue(word.x);
+    bbox["y"] = JsonValue(word.y);
+    bbox["width"] = JsonValue(word.width);
+    bbox["height"] = JsonValue(word.height);
+    wo["bbox"] = bbox;
+    wo["lineIndex"] = JsonValue(word.line_index);
+    words_arr.push_back(wo);
+  }
+  result["words"] = words_arr;
+
+  return ToolResult::ok(result);
+}
+
+// ============================================================
+// query_annotations tool
+// ============================================================
+
+static std::string annotation_type_to_string(AnnotationType t) {
+  switch (t) {
+    case AnnotationType::Text: return "Text";
+    case AnnotationType::Link: return "Link";
+    case AnnotationType::FreeText: return "FreeText";
+    case AnnotationType::Line: return "Line";
+    case AnnotationType::Square: return "Square";
+    case AnnotationType::Circle: return "Circle";
+    case AnnotationType::Polygon: return "Polygon";
+    case AnnotationType::PolyLine: return "PolyLine";
+    case AnnotationType::Highlight: return "Highlight";
+    case AnnotationType::Underline: return "Underline";
+    case AnnotationType::Squiggly: return "Squiggly";
+    case AnnotationType::StrikeOut: return "StrikeOut";
+    case AnnotationType::Stamp: return "Stamp";
+    case AnnotationType::Caret: return "Caret";
+    case AnnotationType::Ink: return "Ink";
+    case AnnotationType::Popup: return "Popup";
+    case AnnotationType::FileAttachment: return "FileAttachment";
+    case AnnotationType::Sound: return "Sound";
+    case AnnotationType::Movie: return "Movie";
+    case AnnotationType::Widget: return "Widget";
+    case AnnotationType::Screen: return "Screen";
+    case AnnotationType::PrinterMark: return "PrinterMark";
+    case AnnotationType::TrapNet: return "TrapNet";
+    case AnnotationType::Watermark: return "Watermark";
+    case AnnotationType::ThreeD: return "3D";
+    case AnnotationType::Redact: return "Redact";
+    default: return "Unknown";
+  }
+}
+
+static std::string action_type_to_string(LinkAnnotation::ActionType t) {
+  switch (t) {
+    case LinkAnnotation::GoTo: return "GoTo";
+    case LinkAnnotation::GoToR: return "GoToR";
+    case LinkAnnotation::Launch: return "Launch";
+    case LinkAnnotation::URI: return "URI";
+    case LinkAnnotation::Named: return "Named";
+    case LinkAnnotation::JavaScript: return "JavaScript";
+    default: return "Unknown";
+  }
+}
+
+static std::string field_type_to_string(FieldType t) {
+  switch (t) {
+    case FieldType::Button: return "Button";
+    case FieldType::Text: return "Text";
+    case FieldType::Choice: return "Choice";
+    case FieldType::Signature: return "Signature";
+    default: return "Unknown";
+  }
+}
+
+ToolResult query_annotations_tool(const JsonValue& args) {
+  if (!g_pdf_state.pdf) {
+    return ToolResult::error("No PDF loaded. Call load_pdf first.");
+  }
+  if (!args.has("page")) {
+    return ToolResult::error("Missing required parameter: 'page'");
+  }
+
+  int page_num = args["page"].get_int();
+  if (page_num < 0 || page_num >= static_cast<int>(g_pdf_state.pdf->catalog.pages.size())) {
+    return ToolResult::error("Page index out of range: " + std::to_string(page_num));
+  }
+
+  auto& page = g_pdf_state.pdf->catalog.pages[page_num];
+
+  // Parse annotations if not already done
+  if (page.annotations.empty() && page.object_number > 0) {
+    auto resolved = resolve_reference(*g_pdf_state.pdf, page.object_number, 0);
+    if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+      parse_page_annotations(*g_pdf_state.pdf, page, resolved.value.dict);
+    }
+  }
+
+  // Optional region filter
+  bool has_region = args.has("x1") && args.has("y1") && args.has("x2") && args.has("y2");
+  double rx1 = 0, ry1 = 0, rx2 = 0, ry2 = 0;
+  if (has_region) {
+    rx1 = args["x1"].get_number();
+    ry1 = args["y1"].get_number();
+    rx2 = args["x2"].get_number();
+    ry2 = args["y2"].get_number();
+    if (rx1 > rx2) std::swap(rx1, rx2);
+    if (ry1 > ry2) std::swap(ry1, ry2);
+  }
+
+  JsonValue annots_arr = JsonValue::array();
+  for (const auto& ann : page.annotations) {
+    if (!ann) continue;
+
+    // Check region overlap if specified
+    if (has_region && ann->rect.size() >= 4) {
+      double ax1 = ann->rect[0], ay1 = ann->rect[1];
+      double ax2 = ann->rect[2], ay2 = ann->rect[3];
+      // No overlap check
+      if (ax2 < rx1 || ax1 > rx2 || ay2 < ry1 || ay1 > ry2) continue;
+    }
+
+    JsonValue ao = JsonValue::object();
+    ao["type"] = JsonValue(annotation_type_to_string(ann->type));
+
+    if (ann->rect.size() >= 4) {
+      JsonValue rect = JsonValue::object();
+      rect["x1"] = JsonValue(ann->rect[0]);
+      rect["y1"] = JsonValue(ann->rect[1]);
+      rect["x2"] = JsonValue(ann->rect[2]);
+      rect["y2"] = JsonValue(ann->rect[3]);
+      ao["rect"] = rect;
+    }
+
+    if (!ann->contents.empty()) ao["contents"] = JsonValue(ann->contents);
+    if (!ann->name.empty()) ao["name"] = JsonValue(ann->name);
+
+    // Type-specific fields
+    if (auto* link = dynamic_cast<LinkAnnotation*>(ann.get())) {
+      ao["actionType"] = JsonValue(action_type_to_string(link->action_type));
+      if (!link->uri.empty()) ao["uri"] = JsonValue(link->uri);
+    } else if (auto* widget = dynamic_cast<WidgetAnnotation*>(ann.get())) {
+      ao["fieldType"] = JsonValue(field_type_to_string(widget->field_type));
+      if (!widget->field_name.empty()) ao["fieldName"] = JsonValue(widget->field_name);
+      if (!widget->field_value.empty()) ao["fieldValue"] = JsonValue(widget->field_value);
+    } else if (auto* ft = dynamic_cast<FreeTextAnnotation*>(ann.get())) {
+      if (!ft->default_appearance.empty()) ao["defaultAppearance"] = JsonValue(ft->default_appearance);
+    }
+
+    annots_arr.push_back(ao);
+  }
+
+  JsonValue result = JsonValue::object();
+  result["page"] = JsonValue(page_num);
+  result["annotationCount"] = JsonValue(static_cast<int>(annots_arr.size()));
+  result["annotations"] = annots_arr;
+  return ToolResult::ok(result);
+}
+
+// ============================================================
+// get_image_placements tool
+// ============================================================
+
+ToolResult get_image_placements_tool(const JsonValue& args) {
+  if (!g_pdf_state.pdf) {
+    return ToolResult::error("No PDF loaded. Call load_pdf first.");
+  }
+  if (!args.has("page")) {
+    return ToolResult::error("Missing required parameter: 'page'");
+  }
+
+  int page_num = args["page"].get_int();
+  if (page_num < 0 || page_num >= static_cast<int>(g_pdf_state.pdf->catalog.pages.size())) {
+    return ToolResult::error("Page index out of range: " + std::to_string(page_num));
+  }
+
+  const auto& page = g_pdf_state.pdf->catalog.pages[page_num];
+
+  // Parse image XObjects to know dimensions
+  auto image_xobjects = parse_xobject_resources(*g_pdf_state.pdf, page.resources);
+
+  // Decode content streams and parse for q/Q/cm/Do
+  // CTM stack
+  struct Matrix {
+    double a, b, c, d, e, f;
+    Matrix() : a(1), b(0), c(0), d(1), e(0), f(0) {}
+    Matrix(double a_, double b_, double c_, double d_, double e_, double f_)
+        : a(a_), b(b_), c(c_), d(d_), e(e_), f(f_) {}
+    // Multiply: this = m * this (pre-multiply)
+    Matrix concat(const Matrix& m) const {
+      return Matrix(
+          m.a * a + m.b * c,
+          m.a * b + m.b * d,
+          m.c * a + m.d * c,
+          m.c * b + m.d * d,
+          m.e * a + m.f * c + e,
+          m.e * b + m.f * d + f);
+    }
+  };
+
+  Matrix ctm;
+  std::vector<Matrix> ctm_stack;
+  std::vector<double> num_stack;
+
+  struct ImagePlacement {
+    std::string name;
+    Matrix ctm;
+  };
+  std::vector<ImagePlacement> placements;
+
+  // Get content stream data
+  auto page_content = page.load_contents(*g_pdf_state.pdf);
+  if (!page_content.success) {
+    return ToolResult::error("Failed to load page content: " + page_content.error);
+  }
+
+  // Simple tokenizer over the content stream
+  std::string stream(page_content.data.begin(), page_content.data.end());
+  size_t pos = 0;
+  size_t len = stream.size();
+
+  auto skip_whitespace = [&]() {
+    while (pos < len && (stream[pos] == ' ' || stream[pos] == '\n' ||
+                         stream[pos] == '\r' || stream[pos] == '\t'))
+      pos++;
+  };
+
+  std::function<bool(std::string&)> read_token = [&](std::string& token) -> bool {
+    skip_whitespace();
+    if (pos >= len) return false;
+    token.clear();
+    char ch = stream[pos];
+
+    // Skip comments
+    if (ch == '%') {
+      while (pos < len && stream[pos] != '\n' && stream[pos] != '\r') pos++;
+      return read_token(token);
+    }
+
+    // Skip strings (...)
+    if (ch == '(') {
+      int depth = 1;
+      pos++;
+      while (pos < len && depth > 0) {
+        if (stream[pos] == '\\') { pos++; }
+        else if (stream[pos] == '(') depth++;
+        else if (stream[pos] == ')') depth--;
+        pos++;
+      }
+      token = "(string)";
+      return true;
+    }
+
+    // Skip hex strings <...>
+    if (ch == '<' && pos + 1 < len && stream[pos + 1] != '<') {
+      pos++;
+      while (pos < len && stream[pos] != '>') pos++;
+      if (pos < len) pos++;
+      token = "<hex>";
+      return true;
+    }
+
+    // Skip dict << ... >>
+    if (ch == '<' && pos + 1 < len && stream[pos + 1] == '<') {
+      pos += 2;
+      int depth = 1;
+      while (pos + 1 < len && depth > 0) {
+        if (stream[pos] == '<' && stream[pos + 1] == '<') { depth++; pos += 2; }
+        else if (stream[pos] == '>' && stream[pos + 1] == '>') { depth--; pos += 2; }
+        else pos++;
+      }
+      token = "<<dict>>";
+      return true;
+    }
+
+    // Skip arrays [...]
+    if (ch == '[') {
+      pos++;
+      int depth = 1;
+      while (pos < len && depth > 0) {
+        if (stream[pos] == '[') depth++;
+        else if (stream[pos] == ']') depth--;
+        pos++;
+      }
+      token = "[array]";
+      return true;
+    }
+
+    // Name /Xxx
+    if (ch == '/') {
+      pos++;
+      while (pos < len && stream[pos] != ' ' && stream[pos] != '\n' &&
+             stream[pos] != '\r' && stream[pos] != '\t' && stream[pos] != '/' &&
+             stream[pos] != '[' && stream[pos] != '(' && stream[pos] != '<' &&
+             stream[pos] != '{' && stream[pos] != '}') {
+        token += stream[pos++];
+      }
+      token = "/" + token;
+      return true;
+    }
+
+    // Number or operator
+    size_t start = pos;
+    while (pos < len && stream[pos] != ' ' && stream[pos] != '\n' &&
+           stream[pos] != '\r' && stream[pos] != '\t' && stream[pos] != '/' &&
+           stream[pos] != '[' && stream[pos] != '(' && stream[pos] != '<' &&
+           stream[pos] != '{' && stream[pos] != '}') {
+      pos++;
+    }
+    token = stream.substr(start, pos - start);
+    return !token.empty();
+  };
+
+  std::string token;
+  std::string last_name;  // last /Name seen (for Do operand)
+
+  while (read_token(token)) {
+    // Try parsing as number
+    if (!token.empty() && (token[0] == '-' || token[0] == '+' || token[0] == '.' ||
+                           (token[0] >= '0' && token[0] <= '9'))) {
+      char* end = nullptr;
+      double val = strtod(token.c_str(), &end);
+      if (end && end != token.c_str()) {
+        num_stack.push_back(val);
+        continue;
+      }
+    }
+
+    // Name
+    if (!token.empty() && token[0] == '/') {
+      last_name = token.substr(1);
+      num_stack.clear();
+      continue;
+    }
+
+    // Operators
+    if (token == "q") {
+      ctm_stack.push_back(ctm);
+      num_stack.clear();
+    } else if (token == "Q") {
+      if (!ctm_stack.empty()) {
+        ctm = ctm_stack.back();
+        ctm_stack.pop_back();
+      }
+      num_stack.clear();
+    } else if (token == "cm") {
+      if (num_stack.size() >= 6) {
+        size_t base = num_stack.size() - 6;
+        Matrix m(num_stack[base], num_stack[base + 1], num_stack[base + 2],
+                 num_stack[base + 3], num_stack[base + 4], num_stack[base + 5]);
+        ctm = m.concat(ctm);
+      }
+      num_stack.clear();
+    } else if (token == "Do") {
+      if (!last_name.empty()) {
+        ImagePlacement ip;
+        ip.name = last_name;
+        ip.ctm = ctm;
+        placements.push_back(ip);
+      }
+      num_stack.clear();
+    } else {
+      num_stack.clear();
+    }
+  }
+
+  // Build result
+  JsonValue result = JsonValue::object();
+  result["page"] = JsonValue(page_num);
+
+  JsonValue arr = JsonValue::array();
+  for (const auto& ip : placements) {
+    // Only include if it's an image XObject
+    auto it = image_xobjects.find(ip.name);
+    if (it == image_xobjects.end()) continue;
+
+    JsonValue obj = JsonValue::object();
+    obj["name"] = JsonValue(ip.name);
+    obj["imageWidth"] = JsonValue(it->second.width);
+    obj["imageHeight"] = JsonValue(it->second.height);
+
+    JsonValue ctm_arr = JsonValue::array();
+    ctm_arr.push_back(JsonValue(ip.ctm.a));
+    ctm_arr.push_back(JsonValue(ip.ctm.b));
+    ctm_arr.push_back(JsonValue(ip.ctm.c));
+    ctm_arr.push_back(JsonValue(ip.ctm.d));
+    ctm_arr.push_back(JsonValue(ip.ctm.e));
+    ctm_arr.push_back(JsonValue(ip.ctm.f));
+    obj["ctm"] = ctm_arr;
+
+    // Derived placement info
+    obj["x"] = JsonValue(ip.ctm.e);
+    obj["y"] = JsonValue(ip.ctm.f);
+    obj["displayWidth"] = JsonValue(std::sqrt(ip.ctm.a * ip.ctm.a + ip.ctm.b * ip.ctm.b));
+    obj["displayHeight"] = JsonValue(std::sqrt(ip.ctm.c * ip.ctm.c + ip.ctm.d * ip.ctm.d));
+
+    arr.push_back(obj);
+  }
+
+  result["imagePlacements"] = arr;
+  result["count"] = JsonValue(static_cast<int>(arr.size()));
+  return ToolResult::ok(result);
+}
+
 // ============================================================
 // Register all tools
 // ============================================================
@@ -720,6 +1377,67 @@ void register_all_tools() {
               "Close the currently loaded PDF and free resources",
               make_object_schema("Close PDF parameters", {}));
     registry.register_tool(tool, close_pdf_tool);
+  }
+
+  // query_region
+  {
+    std::map<std::string, JsonValue> props;
+    props["page"] = make_number_property("Page number (0-indexed)");
+    props["x1"] = make_number_property("Left X coordinate in PDF points");
+    props["y1"] = make_number_property("Bottom Y coordinate in PDF points");
+    props["x2"] = make_number_property("Right X coordinate in PDF points");
+    props["y2"] = make_number_property("Top Y coordinate in PDF points");
+
+    Tool tool("query_region",
+              "Extract PDF object info (text spans with bbox, font, direction/rotation, "
+              "line grouping) for a specified coordinate region. Returns structured data "
+              "useful for image recognition post-processing: text direction metadata, "
+              "bounding boxes, font info, and page image resources.",
+              make_object_schema("Query region parameters", props,
+                                 {"page", "x1", "y1", "x2", "y2"}));
+    registry.register_tool(tool, query_region_tool);
+  }
+
+  // get_page_structure
+  {
+    std::map<std::string, JsonValue> props;
+    props["page"] = make_number_property("Page number (0-indexed)");
+
+    Tool tool("get_page_structure",
+              "Get structured text layout (lines and words with bounding boxes, "
+              "reading order, rotation, RTL detection) for a page. Lighter than "
+              "extract_text_layout which returns per-character data.",
+              make_object_schema("Get page structure parameters", props, {"page"}));
+    registry.register_tool(tool, get_page_structure_tool);
+  }
+
+  // query_annotations
+  {
+    std::map<std::string, JsonValue> props;
+    props["page"] = make_number_property("Page number (0-indexed)");
+    props["x1"] = make_number_property("Optional left X coordinate to filter by region");
+    props["y1"] = make_number_property("Optional bottom Y coordinate to filter by region");
+    props["x2"] = make_number_property("Optional right X coordinate to filter by region");
+    props["y2"] = make_number_property("Optional top Y coordinate to filter by region");
+
+    Tool tool("query_annotations",
+              "List annotations on a page, optionally filtered by region. Returns "
+              "type, rect, contents, and type-specific fields (URI for links, "
+              "field info for widgets, etc.).",
+              make_object_schema("Query annotations parameters", props, {"page"}));
+    registry.register_tool(tool, query_annotations_tool);
+  }
+
+  // get_image_placements
+  {
+    std::map<std::string, JsonValue> props;
+    props["page"] = make_number_property("Page number (0-indexed)");
+
+    Tool tool("get_image_placements",
+              "Get placement info for all images on a page. Returns image name, "
+              "native dimensions, CTM matrix, and derived display position/size.",
+              make_object_schema("Get image placements parameters", props, {"page"}));
+    registry.register_tool(tool, get_image_placements_tool);
   }
 }
 

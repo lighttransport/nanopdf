@@ -110,6 +110,10 @@ ToolResult find_text_tool(const JsonValue& args);
 ToolResult get_fonts_tool(const JsonValue& args);
 ToolResult get_images_tool(const JsonValue& args);
 ToolResult close_pdf_tool(const JsonValue& args);
+ToolResult query_region_tool(const JsonValue& args);
+ToolResult get_page_structure_tool(const JsonValue& args);
+ToolResult query_annotations_tool(const JsonValue& args);
+ToolResult get_image_placements_tool(const JsonValue& args);
 
 // Helper functions
 std::vector<uint8_t> base64_decode(const std::string& encoded);
