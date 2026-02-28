@@ -13,6 +13,10 @@
 #include "cff-wrapper.hh"
 #include "font-provider.hh"
 
+#ifdef NANOPDF_EMBED_FONTS
+#include "embedded-fonts.hh"
+#endif
+
 #ifdef NANOPDF_EMBED_CJK_FONTS
 #include "embedded-cjk-fonts.hh"
 #endif
@@ -1617,7 +1621,19 @@ static int get_thorvg_font_category(const std::string& font_name) {
       lower_name.find("simhei") != std::string::npos ||
       lower_name.find("heiti") != std::string::npos ||
       lower_name.find("songti") != std::string::npos ||
-      lower_name.find("noto") != std::string::npos) {
+      // Specific Noto CJK font families (not all "noto" fonts are CJK)
+      lower_name.find("notosanscjk") != std::string::npos ||
+      lower_name.find("notoserifcjk") != std::string::npos ||
+      lower_name.find("notosansjp") != std::string::npos ||
+      lower_name.find("notoserifjp") != std::string::npos ||
+      lower_name.find("notosanssc") != std::string::npos ||
+      lower_name.find("notoserifsc") != std::string::npos ||
+      lower_name.find("notosanstc") != std::string::npos ||
+      lower_name.find("notoseriftc") != std::string::npos ||
+      lower_name.find("notosanskr") != std::string::npos ||
+      lower_name.find("notoserifkr") != std::string::npos ||
+      lower_name.find("notosanshk") != std::string::npos ||
+      lower_name.find("notoserifhk") != std::string::npos) {
     return 4;  // CJK
   }
 
@@ -1677,13 +1693,49 @@ static bool is_cjk_font(const BaseFont* font) {
   return false;
 }
 
+// Parse weight (400/700) and italic (true/false) from PDF font names.
+// e.g. "Helvetica-Bold" → {700, false}
+//      "Courier-BoldOblique" → {700, true}
+//      "Times-Italic" → {400, true}
+//      "Arial" → {400, false}
+static std::pair<int, bool> parse_font_weight_style(const std::string& name) {
+  std::string lower;
+  for (char c : name) {
+    lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+
+  int weight = 400;
+  bool italic = false;
+
+  if (lower.find("bold") != std::string::npos) weight = 700;
+  else if (lower.find("black") != std::string::npos ||
+           lower.find("heavy") != std::string::npos) weight = 900;
+  else if (lower.find("light") != std::string::npos) weight = 300;
+  else if (lower.find("thin") != std::string::npos) weight = 100;
+  else if (lower.find("medium") != std::string::npos) weight = 500;
+  else if (lower.find("semibold") != std::string::npos ||
+           lower.find("demibold") != std::string::npos) weight = 600;
+
+  if (lower.find("italic") != std::string::npos ||
+      lower.find("oblique") != std::string::npos) {
+    italic = true;
+  }
+
+  return {weight, italic};
+}
+
 bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
   return load_fallback_font_with_hint(font_name, nullptr);
 }
 
 bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, const BaseFont* font) {
+  // Use actual font name (e.g. "Helvetica") for category detection instead of
+  // the PDF resource name (e.g. "F0") which carries no useful type information.
+  const std::string& hint_name =
+      (font && !font->base_font.empty()) ? font->base_font : font_name;
+
   // Determine font category for better substitution
-  int category = get_thorvg_font_category(font_name);
+  int category = get_thorvg_font_category(hint_name);
 
   // Override category to CJK if font structure indicates CJK
   if (is_cjk_font(font)) {
@@ -1826,9 +1878,12 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
         default: pcat = FontCategory::kSans; break;
       }
     }
-    const ProvidedFont* pf = provider.find_by_category(pcat);
+    // Use weight/style-aware matching instead of first-match
+    auto ws = parse_font_weight_style(hint_name);
+    const ProvidedFont* pf = provider.find_best_match(pcat, ws.first, ws.second);
     // For CJK, fall back to CJK sans if specific variant not found
-    if (!pf && category == 4) pf = provider.find_by_category(FontCategory::kCJKSans);
+    if (!pf && category == 4) pf = provider.find_best_match(
+        FontCategory::kCJKSans, ws.first, ws.second);
     if (pf && !pf->data.empty()) {
       FontCache cache;
       cache.font_data = pf->data;
@@ -1841,6 +1896,52 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
       }
     }
   }
+
+#ifdef NANOPDF_EMBED_FONTS
+  // Check embedded Standard 14 fonts (non-CJK)
+  // Try exact PDF name match first (e.g. "Helvetica" → "Arimo-Regular")
+  {
+    const auto* entry = embedded_fonts::get_pdf_standard_font(hint_name.c_str());
+    // Also try with common name variations (e.g. "Helvetica,Bold" → "Helvetica-Bold")
+    if (!entry && font && !font->base_font.empty()) {
+      std::string normalized = font->base_font;
+      // Some PDFs use comma-separated style (e.g. "Helvetica,Bold")
+      for (auto& c : normalized) {
+        if (c == ',') c = '-';
+      }
+      if (normalized != hint_name) {
+        entry = embedded_fonts::get_pdf_standard_font(normalized.c_str());
+      }
+    }
+    // If no exact match, pick a default by category
+    if (!entry) {
+      const char* fallback_name = nullptr;
+      switch (category) {
+        case 0: fallback_name = "Arimo-Regular"; break;      // sans
+        case 1: fallback_name = "Cousine-Regular"; break;    // mono
+        case 2: fallback_name = "Tinos-Regular"; break;      // serif
+        case 3: fallback_name = "STIXTwoMath-Regular"; break; // symbol
+        default: break;
+      }
+      if (fallback_name) {
+        entry = embedded_fonts::find_font(fallback_name);
+      }
+    }
+    if (entry) {
+      FontCache cache;
+      if (embedded_fonts::decompress_font(entry, cache.font_data)) {
+        int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+          cache.initialized = true;
+          font_cache_[font_name] = std::move(cache);
+          NANOPDF_LOG_DEBUG("ThorVG", "Using embedded font: %s for '%s'",
+                           entry->base_name, font_name.c_str());
+          return true;
+        }
+      }
+    }
+  }
+#endif
 
 #ifdef NANOPDF_EMBED_CJK_FONTS
   // Check embedded CJK fonts

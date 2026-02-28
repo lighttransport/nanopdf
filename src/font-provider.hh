@@ -26,6 +26,8 @@ enum class FontCategory {
 struct ProvidedFont {
   std::string name;
   FontCategory category;
+  int weight = 400;    // CSS font weight 100-900
+  bool italic = false;
   std::vector<uint8_t> data;
 };
 
@@ -37,12 +39,22 @@ class FontProvider {
   bool register_font_blob(const std::string& name, FontCategory category,
                           const uint8_t* data, size_t size);
 
+  // Register a font from a memory blob with weight and italic (copies data)
+  bool register_font_blob(const std::string& name, FontCategory category,
+                          int weight, bool italic,
+                          const uint8_t* data, size_t size);
+
   // Register a font from a file path (reads and stores data)
   bool register_font_file(const std::string& name, FontCategory category,
                           const std::string& file_path);
 
   // Find a registered font by category (returns first match, or nullptr)
   const ProvidedFont* find_by_category(FontCategory cat) const;
+
+  // Find best matching font by category + weight + italic.
+  // Uses CSS font matching rules (prefer italic match, then closest weight).
+  const ProvidedFont* find_best_match(FontCategory cat, int weight,
+                                      bool italic) const;
 
   // Find a registered font by name (returns match, or nullptr)
   const ProvidedFont* find_by_name(const std::string& name) const;

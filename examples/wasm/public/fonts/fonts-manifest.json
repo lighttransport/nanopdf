@@ -1,0 +1,148 @@
+{
+  "fonts": [
+    {
+      "name": "Tinos-Bold",
+      "category": 2,
+      "weight": 700,
+      "italic": false,
+      "file": "tinos/Tinos-Bold.ttf",
+      "size": 451516
+    },
+    {
+      "name": "Tinos-BoldItalic",
+      "category": 2,
+      "weight": 700,
+      "italic": true,
+      "file": "tinos/Tinos-BoldItalic.ttf",
+      "size": 456592
+    },
+    {
+      "name": "Tinos-Italic",
+      "category": 2,
+      "weight": 400,
+      "italic": true,
+      "file": "tinos/Tinos-Italic.ttf",
+      "size": 455400
+    },
+    {
+      "name": "Tinos-Regular",
+      "category": 2,
+      "weight": 400,
+      "italic": false,
+      "file": "tinos/Tinos-Regular.ttf",
+      "size": 475288
+    },
+    {
+      "name": "STIXTwoMath-Regular",
+      "category": 3,
+      "weight": 400,
+      "italic": false,
+      "file": "stix/STIXTwoMath-Regular.otf",
+      "size": 838652
+    },
+    {
+      "name": "NotoSansJP-Regular",
+      "category": 4,
+      "weight": 400,
+      "italic": false,
+      "file": "noto-sans-jp/NotoSansJP-Regular.otf",
+      "size": 4533028
+    },
+    {
+      "name": "Arimo-Bold",
+      "category": 0,
+      "weight": 700,
+      "italic": false,
+      "file": "arimo/Arimo-Bold.ttf",
+      "size": 317148
+    },
+    {
+      "name": "Arimo-BoldItalic",
+      "category": 0,
+      "weight": 700,
+      "italic": true,
+      "file": "arimo/Arimo-BoldItalic.ttf",
+      "size": 340112
+    },
+    {
+      "name": "Arimo-Italic",
+      "category": 0,
+      "weight": 400,
+      "italic": true,
+      "file": "arimo/Arimo-Italic.ttf",
+      "size": 338188
+    },
+    {
+      "name": "Arimo-Regular",
+      "category": 0,
+      "weight": 400,
+      "italic": false,
+      "file": "arimo/Arimo-Regular.ttf",
+      "size": 315784
+    },
+    {
+      "name": "Cousine-Bold",
+      "category": 1,
+      "weight": 700,
+      "italic": false,
+      "file": "cousine/Cousine-Bold.ttf",
+      "size": 296624
+    },
+    {
+      "name": "Cousine-BoldItalic",
+      "category": 1,
+      "weight": 700,
+      "italic": true,
+      "file": "cousine/Cousine-BoldItalic.ttf",
+      "size": 272700
+    },
+    {
+      "name": "Cousine-Italic",
+      "category": 1,
+      "weight": 400,
+      "italic": true,
+      "file": "cousine/Cousine-Italic.ttf",
+      "size": 269840
+    },
+    {
+      "name": "Cousine-Regular",
+      "category": 1,
+      "weight": 400,
+      "italic": false,
+      "file": "cousine/Cousine-Regular.ttf",
+      "size": 308360
+    },
+    {
+      "name": "NotoSerifJP-Regular",
+      "category": 5,
+      "weight": 400,
+      "italic": false,
+      "file": "noto-serif-jp/NotoSerifJP-Regular.otf",
+      "size": 6210492
+    },
+    {
+      "name": "NotoSansSymbols-Regular",
+      "category": 3,
+      "weight": 400,
+      "italic": false,
+      "file": "noto-symbols/NotoSansSymbols-Regular.ttf",
+      "size": 297877
+    }
+  ],
+  "pdf14_mapping": {
+    "Helvetica": "arimo/Arimo-Regular.ttf",
+    "Helvetica-Bold": "arimo/Arimo-Bold.ttf",
+    "Helvetica-Oblique": "arimo/Arimo-Italic.ttf",
+    "Helvetica-BoldOblique": "arimo/Arimo-BoldItalic.ttf",
+    "Times-Roman": "tinos/Tinos-Regular.ttf",
+    "Times-Bold": "tinos/Tinos-Bold.ttf",
+    "Times-Italic": "tinos/Tinos-Italic.ttf",
+    "Times-BoldItalic": "tinos/Tinos-BoldItalic.ttf",
+    "Courier": "cousine/Cousine-Regular.ttf",
+    "Courier-Bold": "cousine/Cousine-Bold.ttf",
+    "Courier-Oblique": "cousine/Cousine-Italic.ttf",
+    "Courier-BoldOblique": "cousine/Cousine-BoldItalic.ttf",
+    "Symbol": "stix/STIXTwoMath-Regular.otf",
+    "ZapfDingbats": "noto-symbols/NotoSansSymbols-Regular.ttf"
+  }
+}

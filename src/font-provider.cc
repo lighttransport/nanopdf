@@ -5,6 +5,7 @@
 
 #include "font-provider.hh"
 
+#include <cstdlib>
 #include <fstream>
 
 namespace nanopdf {
@@ -17,6 +18,13 @@ FontProvider& FontProvider::instance() {
 bool FontProvider::register_font_blob(const std::string& name,
                                       FontCategory category,
                                       const uint8_t* data, size_t size) {
+  return register_font_blob(name, category, 400, false, data, size);
+}
+
+bool FontProvider::register_font_blob(const std::string& name,
+                                      FontCategory category,
+                                      int weight, bool italic,
+                                      const uint8_t* data, size_t size) {
   if (!data || size == 0) return false;
 
   auto& list = fonts_[category];
@@ -24,6 +32,8 @@ bool FontProvider::register_font_blob(const std::string& name,
   ProvidedFont& pf = list.back();
   pf.name = name;
   pf.category = category;
+  pf.weight = weight;
+  pf.italic = italic;
   pf.data.assign(data, data + size);
 
   by_name_[name] = &pf;
@@ -53,6 +63,48 @@ const ProvidedFont* FontProvider::find_by_category(FontCategory cat) const {
     return &it->second.front();
   }
   return nullptr;
+}
+
+const ProvidedFont* FontProvider::find_best_match(FontCategory cat, int weight,
+                                                   bool italic) const {
+  auto it = fonts_.find(cat);
+  if (it == fonts_.end() || it->second.empty()) {
+    return nullptr;
+  }
+
+  const auto& candidates = it->second;
+
+  // 1. Filter to italic-matching candidates
+  std::vector<const ProvidedFont*> matched;
+  for (const auto& f : candidates) {
+    if (f.italic == italic) matched.push_back(&f);
+  }
+  // Fall back to all candidates if no italic match
+  if (matched.empty()) {
+    for (const auto& f : candidates) {
+      matched.push_back(&f);
+    }
+  }
+
+  // 2. Find closest weight by absolute distance
+  const ProvidedFont* best = matched[0];
+  int best_dist = std::abs(best->weight - weight);
+  for (size_t i = 1; i < matched.size(); ++i) {
+    int dist = std::abs(matched[i]->weight - weight);
+    if (dist < best_dist) {
+      best = matched[i];
+      best_dist = dist;
+    } else if (dist == best_dist) {
+      // Tie-break: prefer bolder for weight >= 500, lighter for < 500
+      if (weight >= 500) {
+        if (matched[i]->weight > best->weight) best = matched[i];
+      } else {
+        if (matched[i]->weight < best->weight) best = matched[i];
+      }
+    }
+  }
+
+  return best;
 }
 
 const ProvidedFont* FontProvider::find_by_name(const std::string& name) const {
