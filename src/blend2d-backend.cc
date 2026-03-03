@@ -4,6 +4,7 @@
 #ifdef NANOPDF_USE_BLEND2D
 
 #include "blend2d-backend.hh"
+#include "nanopdf-log.hh"
 
 #include <algorithm>
 #include <cmath>
