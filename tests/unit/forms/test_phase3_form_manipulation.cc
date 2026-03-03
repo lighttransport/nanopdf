@@ -302,6 +302,7 @@ trailer
   std::cout << "  ✓ FDF import working\n";
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
   std::cout << "=== Phase 3.1: Form Field Manipulation Tests ===\n\n";
 
@@ -325,3 +326,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

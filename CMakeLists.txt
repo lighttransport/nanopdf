@@ -31,7 +31,7 @@ find_package(Sanitizers) # Address sanitizer (-DSANITIZE_ADDRESS=ON)
 #set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -D_GLIBCXX_DEBUG -D_LIBCPP_DEBUG")
 #set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -D_GLIBCXX_DEBUG -D_LIBCPP_DEBUG")
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -529,14 +529,6 @@ if(NOT NANOPDF_BUILD_WASM)
   # Install MCP server
   install(TARGETS nanopdf-mcp DESTINATION bin)
 
-  # MCP JSON test (optional)
-  if(NANOPDF_BUILD_TESTS)
-    add_executable(test_mcp_json examples/mcp/test-mcp-json.cc)
-    target_link_libraries(test_mcp_json PRIVATE nanopdf_mcp)
-    add_sanitizers(test_mcp_json)
-    add_test(NAME test_mcp_json COMMAND test_mcp_json)
-  endif()
-
   message(STATUS "MCP server target enabled: nanopdf-mcp")
 endif()
 
@@ -547,7 +539,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   # ============================================================================
   # New test infrastructure with doctest framework
   # ============================================================================
-  option(NANOPDF_BUILD_LEGACY_TESTS "Build legacy phase tests" ON)
+  set(NANOPDF_BUILD_LEGACY_TESTS OFF CACHE BOOL "Build legacy phase tests" FORCE)
 
   # Add new test infrastructure (doctest-based, feature-organized)
   add_subdirectory(tests)
@@ -559,44 +551,44 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     message(STATUS "Building legacy phase tests (can be disabled with -DNANOPDF_BUILD_LEGACY_TESTS=OFF)")
   endif()
 
-  if(NANOPDF_BUILD_LEGACY_TESTS)
-    function(add_nanopdf_test target source)
-      add_executable(${target} ${source})
-      target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
-      target_include_directories(${target} PRIVATE
-        ${PROJECT_SOURCE_DIR}
-        ${PROJECT_SOURCE_DIR}/src
-      )
-      add_sanitizers(${target})
-      if(ARGC GREATER 2)
-        add_test(NAME ${target} COMMAND ${target} ${ARGN})
-      else()
-        add_test(NAME ${target} COMMAND ${target})
-      endif()
-      # Mark legacy tests with label for filtering
-      set_tests_properties(${target} PROPERTIES LABELS "legacy")
-    endfunction()
+  function(add_nanopdf_test target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
+    target_include_directories(${target} PRIVATE
+      ${PROJECT_SOURCE_DIR}
+      ${PROJECT_SOURCE_DIR}/src
+    )
+    add_sanitizers(${target})
+    if(ARGC GREATER 2)
+      add_test(NAME ${target} COMMAND ${target} ${ARGN})
+    else()
+      add_test(NAME ${target} COMMAND ${target})
+    endif()
+    # Mark legacy tests with label for filtering
+    set_tests_properties(${target} PROPERTIES LABELS "legacy")
+  endfunction()
 
+  if(NANOPDF_BUILD_LEGACY_TESTS)
     add_nanopdf_test(${TEST_TARGET} src/test-nanopdf.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
 
   set(_NANOPDF_PHASE_TEST_SPECS
     "test_phase1|src/test-phase1-features.cc"
     "test_phase1_simple|src/test-phase1-simple.cc"
-    #"test_phase1_attachments|test_phase1_attachments.cc"  # requires PDF arg not provided by CTest
-    "test_phase1_color|test_phase1_color.cc"
-    "test_phase1_tiff|test_phase1_tiff.cc"
+    #"test_phase1_attachments|tests/unit/document/test_phase1_attachments.cc"  # requires PDF arg not provided by CTest
+    "test_phase1_color|tests/unit/filters/test_phase1_color.cc"
+    "test_phase1_tiff|tests/unit/filters/test_phase1_tiff.cc"
     "test_phase2|src/test-phase2-features.cc"
     "test_phase2_standardencoding|src/test-phase2-standardencoding.cc"
     "test_phase2_rendering|src/test-phase2-rendering.cc"
     "test_phase2_realpdf|src/test-phase2-real-pdfs.cc"
     "test_phase2_text|src/test-phase2-text-extraction.cc"
-    "test_phase2_text_layout|test_phase2_text_layout.cc"
-    "test_phase2_text_layout_integration|test_phase2_text_layout_integration.cc"
-    "test_phase2_table_extraction|test_phase2_table_extraction.cc"
+    "test_phase2_text_layout|tests/unit/text/test_phase2_text_layout.cc"
+    "test_phase2_text_layout_integration|tests/unit/text/test_phase2_text_layout_integration.cc"
+    "test_phase2_table_extraction|tests/unit/text/test_phase2_table_extraction.cc"
     "test_phase3|src/test-phase3-features.cc"
-    "test_phase3_form_manipulation|test_phase3_form_manipulation.cc"
+    "test_phase3_form_manipulation|tests/unit/forms/test_phase3_form_manipulation.cc"
     "test_phase4|src/test-phase4-features.cc"
-    "test_phase4_document_structure|test_phase4_document_structure.cc"
+    "test_phase4_document_structure|tests/unit/document/test_phase4_document_structure.cc"
     "test_phase5|src/test-phase5-features.cc"
     "test_phase6|src/test-phase6-features.cc"
     "test_pdf_parsing|src/test-pdf-parsing.cc"

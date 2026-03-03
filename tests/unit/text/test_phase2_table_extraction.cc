@@ -276,6 +276,7 @@ void test_special_characters() {
   std::cout << "  ✓ JSON escaping working\n";
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
   std::cout << "=== Phase 2.3: Table Extraction Tests ===\n\n";
 
@@ -295,3 +296,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

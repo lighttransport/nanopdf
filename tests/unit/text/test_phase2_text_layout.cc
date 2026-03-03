@@ -281,6 +281,7 @@ void test_spatial_query() {
   std::cout << "  ✓ Spatial queries working\n";
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
   std::cout << "=== Phase 2.1: Text Layout Analysis Tests ===\n\n";
 
@@ -303,3 +304,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

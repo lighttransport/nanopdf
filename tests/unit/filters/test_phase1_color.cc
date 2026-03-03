@@ -212,6 +212,7 @@ bool test_icc_profile_header() {
   return true;
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
   std::cout << "=== nanopdf Color Transform Tests (Phase 1.2) ===" << std::endl << std::endl;
 
@@ -245,3 +246,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

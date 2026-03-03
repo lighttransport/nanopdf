@@ -125,6 +125,7 @@ void test_simple_text_pdf() {
   std::cout << "  ✓ Simple text PDF processed\n";
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
   std::cout << "=== Phase 2.1: Text Layout PDF Integration Tests ===\n\n";
 
@@ -142,3 +143,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

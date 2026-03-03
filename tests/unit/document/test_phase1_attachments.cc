@@ -124,6 +124,7 @@ bool test_attachment_extraction(const char* pdf_path) {
   return true;
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0] << " <pdf_file>" << std::endl;
@@ -134,3 +135,5 @@ int main(int argc, char** argv) {
   bool success = test_attachment_extraction(argv[1]);
   return success ? 0 : 1;
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

@@ -140,6 +140,7 @@ void test_outline_hierarchy() {
   std::cout << "      Child 2: " << root->children[1]->title << "\n";
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
   std::cout << "=== Phase 4: Document Structure and Navigation Tests ===\n\n";
 
@@ -162,3 +163,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

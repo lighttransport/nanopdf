@@ -252,6 +252,7 @@ bool test_from_file(const char* filename) {
   return true;
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main(int argc, char** argv) {
   std::cout << "=== nanopdf TIFF Decoder Tests (Phase 1.3) ===" << std::endl << std::endl;
 
@@ -287,3 +288,5 @@ int main(int argc, char** argv) {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN
