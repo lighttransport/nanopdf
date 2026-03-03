@@ -2362,10 +2362,10 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
   return true;
 }
 
-// C++14 compatible clamp (std::clamp is C++17)
+// C++17 clamp wrapper
 template<typename T>
 constexpr T clamp14(const T& v, const T& lo, const T& hi) {
-  return (v < lo) ? lo : (hi < v) ? hi : v;
+  return std::clamp(v, lo, hi);
 }
 
 // PostScript calculator stack for Type 4 function evaluation

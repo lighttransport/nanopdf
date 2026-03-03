@@ -4,6 +4,7 @@
 #ifdef NANOPDF_USE_THORVG
 
 #include "thorvg-backend.hh"
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -29,10 +30,10 @@ extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
 
-// C++14 compatible clamp (std::clamp is C++17)
+// C++17 clamp wrapper
 template<typename T>
 constexpr T clamp14(const T& v, const T& lo, const T& hi) {
-  return (v < lo) ? lo : (hi < v) ? hi : v;
+  return std::clamp(v, lo, hi);
 }
 
 // Improved CMYK to RGB conversion using Ghostscript-style under-color removal.

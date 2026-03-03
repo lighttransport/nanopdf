@@ -1,6 +1,6 @@
 # NanoPDF
 
-NanoPDF is a lightweight C++14 library for parsing and inspecting PDF files. It focuses on
+NanoPDF is a lightweight C++17 library for parsing and inspecting PDF files. It focuses on
 read-only workflows such as structure inspection, text extraction, annotations, and form
 metadata. The codebase is self-contained and ships with optional miniature STL replacements
 for constrained environments.
@@ -75,6 +75,10 @@ for constrained environments.
 
 ## Building
 
+Requirements:
+- CMake 3.16+
+- C++17 compiler
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -91,7 +95,7 @@ cmake --build build
 | `NANOPDF_USE_BLEND2D` | `OFF` | Build the Blend2D raster backend |
 | `NANOPDF_BUILD_TESTS` | `ON` | Build test executables |
 | `NANOPDF_BUILD_VALIDATION_TESTS` | `ON` | Build PDF spec validation tests |
-| `NANOPDF_BUILD_LEGACY_TESTS` | `ON` | Build legacy phase test executables |
+| `NANOPDF_BUILD_LEGACY_TESTS` | `OFF` | Build legacy phase test executables |
 | `NANOPDF_BUILD_WASM` | `OFF` | Target WebAssembly (requires Emscripten) |
 | `NANOPDF_EMBED_FONTS` | `OFF` | Embed Standard 14 font replacements |
 | `NANOPDF_EMBED_CJK_FONTS` | `OFF` | Embed CJK fonts (~61 MB) |
