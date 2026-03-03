@@ -563,6 +563,10 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     function(add_nanopdf_test target source)
       add_executable(${target} ${source})
       target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
+      target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/src
+      )
       add_sanitizers(${target})
       if(ARGC GREATER 2)
         add_test(NAME ${target} COMMAND ${target} ${ARGN})
