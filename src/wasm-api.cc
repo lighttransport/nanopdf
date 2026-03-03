@@ -2139,6 +2139,85 @@ const char* nanopdf_fonts_get_info(const char* name) {
   return g_text_buffer.c_str();
 }
 
+// Register ALL embedded fonts with FontProvider at init time.
+// This eagerly decompresses every font so they're available for rendering.
+// Returns the number of fonts successfully registered.
+EMSCRIPTEN_KEEPALIVE
+// Helper: detect weight and italic from font base name
+// e.g. "Arimo-Bold" → weight=700, italic=false
+//      "Tinos-BoldItalic" → weight=700, italic=true
+//      "Cousine-Italic" → weight=400, italic=true
+//      "Arimo-Regular" → weight=400, italic=false
+static void detect_weight_italic(const char* name, int& weight, bool& italic) {
+  weight = 400;
+  italic = false;
+  std::string s(name);
+  // Check for Bold
+  if (s.find("Bold") != std::string::npos) weight = 700;
+  // Check for Light
+  if (s.find("Light") != std::string::npos) weight = 300;
+  // Check for Thin
+  if (s.find("Thin") != std::string::npos) weight = 100;
+  // Check for Medium
+  if (s.find("Medium") != std::string::npos) weight = 500;
+  // Check for SemiBold/DemiBold
+  if (s.find("SemiBold") != std::string::npos ||
+      s.find("DemiBold") != std::string::npos ||
+      s.find("DemiLight") != std::string::npos) weight = 350;
+  if (s.find("SemiBold") != std::string::npos) weight = 600;
+  // Check for Black/Heavy
+  if (s.find("Black") != std::string::npos ||
+      s.find("Heavy") != std::string::npos) weight = 900;
+  // Check for ExtraLight
+  if (s.find("ExtraLight") != std::string::npos) weight = 200;
+  // Check for Italic/Oblique
+  if (s.find("Italic") != std::string::npos ||
+      s.find("Oblique") != std::string::npos) italic = true;
+}
+
+int nanopdf_register_embedded_fonts() {
+  int registered = 0;
+
+  for (size_t i = 0; i < nanopdf::embedded_fonts::font_count; ++i) {
+    const auto& entry = nanopdf::embedded_fonts::font_registry[i];
+
+    // Determine FontCategory from font name prefix
+    nanopdf::FontCategory cat;
+    const char* name = entry.base_name;
+    if (strncmp(name, "Arimo", 5) == 0) {
+      cat = nanopdf::FontCategory::kSans;
+    } else if (strncmp(name, "Cousine", 7) == 0) {
+      cat = nanopdf::FontCategory::kMono;
+    } else if (strncmp(name, "Tinos", 5) == 0) {
+      cat = nanopdf::FontCategory::kSerif;
+    } else if (strncmp(name, "NotoSans", 8) == 0) {
+      cat = nanopdf::FontCategory::kSymbol;
+    } else {
+      cat = nanopdf::FontCategory::kSans;  // fallback
+    }
+
+    // Detect weight and italic from font name
+    int weight;
+    bool italic;
+    detect_weight_italic(name, weight, italic);
+
+    // Decompress font data
+    std::vector<uint8_t> font_data;
+    if (!nanopdf::embedded_fonts::decompress_font(&entry, font_data)) {
+      continue;
+    }
+
+    // Register with FontProvider (including weight/italic)
+    if (nanopdf::FontProvider::instance().register_font_blob(
+            entry.base_name, cat, weight, italic,
+            font_data.data(), font_data.size())) {
+      ++registered;
+    }
+  }
+
+  return registered;
+}
+
 #else  // !NANOPDF_EMBED_FONTS
 
 // Stub functions when fonts are not embedded
@@ -2190,34 +2269,65 @@ const char* nanopdf_fonts_get_info(const char* name) {
   return g_text_buffer.c_str();
 }
 
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_register_embedded_fonts() {
+  return 0;
+}
+
 #endif  // NANOPDF_EMBED_FONTS
 
 // ============================================================
 // Generic Font Registration API (always available)
 // ============================================================
 
-// Register any font from a memory blob
+// Helper: convert category int to FontCategory enum
+static nanopdf::FontCategory category_from_int(int category) {
+  switch (category) {
+    case 0: return nanopdf::FontCategory::kSans;
+    case 1: return nanopdf::FontCategory::kMono;
+    case 2: return nanopdf::FontCategory::kSerif;
+    case 3: return nanopdf::FontCategory::kSymbol;
+    case 4: return nanopdf::FontCategory::kCJKSans;
+    case 5: return nanopdf::FontCategory::kCJKSerif;
+    default: return nanopdf::FontCategory::kSans;
+  }
+}
+
+// Helper: generate a unique runtime font name
+static std::string make_runtime_font_name(int category, int weight, bool italic) {
+  static const char* cat_prefixes[] = {
+    "Sans", "Mono", "Serif", "Symbol", "CJKSans", "CJKSerif"
+  };
+  int idx = (category >= 0 && category <= 5) ? category : 0;
+  std::string name = std::string(cat_prefixes[idx]) + "-w" + std::to_string(weight);
+  if (italic) name += "-italic";
+  return name;
+}
+
+// Register any font from a memory blob (legacy, weight=400, italic=false)
 // category: 0=sans, 1=mono, 2=serif, 3=symbol, 4=cjk_sans, 5=cjk_serif
 EMSCRIPTEN_KEEPALIVE
 int nanopdf_register_font(const uint8_t* data, size_t size, int category) {
   if (!data || size == 0) return 0;
-  nanopdf::FontCategory cat;
-  switch (category) {
-    case 0: cat = nanopdf::FontCategory::kSans; break;
-    case 1: cat = nanopdf::FontCategory::kMono; break;
-    case 2: cat = nanopdf::FontCategory::kSerif; break;
-    case 3: cat = nanopdf::FontCategory::kSymbol; break;
-    case 4: cat = nanopdf::FontCategory::kCJKSans; break;
-    case 5: cat = nanopdf::FontCategory::kCJKSerif; break;
-    default: cat = nanopdf::FontCategory::kSans; break;
-  }
-  static const char* cat_names[] = {
-    "Sans-Runtime", "Mono-Runtime", "Serif-Runtime",
-    "Symbol-Runtime", "CJKSans-Runtime", "CJKSerif-Runtime"
-  };
-  int idx = (category >= 0 && category <= 5) ? category : 0;
+  nanopdf::FontCategory cat = category_from_int(category);
+  std::string name = make_runtime_font_name(category, 400, false);
   return nanopdf::FontProvider::instance().register_font_blob(
-      cat_names[idx], cat, data, size) ? 1 : 0;
+      name, cat, 400, false, data, size) ? 1 : 0;
+}
+
+// Register a font with explicit weight and italic
+// category: 0=sans, 1=mono, 2=serif, 3=symbol, 4=cjk_sans, 5=cjk_serif
+// weight: CSS font-weight 100-900 (default 400)
+// is_italic: 0=normal, 1=italic
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_register_font_ex(const uint8_t* data, size_t size,
+                              int category, int weight, int is_italic) {
+  if (!data || size == 0) return 0;
+  nanopdf::FontCategory cat = category_from_int(category);
+  bool italic = (is_italic != 0);
+  std::string name = make_runtime_font_name(category, weight, italic);
+  return nanopdf::FontProvider::instance().register_font_blob(
+      name, cat, weight, italic, data, size) ? 1 : 0;
 }
 
 // ============================================================
