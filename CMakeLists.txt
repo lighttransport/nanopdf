@@ -15,7 +15,6 @@ option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
-option(NANOPDF_USE_BUILTIN_CCITT "Use built-in CCITT decoder instead of PDFium-based" OFF)
 option(NANOPDF_EXTERNAL_FONTS "Load fonts from external files instead of embedding" OFF)
 
 # Log level: 0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
@@ -245,7 +244,8 @@ if(NANOPDF_EMBED_FONTS)
   add_dependencies(${BUILD_TARGET} generate_embedded_fonts)
 
   # Add the build directory to include path so the generated header can be found
-  target_include_directories(${BUILD_TARGET} PRIVATE ${CMAKE_BINARY_DIR})
+  # Also add src/ so generated headers can find miniz.h
+  target_include_directories(${BUILD_TARGET} PRIVATE ${CMAKE_BINARY_DIR} ${PROJECT_SOURCE_DIR}/src)
 
   # Define macro to enable embedded fonts in the code
   target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_EMBED_FONTS=1")
@@ -444,12 +444,6 @@ if (NANOPDF_USE_LIBTIFF)
     target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_LIBTIFF")
     message(STATUS "libtiff CCITT decoder enabled")
   endif()
-endif ()
-
-# Built-in CCITT decoder support (fallback, less accurate)
-if (NANOPDF_USE_BUILTIN_CCITT)
-  target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_BUILTIN_CCITT")
-  message(STATUS "Built-in CCITT decoder enabled (fallback)")
 endif ()
 
 # Blend2D support

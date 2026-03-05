@@ -165,6 +165,35 @@ scripts/update-glyph-list-inc.py
 3. Run `ctest` and corpus tests before submitting changes
 4. Format code with `clang-format -i` (Google style, 2-space indent)
 
+## Third-Party Licenses
+
+nanopdf embeds or links the following third-party libraries:
+
+| Library | Version | License | Copyright |
+| --- | --- | --- | --- |
+| [miniz](https://github.com/richgel999/miniz) | 3.0.0 | Public Domain / Unlicense | Rich Geldreich |
+| [stb_truetype](https://github.com/nothings/stb) | 1.26 | MIT / Public Domain | Sean Barrett |
+| [stb_image](https://github.com/nothings/stb) | 2.30 | MIT / Public Domain | Sean Barrett |
+| [stb_image_write](https://github.com/nothings/stb) | 1.16 | MIT / Public Domain | Sean Barrett |
+| [fpng](https://github.com/richgel999/fpng) | 1.0.6 | Public Domain / Unlicense | Rich Geldreich |
+| [TinyDNGLoader](https://github.com/syoyo/tinydng) | — | MIT | Syoyo Fujita |
+| [nanostl](https://github.com/lighttransport/nanostl) | — | MIT | Light Transport Entertainment Inc. |
+| [fast_float](https://github.com/fastfloat/fast_float) (via nanostl) | — | Apache 2.0 / Boost 1.0 | Daniel Lemire et al. |
+| [Ryu](https://github.com/ulfjack/ryu) (via nanostl) | — | Apache 2.0 / Boost 1.0 | Ulf Adams |
+| JBIG2 decoder (from [PDFium](https://pdfium.googlesource.com/pdfium/)) | — | BSD-3-Clause | The PDFium Authors, Foxit Software Inc. |
+| CCITT Fax decoder (from [PDFium](https://pdfium.googlesource.com/pdfium/)) | — | BSD-3-Clause | The PDFium Authors |
+| [ThorVG](https://github.com/thorvg/thorvg) (optional) | 1.0.1 | MIT | ThorVG Project |
+| [Blend2D](https://blend2d.com/) (optional) | — | Zlib | Blend2D Authors |
+
+### Bundled Fonts (optional, SIL Open Font License 1.1)
+
+When building with `NANOPDF_EMBED_FONTS` or `NANOPDF_EMBED_CJK_FONTS`:
+
+- **Arimo** — metric-compatible Arial replacement (Google, SIL OFL 1.1)
+- **Tinos** — metric-compatible Times New Roman replacement (Google, SIL OFL 1.1)
+- **Cousine** — metric-compatible Courier New replacement (Google, SIL OFL 1.1)
+- **Noto Sans JP / Noto Serif JP** — Japanese font support (Google, SIL OFL 1.1)
+
 ## License
 
 Apache 2.0 © 2024-present Light Transport Entertainment Inc.
