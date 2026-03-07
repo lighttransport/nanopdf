@@ -181,7 +181,7 @@ nanopdf embeds or links the following third-party libraries:
 | [fast_float](https://github.com/fastfloat/fast_float) (via nanostl) | — | Apache 2.0 / Boost 1.0 | Daniel Lemire et al. |
 | [Ryu](https://github.com/ulfjack/ryu) (via nanostl) | — | Apache 2.0 / Boost 1.0 | Ulf Adams |
 | JBIG2 decoder (from [PDFium](https://pdfium.googlesource.com/pdfium/)) | — | BSD-3-Clause | The PDFium Authors, Foxit Software Inc. |
-| CCITT Fax decoder (from [PDFium](https://pdfium.googlesource.com/pdfium/)) | — | BSD-3-Clause | The PDFium Authors |
+| CCITT Fax decoder (from [PDFium](https://pdfium.googlesource.com/pdfium/)) | — | BSD-3-Clause | The PDFium Authors, Foxit Software Inc. |
 | [ThorVG](https://github.com/thorvg/thorvg) (optional) | 1.0.1 | MIT | ThorVG Project |
 | [Blend2D](https://blend2d.com/) (optional) | — | Zlib | Blend2D Authors |
 
