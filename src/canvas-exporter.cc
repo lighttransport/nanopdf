@@ -3111,69 +3111,41 @@ void CanvasExporter::handle_shading_command(const std::vector<std::string>& oper
   auto it = shading_resources_.find(name);
   if (it == shading_resources_.end()) return;
 
-  // For canvas, we approximate shadings by creating a gradient fill over the page
-  // Save state, fill entire page with the shading gradient
+  // Use create_svg_gradient to parse the shading and extract gradient data,
+  // then emit equivalent canvas gradient commands
+  size_t grad_idx = svg_gradients_.size();
+  std::string grad_ref = create_svg_gradient(it->second, state_.ctm);
+  if (grad_ref.empty() || svg_gradients_.size() <= grad_idx) return;
+
+  const SvgGradient& grad = svg_gradients_.back();
+
   add_canvas_command("save");
 
-  std::string grad_ref = create_svg_gradient(it->second, state_.ctm);
-  // Canvas API doesn't directly support SVG gradient references,
-  // so we approximate: extract gradient colors and use a linear/radial gradient
-  // For now, use the shading's background color or first stop color as a fill
-  Value shading = it->second;
-  if (shading.type == Value::REFERENCE) {
-    auto resolved = resolve_reference(*current_pdf_, shading.ref_object_number,
-                                       shading.ref_generation_number);
-    if (resolved.success) shading = resolved.value;
+  // Create the gradient
+  std::string grad_var = "g" + std::to_string(svg_gradient_counter_);
+  if (grad.is_radial) {
+    add_canvas_command("createRadialGradient", {
+      double_to_string(grad.fx), double_to_string(grad.fy), "0",
+      double_to_string(grad.cx), double_to_string(grad.cy), double_to_string(grad.r)
+    });
+  } else {
+    add_canvas_command("createLinearGradient", {
+      double_to_string(grad.x1), double_to_string(grad.y1),
+      double_to_string(grad.x2), double_to_string(grad.y2)
+    });
   }
 
-  const Dictionary& dict = (shading.type == Value::STREAM) ? shading.stream.dict : shading.dict;
-  auto bg_it = dict.find("Background");
-  if (bg_it != dict.end() && bg_it->second.type == Value::ARRAY && bg_it->second.array.size() >= 3) {
-    const auto& bg = bg_it->second.array;
-    if (bg[0].type == Value::NUMBER && bg[1].type == Value::NUMBER && bg[2].type == Value::NUMBER) {
-      std::string color = rgb_to_hex(bg[0].number, bg[1].number, bg[2].number);
-      add_canvas_command("fillStyle", {canvas_color_string(color, state_.fill_alpha)});
-      add_canvas_command("fillRect", {"0", "0", double_to_string(page_width_), double_to_string(page_height_)});
-    }
+  // Add color stops
+  for (const auto& stop : grad.stops) {
+    add_canvas_command("addColorStop", {
+      double_to_string(stop.offset),
+      canvas_color_string(stop.color, stop.opacity)
+    });
   }
 
-  // Emit createLinearGradient/createRadialGradient canvas commands
-  auto type_it = dict.find("ShadingType");
-  if (type_it != dict.end() && type_it->second.type == Value::NUMBER) {
-    int stype = static_cast<int>(type_it->second.number);
-    auto coords_it = dict.find("Coords");
-    if (coords_it != dict.end() && coords_it->second.type == Value::ARRAY) {
-      const auto& coords = coords_it->second.array;
-      if (stype == 2 && coords.size() >= 4) {
-        double x0 = (coords[0].type == Value::NUMBER) ? coords[0].number : 0;
-        double y0 = (coords[1].type == Value::NUMBER) ? coords[1].number : 0;
-        double x1 = (coords[2].type == Value::NUMBER) ? coords[2].number : 0;
-        double y1 = (coords[3].type == Value::NUMBER) ? coords[3].number : 0;
-        apply_matrix_to_point(state_.ctm, x0, y0);
-        apply_matrix_to_point(state_.ctm, x1, y1);
-        add_canvas_command("createLinearGradient", {
-          double_to_string(x0), double_to_string(page_height_ - y0),
-          double_to_string(x1), double_to_string(page_height_ - y1)
-        });
-      } else if (stype == 3 && coords.size() >= 6) {
-        double x0 = (coords[0].type == Value::NUMBER) ? coords[0].number : 0;
-        double y0 = (coords[1].type == Value::NUMBER) ? coords[1].number : 0;
-        double r0 = (coords[2].type == Value::NUMBER) ? coords[2].number : 0;
-        double x1 = (coords[3].type == Value::NUMBER) ? coords[3].number : 0;
-        double y1 = (coords[4].type == Value::NUMBER) ? coords[4].number : 0;
-        double r1 = (coords[5].type == Value::NUMBER) ? coords[5].number : 0;
-        apply_matrix_to_point(state_.ctm, x0, y0);
-        apply_matrix_to_point(state_.ctm, x1, y1);
-        double scale_x = std::sqrt(state_.ctm.a * state_.ctm.a + state_.ctm.b * state_.ctm.b);
-        double scale_y = std::sqrt(state_.ctm.c * state_.ctm.c + state_.ctm.d * state_.ctm.d);
-        double scale = (scale_x + scale_y) * 0.5;
-        add_canvas_command("createRadialGradient", {
-          double_to_string(x0), double_to_string(page_height_ - y0), double_to_string(r0 * scale),
-          double_to_string(x1), double_to_string(page_height_ - y1), double_to_string(r1 * scale)
-        });
-      }
-    }
-  }
+  // Fill the page with the gradient
+  add_canvas_command("fillGradient");
+  add_canvas_command("fillRect", {"0", "0", double_to_string(page_width_), double_to_string(page_height_)});
 
   add_canvas_command("restore");
 }
@@ -3859,69 +3831,165 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
     }
   }
 
-  // Get color function and try to extract C0/C1 for Type 2 exponential interpolation
+  // Helper: convert color components to hex based on component count
+  auto components_to_hex = [this](const std::vector<double>& c, int nc) -> std::string {
+    if (nc == 1 && c.size() >= 1) {
+      return rgb_to_hex(c[0], c[0], c[0]);
+    } else if (nc == 4 && c.size() >= 4) {
+      return cmyk_to_hex(c[0], c[1], c[2], c[3]);
+    } else if (c.size() >= 3) {
+      return rgb_to_hex(c[0], c[1], c[2]);
+    } else if (c.size() >= 1) {
+      return rgb_to_hex(c[0], c[0], c[0]);
+    }
+    return "#000000";
+  };
+
+  // Helper: resolve a function Value (dereference if needed)
+  auto resolve_func = [this](const Value& v) -> Value {
+    if (v.type == Value::REFERENCE) {
+      auto res = resolve_reference(*current_pdf_, v.ref_object_number, v.ref_generation_number);
+      if (res.success) return res.value;
+    }
+    return v;
+  };
+
+  // Helper: extract Type 2 C0/C1 colors from an exponential function
+  auto extract_type2_colors = [&](const Dictionary& fd,
+                                   std::vector<double>& c0_out,
+                                   std::vector<double>& c1_out) {
+    auto c0_it = fd.find("C0");
+    if (c0_it != fd.end() && c0_it->second.type == Value::ARRAY) {
+      for (const auto& v : c0_it->second.array)
+        if (v.type == Value::NUMBER) c0_out.push_back(v.number);
+    }
+    auto c1_it = fd.find("C1");
+    if (c1_it != fd.end() && c1_it->second.type == Value::ARRAY) {
+      for (const auto& v : c1_it->second.array)
+        if (v.type == Value::NUMBER) c1_out.push_back(v.number);
+    }
+    if (c0_out.empty()) c0_out.assign(num_components, 0.0);
+    if (c1_out.empty()) c1_out.assign(num_components, 1.0);
+  };
+
+  // Get color function and extract gradient stops
   auto function_it = dict.find("Function");
   if (function_it != dict.end()) {
-    Value func = function_it->second;
-    if (func.type == Value::REFERENCE) {
-      auto resolved = resolve_reference(*current_pdf_, func.ref_object_number,
-                                         func.ref_generation_number);
-      if (resolved.success) func = resolved.value;
+    Value func = resolve_func(function_it->second);
+    const Dictionary* fd = nullptr;
+    if (func.type == Value::DICTIONARY) {
+      fd = &func.dict;
+    } else if (func.type == Value::STREAM) {
+      fd = &func.stream.dict;
     }
 
-    if (func.type == Value::DICTIONARY) {
-      auto func_type_it = func.dict.find("FunctionType");
-      if (func_type_it != func.dict.end() &&
-          func_type_it->second.type == Value::NUMBER &&
-          static_cast<int>(func_type_it->second.number) == 2) {
-        // Type 2: Exponential interpolation - extract C0 and C1
+    if (fd) {
+      auto func_type_it = fd->find("FunctionType");
+      int func_type = (func_type_it != fd->end() && func_type_it->second.type == Value::NUMBER)
+                          ? static_cast<int>(func_type_it->second.number) : -1;
+
+      if (func_type == 2) {
+        // Type 2: Exponential interpolation - two stops
         std::vector<double> c0, c1;
+        extract_type2_colors(*fd, c0, c1);
+        gradient.stops.push_back({0.0, components_to_hex(c0, num_components), 1.0});
+        gradient.stops.push_back({1.0, components_to_hex(c1, num_components), 1.0});
+      } else if (func_type == 3) {
+        // Type 3: Stitching function - multi-stop gradient
+        auto bounds_it = fd->find("Bounds");
+        auto funcs_it = fd->find("Functions");
+        auto encode_it = fd->find("Encode");
 
-        auto c0_it = func.dict.find("C0");
-        if (c0_it != func.dict.end() && c0_it->second.type == Value::ARRAY) {
-          for (const auto& v : c0_it->second.array) {
-            if (v.type == Value::NUMBER) c0.push_back(v.number);
+        if (funcs_it != fd->end() && funcs_it->second.type == Value::ARRAY) {
+          const auto& sub_funcs = funcs_it->second.array;
+          size_t n = sub_funcs.size();
+
+          // Get domain (default 0..1)
+          double domain_min = 0.0, domain_max = 1.0;
+          auto domain_it = fd->find("Domain");
+          if (domain_it != fd->end() && domain_it->second.type == Value::ARRAY &&
+              domain_it->second.array.size() >= 2) {
+            if (domain_it->second.array[0].type == Value::NUMBER)
+              domain_min = domain_it->second.array[0].number;
+            if (domain_it->second.array[1].type == Value::NUMBER)
+              domain_max = domain_it->second.array[1].number;
+          }
+          double domain_range = domain_max - domain_min;
+          if (domain_range <= 0.0) domain_range = 1.0;
+
+          // Get bounds array
+          std::vector<double> bounds;
+          if (bounds_it != fd->end() && bounds_it->second.type == Value::ARRAY) {
+            for (const auto& bv : bounds_it->second.array) {
+              if (bv.type == Value::NUMBER) bounds.push_back(bv.number);
+            }
+          }
+
+          // For each sub-function, extract its C0 and C1 and map to gradient offsets
+          // Boundaries define: [domain_min, bounds[0], bounds[1], ..., domain_max]
+          for (size_t i = 0; i < n; ++i) {
+            Value sf = resolve_func(sub_funcs[i]);
+            const Dictionary* sfd = nullptr;
+            if (sf.type == Value::DICTIONARY) sfd = &sf.dict;
+            else if (sf.type == Value::STREAM) sfd = &sf.stream.dict;
+            if (!sfd) continue;
+
+            double seg_start = (i == 0) ? domain_min : (i - 1 < bounds.size() ? bounds[i - 1] : domain_min);
+            double seg_end = (i < bounds.size()) ? bounds[i] : domain_max;
+
+            // Normalize to 0..1
+            double offset_start = (seg_start - domain_min) / domain_range;
+            double offset_end = (seg_end - domain_min) / domain_range;
+
+            auto sf_type_it = sfd->find("FunctionType");
+            int sf_type = (sf_type_it != sfd->end() && sf_type_it->second.type == Value::NUMBER)
+                             ? static_cast<int>(sf_type_it->second.number) : -1;
+
+            if (sf_type == 2) {
+              std::vector<double> c0, c1;
+              extract_type2_colors(*sfd, c0, c1);
+              // Add start stop (avoid duplicating the first stop on subsequent segments)
+              if (i == 0 || gradient.stops.empty() ||
+                  std::abs(gradient.stops.back().offset - offset_start) > 1e-6) {
+                gradient.stops.push_back({offset_start, components_to_hex(c0, num_components), 1.0});
+              }
+              gradient.stops.push_back({offset_end, components_to_hex(c1, num_components), 1.0});
+            } else {
+              // Unknown sub-function type: add placeholder stops
+              if (gradient.stops.empty()) {
+                gradient.stops.push_back({offset_start, "#000000", 1.0});
+              }
+              gradient.stops.push_back({offset_end, "#000000", 1.0});
+            }
           }
         }
-
-        auto c1_it = func.dict.find("C1");
-        if (c1_it != func.dict.end() && c1_it->second.type == Value::ARRAY) {
-          for (const auto& v : c1_it->second.array) {
-            if (v.type == Value::NUMBER) c1.push_back(v.number);
-          }
-        }
-
-        // Default C0 is black, C1 is white
-        if (c0.empty()) c0 = std::vector<double>(num_components, 0.0);
-        if (c1.empty()) c1 = std::vector<double>(num_components, 1.0);
-
-        // Create gradient stops
-        SvgGradient::Stop start_stop, end_stop;
-        start_stop.offset = 0.0;
-        end_stop.offset = 1.0;
-
-        if (num_components == 1 && c0.size() >= 1 && c1.size() >= 1) {
-          start_stop.color = rgb_to_hex(c0[0], c0[0], c0[0]);
-          end_stop.color = rgb_to_hex(c1[0], c1[0], c1[0]);
-        } else if (num_components == 4 && c0.size() >= 4 && c1.size() >= 4) {
-          // CMYK to RGB
-          double r0 = (1.0 - c0[0]) * (1.0 - c0[3]);
-          double g0 = (1.0 - c0[1]) * (1.0 - c0[3]);
-          double b0 = (1.0 - c0[2]) * (1.0 - c0[3]);
-          start_stop.color = rgb_to_hex(r0, g0, b0);
-
-          double r1 = (1.0 - c1[0]) * (1.0 - c1[3]);
-          double g1 = (1.0 - c1[1]) * (1.0 - c1[3]);
-          double b1 = (1.0 - c1[2]) * (1.0 - c1[3]);
-          end_stop.color = rgb_to_hex(r1, g1, b1);
-        } else if (c0.size() >= 3 && c1.size() >= 3) {
-          start_stop.color = rgb_to_hex(c0[0], c0[1], c0[2]);
-          end_stop.color = rgb_to_hex(c1[0], c1[1], c1[2]);
-        }
-
-        gradient.stops.push_back(start_stop);
-        gradient.stops.push_back(end_stop);
       }
+    } else if (func.type == Value::ARRAY) {
+      // Function array - one function per color component
+      // Evaluate at t=0 and t=1 to get endpoint colors
+      std::vector<double> c0_vals, c1_vals;
+      for (const auto& fn_ref : func.array) {
+        Value fn = resolve_func(fn_ref);
+        const Dictionary* fnd = nullptr;
+        if (fn.type == Value::DICTIONARY) fnd = &fn.dict;
+        else if (fn.type == Value::STREAM) fnd = &fn.stream.dict;
+        if (!fnd) { c0_vals.push_back(0.0); c1_vals.push_back(1.0); continue; }
+
+        auto ft_it = fnd->find("FunctionType");
+        int ft = (ft_it != fnd->end() && ft_it->second.type == Value::NUMBER)
+                    ? static_cast<int>(ft_it->second.number) : -1;
+        if (ft == 2) {
+          std::vector<double> c0, c1;
+          extract_type2_colors(*fnd, c0, c1);
+          c0_vals.push_back(c0.empty() ? 0.0 : c0[0]);
+          c1_vals.push_back(c1.empty() ? 1.0 : c1[0]);
+        } else {
+          c0_vals.push_back(0.0);
+          c1_vals.push_back(1.0);
+        }
+      }
+      gradient.stops.push_back({0.0, components_to_hex(c0_vals, num_components), 1.0});
+      gradient.stops.push_back({1.0, components_to_hex(c1_vals, num_components), 1.0});
     }
   }
 
