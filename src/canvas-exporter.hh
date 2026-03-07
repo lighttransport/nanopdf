@@ -120,12 +120,17 @@ private:
   void handle_path_command(const std::string& op, const std::vector<std::string>& operands);
   void handle_graphics_state_command(const std::string& op, const std::vector<std::string>& operands);
   void handle_color_command(const std::string& op, const std::vector<std::string>& operands);
-  
+  void handle_xobject_command(const std::vector<std::string>& operands);
+  void handle_shading_command(const std::vector<std::string>& operands);
+  void apply_pending_clip();
+  void apply_pending_clip_svg();
+
   void handle_text_command_svg(const std::string& op, const std::vector<std::string>& operands);
   void handle_path_command_svg(const std::string& op, const std::vector<std::string>& operands);
   void handle_graphics_state_command_svg(const std::string& op, const std::vector<std::string>& operands);
   void handle_color_command_svg(const std::string& op, const std::vector<std::string>& operands);
   void handle_xobject_command_svg(const std::vector<std::string>& operands);
+  void handle_shading_command_svg(const std::vector<std::string>& operands);
   
   void add_canvas_command(const std::string& command);
   void add_canvas_command(const std::string& command, const std::vector<std::string>& args);
@@ -138,7 +143,9 @@ private:
   std::string escape_json_string(const std::string& str) const;
   std::string escape_xml_string(const std::string& str) const;
   std::string rgb_to_hex(double r, double g, double b) const;
+  std::string cmyk_to_hex(double c, double m, double y, double k) const;
   std::string canvas_color_string(const std::string& hex, double alpha) const;
+  std::string resolve_scn_color(const std::vector<std::string>& operands, bool is_stroking);
   void update_canvas_fill_style();
   void update_canvas_stroke_style();
   void update_canvas_line_width();
@@ -239,6 +246,11 @@ private:
    double leading{0.0};
     SoftMaskType soft_mask_type{SoftMaskType::None};
     Value soft_mask_value;
+    std::string fill_color_space;    // Current nonstroking color space name
+    std::string stroke_color_space;  // Current stroking color space name
+    bool pending_clip{false};        // W operator sets this
+    bool pending_clip_evenodd{false}; // W* operator sets this
+    int svg_clip_group_depth{0};     // Open <g clip-path> elements at this save level
   } state_;
 
   // OCG (Optional Content Group) visibility tracking
@@ -252,6 +264,7 @@ private:
   size_t inline_image_cursor_{0};
   std::map<std::string, ExtendedGraphicsState> ext_gstates_;
   const Pdf* current_pdf_{nullptr};
+  const Page* current_page_{nullptr};
   std::vector<GraphicsState> graphics_state_stack_;
   bool canvas_mode_{false};
   bool svg_mode_{false};
@@ -261,6 +274,7 @@ private:
   std::vector<SvgPattern> svg_patterns_;
   int svg_gradient_counter_{0};
   int svg_pattern_counter_{0};
+  int svg_clip_counter_{0};
 
   // Methods for gradient/pattern handling
   std::string create_svg_gradient(const Value& shading, const Matrix2D& ctm);

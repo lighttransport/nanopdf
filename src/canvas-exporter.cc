@@ -277,6 +277,7 @@ void CanvasExporter::reset_state() {
   inline_image_cursor_ = 0;
   ext_gstates_.clear();
   current_pdf_ = nullptr;
+  current_page_ = nullptr;
   graphics_state_stack_.clear();
   state_ = GraphicsState{};
   canvas_mode_ = false;
@@ -287,6 +288,7 @@ void CanvasExporter::reset_state() {
   svg_patterns_.clear();
   svg_gradient_counter_ = 0;
   svg_pattern_counter_ = 0;
+  svg_clip_counter_ = 0;
   shading_resources_.clear();
   pattern_resources_.clear();
 }
@@ -319,8 +321,11 @@ CanvasExportResult CanvasExporter::export_page(const Pdf& pdf, const Page& page)
     return result;
   }
   
+  current_page_ = &page;
   image_xobjects_ = parse_xobject_resources(pdf, page.resources);
   ext_gstates_ = parse_extgstate_resources(pdf, page.resources);
+  parse_shading_resources(pdf, page.resources);
+  parse_pattern_resources(pdf, page.resources);
   inline_image_cursor_ = 0;
   TokenizedStream stream = tokenize_content_stream(content.data);
   inline_images_ = stream.inline_images;
@@ -330,6 +335,7 @@ CanvasExportResult CanvasExporter::export_page(const Pdf& pdf, const Page& page)
 
   result.commands = canvas_commands_;
   result.success = true;
+  current_page_ = nullptr;
   current_pdf_ = nullptr;
   pending_inline_mask_.reset();
   canvas_mode_ = false;
@@ -375,6 +381,12 @@ void CanvasExporter::parse_content_stream_from_tokens(const std::vector<std::str
                token == "sc" || token == "scn" || token == "G" || token == "g" ||
                token == "RG" || token == "rg" || token == "K" || token == "k") {
       handle_color_command(token, operand_stack);
+      is_operator = true;
+    } else if (token == "Do") {
+      handle_xobject_command(operand_stack);
+      is_operator = true;
+    } else if (token == "sh") {
+      handle_shading_command(operand_stack);
       is_operator = true;
     }
 
@@ -479,6 +491,40 @@ void CanvasExporter::handle_path_command(const std::string& op,
       state_.current_x = x3;
       state_.current_y = y3;
     } catch (...) {}
+  } else if (op == "v" && operands.size() >= 4) {
+    // Curve with first control point = current point
+    try {
+      double x2 = std::stod(operands[0]);
+      double y2 = std::stod(operands[1]);
+      double x3 = std::stod(operands[2]);
+      double y3 = std::stod(operands[3]);
+      transform_coordinates(x2, y2);
+      transform_coordinates(x3, y3);
+      add_canvas_command("bezierCurveTo", {
+        double_to_string(state_.current_x), double_to_string(state_.current_y),
+        double_to_string(x2), double_to_string(y2),
+        double_to_string(x3), double_to_string(y3)
+      });
+      state_.current_x = x3;
+      state_.current_y = y3;
+    } catch (...) {}
+  } else if (op == "y" && operands.size() >= 4) {
+    // Curve with last control point = end point
+    try {
+      double x1 = std::stod(operands[0]);
+      double y1 = std::stod(operands[1]);
+      double x3 = std::stod(operands[2]);
+      double y3 = std::stod(operands[3]);
+      transform_coordinates(x1, y1);
+      transform_coordinates(x3, y3);
+      add_canvas_command("bezierCurveTo", {
+        double_to_string(x1), double_to_string(y1),
+        double_to_string(x3), double_to_string(y3),
+        double_to_string(x3), double_to_string(y3)
+      });
+      state_.current_x = x3;
+      state_.current_y = y3;
+    } catch (...) {}
   } else if (op == "re" && operands.size() >= 4) {
     try {
       double x = std::stod(operands[0]);
@@ -486,32 +532,64 @@ void CanvasExporter::handle_path_command(const std::string& op,
       double w = std::stod(operands[2]);
       double h = std::stod(operands[3]);
       transform_coordinates(x, y);
-      add_canvas_command("rect", {
-        double_to_string(x), double_to_string(y),
-        double_to_string(w), double_to_string(h)
-      });
       if (!state_.in_path) {
         add_canvas_command("beginPath");
         state_.in_path = true;
       }
+      add_canvas_command("rect", {
+        double_to_string(x), double_to_string(y),
+        double_to_string(w), double_to_string(h)
+      });
     } catch (...) {}
   } else if (op == "h") {
     add_canvas_command("closePath");
+  } else if (op == "W") {
+    state_.pending_clip = true;
+    state_.pending_clip_evenodd = false;
+  } else if (op == "W*") {
+    state_.pending_clip = true;
+    state_.pending_clip_evenodd = true;
   } else if (op == "S") {
+    apply_pending_clip();
     add_canvas_command("stroke");
     state_.in_path = false;
   } else if (op == "s") {
     add_canvas_command("closePath");
+    apply_pending_clip();
     add_canvas_command("stroke");
     state_.in_path = false;
   } else if (op == "f" || op == "F") {
+    apply_pending_clip();
     add_canvas_command("fill");
     state_.in_path = false;
+  } else if (op == "f*") {
+    apply_pending_clip();
+    add_canvas_command("fill", {"\"evenodd\""});
+    state_.in_path = false;
   } else if (op == "B") {
+    apply_pending_clip();
     add_canvas_command("fill");
     add_canvas_command("stroke");
     state_.in_path = false;
+  } else if (op == "B*") {
+    apply_pending_clip();
+    add_canvas_command("fill", {"\"evenodd\""});
+    add_canvas_command("stroke");
+    state_.in_path = false;
+  } else if (op == "b") {
+    add_canvas_command("closePath");
+    apply_pending_clip();
+    add_canvas_command("fill");
+    add_canvas_command("stroke");
+    state_.in_path = false;
+  } else if (op == "b*") {
+    add_canvas_command("closePath");
+    apply_pending_clip();
+    add_canvas_command("fill", {"\"evenodd\""});
+    add_canvas_command("stroke");
+    state_.in_path = false;
   } else if (op == "n") {
+    apply_pending_clip();
     state_.in_path = false;
   }
 }
@@ -548,6 +626,16 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
       apply_extended_graphics_state(name);
     }
   } else if (op == "cm" && operands.size() >= 6) {
+    try {
+      Matrix2D m;
+      m.a = std::stod(operands[0]);
+      m.b = std::stod(operands[1]);
+      m.c = std::stod(operands[2]);
+      m.d = std::stod(operands[3]);
+      m.e = std::stod(operands[4]);
+      m.f = std::stod(operands[5]);
+      state_.ctm = multiply_matrices(state_.ctm, m);
+    } catch (...) {}
     add_canvas_command("transform", {
       operands[0], operands[1], operands[2],
       operands[3], operands[4], operands[5]
@@ -603,36 +691,68 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
   }
 }
 
-void CanvasExporter::handle_color_command(const std::string& op, 
+void CanvasExporter::handle_color_command(const std::string& op,
                                         const std::vector<std::string>& operands) {
   if (op == "rg" && operands.size() >= 3) {
     try {
-      double r = std::stod(operands[0]);
-      double g = std::stod(operands[1]);
-      double b = std::stod(operands[2]);
-      state_.fill_color = rgb_to_hex(r, g, b);
+      state_.fill_color_space = "DeviceRGB";
+      state_.fill_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
       update_canvas_fill_style();
     } catch (...) {}
   } else if (op == "RG" && operands.size() >= 3) {
     try {
-      double r = std::stod(operands[0]);
-      double g = std::stod(operands[1]);
-      double b = std::stod(operands[2]);
-      state_.stroke_color = rgb_to_hex(r, g, b);
+      state_.stroke_color_space = "DeviceRGB";
+      state_.stroke_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
       update_canvas_stroke_style();
     } catch (...) {}
   } else if (op == "g" && operands.size() >= 1) {
     try {
+      state_.fill_color_space = "DeviceGray";
       double gray = std::stod(operands[0]);
       state_.fill_color = rgb_to_hex(gray, gray, gray);
       update_canvas_fill_style();
     } catch (...) {}
   } else if (op == "G" && operands.size() >= 1) {
     try {
+      state_.stroke_color_space = "DeviceGray";
       double gray = std::stod(operands[0]);
       state_.stroke_color = rgb_to_hex(gray, gray, gray);
       update_canvas_stroke_style();
     } catch (...) {}
+  } else if (op == "k" && operands.size() >= 4) {
+    try {
+      state_.fill_color_space = "DeviceCMYK";
+      state_.fill_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                                       std::stod(operands[2]), std::stod(operands[3]));
+      update_canvas_fill_style();
+    } catch (...) {}
+  } else if (op == "K" && operands.size() >= 4) {
+    try {
+      state_.stroke_color_space = "DeviceCMYK";
+      state_.stroke_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                                         std::stod(operands[2]), std::stod(operands[3]));
+      update_canvas_stroke_style();
+    } catch (...) {}
+  } else if (op == "cs" && !operands.empty()) {
+    std::string cs = operands.back();
+    if (!cs.empty() && cs.front() == '/') cs.erase(0, 1);
+    state_.fill_color_space = cs;
+  } else if (op == "CS" && !operands.empty()) {
+    std::string cs = operands.back();
+    if (!cs.empty() && cs.front() == '/') cs.erase(0, 1);
+    state_.stroke_color_space = cs;
+  } else if (op == "sc" || op == "scn") {
+    std::string color = resolve_scn_color(operands, false);
+    if (!color.empty()) {
+      state_.fill_color = color;
+      update_canvas_fill_style();
+    }
+  } else if (op == "SC" || op == "SCN") {
+    std::string color = resolve_scn_color(operands, true);
+    if (!color.empty()) {
+      state_.stroke_color = color;
+      update_canvas_stroke_style();
+    }
   }
 }
 
@@ -1984,8 +2104,11 @@ SvgExportResult CanvasExporter::export_page_to_svg(const Pdf& pdf, const Page& p
     return result;
   }
   
+  current_page_ = &page;
   image_xobjects_ = parse_xobject_resources(pdf, page.resources);
   ext_gstates_ = parse_extgstate_resources(pdf, page.resources);
+  parse_shading_resources(pdf, page.resources);
+  parse_pattern_resources(pdf, page.resources);
   inline_image_cursor_ = 0;
   TokenizedStream stream = tokenize_content_stream(content.data);
   inline_images_ = stream.inline_images;
@@ -1993,6 +2116,7 @@ SvgExportResult CanvasExporter::export_page_to_svg(const Pdf& pdf, const Page& p
 
   result.elements = svg_elements_;
   result.success = true;
+  current_page_ = nullptr;
   current_pdf_ = nullptr;
   pending_inline_mask_.reset();
   svg_mode_ = false;
@@ -2041,6 +2165,9 @@ void CanvasExporter::parse_content_stream_for_svg_from_tokens(const std::vector<
       is_operator = true;
     } else if (token == "Do") {
       handle_xobject_command_svg(operand_stack);
+      is_operator = true;
+    } else if (token == "sh") {
+      handle_shading_command_svg(operand_stack);
       is_operator = true;
     } else if (token == "BDC") {
       // Begin Marked Content with properties - check for OCG reference
@@ -2346,7 +2473,14 @@ void CanvasExporter::handle_path_command_svg(const std::string& op,
     emit_svg_path(true, true, true, false);
   } else if (op == "b*") {
     emit_svg_path(true, true, true, true);
+  } else if (op == "W") {
+    state_.pending_clip = true;
+    state_.pending_clip_evenodd = false;
+  } else if (op == "W*") {
+    state_.pending_clip = true;
+    state_.pending_clip_evenodd = true;
   } else if (op == "n") {
+    apply_pending_clip_svg();
     state_.path_data.clear();
     state_.in_path = false;
   }
@@ -2355,6 +2489,11 @@ void CanvasExporter::handle_path_command_svg(const std::string& op,
 void CanvasExporter::emit_svg_path(bool close_path, bool fill, bool stroke, bool use_evenodd) {
   if (!state_.in_path || state_.path_data.empty()) {
     return;
+  }
+
+  // Apply pending clipping path before painting
+  if (state_.pending_clip) {
+    apply_pending_clip_svg();
   }
 
   std::string path_data = state_.path_data;
@@ -2435,6 +2574,10 @@ void CanvasExporter::handle_graphics_state_command_svg(const std::string& op,
   if (op == "q") {
     graphics_state_stack_.push_back(state_);
   } else if (op == "Q") {
+    // Close any open clip groups from this save level
+    for (int i = 0; i < state_.svg_clip_group_depth; ++i) {
+      add_svg_element("/g");
+    }
     if (!graphics_state_stack_.empty()) {
       state_ = graphics_state_stack_.back();
       graphics_state_stack_.pop_back();
@@ -2514,64 +2657,60 @@ void CanvasExporter::handle_graphics_state_command_svg(const std::string& op,
   }
 }
 
-void CanvasExporter::handle_color_command_svg(const std::string& op, 
+void CanvasExporter::handle_color_command_svg(const std::string& op,
                                              const std::vector<std::string>& operands) {
   if (op == "rg" && operands.size() >= 3) {
     try {
-      double r = std::stod(operands[0]);
-      double g = std::stod(operands[1]);
-      double b = std::stod(operands[2]);
-      state_.fill_color = rgb_to_hex(r, g, b);
+      state_.fill_color_space = "DeviceRGB";
+      state_.fill_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
     } catch (...) {}
   } else if (op == "RG" && operands.size() >= 3) {
     try {
-      double r = std::stod(operands[0]);
-      double g = std::stod(operands[1]);
-      double b = std::stod(operands[2]);
-      state_.stroke_color = rgb_to_hex(r, g, b);
+      state_.stroke_color_space = "DeviceRGB";
+      state_.stroke_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
     } catch (...) {}
   } else if (op == "g" && operands.size() >= 1) {
     try {
+      state_.fill_color_space = "DeviceGray";
       double gray = std::stod(operands[0]);
       state_.fill_color = rgb_to_hex(gray, gray, gray);
     } catch (...) {}
   } else if (op == "G" && operands.size() >= 1) {
     try {
+      state_.stroke_color_space = "DeviceGray";
       double gray = std::stod(operands[0]);
       state_.stroke_color = rgb_to_hex(gray, gray, gray);
     } catch (...) {}
   } else if (op == "k" && operands.size() >= 4) {
     try {
-      double c = std::stod(operands[0]);
-      double m = std::stod(operands[1]);
-      double y = std::stod(operands[2]);
-      double k_val = std::stod(operands[3]);
-      c = std::max(0.0, std::min(1.0, c));
-      m = std::max(0.0, std::min(1.0, m));
-      y = std::max(0.0, std::min(1.0, y));
-      k_val = std::max(0.0, std::min(1.0, k_val));
-      double r = 1.0 - std::min(1.0, c + k_val);
-      double g = 1.0 - std::min(1.0, m + k_val);
-      double b = 1.0 - std::min(1.0, y + k_val);
-      state_.fill_color = rgb_to_hex(r, g, b);
-      update_canvas_fill_style();
+      state_.fill_color_space = "DeviceCMYK";
+      state_.fill_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                                       std::stod(operands[2]), std::stod(operands[3]));
     } catch (...) {}
   } else if (op == "K" && operands.size() >= 4) {
     try {
-      double c = std::stod(operands[0]);
-      double m = std::stod(operands[1]);
-      double y = std::stod(operands[2]);
-      double k_val = std::stod(operands[3]);
-      c = std::max(0.0, std::min(1.0, c));
-      m = std::max(0.0, std::min(1.0, m));
-      y = std::max(0.0, std::min(1.0, y));
-      k_val = std::max(0.0, std::min(1.0, k_val));
-      double r = 1.0 - std::min(1.0, c + k_val);
-      double g = 1.0 - std::min(1.0, m + k_val);
-      double b = 1.0 - std::min(1.0, y + k_val);
-      state_.stroke_color = rgb_to_hex(r, g, b);
-      update_canvas_stroke_style();
+      state_.stroke_color_space = "DeviceCMYK";
+      state_.stroke_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                                         std::stod(operands[2]), std::stod(operands[3]));
     } catch (...) {}
+  } else if (op == "cs" && !operands.empty()) {
+    std::string cs = operands.back();
+    if (!cs.empty() && cs.front() == '/') cs.erase(0, 1);
+    state_.fill_color_space = cs;
+  } else if (op == "CS" && !operands.empty()) {
+    std::string cs = operands.back();
+    if (!cs.empty() && cs.front() == '/') cs.erase(0, 1);
+    state_.stroke_color_space = cs;
+  } else if (op == "sc" || op == "scn") {
+    std::string color = resolve_scn_color(operands, false);
+    if (!color.empty()) {
+      state_.fill_color = color;
+    }
+  } else if (op == "SC" || op == "SCN") {
+    std::string color = resolve_scn_color(operands, true);
+    if (!color.empty()) {
+      state_.stroke_color = color;
+    }
   }
 }
 
@@ -2661,6 +2800,413 @@ void CanvasExporter::apply_extended_graphics_state(const ExtendedGraphicsState& 
     state_.blend_mode = new_mode;
     update_canvas_blend_mode();
   }
+}
+
+// Helper: apply pending clipping path in canvas mode
+void CanvasExporter::apply_pending_clip() {
+  if (!state_.pending_clip) return;
+  if (state_.pending_clip_evenodd) {
+    add_canvas_command("clip", {"\"evenodd\""});
+  } else {
+    add_canvas_command("clip");
+  }
+  state_.pending_clip = false;
+  state_.pending_clip_evenodd = false;
+}
+
+// Helper: apply pending clipping path in SVG mode
+void CanvasExporter::apply_pending_clip_svg() {
+  if (!state_.pending_clip || !state_.in_path || state_.path_data.empty()) {
+    state_.pending_clip = false;
+    state_.pending_clip_evenodd = false;
+    return;
+  }
+
+  std::string clip_id = "clip_" + std::to_string(++svg_clip_counter_);
+
+  // Emit <clipPath> definition
+  std::map<std::string, std::string> clip_attrs;
+  clip_attrs["id"] = clip_id;
+  add_svg_element("clipPath", clip_attrs);
+
+  // Emit path inside clipPath
+  std::map<std::string, std::string> path_attrs;
+  path_attrs["d"] = state_.path_data;
+  if (state_.pending_clip_evenodd) {
+    path_attrs["clip-rule"] = "evenodd";
+  }
+  add_svg_element("path", path_attrs);
+  add_svg_element("/clipPath");
+
+  // Wrap subsequent content in a <g> with clip-path
+  std::map<std::string, std::string> g_attrs;
+  g_attrs["clip-path"] = "url(#" + clip_id + ")";
+  add_svg_element("g", g_attrs);
+  state_.svg_clip_group_depth++;
+
+  state_.pending_clip = false;
+  state_.pending_clip_evenodd = false;
+}
+
+// CMYK to hex conversion helper
+std::string CanvasExporter::cmyk_to_hex(double c, double m, double y, double k) const {
+  c = std::max(0.0, std::min(1.0, c));
+  m = std::max(0.0, std::min(1.0, m));
+  y = std::max(0.0, std::min(1.0, y));
+  k = std::max(0.0, std::min(1.0, k));
+  double r = (1.0 - c) * (1.0 - k);
+  double g = (1.0 - m) * (1.0 - k);
+  double b = (1.0 - y) * (1.0 - k);
+  return rgb_to_hex(r, g, b);
+}
+
+// Resolve SC/SCN/sc/scn color based on current color space
+std::string CanvasExporter::resolve_scn_color(const std::vector<std::string>& operands,
+                                               bool is_stroking) {
+  if (operands.empty()) return "";
+
+  const std::string& cs = is_stroking ? state_.stroke_color_space : state_.fill_color_space;
+
+  // Check if last operand is a pattern name (starts with /)
+  std::string last = operands.back();
+  if (!last.empty() && last.front() == '/') {
+    // Pattern color space - look up pattern resource
+    std::string pat_name = last.substr(1);
+    auto it = pattern_resources_.find(pat_name);
+    if (it != pattern_resources_.end()) {
+      // For SVG mode, create gradient/pattern reference
+      if (svg_mode_) {
+        return create_svg_pattern(it->second, state_.ctm);
+      }
+      // For canvas mode, try to create gradient from shading pattern
+      // (Canvas doesn't support tiling patterns natively)
+      return create_svg_gradient(it->second, state_.ctm);
+    }
+    return "";
+  }
+
+  try {
+    if ((cs == "DeviceGray" || cs == "CalGray") && operands.size() >= 1) {
+      double gray = std::stod(operands[0]);
+      return rgb_to_hex(gray, gray, gray);
+    } else if ((cs == "DeviceRGB" || cs == "CalRGB") && operands.size() >= 3) {
+      return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
+    } else if (cs == "DeviceCMYK") {
+      if (operands.size() >= 4) {
+        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                           std::stod(operands[2]), std::stod(operands[3]));
+      }
+    } else if (cs == "ICCBased" || cs == "Indexed" || cs == "Separation" || cs == "DeviceN") {
+      // Best effort: interpret based on operand count
+      if (operands.size() >= 4) {
+        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                           std::stod(operands[2]), std::stod(operands[3]));
+      } else if (operands.size() >= 3) {
+        return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
+      } else if (operands.size() >= 1) {
+        double gray = std::stod(operands[0]);
+        return rgb_to_hex(gray, gray, gray);
+      }
+    } else {
+      // Unknown color space - guess from operand count
+      if (operands.size() >= 4) {
+        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                           std::stod(operands[2]), std::stod(operands[3]));
+      } else if (operands.size() >= 3) {
+        return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
+      } else if (operands.size() >= 1) {
+        double gray = std::stod(operands[0]);
+        return rgb_to_hex(gray, gray, gray);
+      }
+    }
+  } catch (...) {}
+  return "";
+}
+
+// Canvas mode: Do operator - render Form XObjects
+void CanvasExporter::handle_xobject_command(const std::vector<std::string>& operands) {
+  if (operands.empty() || !current_pdf_) return;
+
+  std::string name = operands.back();
+  if (!name.empty() && name.front() == '/') name.erase(0, 1);
+
+  // Try as Image XObject first
+  auto img_it = image_xobjects_.find(name);
+  if (img_it != image_xobjects_.end()) {
+    // Image rendering - delegate to existing canvas image pipeline
+    const auto& image = img_it->second;
+    std::vector<uint8_t> pixels;
+    int components = 0;
+    if (prepare_image_pixels(image, pixels, components)) {
+      // Encode to PNG data URL and emit drawImage
+      std::vector<uint8_t> png_data;
+      int w = image.width;
+      int h = image.height;
+      if (components == 1) {
+        // Expand grayscale to RGB for PNG
+        std::vector<uint8_t> rgb(w * h * 3);
+        for (int i = 0; i < w * h; ++i) {
+          rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = pixels[i];
+        }
+        pixels = std::move(rgb);
+        components = 3;
+      }
+      // Use stb to write PNG
+      int stride = w * components;
+      auto write_func = [](void* ctx, void* data, int size) {
+        auto* out = static_cast<std::vector<uint8_t>*>(ctx);
+        auto* bytes = static_cast<uint8_t*>(data);
+        out->insert(out->end(), bytes, bytes + size);
+      };
+      stbi_write_png_to_func(write_func, &png_data, w, h, components,
+                              pixels.data(), stride);
+      if (!png_data.empty()) {
+        std::string data_url = "data:image/png;base64," + base64_encode(png_data);
+        queue_canvas_image(
+          static_cast<double>(w), 0.0, 0.0, static_cast<double>(h),
+          0.0, 0.0, data_url);
+      }
+    }
+    return;
+  }
+
+  // Try as Form XObject
+  const auto& pages = current_pdf_->catalog.pages;
+  for (const auto& page : pages) {
+    auto xobj_it = page.resources.find("XObject");
+    if (xobj_it == page.resources.end() || xobj_it->second.type != Value::DICTIONARY)
+      continue;
+    auto form_it = xobj_it->second.dict.find(name);
+    if (form_it == xobj_it->second.dict.end()) continue;
+
+    const Value& xobj_ref = form_it->second;
+    Value resolved;
+    if (xobj_ref.type == Value::REFERENCE) {
+      ResolvedObject res = resolve_reference(*current_pdf_, xobj_ref.ref_object_number,
+                                              xobj_ref.ref_generation_number);
+      if (!res.success) continue;
+      resolved = std::move(res.value);
+    } else {
+      resolved = xobj_ref;
+    }
+    if (resolved.type != Value::STREAM) continue;
+
+    auto subtype_it = resolved.stream.dict.find("Subtype");
+    if (subtype_it == resolved.stream.dict.end() ||
+        subtype_it->second.type != Value::NAME ||
+        subtype_it->second.name != "Form")
+      continue;
+
+    uint32_t obj_num = (xobj_ref.type == Value::REFERENCE) ? xobj_ref.ref_object_number : 0;
+    uint16_t gen_num = (xobj_ref.type == Value::REFERENCE) ? xobj_ref.ref_generation_number : 0;
+    DecodedStream decoded = decode_stream(*current_pdf_, resolved, obj_num, gen_num);
+    if (!decoded.success || decoded.data.empty()) continue;
+
+    // Save state
+    add_canvas_command("save");
+    graphics_state_stack_.push_back(state_);
+
+    // Apply transparency group attributes
+    auto group_it = resolved.stream.dict.find("Group");
+    if (group_it != resolved.stream.dict.end()) {
+      const Value* group_val = &group_it->second;
+      Value group_resolved;
+      if (group_val->type == Value::REFERENCE) {
+        ResolvedObject gr = resolve_reference(*current_pdf_, group_val->ref_object_number,
+                                               group_val->ref_generation_number);
+        if (gr.success) {
+          group_resolved = std::move(gr.value);
+          group_val = &group_resolved;
+        }
+      }
+      // Transparency group opacity
+      double opacity = std::min(state_.fill_alpha, state_.stroke_alpha);
+      if (std::abs(opacity - 1.0) > 1e-6) {
+        add_canvas_command("globalAlpha", {double_to_string(opacity)});
+      }
+    }
+
+    // Apply Form XObject matrix
+    auto matrix_it = resolved.stream.dict.find("Matrix");
+    if (matrix_it != resolved.stream.dict.end() &&
+        matrix_it->second.type == Value::ARRAY &&
+        matrix_it->second.array.size() >= 6) {
+      const auto& m = matrix_it->second.array;
+      if (m[0].type == Value::NUMBER && m[1].type == Value::NUMBER &&
+          m[2].type == Value::NUMBER && m[3].type == Value::NUMBER &&
+          m[4].type == Value::NUMBER && m[5].type == Value::NUMBER) {
+        add_canvas_command("transform", {
+          double_to_string(m[0].number), double_to_string(m[1].number),
+          double_to_string(m[2].number), double_to_string(m[3].number),
+          double_to_string(m[4].number), double_to_string(m[5].number)
+        });
+      }
+    }
+
+    // Load Form XObject resources
+    auto res_it = resolved.stream.dict.find("Resources");
+    if (res_it != resolved.stream.dict.end()) {
+      const Value* res_val = &res_it->second;
+      Value res_resolved;
+      if (res_val->type == Value::REFERENCE) {
+        ResolvedObject rr = resolve_reference(*current_pdf_, res_val->ref_object_number,
+                                               res_val->ref_generation_number);
+        if (rr.success) {
+          res_resolved = std::move(rr.value);
+          res_val = &res_resolved;
+        }
+      }
+      if (res_val->type == Value::DICTIONARY) {
+        auto form_images = parse_xobject_resources(*current_pdf_, res_val->dict);
+        for (auto& img_pair : form_images) {
+          image_xobjects_[img_pair.first] = std::move(img_pair.second);
+        }
+        auto gs_it = res_val->dict.find("ExtGState");
+        if (gs_it != res_val->dict.end() && gs_it->second.type == Value::DICTIONARY) {
+          for (const auto& gs_entry : gs_it->second.dict) {
+            const Value* gs_val = &gs_entry.second;
+            Value gs_resolved;
+            if (gs_val->type == Value::REFERENCE) {
+              ResolvedObject gr = resolve_reference(*current_pdf_, gs_val->ref_object_number,
+                                                     gs_val->ref_generation_number);
+              if (gr.success) {
+                gs_resolved = std::move(gr.value);
+                gs_val = &gs_resolved;
+              }
+            }
+            if (gs_val->type == Value::DICTIONARY) {
+              ext_gstates_[gs_entry.first] = parse_ext_gstate(*current_pdf_, gs_val->dict);
+            }
+          }
+        }
+        parse_shading_resources(*current_pdf_, res_val->dict);
+        parse_pattern_resources(*current_pdf_, res_val->dict);
+      }
+    }
+
+    // Parse Form content
+    TokenizedStream form_stream = tokenize_content_stream(decoded.data);
+    for (auto& img : form_stream.inline_images) {
+      inline_images_.push_back(std::move(img));
+    }
+    parse_content_stream_from_tokens(form_stream.tokens);
+
+    // Restore state
+    if (!graphics_state_stack_.empty()) {
+      state_ = graphics_state_stack_.back();
+      graphics_state_stack_.pop_back();
+    }
+    add_canvas_command("restore");
+    return;
+  }
+}
+
+// Canvas mode: sh operator - paint shading directly
+void CanvasExporter::handle_shading_command(const std::vector<std::string>& operands) {
+  if (operands.empty() || !current_pdf_) return;
+
+  std::string name = operands.back();
+  if (!name.empty() && name.front() == '/') name.erase(0, 1);
+
+  auto it = shading_resources_.find(name);
+  if (it == shading_resources_.end()) return;
+
+  // For canvas, we approximate shadings by creating a gradient fill over the page
+  // Save state, fill entire page with the shading gradient
+  add_canvas_command("save");
+
+  std::string grad_ref = create_svg_gradient(it->second, state_.ctm);
+  // Canvas API doesn't directly support SVG gradient references,
+  // so we approximate: extract gradient colors and use a linear/radial gradient
+  // For now, use the shading's background color or first stop color as a fill
+  Value shading = it->second;
+  if (shading.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_, shading.ref_object_number,
+                                       shading.ref_generation_number);
+    if (resolved.success) shading = resolved.value;
+  }
+
+  const Dictionary& dict = (shading.type == Value::STREAM) ? shading.stream.dict : shading.dict;
+  auto bg_it = dict.find("Background");
+  if (bg_it != dict.end() && bg_it->second.type == Value::ARRAY && bg_it->second.array.size() >= 3) {
+    const auto& bg = bg_it->second.array;
+    if (bg[0].type == Value::NUMBER && bg[1].type == Value::NUMBER && bg[2].type == Value::NUMBER) {
+      std::string color = rgb_to_hex(bg[0].number, bg[1].number, bg[2].number);
+      add_canvas_command("fillStyle", {canvas_color_string(color, state_.fill_alpha)});
+      add_canvas_command("fillRect", {"0", "0", double_to_string(page_width_), double_to_string(page_height_)});
+    }
+  }
+
+  // Emit createLinearGradient/createRadialGradient canvas commands
+  auto type_it = dict.find("ShadingType");
+  if (type_it != dict.end() && type_it->second.type == Value::NUMBER) {
+    int stype = static_cast<int>(type_it->second.number);
+    auto coords_it = dict.find("Coords");
+    if (coords_it != dict.end() && coords_it->second.type == Value::ARRAY) {
+      const auto& coords = coords_it->second.array;
+      if (stype == 2 && coords.size() >= 4) {
+        double x0 = (coords[0].type == Value::NUMBER) ? coords[0].number : 0;
+        double y0 = (coords[1].type == Value::NUMBER) ? coords[1].number : 0;
+        double x1 = (coords[2].type == Value::NUMBER) ? coords[2].number : 0;
+        double y1 = (coords[3].type == Value::NUMBER) ? coords[3].number : 0;
+        apply_matrix_to_point(state_.ctm, x0, y0);
+        apply_matrix_to_point(state_.ctm, x1, y1);
+        add_canvas_command("createLinearGradient", {
+          double_to_string(x0), double_to_string(page_height_ - y0),
+          double_to_string(x1), double_to_string(page_height_ - y1)
+        });
+      } else if (stype == 3 && coords.size() >= 6) {
+        double x0 = (coords[0].type == Value::NUMBER) ? coords[0].number : 0;
+        double y0 = (coords[1].type == Value::NUMBER) ? coords[1].number : 0;
+        double r0 = (coords[2].type == Value::NUMBER) ? coords[2].number : 0;
+        double x1 = (coords[3].type == Value::NUMBER) ? coords[3].number : 0;
+        double y1 = (coords[4].type == Value::NUMBER) ? coords[4].number : 0;
+        double r1 = (coords[5].type == Value::NUMBER) ? coords[5].number : 0;
+        apply_matrix_to_point(state_.ctm, x0, y0);
+        apply_matrix_to_point(state_.ctm, x1, y1);
+        double scale_x = std::sqrt(state_.ctm.a * state_.ctm.a + state_.ctm.b * state_.ctm.b);
+        double scale_y = std::sqrt(state_.ctm.c * state_.ctm.c + state_.ctm.d * state_.ctm.d);
+        double scale = (scale_x + scale_y) * 0.5;
+        add_canvas_command("createRadialGradient", {
+          double_to_string(x0), double_to_string(page_height_ - y0), double_to_string(r0 * scale),
+          double_to_string(x1), double_to_string(page_height_ - y1), double_to_string(r1 * scale)
+        });
+      }
+    }
+  }
+
+  add_canvas_command("restore");
+}
+
+// SVG mode: sh operator - paint shading as a filled rect with gradient
+void CanvasExporter::handle_shading_command_svg(const std::vector<std::string>& operands) {
+  if (ocg_skip_depth_ > 0) return;
+  if (operands.empty() || !current_pdf_) return;
+
+  std::string name = operands.back();
+  if (!name.empty() && name.front() == '/') name.erase(0, 1);
+
+  auto it = shading_resources_.find(name);
+  if (it == shading_resources_.end()) return;
+
+  std::string fill_ref = create_svg_gradient(it->second, state_.ctm);
+  if (fill_ref.empty()) return;
+
+  // Emit a rect covering the page filled with the gradient
+  std::map<std::string, std::string> attrs;
+  attrs["x"] = "0";
+  attrs["y"] = "0";
+  attrs["width"] = double_to_string(page_width_);
+  attrs["height"] = double_to_string(page_height_);
+  attrs["fill"] = fill_ref;
+  if (std::abs(state_.fill_alpha - 1.0) > 1e-6) {
+    attrs["fill-opacity"] = double_to_string(state_.fill_alpha);
+  }
+  std::string css_mode = blend_mode_to_css(state_.blend_mode);
+  if (!css_mode.empty()) {
+    attrs["style"] = "mix-blend-mode:" + css_mode + ';';
+  }
+  add_svg_element("rect", attrs);
 }
 
 void CanvasExporter::handle_xobject_command_svg(const std::vector<std::string>& operands) {
