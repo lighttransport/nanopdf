@@ -6007,7 +6007,16 @@ private:
     if (cmap.name.empty()) {
       return false;
     }
-    return cmap.name == "Identity-H" || cmap.name == "Identity-V";
+    if (cmap.name == "Identity-H" || cmap.name == "Identity-V") {
+      return true;
+    }
+    // UTF16-based predefined CMaps: CID values are Unicode code points,
+    // so they can be decoded the same way as Identity CMaps.
+    if (cmap.name.find("-UTF16-") != std::string::npos ||
+        cmap.name.find("-UCS2-") != std::string::npos) {
+      return true;
+    }
+    return false;
   }
 
   std::string decode_utf16be(const std::string& raw) {

@@ -15,6 +15,7 @@
 #endif
 
 #include "canvas-exporter.hh"
+#include "pdf-function.hh"
 #include "common-macros.inc"
 #include "stb_image_write.h"
 
@@ -3918,7 +3919,7 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
                           ? static_cast<int>(func_type_it->second.number) : -1;
 
       if (func_type == 2) {
-        // Type 2: Exponential interpolation - two stops
+        // Type 2: Exponential interpolation - two stops (fast path)
         std::vector<double> c0, c1;
         extract_type2_colors(*fd, c0, c1);
         gradient.stops.push_back({0.0, components_to_hex(c0, num_components), 1.0});
@@ -3927,13 +3928,11 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
         // Type 3: Stitching function - multi-stop gradient
         auto bounds_it = fd->find("Bounds");
         auto funcs_it = fd->find("Functions");
-        auto encode_it = fd->find("Encode");
 
         if (funcs_it != fd->end() && funcs_it->second.type == Value::ARRAY) {
           const auto& sub_funcs = funcs_it->second.array;
           size_t n = sub_funcs.size();
 
-          // Get domain (default 0..1)
           double domain_min = 0.0, domain_max = 1.0;
           auto domain_it = fd->find("Domain");
           if (domain_it != fd->end() && domain_it->second.type == Value::ARRAY &&
@@ -3946,7 +3945,6 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
           double domain_range = domain_max - domain_min;
           if (domain_range <= 0.0) domain_range = 1.0;
 
-          // Get bounds array
           std::vector<double> bounds;
           if (bounds_it != fd->end() && bounds_it->second.type == Value::ARRAY) {
             for (const auto& bv : bounds_it->second.array) {
@@ -3954,71 +3952,57 @@ std::string CanvasExporter::create_svg_gradient(const Value& shading_val, const 
             }
           }
 
-          // For each sub-function, extract its C0 and C1 and map to gradient offsets
-          // Boundaries define: [domain_min, bounds[0], bounds[1], ..., domain_max]
           for (size_t i = 0; i < n; ++i) {
-            Value sf = resolve_func(sub_funcs[i]);
-            const Dictionary* sfd = nullptr;
-            if (sf.type == Value::DICTIONARY) sfd = &sf.dict;
-            else if (sf.type == Value::STREAM) sfd = &sf.stream.dict;
-            if (!sfd) continue;
-
             double seg_start = (i == 0) ? domain_min : (i - 1 < bounds.size() ? bounds[i - 1] : domain_min);
             double seg_end = (i < bounds.size()) ? bounds[i] : domain_max;
-
-            // Normalize to 0..1
             double offset_start = (seg_start - domain_min) / domain_range;
             double offset_end = (seg_end - domain_min) / domain_range;
 
-            auto sf_type_it = sfd->find("FunctionType");
-            int sf_type = (sf_type_it != sfd->end() && sf_type_it->second.type == Value::NUMBER)
-                             ? static_cast<int>(sf_type_it->second.number) : -1;
+            Value sf = resolve_func(sub_funcs[i]);
+            // Use pdfunc::evaluate for all sub-function types
+            std::vector<double> c0_out, c1_out;
+            bool got_c0 = pdfunc::evaluate(*current_pdf_, sf, {seg_start}, c0_out);
+            bool got_c1 = pdfunc::evaluate(*current_pdf_, sf, {seg_end}, c1_out);
+            if (!got_c0) c0_out.assign(num_components, 0.0);
+            if (!got_c1) c1_out.assign(num_components, 0.0);
 
-            if (sf_type == 2) {
-              std::vector<double> c0, c1;
-              extract_type2_colors(*sfd, c0, c1);
-              // Add start stop (avoid duplicating the first stop on subsequent segments)
-              if (i == 0 || gradient.stops.empty() ||
-                  std::abs(gradient.stops.back().offset - offset_start) > 1e-6) {
-                gradient.stops.push_back({offset_start, components_to_hex(c0, num_components), 1.0});
-              }
-              gradient.stops.push_back({offset_end, components_to_hex(c1, num_components), 1.0});
-            } else {
-              // Unknown sub-function type: add placeholder stops
-              if (gradient.stops.empty()) {
-                gradient.stops.push_back({offset_start, "#000000", 1.0});
-              }
-              gradient.stops.push_back({offset_end, "#000000", 1.0});
+            if (i == 0 || gradient.stops.empty() ||
+                std::abs(gradient.stops.back().offset - offset_start) > 1e-6) {
+              gradient.stops.push_back({offset_start, components_to_hex(c0_out, num_components), 1.0});
             }
+            gradient.stops.push_back({offset_end, components_to_hex(c1_out, num_components), 1.0});
+          }
+        }
+      } else if (func_type == 0 || func_type == 4) {
+        // Type 0 (sampled) or Type 4 (PostScript calculator)
+        // Sample the function at multiple points to build gradient stops
+        const int n_samples = 8;
+        for (int i = 0; i <= n_samples; ++i) {
+          double t = static_cast<double>(i) / n_samples;
+          std::vector<double> outputs;
+          if (pdfunc::evaluate(*current_pdf_, func, {t}, outputs)) {
+            gradient.stops.push_back({t, components_to_hex(outputs, num_components), 1.0});
           }
         }
       }
     } else if (func.type == Value::ARRAY) {
       // Function array - one function per color component
-      // Evaluate at t=0 and t=1 to get endpoint colors
-      std::vector<double> c0_vals, c1_vals;
-      for (const auto& fn_ref : func.array) {
-        Value fn = resolve_func(fn_ref);
-        const Dictionary* fnd = nullptr;
-        if (fn.type == Value::DICTIONARY) fnd = &fn.dict;
-        else if (fn.type == Value::STREAM) fnd = &fn.stream.dict;
-        if (!fnd) { c0_vals.push_back(0.0); c1_vals.push_back(1.0); continue; }
-
-        auto ft_it = fnd->find("FunctionType");
-        int ft = (ft_it != fnd->end() && ft_it->second.type == Value::NUMBER)
-                    ? static_cast<int>(ft_it->second.number) : -1;
-        if (ft == 2) {
-          std::vector<double> c0, c1;
-          extract_type2_colors(*fnd, c0, c1);
-          c0_vals.push_back(c0.empty() ? 0.0 : c0[0]);
-          c1_vals.push_back(c1.empty() ? 1.0 : c1[0]);
-        } else {
-          c0_vals.push_back(0.0);
-          c1_vals.push_back(1.0);
+      // Sample at multiple points using pdfunc::evaluate
+      const int n_samples = 8;
+      for (int s = 0; s <= n_samples; ++s) {
+        double t = static_cast<double>(s) / n_samples;
+        std::vector<double> color_vals;
+        for (const auto& fn_ref : func.array) {
+          Value fn = resolve_func(fn_ref);
+          std::vector<double> out;
+          if (pdfunc::evaluate(*current_pdf_, fn, {t}, out) && !out.empty()) {
+            color_vals.push_back(out[0]);
+          } else {
+            color_vals.push_back(t);  // fallback: linear
+          }
         }
+        gradient.stops.push_back({t, components_to_hex(color_vals, num_components), 1.0});
       }
-      gradient.stops.push_back({0.0, components_to_hex(c0_vals, num_components), 1.0});
-      gradient.stops.push_back({1.0, components_to_hex(c1_vals, num_components), 1.0});
     }
   }
 
@@ -4137,16 +4121,89 @@ std::string CanvasExporter::create_svg_pattern(const Value& pattern_val, const M
     svg_pattern.transform = transform.str();
   }
 
-  // For tiling patterns, add a simple rectangle as placeholder
-  // A full implementation would parse the pattern's content stream
-  SvgElement rect("rect");
-  rect.attributes["x"] = "0";
-  rect.attributes["y"] = "0";
-  rect.attributes["width"] = double_to_string(svg_pattern.width);
-  rect.attributes["height"] = double_to_string(svg_pattern.height);
-  rect.attributes["fill"] = "#808080";
-  rect.attributes["fill-opacity"] = "0.5";
-  svg_pattern.content.push_back(rect);
+  // Render tiling pattern content stream
+  bool rendered_content = false;
+  if (pattern.type == Value::STREAM && current_pdf_) {
+    auto decoded = decode_stream(*current_pdf_, pattern);
+    if (decoded.success && !decoded.data.empty()) {
+      // Save current SVG state
+      auto saved_elements = std::move(svg_elements_);
+      auto saved_state = state_;
+      auto saved_ext_gstates = ext_gstates_;
+      auto saved_images = image_xobjects_;
+      svg_elements_.clear();
+
+      // Reset state for pattern rendering
+      state_ = GraphicsState();
+      state_.fill_color = "#000000";
+      state_.stroke_color = "#000000";
+
+      // Load pattern's own resources if present
+      auto resources_it = dict.find("Resources");
+      if (resources_it != dict.end()) {
+        const Value* res_val = &resources_it->second;
+        Value res_resolved;
+        if (res_val->type == Value::REFERENCE) {
+          auto rr = resolve_reference(*current_pdf_, res_val->ref_object_number,
+                                       res_val->ref_generation_number);
+          if (rr.success) {
+            res_resolved = std::move(rr.value);
+            res_val = &res_resolved;
+          }
+        }
+        if (res_val->type == Value::DICTIONARY) {
+          auto form_images = parse_xobject_resources(*current_pdf_, res_val->dict);
+          for (auto& img_pair : form_images)
+            image_xobjects_[img_pair.first] = std::move(img_pair.second);
+
+          auto gs_it = res_val->dict.find("ExtGState");
+          if (gs_it != res_val->dict.end() && gs_it->second.type == Value::DICTIONARY) {
+            for (const auto& gs_entry : gs_it->second.dict) {
+              const Value* gs_val = &gs_entry.second;
+              Value gs_res_val;
+              if (gs_val->type == Value::REFERENCE) {
+                auto gr = resolve_reference(*current_pdf_, gs_val->ref_object_number,
+                                             gs_val->ref_generation_number);
+                if (gr.success) { gs_res_val = std::move(gr.value); gs_val = &gs_res_val; }
+              }
+              if (gs_val->type == Value::DICTIONARY)
+                ext_gstates_[gs_entry.first] = parse_ext_gstate(*current_pdf_, gs_val->dict);
+            }
+          }
+          parse_shading_resources(*current_pdf_, res_val->dict);
+          parse_pattern_resources(*current_pdf_, res_val->dict);
+        }
+      }
+
+      // Tokenize and render content stream
+      TokenizedStream pat_stream = tokenize_content_stream(decoded.data);
+      for (auto& img : pat_stream.inline_images)
+        inline_images_.push_back(std::move(img));
+      parse_content_stream_for_svg_from_tokens(pat_stream.tokens);
+
+      // Collect rendered SVG elements as pattern content
+      svg_pattern.content = std::move(svg_elements_);
+      rendered_content = !svg_pattern.content.empty();
+
+      // Restore state
+      svg_elements_ = std::move(saved_elements);
+      state_ = saved_state;
+      ext_gstates_ = std::move(saved_ext_gstates);
+      image_xobjects_ = std::move(saved_images);
+    }
+  }
+
+  if (!rendered_content) {
+    // Fallback: simple colored rectangle
+    SvgElement rect("rect");
+    rect.attributes["x"] = "0";
+    rect.attributes["y"] = "0";
+    rect.attributes["width"] = double_to_string(svg_pattern.width);
+    rect.attributes["height"] = double_to_string(svg_pattern.height);
+    rect.attributes["fill"] = "#808080";
+    rect.attributes["fill-opacity"] = "0.5";
+    svg_pattern.content.push_back(rect);
+  }
 
   svg_patterns_.push_back(svg_pattern);
   return "url(#" + svg_pattern.id + ")";
