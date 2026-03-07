@@ -2058,16 +2058,34 @@ std::string CanvasExporter::commands_to_javascript(const std::vector<CanvasComma
   js << "canvas.width = " << page_width_ << ";\n";
   js << "canvas.height = " << page_height_ << ";\n\n";
   
+  int gradient_counter = 0;
   for (const CanvasCommand& cmd : commands) {
     if (cmd.args.empty()) {
       js << "ctx." << cmd.command << "();\n";
-    } else if (cmd.command == "fillStyle" || cmd.command == "strokeStyle" || 
+    } else if (cmd.command == "fillStyle" || cmd.command == "strokeStyle" ||
                cmd.command == "font") {
       js << "ctx." << cmd.command << " = " << cmd.args[0] << ";\n";
     } else if (cmd.command == "lineWidth" || cmd.command == "lineCap" ||
                cmd.command == "lineJoin" || cmd.command == "miterLimit" ||
-               cmd.command == "lineDashOffset") {
+               cmd.command == "lineDashOffset" || cmd.command == "globalAlpha" ||
+               cmd.command == "globalCompositeOperation") {
       js << "ctx." << cmd.command << " = " << cmd.args[0] << ";\n";
+    } else if (cmd.command == "createLinearGradient" || cmd.command == "createRadialGradient") {
+      ++gradient_counter;
+      js << "var _grad" << gradient_counter << " = ctx." << cmd.command << "(";
+      for (size_t i = 0; i < cmd.args.size(); ++i) {
+        if (i > 0) js << ", ";
+        js << cmd.args[i];
+      }
+      js << ");\n";
+    } else if (cmd.command == "addColorStop") {
+      if (gradient_counter > 0 && cmd.args.size() >= 2) {
+        js << "_grad" << gradient_counter << ".addColorStop(" << cmd.args[0] << ", " << cmd.args[1] << ");\n";
+      }
+    } else if (cmd.command == "fillGradient") {
+      if (gradient_counter > 0) {
+        js << "ctx.fillStyle = _grad" << gradient_counter << ";\n";
+      }
     } else {
       js << "ctx." << cmd.command << "(";
       for (size_t i = 0; i < cmd.args.size(); ++i) {
@@ -3659,16 +3677,27 @@ std::string CanvasExporter::svg_to_markup(const std::vector<SvgElement>& element
   }
 
   for (const SvgElement& elem : elements) {
+    // Handle closing tags (element_type starts with '/')
+    if (!elem.element_type.empty() && elem.element_type[0] == '/') {
+      svg << "  <" << elem.element_type << ">\n";
+      continue;
+    }
+
     svg << "  <" << elem.element_type;
     for (const auto& attr : elem.attributes) {
       svg << " " << attr.first << "=\"" << escape_xml_string(attr.second) << "\"";
     }
 
-    if (elem.text_content.empty()) {
-      svg << " />\n";
-    } else {
+    // Elements that can contain children (g, clipPath, etc.) should not self-close
+    bool is_container = (elem.element_type == "g" || elem.element_type == "clipPath" ||
+                         elem.element_type == "defs" || elem.element_type == "svg");
+    if (!elem.text_content.empty()) {
       svg << ">" << escape_xml_string(elem.text_content)
           << "</" << elem.element_type << ">\n";
+    } else if (is_container) {
+      svg << ">\n";
+    } else {
+      svg << " />\n";
     }
   }
 
