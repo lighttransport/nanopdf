@@ -70,7 +70,318 @@ inline float read_u8Fixed8(const uint8_t* data) {
   return static_cast<float>(raw) / 256.0f;
 }
 
+// Rec.2020 OETF (forward: linear → encoded)
+inline float rec2020_oetf(float L) {
+  const float alpha = 1.09929682680944f;
+  const float beta = 0.018053968510807f;
+  if (L < beta) {
+    return 4.5f * L;
+  }
+  return alpha * std::pow(L, 0.45f) - (alpha - 1.0f);
+}
+
+// Rec.2020 inverse OETF (encoded → linear)
+inline float rec2020_inv_oetf(float V) {
+  const float alpha = 1.09929682680944f;
+  const float beta_v = 4.5f * 0.018053968510807f;
+  if (V < beta_v) {
+    return V / 4.5f;
+  }
+  return std::pow((V + (alpha - 1.0f)) / alpha, 1.0f / 0.45f);
+}
+
 }  // namespace
+
+// ============================================================================
+// Color space definitions
+// ============================================================================
+
+// D65 white point: x=0.3127, y=0.3290
+// D60 (ACES): x=0.32168, y=0.33767
+
+static const RGBColorSpaceDef kColorSpaceDefs[] = {
+  // sRGB / Rec.709 primaries, sRGB transfer
+  {"sRGB",
+   0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f,
+   0.3127f, 0.3290f,
+   true, false, 2.2f, false},
+
+  // Linear sRGB
+  {"Linear sRGB",
+   0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f,
+   0.3127f, 0.3290f,
+   false, false, 1.0f, true},
+
+  // Rec.709 (BT.1886 gamma 2.4)
+  {"Rec. 709",
+   0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f,
+   0.3127f, 0.3290f,
+   false, false, 2.4f, false},
+
+  // Linear Rec.709
+  {"Linear Rec. 709",
+   0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f,
+   0.3127f, 0.3290f,
+   false, false, 1.0f, true},
+
+  // Display P3 (DCI-P3 primaries, sRGB transfer, D65)
+  {"Display P3",
+   0.6800f, 0.3200f, 0.2650f, 0.6900f, 0.1500f, 0.0600f,
+   0.3127f, 0.3290f,
+   true, false, 2.2f, false},
+
+  // Linear Display P3
+  {"Linear Display P3",
+   0.6800f, 0.3200f, 0.2650f, 0.6900f, 0.1500f, 0.0600f,
+   0.3127f, 0.3290f,
+   false, false, 1.0f, true},
+
+  // Rec.2020 with BT.2020 transfer
+  {"Rec. 2020",
+   0.7080f, 0.2920f, 0.1700f, 0.7970f, 0.1310f, 0.0460f,
+   0.3127f, 0.3290f,
+   false, true, 2.2f, false},
+
+  // Linear Rec.2020
+  {"Linear Rec. 2020",
+   0.7080f, 0.2920f, 0.1700f, 0.7970f, 0.1310f, 0.0460f,
+   0.3127f, 0.3290f,
+   false, false, 1.0f, true},
+
+  // ACEScg (AP1 primaries, linear, D60)
+  {"ACEScg",
+   0.7130f, 0.2930f, 0.1650f, 0.8300f, 0.1280f, 0.0440f,
+   0.32168f, 0.33767f,
+   false, false, 1.0f, true},
+
+  // ACES 2065-1 (AP0 primaries, linear, D60)
+  {"ACES 2065-1",
+   0.7347f, 0.2653f, 0.0000f, 1.0000f, 0.0001f, -0.0770f,
+   0.32168f, 0.33767f,
+   false, false, 1.0f, true},
+};
+
+const RGBColorSpaceDef& get_color_space_def(RGBColorSpace cs) {
+  return kColorSpaceDefs[static_cast<int>(cs)];
+}
+
+const char* color_space_name(RGBColorSpace cs) {
+  return kColorSpaceDefs[static_cast<int>(cs)].name;
+}
+
+// ============================================================================
+// Matrix3x3 implementation
+// ============================================================================
+
+Matrix3x3 Matrix3x3::operator*(const Matrix3x3& rhs) const {
+  Matrix3x3 r;
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      r.m[row * 3 + col] = m[row * 3 + 0] * rhs.m[0 * 3 + col] +
+                            m[row * 3 + 1] * rhs.m[1 * 3 + col] +
+                            m[row * 3 + 2] * rhs.m[2 * 3 + col];
+    }
+  }
+  return r;
+}
+
+void Matrix3x3::apply(float x, float y, float z,
+                       float& ox, float& oy, float& oz) const {
+  ox = m[0] * x + m[1] * y + m[2] * z;
+  oy = m[3] * x + m[4] * y + m[5] * z;
+  oz = m[6] * x + m[7] * y + m[8] * z;
+}
+
+namespace {
+
+// Invert a 3x3 matrix. Returns false if singular.
+bool invert3x3(const float* src, float* dst) {
+  float det = src[0] * (src[4] * src[8] - src[5] * src[7]) -
+              src[1] * (src[3] * src[8] - src[5] * src[6]) +
+              src[2] * (src[3] * src[7] - src[4] * src[6]);
+  if (std::abs(det) < 1e-12f) return false;
+  float inv_det = 1.0f / det;
+  dst[0] = (src[4] * src[8] - src[5] * src[7]) * inv_det;
+  dst[1] = (src[2] * src[7] - src[1] * src[8]) * inv_det;
+  dst[2] = (src[1] * src[5] - src[2] * src[4]) * inv_det;
+  dst[3] = (src[5] * src[6] - src[3] * src[8]) * inv_det;
+  dst[4] = (src[0] * src[8] - src[2] * src[6]) * inv_det;
+  dst[5] = (src[2] * src[3] - src[0] * src[5]) * inv_det;
+  dst[6] = (src[3] * src[7] - src[4] * src[6]) * inv_det;
+  dst[7] = (src[1] * src[6] - src[0] * src[7]) * inv_det;
+  dst[8] = (src[0] * src[4] - src[1] * src[3]) * inv_det;
+  return true;
+}
+
+// Bradford chromatic adaptation matrix D65→D60
+// M_adapt = M_bradford * diag(cone_d60/cone_d65) * M_bradford_inv
+// Pre-computed for D65 → D60 adaptation
+constexpr float kBradford_D65_to_D60[9] = {
+   1.01303f,  0.00610531f, -0.014971f,
+   0.00769823f, 0.998165f,  -0.00503203f,
+  -0.00284131f, 0.00468516f, 0.924507f
+};
+constexpr float kBradford_D60_to_D65[9] = {
+   0.987224f,  -0.00611327f,  0.0159533f,
+  -0.00759836f,  1.00186f,     0.00533002f,
+   0.00307257f, -0.00509595f,  1.08168f
+};
+
+}  // namespace
+
+// Build RGB→XYZ matrix from chromaticity coordinates and white point.
+// Uses the standard algorithm: compute S = M_prim^-1 * W, then scale columns.
+Matrix3x3 rgb_to_xyz_matrix(const RGBColorSpaceDef& def) {
+  // Convert xy to XYZ (Y=1)
+  auto xy_to_XYZ = [](float x, float y, float& X, float& Y, float& Z) {
+    if (std::abs(y) < 1e-10f) { X = Y = Z = 0; return; }
+    X = x / y;
+    Y = 1.0f;
+    Z = (1.0f - x - y) / y;
+  };
+
+  float rX, rY, rZ, gX, gY, gZ, bX, bY, bZ, wX, wY, wZ;
+  xy_to_XYZ(def.rx, def.ry, rX, rY, rZ);
+  xy_to_XYZ(def.gx, def.gy, gX, gY, gZ);
+  xy_to_XYZ(def.bx, def.by, bX, bY, bZ);
+  xy_to_XYZ(def.wx, def.wy, wX, wY, wZ);
+
+  // M_prim = [rX gX bX; rY gY bY; rZ gZ bZ]
+  float M[9] = {rX, gX, bX, rY, gY, bY, rZ, gZ, bZ};
+  float M_inv[9];
+  if (!invert3x3(M, M_inv)) {
+    Matrix3x3 identity;
+    return identity;
+  }
+
+  // S = M_inv * W
+  float Sr = M_inv[0] * wX + M_inv[1] * wY + M_inv[2] * wZ;
+  float Sg = M_inv[3] * wX + M_inv[4] * wY + M_inv[5] * wZ;
+  float Sb = M_inv[6] * wX + M_inv[7] * wY + M_inv[8] * wZ;
+
+  Matrix3x3 result;
+  result.m[0] = Sr * rX; result.m[1] = Sg * gX; result.m[2] = Sb * bX;
+  result.m[3] = Sr * rY; result.m[4] = Sg * gY; result.m[5] = Sb * bY;
+  result.m[6] = Sr * rZ; result.m[7] = Sg * gZ; result.m[8] = Sb * bZ;
+  return result;
+}
+
+Matrix3x3 xyz_to_rgb_matrix(const RGBColorSpaceDef& def) {
+  Matrix3x3 fwd = rgb_to_xyz_matrix(def);
+  Matrix3x3 inv;
+  if (!invert3x3(fwd.m, inv.m)) {
+    return Matrix3x3{};  // identity fallback
+  }
+  return inv;
+}
+
+Matrix3x3 rgb_to_rgb_matrix(RGBColorSpace src, RGBColorSpace dst) {
+  const auto& src_def = get_color_space_def(src);
+  const auto& dst_def = get_color_space_def(dst);
+
+  Matrix3x3 src_to_xyz = rgb_to_xyz_matrix(src_def);
+  Matrix3x3 xyz_to_dst = xyz_to_rgb_matrix(dst_def);
+
+  // Check if chromatic adaptation is needed (different white points)
+  float dx = src_def.wx - dst_def.wx;
+  float dy = src_def.wy - dst_def.wy;
+  bool need_adapt = (dx * dx + dy * dy) > 1e-8f;
+
+  if (!need_adapt) {
+    return xyz_to_dst * src_to_xyz;
+  }
+
+  // Use pre-computed Bradford matrices for D65↔D60 (ACES)
+  bool src_d60 = (std::abs(src_def.wx - 0.32168f) < 0.001f);
+  bool dst_d60 = (std::abs(dst_def.wx - 0.32168f) < 0.001f);
+
+  if (src_d60 && !dst_d60) {
+    // Source is D60, dest is D65: adapt D60→D65
+    Matrix3x3 adapt;
+    std::memcpy(adapt.m, kBradford_D60_to_D65, sizeof(adapt.m));
+    return xyz_to_dst * adapt * src_to_xyz;
+  } else if (!src_d60 && dst_d60) {
+    // Source is D65, dest is D60: adapt D65→D60
+    Matrix3x3 adapt;
+    std::memcpy(adapt.m, kBradford_D65_to_D60, sizeof(adapt.m));
+    return xyz_to_dst * adapt * src_to_xyz;
+  }
+
+  // General case: just go through XYZ without adaptation
+  return xyz_to_dst * src_to_xyz;
+}
+
+// ============================================================================
+// Transfer function implementations
+// ============================================================================
+
+float apply_transfer(float linear, RGBColorSpace cs) {
+  const auto& def = get_color_space_def(cs);
+  if (def.is_linear) return linear;
+  if (def.srgb_transfer) return srgb_gamma(std::max(0.0f, linear));
+  if (def.rec2020_transfer) return rec2020_oetf(std::max(0.0f, linear));
+  // Simple power-law gamma
+  if (linear <= 0.0f) return 0.0f;
+  return std::pow(linear, 1.0f / def.gamma);
+}
+
+float apply_inverse_transfer(float encoded, RGBColorSpace cs) {
+  const auto& def = get_color_space_def(cs);
+  if (def.is_linear) return encoded;
+  if (def.srgb_transfer) return srgb_inverse_gamma(std::max(0.0f, encoded));
+  if (def.rec2020_transfer) return rec2020_inv_oetf(std::max(0.0f, encoded));
+  if (encoded <= 0.0f) return 0.0f;
+  return std::pow(encoded, def.gamma);
+}
+
+// ============================================================================
+// High-level conversion
+// ============================================================================
+
+RGB convert_rgb(const RGB& src, RGBColorSpace from, RGBColorSpace to) {
+  if (from == to) return src;
+
+  // 1. Linearize source
+  float lr = apply_inverse_transfer(src.r, from);
+  float lg = apply_inverse_transfer(src.g, from);
+  float lb = apply_inverse_transfer(src.b, from);
+
+  // 2. Apply combined matrix (src linear RGB → dst linear RGB)
+  Matrix3x3 mat = rgb_to_rgb_matrix(from, to);
+  float dr, dg, db;
+  mat.apply(lr, lg, lb, dr, dg, db);
+
+  // 3. Apply destination transfer function
+  return RGB(apply_transfer(dr, to),
+             apply_transfer(dg, to),
+             apply_transfer(db, to));
+}
+
+RGB xyz_to_rgb(const XYZ& xyz, RGBColorSpace target) {
+  Matrix3x3 mat = xyz_to_rgb_matrix(get_color_space_def(target));
+
+  // Check if target white point differs from D65 (XYZ is D65-referenced)
+  const auto& def = get_color_space_def(target);
+  bool dst_d60 = (std::abs(def.wx - 0.32168f) < 0.001f);
+
+  float x = xyz.x, y = xyz.y, z = xyz.z;
+
+  if (dst_d60) {
+    // Adapt D65 XYZ → D60 XYZ
+    float ax, ay, az;
+    Matrix3x3 adapt;
+    std::memcpy(adapt.m, kBradford_D65_to_D60, sizeof(adapt.m));
+    adapt.apply(x, y, z, ax, ay, az);
+    x = ax; y = ay; z = az;
+  }
+
+  float r, g, b;
+  mat.apply(x, y, z, r, g, b);
+
+  return RGB(apply_transfer(r, target),
+             apply_transfer(g, target),
+             apply_transfer(b, target));
+}
 
 // IccParametricCurve implementation
 float IccParametricCurve::apply(float x) const {
