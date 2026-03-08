@@ -72,14 +72,47 @@ inline float read_u8Fixed8(const uint8_t* data) {
 
 }  // namespace
 
+// IccParametricCurve implementation
+float IccParametricCurve::apply(float x) const {
+  x = std::max(0.0f, std::min(1.0f, x));
+  switch (type) {
+    case 0:
+      // Y = X^g
+      return std::pow(x, g);
+    case 1:
+      // Y = (aX+b)^g  if X >= -b/a, else Y = 0
+      if (a != 0.0f && x >= -b / a)
+        return std::pow(a * x + b, g);
+      return 0.0f;
+    case 2:
+      // Y = (aX+b)^g + c  if X >= -b/a, else Y = c
+      if (a != 0.0f && x >= -b / a)
+        return std::pow(a * x + b, g) + c;
+      return c;
+    case 3:
+      // Y = (aX+b)^g  if X >= d, else Y = cX
+      if (x >= d)
+        return std::pow(a * x + b, g);
+      return c * x;
+    case 4:
+      // Y = (aX+b)^g + e  if X >= d, else Y = cX + f
+      if (x >= d)
+        return std::pow(a * x + b, g) + e;
+      return c * x + f;
+    default:
+      return std::pow(x, g);
+  }
+}
+
 // IccTRC implementation
 float IccTRC::apply(float v) const {
   if (!valid) return v;
 
   v = clamp01(v);
 
-  if (is_gamma) {
-    // Simple gamma
+  if (is_parametric) {
+    return clamp01(parametric.apply(v));
+  } else if (is_gamma) {
     return std::pow(v, gamma);
   } else if (!curve.empty()) {
     // Curve table lookup with linear interpolation
@@ -227,33 +260,49 @@ IccTRC parse_trc_tag(const uint8_t* data, size_t data_size,
   else if (type_sig == 0x70617261) {
     if (size >= 16) {
       uint16_t func_type = read_be_u16(tag_data + 8);
+      // Reserved bytes at 10-11, parameters start at 12
+
+      trc.parametric.type = func_type;
+      trc.parametric.g = read_s15Fixed16(tag_data + 12);
 
       if (func_type == 0) {
-        // Type 0: Y = X^g
+        // Type 0: Y = X^g  (1 param)
         trc.valid = true;
         trc.is_gamma = true;
-        trc.gamma = read_s15Fixed16(tag_data + 12);
+        trc.gamma = trc.parametric.g;
       } else if (func_type == 1 && size >= 24) {
-        // Type 1: Y = (aX+b)^g for X >= -b/a, else Y = 0
-        // Approximate as simple gamma
+        // Type 1: Y = (aX+b)^g for X >= -b/a, else Y = 0  (3 params)
+        trc.parametric.a = read_s15Fixed16(tag_data + 16);
+        trc.parametric.b = read_s15Fixed16(tag_data + 20);
         trc.valid = true;
-        trc.is_gamma = true;
-        trc.gamma = read_s15Fixed16(tag_data + 12);
+        trc.is_parametric = true;
       } else if (func_type == 2 && size >= 28) {
-        // Type 2: sRGB-like
+        // Type 2: Y = (aX+b)^g + c for X >= -b/a, else Y = c  (4 params)
+        trc.parametric.a = read_s15Fixed16(tag_data + 16);
+        trc.parametric.b = read_s15Fixed16(tag_data + 20);
+        trc.parametric.c = read_s15Fixed16(tag_data + 24);
         trc.valid = true;
-        trc.is_gamma = true;
-        trc.gamma = read_s15Fixed16(tag_data + 12);
+        trc.is_parametric = true;
       } else if (func_type == 3 && size >= 32) {
-        // Type 3: Y = (aX+b)^g + c for X >= d, else Y = cX
+        // Type 3: Y = (aX+b)^g for X >= d, else Y = cX  (5 params)
+        trc.parametric.a = read_s15Fixed16(tag_data + 16);
+        trc.parametric.b = read_s15Fixed16(tag_data + 20);
+        trc.parametric.c = read_s15Fixed16(tag_data + 24);
+        trc.parametric.d = read_s15Fixed16(tag_data + 28);
         trc.valid = true;
-        trc.is_gamma = true;
-        trc.gamma = read_s15Fixed16(tag_data + 12);
+        trc.is_parametric = true;
       } else if (func_type == 4 && size >= 36) {
-        // Type 4: Y = (aX+b)^g + e for X >= d, else Y = cX + f
+        // Type 4: Y = (aX+b)^g + e for X >= d, else Y = cX + f  (7 params)
+        trc.parametric.a = read_s15Fixed16(tag_data + 16);
+        trc.parametric.b = read_s15Fixed16(tag_data + 20);
+        trc.parametric.c = read_s15Fixed16(tag_data + 24);
+        trc.parametric.d = read_s15Fixed16(tag_data + 28);
+        trc.parametric.e = read_s15Fixed16(tag_data + 32);
+        // f starts at offset 36 if present
+        if (size >= 40)
+          trc.parametric.f = read_s15Fixed16(tag_data + 36);
         trc.valid = true;
-        trc.is_gamma = true;
-        trc.gamma = read_s15Fixed16(tag_data + 12);
+        trc.is_parametric = true;
       }
     }
   }
@@ -283,6 +332,174 @@ bool parse_xyz_tag(const uint8_t* data, size_t data_size,
   *z = read_s15Fixed16(tag_data + 16);
 
   return true;
+}
+
+// Parse mft2 (lut16Type) or mft1 (lut8Type) tag for CLUT-based transforms
+// Returns true if CLUT was successfully parsed into the profile info
+bool parse_clut_tag(const uint8_t* data, size_t data_size,
+                    uint32_t offset, uint32_t tag_size,
+                    IccProfileInfo* info) {
+  if (offset + tag_size > data_size || tag_size < 52) return false;
+
+  const uint8_t* t = data + offset;
+  uint32_t type_sig = read_be_u32(t);
+
+  // mft2 = 0x6D667432, mft1 = 0x6D667431
+  bool is_16bit = (type_sig == 0x6D667432);
+  bool is_8bit = (type_sig == 0x6D667431);
+  if (!is_16bit && !is_8bit) return false;
+
+  int input_channels = t[8];
+  int output_channels = t[9];
+  int grid_points = t[10];  // Same for all dimensions in lut8/lut16
+
+  if (input_channels < 1 || input_channels > 4 ||
+      output_channels < 1 || output_channels > 4 ||
+      grid_points < 2) return false;
+
+  info->clut_input_channels = input_channels;
+  info->clut_output_channels = output_channels;
+  info->clut_grid_points.assign(input_channels, grid_points);
+
+  // Skip 3x3 matrix at bytes 12-47 (for PCS-to-PCS, not used for device-to-PCS)
+
+  size_t pos = 48;
+  if (is_16bit) {
+    // lut16Type: bytes 48-49 = input table entries, 50-51 = output table entries
+    int input_entries = read_be_u16(t + 48);
+    int output_entries = read_be_u16(t + 50);
+    pos = 52;
+
+    // Input curves: input_channels * input_entries * 2 bytes
+    info->clut_input_curves.resize(input_channels);
+    for (int ch = 0; ch < input_channels; ++ch) {
+      IccTRC& trc = info->clut_input_curves[ch];
+      trc.valid = true;
+      trc.curve.resize(input_entries);
+      for (int i = 0; i < input_entries; ++i) {
+        if (pos + 2 > tag_size) return false;
+        trc.curve[i] = static_cast<float>(read_be_u16(t + pos)) / 65535.0f;
+        pos += 2;
+      }
+    }
+
+    // CLUT data: grid_points^input_channels * output_channels * 2 bytes
+    size_t clut_entries = 1;
+    for (int i = 0; i < input_channels; ++i) clut_entries *= grid_points;
+    clut_entries *= output_channels;
+
+    info->clut_data.resize(clut_entries);
+    for (size_t i = 0; i < clut_entries; ++i) {
+      if (pos + 2 > tag_size) return false;
+      info->clut_data[i] = static_cast<float>(read_be_u16(t + pos)) / 65535.0f;
+      pos += 2;
+    }
+
+    // Output curves: output_channels * output_entries * 2 bytes
+    info->clut_output_curves.resize(output_channels);
+    for (int ch = 0; ch < output_channels; ++ch) {
+      IccTRC& trc = info->clut_output_curves[ch];
+      trc.valid = true;
+      trc.curve.resize(output_entries);
+      for (int i = 0; i < output_entries; ++i) {
+        if (pos + 2 > tag_size) return false;
+        trc.curve[i] = static_cast<float>(read_be_u16(t + pos)) / 65535.0f;
+        pos += 2;
+      }
+    }
+  } else {
+    // lut8Type: 256-entry tables, 1 byte per entry
+    pos = 48;  // No extra counts in lut8
+    int input_entries = 256;
+    int output_entries = 256;
+
+    info->clut_input_curves.resize(input_channels);
+    for (int ch = 0; ch < input_channels; ++ch) {
+      IccTRC& trc = info->clut_input_curves[ch];
+      trc.valid = true;
+      trc.curve.resize(input_entries);
+      for (int i = 0; i < input_entries; ++i) {
+        if (pos + 1 > tag_size) return false;
+        trc.curve[i] = static_cast<float>(t[pos]) / 255.0f;
+        pos += 1;
+      }
+    }
+
+    size_t clut_entries = 1;
+    for (int i = 0; i < input_channels; ++i) clut_entries *= grid_points;
+    clut_entries *= output_channels;
+
+    info->clut_data.resize(clut_entries);
+    for (size_t i = 0; i < clut_entries; ++i) {
+      if (pos + 1 > tag_size) return false;
+      info->clut_data[i] = static_cast<float>(t[pos]) / 255.0f;
+      pos += 1;
+    }
+
+    info->clut_output_curves.resize(output_channels);
+    for (int ch = 0; ch < output_channels; ++ch) {
+      IccTRC& trc = info->clut_output_curves[ch];
+      trc.valid = true;
+      trc.curve.resize(output_entries);
+      for (int i = 0; i < output_entries; ++i) {
+        if (pos + 1 > tag_size) return false;
+        trc.curve[i] = static_cast<float>(t[pos]) / 255.0f;
+        pos += 1;
+      }
+    }
+  }
+
+  info->has_clut = true;
+  return true;
+}
+
+// Multilinear interpolation in CLUT
+// components: input values (normalized 0-1), n = input_channels
+// Returns output values (output_channels floats)
+void interpolate_clut(const IccProfileInfo& info, const float* components,
+                      float* output) {
+  int n_in = info.clut_input_channels;
+  int n_out = info.clut_output_channels;
+  const auto& grid = info.clut_grid_points;
+
+  // Compute fractional grid positions and integer indices
+  float frac[4] = {0};
+  int idx[4] = {0};
+  for (int i = 0; i < n_in && i < 4; ++i) {
+    float v = std::max(0.0f, std::min(1.0f, components[i]));
+    float pos = v * static_cast<float>(grid[i] - 1);
+    idx[i] = std::min(static_cast<int>(pos), grid[i] - 2);
+    frac[i] = pos - static_cast<float>(idx[i]);
+  }
+
+  // Compute strides for each dimension
+  int stride[4] = {0};
+  stride[0] = n_out;
+  for (int i = 1; i < n_in; ++i) {
+    stride[i] = stride[i - 1] * grid[i - 1];
+  }
+
+  // For CMYK (4D) or RGB (3D) - use multilinear interpolation
+  // Number of corners = 2^n_in
+  int num_corners = 1 << n_in;
+  for (int c = 0; c < n_out; ++c) output[c] = 0.0f;
+
+  for (int corner = 0; corner < num_corners; ++corner) {
+    // Compute weight and base index for this corner
+    float weight = 1.0f;
+    int base = 0;
+    for (int dim = 0; dim < n_in; ++dim) {
+      int bit = (corner >> dim) & 1;
+      base += (idx[dim] + bit) * stride[dim];
+      weight *= bit ? frac[dim] : (1.0f - frac[dim]);
+    }
+
+    if (weight > 0.0f && base + n_out <= static_cast<int>(info.clut_data.size())) {
+      for (int c = 0; c < n_out; ++c) {
+        output[c] += weight * info.clut_data[base + c];
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -376,6 +593,16 @@ IccProfileInfo parse_icc_profile(const uint8_t* data, size_t size) {
     }
   }
 
+  // For CMYK profiles (or RGB without matrix), try CLUT-based A2B0 tag
+  if (info.color_space == ICC_SIG_CMYK ||
+      (info.color_space == ICC_SIG_RGB && !info.is_matrix_profile)) {
+    const IccTag* a2b0 = find_tag(ICC_TAG_A2B0);
+    if (!a2b0) a2b0 = find_tag(ICC_TAG_A2B1);
+    if (a2b0) {
+      parse_clut_tag(data, size, a2b0->offset, a2b0->size, &info);
+    }
+  }
+
   // Parse white point if available
   const IccTag* wtpt = find_tag(ICC_TAG_wtpt);
   if (wtpt) {
@@ -435,7 +662,51 @@ RGB iccbased_to_rgb(const float* components, int num_components,
   }
 
   if (profile.color_space == ICC_SIG_CMYK && num_components >= 4) {
-    // CMYK profiles require CLUT - fall back to simple conversion
+    if (profile.has_clut && profile.clut_output_channels >= 3) {
+      // Apply input curves
+      float adjusted[4];
+      for (int i = 0; i < 4; ++i) {
+        adjusted[i] = clamp01(components[i]);
+        if (i < static_cast<int>(profile.clut_input_curves.size()) &&
+            profile.clut_input_curves[i].valid) {
+          adjusted[i] = profile.clut_input_curves[i].apply(adjusted[i]);
+        }
+      }
+
+      // Interpolate CLUT
+      float output[4] = {0};
+      interpolate_clut(profile, adjusted, output);
+
+      // Apply output curves
+      for (int i = 0; i < profile.clut_output_channels && i < 4; ++i) {
+        if (i < static_cast<int>(profile.clut_output_curves.size()) &&
+            profile.clut_output_curves[i].valid) {
+          output[i] = profile.clut_output_curves[i].apply(output[i]);
+        }
+      }
+
+      // Output is in PCS (XYZ or Lab) - convert to sRGB
+      if (profile.pcs == ICC_SIG_XYZ) {
+        // CLUT output is XYZ (s15Fixed16-like, but normalized)
+        // ICC PCS XYZ is encoded as X/1.0+32768/65535 range
+        return xyz_to_rgb(XYZ(output[0] * 1.999969482421875f,
+                               output[1] * 1.999969482421875f,
+                               output[2] * 1.999969482421875f));
+      } else if (profile.pcs == ICC_SIG_LAB) {
+        Lab lab;
+        lab.L = output[0] * 100.0f;
+        lab.a = output[1] * 255.0f - 128.0f;
+        lab.b = output[2] * 255.0f - 128.0f;
+        std::vector<double> wp = {
+            static_cast<double>(profile.white_point[0]),
+            static_cast<double>(profile.white_point[1]),
+            static_cast<double>(profile.white_point[2])};
+        return lab_to_rgb(lab, wp);
+      }
+      // Assume output is already RGB
+      return RGB(clamp01(output[0]), clamp01(output[1]), clamp01(output[2]));
+    }
+    // Fall back to simple CMYK conversion
     return cmyk_to_rgb(components[0], components[1],
                        components[2], components[3]);
   }

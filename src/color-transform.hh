@@ -63,13 +63,27 @@ constexpr uint32_t ICC_TAG_gTRC = 0x67545243;  // Green TRC (gamma)
 constexpr uint32_t ICC_TAG_bTRC = 0x62545243;  // Blue TRC (gamma)
 constexpr uint32_t ICC_TAG_kTRC = 0x6B545243;  // Gray TRC
 constexpr uint32_t ICC_TAG_wtpt = 0x77747074;  // White point
+constexpr uint32_t ICC_TAG_A2B0 = 0x41324230;  // AToB0 (perceptual intent)
+constexpr uint32_t ICC_TAG_A2B1 = 0x41324231;  // AToB1 (relative colorimetric)
+constexpr uint32_t ICC_TAG_desc = 0x64657363;  // Profile description
+
+// Parametric curve function types (ICC 'para' tag)
+struct IccParametricCurve {
+  int type{0};  // Function type 0-4
+  float g{1.0f};  // gamma
+  float a{1.0f}, b{0.0f}, c{0.0f}, d{0.0f}, e{0.0f}, f{0.0f};
+
+  float apply(float x) const;
+};
 
 // TRC (Tone Reproduction Curve) representation
 struct IccTRC {
   bool valid{false};
-  bool is_gamma{false};    // True if simple gamma, false if curve table
-  float gamma{1.0f};       // Simple gamma value
-  std::vector<float> curve;  // Curve table (normalized 0-1)
+  bool is_gamma{false};       // True if simple gamma, false if curve table or parametric
+  bool is_parametric{false};  // True if parametric curve (not simple gamma)
+  float gamma{1.0f};          // Simple gamma value
+  std::vector<float> curve;   // Curve table (normalized 0-1)
+  IccParametricCurve parametric;  // Parametric curve parameters
 
   // Apply TRC to a value
   float apply(float v) const;
@@ -106,6 +120,16 @@ struct IccProfileInfo {
 
   // White point
   float white_point[3]{0.9505f, 1.0f, 1.0889f};  // Default D65
+
+  // CLUT (Color Lookup Table) for CMYK and LUT-based profiles
+  bool has_clut{false};
+  int clut_input_channels{0};
+  int clut_output_channels{0};
+  std::vector<int> clut_grid_points;  // Grid size per input dimension
+  std::vector<float> clut_data;       // Flattened CLUT values (normalized 0-1)
+  // Input/output curves for CLUT pipeline
+  std::vector<IccTRC> clut_input_curves;
+  std::vector<IccTRC> clut_output_curves;
 };
 
 // Parse ICC profile header (first 128 bytes)

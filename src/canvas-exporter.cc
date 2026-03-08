@@ -15,6 +15,7 @@
 #endif
 
 #include "canvas-exporter.hh"
+#include "color-transform.hh"
 #include "pdf-function.hh"
 #include "common-macros.inc"
 #include "stb_image_write.h"
@@ -1540,6 +1541,19 @@ bool CanvasExporter::prepare_image_pixels(const ImageXObject& image,
     }
     case ColorSpaceType::Indexed: {
       return expand_indexed_pixels(image, out, components);
+    }
+    case ColorSpaceType::ICCBased: {
+      // Use color-transform module for ICC profile-based conversion
+      if (image.bits_per_component != 8 && image.bits_per_component != 16) {
+        return false;
+      }
+      color::TransformResult result = color::transform_to_rgb(
+          image.color_space, image.data.data(), image.data.size(),
+          image.width, image.height, image.bits_per_component);
+      if (!result.success) return false;
+      out = std::move(result.data);
+      components = 3;
+      return true;
     }
     default:
       break;
@@ -4646,15 +4660,27 @@ std::string CanvasExporter::resolve_color_with_space(const ColorSpace& cs,
     }
 
     if (cs.type == ColorSpaceType::ICCBased) {
-      // Use num_components to interpret as device color
-      if (cs.num_components == 1 && operands.size() >= 1) {
-        double g = std::stod(operands[0]);
-        return rgb_to_hex(g, g, g);
-      } else if (cs.num_components == 3 && operands.size() >= 3) {
-        return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
-      } else if (cs.num_components == 4 && operands.size() >= 4) {
-        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                           std::stod(operands[2]), std::stod(operands[3]));
+      // Parse and apply ICC profile for accurate color conversion
+      int nc = cs.num_components;
+      if (nc <= 0) nc = 3;
+      if (static_cast<int>(operands.size()) >= nc) {
+        float components[4] = {0};
+        for (int i = 0; i < nc && i < 4; ++i) {
+          try { components[i] = static_cast<float>(std::stod(operands[i])); } catch (...) {}
+        }
+
+        if (!cs.icc_profile_data.empty()) {
+          color::IccProfileInfo profile = color::parse_icc_profile(
+              cs.icc_profile_data.data(), cs.icc_profile_data.size());
+          if (profile.valid && (profile.is_matrix_profile || profile.has_clut)) {
+            color::RGB rgb = color::iccbased_to_rgb(components, nc, profile);
+            return rgb_to_hex(rgb.r, rgb.g, rgb.b);
+          }
+        }
+        // Fallback: interpret based on component count
+        if (nc == 1) return rgb_to_hex(components[0], components[0], components[0]);
+        if (nc == 3) return rgb_to_hex(components[0], components[1], components[2]);
+        if (nc == 4) return cmyk_to_hex(components[0], components[1], components[2], components[3]);
       }
     }
 
