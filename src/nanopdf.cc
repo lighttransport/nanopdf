@@ -5722,6 +5722,41 @@ private:
             if (subtype_it != xobj_val.stream.dict.end() &&
                 subtype_it->second.type == Value::NAME &&
                 subtype_it->second.name == "Form") {
+              // Load Form XObject's font resources into page font cache
+              auto form_res_it = xobj_val.stream.dict.find("Resources");
+              if (form_res_it != xobj_val.stream.dict.end()) {
+                Value form_res = form_res_it->second;
+                if (form_res.type == Value::REFERENCE) {
+                  auto rr = resolve_reference(pdf_, form_res.ref_object_number,
+                                               form_res.ref_generation_number);
+                  if (rr.success) form_res = rr.value;
+                }
+                if (form_res.type == Value::DICTIONARY) {
+                  auto font_res_it = form_res.dict.find("Font");
+                  if (font_res_it != form_res.dict.end()) {
+                    Value font_dict = font_res_it->second;
+                    if (font_dict.type == Value::REFERENCE) {
+                      auto fr = resolve_reference(pdf_, font_dict.ref_object_number,
+                                                   font_dict.ref_generation_number);
+                      if (fr.success) font_dict = fr.value;
+                    }
+                    if (font_dict.type == Value::DICTIONARY) {
+                      for (const auto& fe : font_dict.dict) {
+                        if (page_.fonts.find(fe.first) == page_.fonts.end()) {
+                          Value fv = fe.second;
+                          if (fv.type == Value::REFERENCE) {
+                            auto fres = resolve_reference(pdf_, fv.ref_object_number,
+                                                           fv.ref_generation_number);
+                            if (fres.success) fv = fres.value;
+                          }
+                          auto parsed = Pdf::parse_font(pdf_, fv);
+                          if (parsed) page_.fonts[fe.first] = std::move(parsed);
+                        }
+                      }
+                    }
+                  }
+                }
+              }
               auto decoded = decode_stream(pdf_, xobj_val);
               if (decoded.success && !decoded.data.empty()) {
                 process_content_stream(decoded.data);

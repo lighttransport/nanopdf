@@ -2394,96 +2394,105 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     handle_text_command_svg("T*", {});
     handle_text_command_svg("Tj", {operands[2]});
   } else if (op == "Tj" && operands.size() >= 1) {
-    std::string text = operands[0];
-    if (text.length() >= 2 && text[0] == '(' && text[text.length()-1] == ')') {
-      text = text.substr(1, text.length()-2);
-    }
+    // Decode string (handles both literal and hex strings)
+    std::string text = decode_pdf_text_for_display(operands[0]);
 
     // Compute position: apply text matrix (with text rise) through CTM
     double tx = state_.text_matrix.e;
     double ty = state_.text_matrix.f + state_.text_rise;
     apply_matrix_to_point(state_.ctm, tx, ty);
-    double svg_x = tx;
-    double svg_y = page_height_ - ty;
 
-    std::map<std::string, std::string> attrs;
-    attrs["x"] = double_to_string(svg_x);
-    attrs["y"] = double_to_string(svg_y);
-
-    // Compute effective font size from text matrix scale
     double text_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
                                    state_.text_matrix.b * state_.text_matrix.b);
     double ctm_scale = std::sqrt(state_.ctm.a * state_.ctm.a + state_.ctm.b * state_.ctm.b);
     double effective_size = std::abs(state_.font_size) * text_scale * ctm_scale;
+
+    std::map<std::string, std::string> attrs;
+    attrs["x"] = double_to_string(tx);
+    attrs["y"] = double_to_string(page_height_ - ty);
     attrs["font-size"] = double_to_string(effective_size);
     attrs["fill"] = state_.fill_color;
-    if (std::abs(state_.fill_alpha - 1.0) > 1e-6) {
+
+    // Font family
+    std::string family = resolve_font_family(state_.current_font);
+    if (!family.empty()) attrs["font-family"] = family;
+
+    // Vertical writing mode
+    if (is_vertical_font(state_.current_font)) {
+      attrs["writing-mode"] = "tb";
+    }
+
+    if (std::abs(state_.fill_alpha - 1.0) > 1e-6)
       attrs["fill-opacity"] = double_to_string(state_.fill_alpha);
-    }
-    // Apply horizontal scaling
-    if (std::abs(state_.horizontal_scaling - 100.0) > 0.1) {
-      double scale_factor = state_.horizontal_scaling / 100.0;
-      attrs["transform"] = "scale(" + double_to_string(scale_factor) + ",1)";
-    }
-    // Apply character spacing as SVG letter-spacing
-    if (std::abs(state_.char_spacing) > 0.01) {
+    if (std::abs(state_.horizontal_scaling - 100.0) > 0.1)
+      attrs["transform"] = "scale(" + double_to_string(state_.horizontal_scaling / 100.0) + ",1)";
+    if (std::abs(state_.char_spacing) > 0.01)
       attrs["letter-spacing"] = double_to_string(state_.char_spacing * ctm_scale);
-    }
-    // Apply word spacing
-    if (std::abs(state_.word_spacing) > 0.01) {
+    if (std::abs(state_.word_spacing) > 0.01)
       attrs["word-spacing"] = double_to_string(state_.word_spacing * ctm_scale);
-    }
-    // Text rendering mode
     if (state_.text_render_mode == 1 || state_.text_render_mode == 2) {
       attrs["stroke"] = state_.stroke_color;
       attrs["stroke-width"] = double_to_string(state_.stroke_width);
       if (state_.text_render_mode == 1) attrs["fill"] = "none";
     } else if (state_.text_render_mode == 3) {
-      attrs["fill"] = "none";  // Invisible text
+      attrs["fill"] = "none";
     }
     std::string css_mode = blend_mode_to_css(state_.blend_mode);
-    if (!css_mode.empty()) {
-      attrs["style"] = "mix-blend-mode:" + css_mode + ';';
-    }
+    if (!css_mode.empty()) attrs["style"] = "mix-blend-mode:" + css_mode + ';';
 
     add_svg_element("text", attrs, text);
   } else if (op == "TJ" && !operands.empty()) {
-    std::string combined;
+    // TJ array: mix of strings and numeric spacing adjustments
+    // Numeric values are displacement in thousandths of text space units
+    double text_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                   state_.text_matrix.b * state_.text_matrix.b);
+    double ctm_scale = std::sqrt(state_.ctm.a * state_.ctm.a + state_.ctm.b * state_.ctm.b);
+    double effective_size = std::abs(state_.font_size) * text_scale * ctm_scale;
+    double h_scale = state_.horizontal_scaling / 100.0;
+
+    // Collect text fragments with x-offset adjustments
+    struct TextFragment {
+      std::string text;
+      double x_offset;  // Cumulative x offset in SVG units
+    };
+    std::vector<TextFragment> fragments;
+    double cumulative_offset = 0.0;
+
     for (const std::string& token : operands) {
-      if (token.length() >= 2 && token.front() == '(' && token.back() == ')') {
-        combined += token.substr(1, token.length() - 2);
+      if ((token.front() == '(' && token.back() == ')') ||
+          (token.front() == '<' && token.back() == '>')) {
+        std::string decoded = decode_pdf_text_for_display(token);
+        if (!decoded.empty()) {
+          fragments.push_back({decoded, cumulative_offset});
+        }
+      } else {
+        // Numeric spacing value: negative = move right (kerning), positive = move left
+        try {
+          double val = std::stod(token);
+          // Convert from thousandths of text space to SVG units
+          cumulative_offset += (-val / 1000.0) * std::abs(state_.font_size) * text_scale * ctm_scale * h_scale;
+        } catch (...) {}
       }
     }
 
-    if (!combined.empty()) {
+    if (fragments.empty()) {
+      // Nothing to render
+    } else if (fragments.size() == 1 && std::abs(fragments[0].x_offset) < 0.01) {
+      // Single fragment with no offset - emit simple text element
       double tx = state_.text_matrix.e;
       double ty = state_.text_matrix.f + state_.text_rise;
       apply_matrix_to_point(state_.ctm, tx, ty);
-      double svg_x = tx;
-      double svg_y = page_height_ - ty;
-
-      double text_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
-                                     state_.text_matrix.b * state_.text_matrix.b);
-      double ctm_scale = std::sqrt(state_.ctm.a * state_.ctm.a + state_.ctm.b * state_.ctm.b);
-      double effective_size = std::abs(state_.font_size) * text_scale * ctm_scale;
 
       std::map<std::string, std::string> attrs;
-      attrs["x"] = double_to_string(svg_x);
-      attrs["y"] = double_to_string(svg_y);
+      attrs["x"] = double_to_string(tx);
+      attrs["y"] = double_to_string(page_height_ - ty);
       attrs["font-size"] = double_to_string(effective_size);
       attrs["fill"] = state_.fill_color;
-      if (std::abs(state_.fill_alpha - 1.0) > 1e-6) {
+      std::string family = resolve_font_family(state_.current_font);
+      if (!family.empty()) attrs["font-family"] = family;
+      if (is_vertical_font(state_.current_font)) attrs["writing-mode"] = "tb";
+      if (std::abs(state_.fill_alpha - 1.0) > 1e-6)
         attrs["fill-opacity"] = double_to_string(state_.fill_alpha);
-      }
-      if (std::abs(state_.horizontal_scaling - 100.0) > 0.1) {
-        attrs["transform"] = "scale(" + double_to_string(state_.horizontal_scaling / 100.0) + ",1)";
-      }
-      if (std::abs(state_.char_spacing) > 0.01) {
-        attrs["letter-spacing"] = double_to_string(state_.char_spacing * ctm_scale);
-      }
-      if (std::abs(state_.word_spacing) > 0.01) {
-        attrs["word-spacing"] = double_to_string(state_.word_spacing * ctm_scale);
-      }
       if (state_.text_render_mode == 1 || state_.text_render_mode == 2) {
         attrs["stroke"] = state_.stroke_color;
         attrs["stroke-width"] = double_to_string(state_.stroke_width);
@@ -2492,11 +2501,36 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
         attrs["fill"] = "none";
       }
       std::string css_mode2 = blend_mode_to_css(state_.blend_mode);
-      if (!css_mode2.empty()) {
-        attrs["style"] = "mix-blend-mode:" + css_mode2 + ';';
-      }
+      if (!css_mode2.empty()) attrs["style"] = "mix-blend-mode:" + css_mode2 + ';';
 
-      add_svg_element("text", attrs, combined);
+      add_svg_element("text", attrs, fragments[0].text);
+    } else {
+      // Multiple fragments with spacing - emit each as positioned text
+      for (const auto& frag : fragments) {
+        double tx = state_.text_matrix.e;
+        double ty = state_.text_matrix.f + state_.text_rise;
+        apply_matrix_to_point(state_.ctm, tx, ty);
+        tx += frag.x_offset;
+
+        std::map<std::string, std::string> attrs;
+        attrs["x"] = double_to_string(tx);
+        attrs["y"] = double_to_string(page_height_ - ty);
+        attrs["font-size"] = double_to_string(effective_size);
+        attrs["fill"] = state_.fill_color;
+        std::string family = resolve_font_family(state_.current_font);
+        if (!family.empty()) attrs["font-family"] = family;
+        if (std::abs(state_.fill_alpha - 1.0) > 1e-6)
+          attrs["fill-opacity"] = double_to_string(state_.fill_alpha);
+        if (state_.text_render_mode == 1 || state_.text_render_mode == 2) {
+          attrs["stroke"] = state_.stroke_color;
+          attrs["stroke-width"] = double_to_string(state_.stroke_width);
+          if (state_.text_render_mode == 1) attrs["fill"] = "none";
+        } else if (state_.text_render_mode == 3) {
+          attrs["fill"] = "none";
+        }
+
+        add_svg_element("text", attrs, frag.text);
+      }
     }
   }
 }
@@ -3012,6 +3046,134 @@ std::string CanvasExporter::cmyk_to_hex(double c, double m, double y, double k) 
   double g = (1.0 - m) * (1.0 - k);
   double b = (1.0 - y) * (1.0 - k);
   return rgb_to_hex(r, g, b);
+}
+
+// Decode a PDF string (literal or hex) for display as text
+std::string CanvasExporter::decode_pdf_text_for_display(const std::string& str) const {
+  if (str.empty()) return "";
+
+  if (str.front() == '(' && str.back() == ')') {
+    // Literal string - decode escape sequences
+    std::string result = str.substr(1, str.size() - 2);
+    std::string decoded;
+    for (size_t i = 0; i < result.size(); ++i) {
+      if (result[i] == '\\' && i + 1 < result.size()) {
+        char next = result[++i];
+        if (next == 'n') decoded += '\n';
+        else if (next == 'r') decoded += '\r';
+        else if (next == 't') decoded += '\t';
+        else if (next == '\\' || next == '(' || next == ')') decoded += next;
+        else if (next >= '0' && next <= '7') {
+          std::string octal(1, next);
+          while (i + 1 < result.size() && octal.size() < 3 &&
+                 result[i + 1] >= '0' && result[i + 1] <= '7') {
+            octal += result[++i];
+          }
+          decoded += static_cast<char>(std::stoi(octal, nullptr, 8));
+        } else {
+          decoded += next;
+        }
+      } else {
+        decoded += result[i];
+      }
+    }
+    return decoded;
+  }
+
+  if (str.front() == '<' && str.back() == '>') {
+    // Hex string - decode to bytes, then interpret as UTF-16BE if BOM present
+    std::string hex = str.substr(1, str.size() - 2);
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < hex.size(); i += 2) {
+      std::string byte_str = hex.substr(i, std::min<size_t>(2, hex.size() - i));
+      if (byte_str.size() == 1) byte_str += "0";
+      bytes.push_back(static_cast<uint8_t>(std::stoi(byte_str, nullptr, 16)));
+    }
+    if (bytes.size() >= 2) {
+      // Check for UTF-16BE BOM or assume UTF-16BE for multi-byte
+      bool is_utf16 = (bytes[0] == 0xFE && bytes[1] == 0xFF);
+      if (!is_utf16 && bytes.size() >= 2 && bytes.size() % 2 == 0) {
+        // Heuristic: if most even bytes are 0, likely UTF-16BE
+        int zero_count = 0;
+        for (size_t i = 0; i < bytes.size(); i += 2)
+          if (bytes[i] == 0) ++zero_count;
+        is_utf16 = (zero_count > static_cast<int>(bytes.size() / 4));
+      }
+      if (is_utf16) {
+        std::string result;
+        size_t start = (bytes[0] == 0xFE && bytes[1] == 0xFF) ? 2 : 0;
+        for (size_t i = start; i + 1 < bytes.size(); i += 2) {
+          uint32_t cp = (static_cast<uint32_t>(bytes[i]) << 8) | bytes[i + 1];
+          // Handle surrogate pairs
+          if (cp >= 0xD800 && cp <= 0xDBFF && i + 3 < bytes.size()) {
+            uint32_t lo = (static_cast<uint32_t>(bytes[i + 2]) << 8) | bytes[i + 3];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+              cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+              i += 2;
+            }
+          }
+          // Encode as UTF-8
+          if (cp < 0x80) {
+            result += static_cast<char>(cp);
+          } else if (cp < 0x800) {
+            result += static_cast<char>(0xC0 | (cp >> 6));
+            result += static_cast<char>(0x80 | (cp & 0x3F));
+          } else if (cp < 0x10000) {
+            result += static_cast<char>(0xE0 | (cp >> 12));
+            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            result += static_cast<char>(0x80 | (cp & 0x3F));
+          } else {
+            result += static_cast<char>(0xF0 | (cp >> 18));
+            result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            result += static_cast<char>(0x80 | (cp & 0x3F));
+          }
+        }
+        return result;
+      }
+    }
+    // Not UTF-16, return as raw bytes
+    return std::string(bytes.begin(), bytes.end());
+  }
+
+  return str;
+}
+
+// Resolve font family name from resource name (e.g., "F1" -> "Helvetica")
+std::string CanvasExporter::resolve_font_family(const std::string& resource_name) const {
+  if (!current_page_ || !current_pdf_) return "";
+  std::string name = resource_name;
+  if (!name.empty() && name.front() == '/') name.erase(0, 1);
+  const BaseFont* font = current_page_->get_font(name, *current_pdf_);
+  if (!font || font->base_font.empty()) return "";
+
+  // Extract family name: strip subset prefix (6 chars + '+') if present
+  std::string family = font->base_font;
+  if (family.size() > 7 && family[6] == '+') {
+    family = family.substr(7);
+  }
+  // Replace common separators
+  for (auto& c : family) {
+    if (c == ',') c = ' ';
+  }
+  return family;
+}
+
+// Check if the current font uses a vertical writing CMap
+bool CanvasExporter::is_vertical_font(const std::string& resource_name) const {
+  if (!current_page_ || !current_pdf_) return false;
+  std::string name = resource_name;
+  if (!name.empty() && name.front() == '/') name.erase(0, 1);
+  const BaseFont* font = current_page_->get_font(name, *current_pdf_);
+  if (!font || font->subtype != "Type0") return false;
+  const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+  if (!type0) return false;
+  // Check CMap name for vertical indicator
+  const std::string& cmap_name = type0->encoding_cmap.name;
+  if (cmap_name.size() >= 2) {
+    return cmap_name.back() == 'V' && cmap_name[cmap_name.size() - 2] == '-';
+  }
+  return false;
 }
 
 // Resolve SC/SCN/sc/scn color based on current color space

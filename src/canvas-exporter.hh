@@ -146,6 +146,9 @@ private:
   std::string cmyk_to_hex(double c, double m, double y, double k) const;
   std::string canvas_color_string(const std::string& hex, double alpha) const;
   std::string resolve_scn_color(const std::vector<std::string>& operands, bool is_stroking);
+  std::string decode_pdf_text_for_display(const std::string& str) const;
+  std::string resolve_font_family(const std::string& resource_name) const;
+  bool is_vertical_font(const std::string& resource_name) const;
   void update_canvas_fill_style();
   void update_canvas_stroke_style();
   void update_canvas_line_width();
