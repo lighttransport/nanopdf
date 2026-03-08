@@ -150,6 +150,9 @@ private:
   std::string decode_pdf_text_with_font(const std::string& str) const;
   std::string resolve_font_family(const std::string& resource_name) const;
   bool is_vertical_font(const std::string& resource_name) const;
+  double compute_string_width(const std::string& raw_str) const;
+  void advance_text_matrix(const std::string& raw_str);
+  void advance_text_matrix_tj(const std::vector<std::string>& operands);
   void update_canvas_fill_style();
   void update_canvas_stroke_style();
   void update_canvas_line_width();

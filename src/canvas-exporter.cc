@@ -267,6 +267,37 @@ TokenizedStream tokenize_content_stream(const std::vector<uint8_t>& data) {
   return result;
 }
 
+// Extract raw bytes from a PDF string (literal or hex)
+std::string extract_raw_bytes(const std::string& str) {
+  std::string raw;
+  if (!str.empty() && str.front() == '(' && str.back() == ')') {
+    std::string inner = str.substr(1, str.size() - 2);
+    for (size_t i = 0; i < inner.size(); ++i) {
+      if (inner[i] == '\\' && i + 1 < inner.size()) {
+        char next = inner[++i];
+        if (next == 'n') raw += '\n';
+        else if (next == 'r') raw += '\r';
+        else if (next == 't') raw += '\t';
+        else if (next == '\\' || next == '(' || next == ')') raw += next;
+        else if (next >= '0' && next <= '7') {
+          std::string oct(1, next);
+          while (i + 1 < inner.size() && oct.size() < 3 &&
+                 inner[i + 1] >= '0' && inner[i + 1] <= '7') oct += inner[++i];
+          raw += static_cast<char>(std::stoi(oct, nullptr, 8));
+        } else raw += next;
+      } else raw += inner[i];
+    }
+  } else if (!str.empty() && str.front() == '<' && str.back() == '>') {
+    std::string hex = str.substr(1, str.size() - 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+      std::string bs = hex.substr(i, std::min<size_t>(2, hex.size() - i));
+      if (bs.size() == 1) bs += "0";
+      raw += static_cast<char>(std::stoi(bs, nullptr, 16));
+    }
+  }
+  return raw;
+}
+
 }  // anonymous namespace
 
 void CanvasExporter::reset_state() {
@@ -498,12 +529,15 @@ void CanvasExporter::handle_text_command(const std::string& op,
       double_to_string(tx),
       double_to_string(page_height_ - ty)
     });
+    // Advance text matrix by rendered string width
+    std::string raw = extract_raw_bytes(operands[0]);
+    advance_text_matrix(raw);
   } else if (op == "TJ" && !operands.empty()) {
     // TJ array: concatenate text fragments with spacing
     std::string combined;
     for (const std::string& token : operands) {
-      if ((token.front() == '(' && token.back() == ')') ||
-          (token.front() == '<' && token.back() == '>')) {
+      if (!token.empty() && ((token.front() == '(' && token.back() == ')') ||
+          (token.front() == '<' && token.back() == '>'))) {
         combined += decode_pdf_text_for_display(token);
       }
     }
@@ -517,6 +551,8 @@ void CanvasExporter::handle_text_command(const std::string& op,
         double_to_string(page_height_ - ty)
       });
     }
+    // Advance text matrix by all fragments + spacing
+    advance_text_matrix_tj(operands);
   } else if (op == "'" && operands.size() >= 1) {
     // Move to next line and show text
     handle_text_command("T*", {});
@@ -2006,10 +2042,12 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
     cs = cs.substr(1);
   }
 
-  if (cs == "DeviceRGB") {
+  if (cs == "DeviceRGB" || cs == "RGB") {
     image.color_space = ColorSpace(ColorSpaceType::DeviceRGB);
-  } else if (cs == "DeviceGray") {
+  } else if (cs == "DeviceGray" || cs == "G") {
     image.color_space = ColorSpace(ColorSpaceType::DeviceGray);
+  } else if (cs == "DeviceCMYK" || cs == "CMYK") {
+    image.color_space = ColorSpace(ColorSpaceType::DeviceCMYK);
   } else {
     if (!cs.empty()) {
       return false;
@@ -2055,7 +2093,8 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
   });
 
   filters::DecodeParams decode_params;
-  decode_params.colors = (image.color_space.type == ColorSpaceType::DeviceRGB) ? 3 : 1;
+  decode_params.colors = (image.color_space.type == ColorSpaceType::DeviceRGB) ? 3 :
+                          (image.color_space.type == ColorSpaceType::DeviceCMYK) ? 4 : 1;
   decode_params.bits_per_component = image.bits_per_component;
   decode_params.columns = image.width;
 
@@ -2090,14 +2129,34 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
 
   if (filter_upper.empty()) {
     image.data = data;
-  } else if (filter_upper == "FLATEDECODE") {
+  } else if (filter_upper == "FLATEDECODE" || filter_upper == "FL") {
     DecodedStream decoded = filters::decode_flate(data.data(), data.size(), decode_params);
-    if (!decoded.success) {
-      return false;
-    }
+    if (!decoded.success) return false;
     image.data = std::move(decoded.data);
-  } else if (filter_upper == "DCTDECODE" || filter_upper == "JPXDECODE") {
+  } else if (filter_upper == "DCTDECODE" || filter_upper == "DCT" || filter_upper == "JPXDECODE") {
     // Keep encoded data in raw_data; pixels will be derived on demand.
+  } else if (filter_upper == "LZWDECODE" || filter_upper == "LZW") {
+    DecodedStream decoded = filters::decode_lzw(data.data(), data.size(), decode_params);
+    if (!decoded.success) return false;
+    image.data = std::move(decoded.data);
+  } else if (filter_upper == "ASCII85DECODE" || filter_upper == "A85") {
+    DecodedStream decoded = filters::decode_ascii85(data.data(), data.size(), decode_params);
+    if (!decoded.success) return false;
+    image.data = std::move(decoded.data);
+  } else if (filter_upper == "ASCIIHEXDECODE" || filter_upper == "AHX") {
+    DecodedStream decoded = filters::decode_asciihex(data.data(), data.size(), decode_params);
+    if (!decoded.success) return false;
+    image.data = std::move(decoded.data);
+  } else if (filter_upper == "RUNLENGTHDECODE" || filter_upper == "RL") {
+    DecodedStream decoded = filters::decode_runlength(data.data(), data.size(), decode_params);
+    if (!decoded.success) return false;
+    image.data = std::move(decoded.data);
+  } else if (filter_upper == "CCITTFAXDECODE" || filter_upper == "CCF") {
+    decode_params.columns = image.width;
+    decode_params.rows = image.height;
+    DecodedStream decoded = filters::decode_ccittfax(data.data(), data.size(), decode_params);
+    if (!decoded.success) return false;
+    image.data = std::move(decoded.data);
   } else {
     return false;
   }
@@ -2458,6 +2517,9 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     if (!css_mode.empty()) attrs["style"] = "mix-blend-mode:" + css_mode + ';';
 
     add_svg_element("text", attrs, text);
+    // Advance text matrix by rendered string width
+    std::string raw = extract_raw_bytes(operands[0]);
+    advance_text_matrix(raw);
   } else if (op == "TJ" && !operands.empty()) {
     // TJ array: mix of strings and numeric spacing adjustments
     // Numeric values are displacement in thousandths of text space units
@@ -2549,6 +2611,8 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
         add_svg_element("text", attrs, frag.text);
       }
     }
+    // Advance text matrix by all fragments + spacing
+    advance_text_matrix_tj(operands);
   }
 }
 
@@ -3273,6 +3337,90 @@ std::string CanvasExporter::decode_pdf_text_with_font(const std::string& str) co
 
   // Fallback to simple decode
   return decode_pdf_text_for_display(str);
+}
+
+// Compute the width of a raw PDF string in text space units (unscaled).
+// raw_str should already be the raw bytes extracted from the PDF string.
+double CanvasExporter::compute_string_width(const std::string& raw_str) const {
+  if (!current_page_ || !current_pdf_) return 0.0;
+
+  std::string font_name = state_.current_font;
+  if (!font_name.empty() && font_name.front() == '/') font_name.erase(0, 1);
+  const BaseFont* font = current_page_->get_font(font_name, *current_pdf_);
+
+  double width = 0.0;
+  double h_scale = state_.horizontal_scaling / 100.0;
+
+  if (font && font->subtype == "Type0") {
+    const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+    int dw = type0 ? type0->default_width : 1000;
+    for (size_t i = 0; i + 1 < raw_str.size(); i += 2) {
+      uint32_t cid = (static_cast<uint8_t>(raw_str[i]) << 8) | static_cast<uint8_t>(raw_str[i + 1]);
+      int w = dw;
+      if (type0) {
+        auto it = type0->cid_widths.find(cid);
+        if (it != type0->cid_widths.end()) w = it->second;
+      }
+      // Width in thousandths of text space unit
+      double char_w = w / 1000.0 * std::abs(state_.font_size);
+      width += char_w * h_scale + state_.char_spacing;
+      // Add word spacing for space character (CID 32)
+      if (cid == 32) width += state_.word_spacing;
+    }
+  } else {
+    for (size_t i = 0; i < raw_str.size(); ++i) {
+      uint8_t code = static_cast<uint8_t>(raw_str[i]);
+      int w = 0;
+      if (font && !font->widths.empty() &&
+          code >= static_cast<uint32_t>(font->first_char) &&
+          code <= static_cast<uint32_t>(font->last_char)) {
+        w = font->widths[code - font->first_char];
+      } else {
+        w = 600;  // Reasonable default for missing width
+      }
+      double char_w = w / 1000.0 * std::abs(state_.font_size);
+      width += char_w * h_scale + state_.char_spacing;
+      if (code == 32) width += state_.word_spacing;
+    }
+  }
+  return width;
+}
+
+// Advance text matrix after rendering a Tj string
+void CanvasExporter::advance_text_matrix(const std::string& raw_str) {
+  double w = compute_string_width(raw_str);
+  // Advance text matrix by the string width in the horizontal direction
+  Matrix2D advance;
+  advance.e = w;
+  state_.text_matrix = multiply_matrices(state_.text_matrix, advance);
+  state_.text_x = state_.text_matrix.e;
+  state_.text_y = state_.text_matrix.f;
+}
+
+// Advance text matrix after rendering a TJ array
+void CanvasExporter::advance_text_matrix_tj(const std::vector<std::string>& operands) {
+  double h_scale = state_.horizontal_scaling / 100.0;
+  double total_advance = 0.0;
+
+  for (const std::string& token : operands) {
+    if (!token.empty() && ((token.front() == '(' && token.back() == ')') ||
+        (token.front() == '<' && token.back() == '>'))) {
+      std::string raw = extract_raw_bytes(token);
+      total_advance += compute_string_width(raw);
+    } else {
+      // Numeric spacing: negative = move right
+      try {
+        double val = std::stod(token);
+        total_advance += (-val / 1000.0) * std::abs(state_.font_size) * h_scale;
+      } catch (...) {}
+    }
+  }
+
+  Matrix2D advance;
+  advance.e = total_advance;
+  state_.text_matrix = multiply_matrices(state_.text_matrix, advance);
+  state_.text_x = state_.text_matrix.e;
+  state_.text_y = state_.text_matrix.f;
 }
 
 // Resolve font family name from resource name (e.g., "F1" -> "Helvetica")
