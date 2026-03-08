@@ -524,35 +524,69 @@ void CanvasExporter::handle_text_command(const std::string& op,
     double ty = state_.text_matrix.f + state_.text_rise;
     apply_matrix_to_point(state_.ctm, tx, ty);
 
-    add_canvas_command("fillText", {
-      "\"" + escape_json_string(text) + "\"",
-      double_to_string(tx),
-      double_to_string(page_height_ - ty)
-    });
+    // Apply text rendering mode: 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
+    if (state_.text_render_mode != 3) {
+      std::string draw_cmd = (state_.text_render_mode == 1) ? "strokeText" : "fillText";
+      add_canvas_command(draw_cmd, {
+        "\"" + escape_json_string(text) + "\"",
+        double_to_string(tx),
+        double_to_string(page_height_ - ty)
+      });
+      if (state_.text_render_mode == 2) {
+        add_canvas_command("strokeText", {
+          "\"" + escape_json_string(text) + "\"",
+          double_to_string(tx),
+          double_to_string(page_height_ - ty)
+        });
+      }
+    }
     // Advance text matrix by rendered string width
     std::string raw = extract_raw_bytes(operands[0]);
     advance_text_matrix(raw);
   } else if (op == "TJ" && !operands.empty()) {
-    // TJ array: concatenate text fragments with spacing
-    std::string combined;
+    // TJ array: render each string fragment at the correct position,
+    // applying numeric spacing adjustments between fragments
+    double h_scale = state_.horizontal_scaling / 100.0;
+
     for (const std::string& token : operands) {
       if (!token.empty() && ((token.front() == '(' && token.back() == ')') ||
           (token.front() == '<' && token.back() == '>'))) {
-        combined += decode_pdf_text_for_display(token);
+        std::string text = decode_pdf_text_for_display(token);
+        if (!text.empty()) {
+          double tx = state_.text_matrix.e;
+          double ty = state_.text_matrix.f + state_.text_rise;
+          apply_matrix_to_point(state_.ctm, tx, ty);
+
+          std::string draw_cmd = (state_.text_render_mode == 1) ? "strokeText" :
+                                  "fillText";
+          add_canvas_command(draw_cmd, {
+            "\"" + escape_json_string(text) + "\"",
+            double_to_string(tx),
+            double_to_string(page_height_ - ty)
+          });
+          if (state_.text_render_mode == 2) {
+            add_canvas_command("strokeText", {
+              "\"" + escape_json_string(text) + "\"",
+              double_to_string(tx),
+              double_to_string(page_height_ - ty)
+            });
+          }
+          // Advance text matrix by this fragment's width
+          std::string raw = extract_raw_bytes(token);
+          advance_text_matrix(raw);
+        }
+      } else {
+        // Numeric spacing: negative = move right (kerning)
+        try {
+          double val = std::stod(token);
+          Matrix2D advance;
+          advance.e = (-val / 1000.0) * std::abs(state_.font_size) * h_scale;
+          state_.text_matrix = multiply_matrices(state_.text_matrix, advance);
+          state_.text_x = state_.text_matrix.e;
+          state_.text_y = state_.text_matrix.f;
+        } catch (...) {}
       }
     }
-    if (!combined.empty()) {
-      double tx = state_.text_matrix.e;
-      double ty = state_.text_matrix.f + state_.text_rise;
-      apply_matrix_to_point(state_.ctm, tx, ty);
-      add_canvas_command("fillText", {
-        "\"" + escape_json_string(combined) + "\"",
-        double_to_string(tx),
-        double_to_string(page_height_ - ty)
-      });
-    }
-    // Advance text matrix by all fragments + spacing
-    advance_text_matrix_tj(operands);
   } else if (op == "'" && operands.size() >= 1) {
     // Move to next line and show text
     handle_text_command("T*", {});
@@ -1361,6 +1395,16 @@ bool CanvasExporter::prepare_image_pixels(const ImageXObject& image,
   switch (image.color_space.type) {
     case ColorSpaceType::DeviceGray:
     case ColorSpaceType::CalGray: {
+      if (image.bits_per_component == 16) {
+        // Downsample 16-bit to 8-bit by taking the high byte
+        size_t pixels = static_cast<size_t>(image.width) * image.height;
+        if (image.data.size() < pixels * 2) return false;
+        out.resize(pixels);
+        for (size_t i = 0; i < pixels; ++i)
+          out[i] = image.data[i * 2];  // Big-endian: first byte is high byte
+        components = 1;
+        return apply_decode_to_buffer(image, out, components);
+      }
       if (image.bits_per_component == 8) {
         size_t expected = static_cast<size_t>(image.width) * image.height;
         if (image.data.size() < expected) {
@@ -1382,6 +1426,16 @@ bool CanvasExporter::prepare_image_pixels(const ImageXObject& image,
     }
     case ColorSpaceType::DeviceRGB:
     case ColorSpaceType::CalRGB: {
+      if (image.bits_per_component == 16) {
+        // Downsample 16-bit to 8-bit
+        size_t pixels = static_cast<size_t>(image.width) * image.height * 3;
+        if (image.data.size() < pixels * 2) return false;
+        out.resize(pixels);
+        for (size_t i = 0; i < pixels; ++i)
+          out[i] = image.data[i * 2];
+        components = 3;
+        return apply_decode_to_buffer(image, out, components);
+      }
       if (image.bits_per_component != 8) {
         return false;
       }
@@ -1394,6 +1448,20 @@ bool CanvasExporter::prepare_image_pixels(const ImageXObject& image,
       return apply_decode_to_buffer(image, out, components);
     }
     case ColorSpaceType::DeviceCMYK: {
+      if (image.bits_per_component == 16) {
+        // Downsample 16-bit CMYK to 8-bit, then convert to RGB
+        size_t pixels = static_cast<size_t>(image.width) * image.height * 4;
+        if (image.data.size() < pixels * 2) return false;
+        // Create a temporary 8-bit image for CMYK conversion
+        ImageXObject temp = image;
+        temp.data.resize(pixels);
+        for (size_t i = 0; i < pixels; ++i)
+          temp.data[i] = image.data[i * 2];
+        temp.bits_per_component = 8;
+        if (!convert_cmyk_to_rgb(temp, out)) return false;
+        components = 3;
+        return true;
+      }
       if (image.bits_per_component != 8) {
         return false;
       }
@@ -2042,15 +2110,61 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
     cs = cs.substr(1);
   }
 
-  if (cs == "DeviceRGB" || cs == "RGB") {
-    image.color_space = ColorSpace(ColorSpaceType::DeviceRGB);
-  } else if (cs == "DeviceGray" || cs == "G") {
-    image.color_space = ColorSpace(ColorSpaceType::DeviceGray);
-  } else if (cs == "DeviceCMYK" || cs == "CMYK") {
-    image.color_space = ColorSpace(ColorSpaceType::DeviceCMYK);
-  } else {
-    if (!cs.empty()) {
-      return false;
+  // Check for array-form color space (e.g., Indexed)
+  auto cs_it = dict.find("CS");
+  if (cs_it == dict.end()) cs_it = dict.find("ColorSpace");
+  bool is_indexed = false;
+  if (cs_it != dict.end() && cs_it->second.size() >= 4) {
+    // Array form: [/Indexed <base> <hival> <lookup>] or [/I <base> <hival> <lookup>]
+    const auto& tokens = cs_it->second;
+    std::string first = tokens[0];
+    if (!first.empty() && first.front() == '/') first = first.substr(1);
+    if (first == "Indexed" || first == "I") {
+      is_indexed = true;
+      std::string base = tokens[1];
+      if (!base.empty() && base.front() == '/') base = base.substr(1);
+      int hival = 0;
+      try { hival = static_cast<int>(std::stod(tokens[2])); } catch (...) {}
+
+      // Parse lookup table (hex string or raw bytes)
+      std::vector<uint8_t> lookup;
+      const std::string& lookup_str = tokens[3];
+      if (!lookup_str.empty() && lookup_str.front() == '<' && lookup_str.back() == '>') {
+        std::string hex = lookup_str.substr(1, lookup_str.size() - 2);
+        for (size_t i = 0; i < hex.size(); i += 2) {
+          std::string bs = hex.substr(i, std::min<size_t>(2, hex.size() - i));
+          if (bs.size() == 1) bs += "0";
+          try { lookup.push_back(static_cast<uint8_t>(std::stoi(bs, nullptr, 16))); } catch (...) {}
+        }
+      } else if (!lookup_str.empty() && lookup_str.front() == '(' && lookup_str.back() == ')') {
+        std::string raw = extract_raw_bytes(lookup_str);
+        lookup.assign(raw.begin(), raw.end());
+      }
+
+      // Determine base components
+      int base_components = 3;  // default RGB
+      ColorSpaceType base_type = ColorSpaceType::DeviceRGB;
+      if (base == "DeviceGray" || base == "G") { base_components = 1; base_type = ColorSpaceType::DeviceGray; }
+      else if (base == "DeviceCMYK" || base == "CMYK") { base_components = 4; base_type = ColorSpaceType::DeviceCMYK; }
+
+      image.color_space = ColorSpace(ColorSpaceType::Indexed);
+      image.color_space.base_color_space.reset(new ColorSpace(base_type));
+      image.color_space.hival = hival;
+      image.color_space.lookup_table = std::move(lookup);
+    }
+  }
+
+  if (!is_indexed) {
+    if (cs == "DeviceRGB" || cs == "RGB") {
+      image.color_space = ColorSpace(ColorSpaceType::DeviceRGB);
+    } else if (cs == "DeviceGray" || cs == "G") {
+      image.color_space = ColorSpace(ColorSpaceType::DeviceGray);
+    } else if (cs == "DeviceCMYK" || cs == "CMYK") {
+      image.color_space = ColorSpace(ColorSpaceType::DeviceCMYK);
+    } else {
+      if (!cs.empty()) {
+        return false;
+      }
     }
   }
 
@@ -2094,7 +2208,8 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
 
   filters::DecodeParams decode_params;
   decode_params.colors = (image.color_space.type == ColorSpaceType::DeviceRGB) ? 3 :
-                          (image.color_space.type == ColorSpaceType::DeviceCMYK) ? 4 : 1;
+                          (image.color_space.type == ColorSpaceType::DeviceCMYK) ? 4 :
+                          (image.color_space.type == ColorSpaceType::Indexed) ? 1 : 1;
   decode_params.bits_per_component = image.bits_per_component;
   decode_params.columns = image.width;
 
