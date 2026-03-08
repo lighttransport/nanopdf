@@ -362,10 +362,11 @@ void CanvasExporter::parse_content_stream_from_tokens(const std::vector<std::str
 
     bool is_operator = false;
 
-    if (token == "BT" || token == "ET" || token == "Tj" || token == "TJ" || 
+    if (token == "BT" || token == "ET" || token == "Tj" || token == "TJ" ||
         token == "Td" || token == "TD" || token == "Tm" || token == "T*" ||
         token == "Tf" || token == "TL" || token == "Tc" || token == "Tw" ||
-        token == "Tz" || token == "TL" || token == "Ts" || token == "Tr") {
+        token == "Tz" || token == "Ts" || token == "Tr" ||
+        token == "'" || token == "\"") {
       handle_text_command(token, operand_stack);
       is_operator = true;
     } else if (token == "m" || token == "l" || token == "c" || token == "v" || 
@@ -486,21 +487,36 @@ void CanvasExporter::handle_text_command(const std::string& op,
     state_.text_x = state_.text_matrix.e;
     state_.text_y = state_.text_matrix.f;
   } else if (op == "Tj" && operands.size() >= 1) {
-    std::string text = operands[0];
-    if (text.length() >= 2 && text[0] == '(' && text[text.length()-1] == ')') {
-      text = text.substr(1, text.length()-2);
-    }
+    std::string text = decode_pdf_text_for_display(operands[0]);
 
-    // Apply text matrix with CTM for final position
     double tx = state_.text_matrix.e;
     double ty = state_.text_matrix.f + state_.text_rise;
     apply_matrix_to_point(state_.ctm, tx, ty);
 
     add_canvas_command("fillText", {
-      "\"" + text + "\"",
+      "\"" + escape_json_string(text) + "\"",
       double_to_string(tx),
       double_to_string(page_height_ - ty)
     });
+  } else if (op == "TJ" && !operands.empty()) {
+    // TJ array: concatenate text fragments with spacing
+    std::string combined;
+    for (const std::string& token : operands) {
+      if ((token.front() == '(' && token.back() == ')') ||
+          (token.front() == '<' && token.back() == '>')) {
+        combined += decode_pdf_text_for_display(token);
+      }
+    }
+    if (!combined.empty()) {
+      double tx = state_.text_matrix.e;
+      double ty = state_.text_matrix.f + state_.text_rise;
+      apply_matrix_to_point(state_.ctm, tx, ty);
+      add_canvas_command("fillText", {
+        "\"" + escape_json_string(combined) + "\"",
+        double_to_string(tx),
+        double_to_string(page_height_ - ty)
+      });
+    }
   } else if (op == "'" && operands.size() >= 1) {
     // Move to next line and show text
     handle_text_command("T*", {});
@@ -2225,10 +2241,11 @@ void CanvasExporter::parse_content_stream_for_svg_from_tokens(const std::vector<
 
     bool is_operator = false;
 
-    if (token == "BT" || token == "ET" || token == "Tj" || token == "TJ" || 
+    if (token == "BT" || token == "ET" || token == "Tj" || token == "TJ" ||
         token == "Td" || token == "TD" || token == "Tm" || token == "T*" ||
         token == "Tf" || token == "TL" || token == "Tc" || token == "Tw" ||
-        token == "Tz" || token == "TL" || token == "Ts" || token == "Tr") {
+        token == "Tz" || token == "Ts" || token == "Tr" ||
+        token == "'" || token == "\"") {
       handle_text_command_svg(token, operand_stack);
       is_operator = true;
     } else if (token == "m" || token == "l" || token == "c" || token == "v" || 
@@ -2394,8 +2411,8 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     handle_text_command_svg("T*", {});
     handle_text_command_svg("Tj", {operands[2]});
   } else if (op == "Tj" && operands.size() >= 1) {
-    // Decode string (handles both literal and hex strings)
-    std::string text = decode_pdf_text_for_display(operands[0]);
+    // Decode string through font's ToUnicode/encoding for proper Unicode
+    std::string text = decode_pdf_text_with_font(operands[0]);
 
     // Compute position: apply text matrix (with text rise) through CTM
     double tx = state_.text_matrix.e;
@@ -2461,7 +2478,7 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     for (const std::string& token : operands) {
       if ((token.front() == '(' && token.back() == ')') ||
           (token.front() == '<' && token.back() == '>')) {
-        std::string decoded = decode_pdf_text_for_display(token);
+        std::string decoded = decode_pdf_text_with_font(token);
         if (!decoded.empty()) {
           fragments.push_back({decoded, cumulative_offset});
         }
@@ -3137,6 +3154,125 @@ std::string CanvasExporter::decode_pdf_text_for_display(const std::string& str) 
   }
 
   return str;
+}
+
+// Decode PDF string bytes through the current font's ToUnicode/encoding
+std::string CanvasExporter::decode_pdf_text_with_font(const std::string& str) const {
+  if (!current_page_ || !current_pdf_) return decode_pdf_text_for_display(str);
+
+  // First extract raw bytes from the PDF string
+  std::string raw;
+  if (!str.empty() && str.front() == '(' && str.back() == ')') {
+    // Literal string - decode escapes to raw bytes
+    std::string inner = str.substr(1, str.size() - 2);
+    for (size_t i = 0; i < inner.size(); ++i) {
+      if (inner[i] == '\\' && i + 1 < inner.size()) {
+        char next = inner[++i];
+        if (next == 'n') raw += '\n';
+        else if (next == 'r') raw += '\r';
+        else if (next == 't') raw += '\t';
+        else if (next == '\\' || next == '(' || next == ')') raw += next;
+        else if (next >= '0' && next <= '7') {
+          std::string oct(1, next);
+          while (i + 1 < inner.size() && oct.size() < 3 &&
+                 inner[i + 1] >= '0' && inner[i + 1] <= '7') oct += inner[++i];
+          raw += static_cast<char>(std::stoi(oct, nullptr, 8));
+        } else raw += next;
+      } else raw += inner[i];
+    }
+  } else if (!str.empty() && str.front() == '<' && str.back() == '>') {
+    // Hex string - decode to raw bytes
+    std::string hex = str.substr(1, str.size() - 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+      std::string bs = hex.substr(i, std::min<size_t>(2, hex.size() - i));
+      if (bs.size() == 1) bs += "0";
+      raw += static_cast<char>(std::stoi(bs, nullptr, 16));
+    }
+  } else {
+    return decode_pdf_text_for_display(str);
+  }
+
+  // Look up font and apply encoding
+  std::string font_name = state_.current_font;
+  if (!font_name.empty() && font_name.front() == '/') font_name.erase(0, 1);
+  const BaseFont* font = current_page_->get_font(font_name, *current_pdf_);
+  if (!font) return decode_pdf_text_for_display(str);
+
+  // Try ToUnicode CMap first
+  if (!font->to_unicode_cmap.code_to_unicode.empty()) {
+    std::string result;
+    // Determine if this is a 2-byte CMap
+    bool is_two_byte = (font->subtype == "Type0");
+    if (is_two_byte) {
+      for (size_t i = 0; i + 1 < raw.size(); i += 2) {
+        uint32_t code = (static_cast<uint8_t>(raw[i]) << 8) | static_cast<uint8_t>(raw[i + 1]);
+        uint32_t unicode = font->to_unicode_cmap.map_code_to_unicode(code);
+        if (unicode == 0) unicode = code;  // fallback
+        // Encode as UTF-8
+        if (unicode < 0x80) {
+          result += static_cast<char>(unicode);
+        } else if (unicode < 0x800) {
+          result += static_cast<char>(0xC0 | (unicode >> 6));
+          result += static_cast<char>(0x80 | (unicode & 0x3F));
+        } else if (unicode < 0x10000) {
+          result += static_cast<char>(0xE0 | (unicode >> 12));
+          result += static_cast<char>(0x80 | ((unicode >> 6) & 0x3F));
+          result += static_cast<char>(0x80 | (unicode & 0x3F));
+        } else {
+          result += static_cast<char>(0xF0 | (unicode >> 18));
+          result += static_cast<char>(0x80 | ((unicode >> 12) & 0x3F));
+          result += static_cast<char>(0x80 | ((unicode >> 6) & 0x3F));
+          result += static_cast<char>(0x80 | (unicode & 0x3F));
+        }
+      }
+    } else {
+      for (size_t i = 0; i < raw.size(); ++i) {
+        uint32_t code = static_cast<uint8_t>(raw[i]);
+        uint32_t unicode = font->to_unicode_cmap.map_code_to_unicode(code);
+        if (unicode == 0) unicode = code;
+        if (unicode < 0x80) {
+          result += static_cast<char>(unicode);
+        } else if (unicode < 0x800) {
+          result += static_cast<char>(0xC0 | (unicode >> 6));
+          result += static_cast<char>(0x80 | (unicode & 0x3F));
+        } else {
+          result += static_cast<char>(0xE0 | (unicode >> 12));
+          result += static_cast<char>(0x80 | ((unicode >> 6) & 0x3F));
+          result += static_cast<char>(0x80 | (unicode & 0x3F));
+        }
+      }
+    }
+    return result;
+  }
+
+  // For Type0 fonts with Identity CMap, treat as UTF-16BE
+  if (font->subtype == "Type0") {
+    const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+    if (type0) {
+      const std::string& cmap_name = type0->encoding_cmap.name;
+      if (cmap_name == "Identity-H" || cmap_name == "Identity-V" ||
+          cmap_name.find("-UTF16-") != std::string::npos ||
+          cmap_name.find("-UCS2-") != std::string::npos) {
+        // Treat raw bytes as UTF-16BE
+        std::string result;
+        for (size_t i = 0; i + 1 < raw.size(); i += 2) {
+          uint32_t cp = (static_cast<uint8_t>(raw[i]) << 8) | static_cast<uint8_t>(raw[i + 1]);
+          if (cp >= 0xD800 && cp <= 0xDBFF && i + 3 < raw.size()) {
+            uint32_t lo = (static_cast<uint8_t>(raw[i + 2]) << 8) | static_cast<uint8_t>(raw[i + 3]);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); i += 2; }
+          }
+          if (cp < 0x80) result += static_cast<char>(cp);
+          else if (cp < 0x800) { result += static_cast<char>(0xC0 | (cp >> 6)); result += static_cast<char>(0x80 | (cp & 0x3F)); }
+          else if (cp < 0x10000) { result += static_cast<char>(0xE0 | (cp >> 12)); result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); result += static_cast<char>(0x80 | (cp & 0x3F)); }
+          else { result += static_cast<char>(0xF0 | (cp >> 18)); result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F)); result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); result += static_cast<char>(0x80 | (cp & 0x3F)); }
+        }
+        return result;
+      }
+    }
+  }
+
+  // Fallback to simple decode
+  return decode_pdf_text_for_display(str);
 }
 
 // Resolve font family name from resource name (e.g., "F1" -> "Helvetica")
