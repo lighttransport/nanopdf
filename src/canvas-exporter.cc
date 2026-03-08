@@ -459,7 +459,57 @@ void CanvasExporter::handle_text_command(const std::string& op,
     } catch (...) {
       state_.font_size = 12.0;
     }
-    add_canvas_command("font", {double_to_string(state_.font_size) + "px Arial"});
+    // Build CSS font string: "<style> <weight> <size>px <family>"
+    std::string family = resolve_font_family(state_.current_font);
+    if (family.empty()) family = "sans-serif";
+
+    // Extract weight and style from font name and descriptor
+    std::string weight;
+    std::string style;
+    std::string family_lower = family;
+    std::transform(family_lower.begin(), family_lower.end(), family_lower.begin(),
+                   [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+
+    if (family_lower.find("bold") != std::string::npos) weight = "bold";
+    else if (family_lower.find("black") != std::string::npos) weight = "900";
+    else if (family_lower.find("heavy") != std::string::npos) weight = "900";
+    else if (family_lower.find("semibold") != std::string::npos) weight = "600";
+    else if (family_lower.find("demibold") != std::string::npos) weight = "600";
+    else if (family_lower.find("medium") != std::string::npos) weight = "500";
+    else if (family_lower.find("light") != std::string::npos) weight = "300";
+    else if (family_lower.find("thin") != std::string::npos) weight = "100";
+
+    if (family_lower.find("italic") != std::string::npos) style = "italic";
+    else if (family_lower.find("oblique") != std::string::npos) style = "oblique";
+
+    // Check FontDescriptor flags if available
+    {
+      std::string fname = state_.current_font;
+      if (!fname.empty() && fname.front() == '/') fname.erase(0, 1);
+      if (current_page_ && current_pdf_) {
+        const BaseFont* font = current_page_->get_font(fname, *current_pdf_);
+        if (font && font->descriptor) {
+          // PDF font flags: bit 7 (0x40) = italic, bit 19 (0x40000) = force bold
+          if ((font->descriptor->flags & 0x40) && style.empty()) style = "italic";
+          if ((font->descriptor->flags & 0x40000) && weight.empty()) weight = "bold";
+          if (std::abs(font->descriptor->italic_angle) > 1.0 && style.empty()) style = "italic";
+        }
+      }
+    }
+
+    // Strip style/weight suffixes from family for cleaner CSS
+    std::string clean_family = family;
+    // Remove common suffixes: -Bold, -Italic, -BoldItalic, etc.
+    size_t dash = clean_family.find('-');
+    if (dash != std::string::npos && dash > 0) {
+      clean_family = clean_family.substr(0, dash);
+    }
+
+    std::string font_str;
+    if (!style.empty()) font_str += style + " ";
+    if (!weight.empty()) font_str += weight + " ";
+    font_str += double_to_string(state_.font_size) + "px " + clean_family;
+    add_canvas_command("font", {font_str});
   } else if (op == "Tc" && operands.size() >= 1) {
     try { state_.char_spacing = std::stod(operands[0]); } catch (...) {}
   } else if (op == "Tw" && operands.size() >= 1) {
@@ -526,6 +576,13 @@ void CanvasExporter::handle_text_command(const std::string& op,
 
     // Apply text rendering mode: 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
     if (state_.text_render_mode != 3) {
+      // Ensure fill/stroke style matches current color state before text drawing
+      if (state_.text_render_mode == 0 || state_.text_render_mode == 2) {
+        update_canvas_fill_style();
+      }
+      if (state_.text_render_mode == 1 || state_.text_render_mode == 2) {
+        update_canvas_stroke_style();
+      }
       std::string draw_cmd = (state_.text_render_mode == 1) ? "strokeText" : "fillText";
       add_canvas_command(draw_cmd, {
         "\"" + escape_json_string(text) + "\"",
@@ -547,6 +604,16 @@ void CanvasExporter::handle_text_command(const std::string& op,
     // TJ array: render each string fragment at the correct position,
     // applying numeric spacing adjustments between fragments
     double h_scale = state_.horizontal_scaling / 100.0;
+
+    // Ensure fill/stroke style is set before text drawing
+    if (state_.text_render_mode != 3) {
+      if (state_.text_render_mode == 0 || state_.text_render_mode == 2) {
+        update_canvas_fill_style();
+      }
+      if (state_.text_render_mode == 1 || state_.text_render_mode == 2) {
+        update_canvas_stroke_style();
+      }
+    }
 
     for (const std::string& token : operands) {
       if (!token.empty() && ((token.front() == '(' && token.back() == ')') ||
@@ -3735,6 +3802,10 @@ void CanvasExporter::handle_xobject_command(const std::vector<std::string>& oper
       if (std::abs(opacity - 1.0) > 1e-6) {
         add_canvas_command("globalAlpha", {double_to_string(opacity)});
       }
+      // Apply blend mode if set
+      if (state_.blend_mode != "source-over") {
+        update_canvas_blend_mode();
+      }
     }
 
     // Apply Form XObject matrix
@@ -3768,6 +3839,13 @@ void CanvasExporter::handle_xobject_command(const std::vector<std::string>& oper
         }
       }
       if (res_val->type == Value::DICTIONARY) {
+        // Save resource state before Form XObject overrides
+        auto saved_images = image_xobjects_;
+        auto saved_gstates = ext_gstates_;
+        auto saved_shadings = shading_resources_;
+        auto saved_patterns = pattern_resources_;
+        auto saved_inline_cursor = inline_image_cursor_;
+
         auto form_images = parse_xobject_resources(*current_pdf_, res_val->dict);
         for (auto& img_pair : form_images) {
           image_xobjects_[img_pair.first] = std::move(img_pair.second);
@@ -3792,15 +3870,39 @@ void CanvasExporter::handle_xobject_command(const std::vector<std::string>& oper
         }
         parse_shading_resources(*current_pdf_, res_val->dict);
         parse_pattern_resources(*current_pdf_, res_val->dict);
+
+        // Parse Form content
+        TokenizedStream form_stream = tokenize_content_stream(decoded.data);
+        for (auto& img : form_stream.inline_images) {
+          inline_images_.push_back(std::move(img));
+        }
+        parse_content_stream_from_tokens(form_stream.tokens);
+
+        // Restore resource state
+        image_xobjects_ = std::move(saved_images);
+        ext_gstates_ = std::move(saved_gstates);
+        shading_resources_ = std::move(saved_shadings);
+        pattern_resources_ = std::move(saved_patterns);
+        inline_image_cursor_ = saved_inline_cursor;
+
+        // Restore graphics state
+        if (!graphics_state_stack_.empty()) {
+          state_ = graphics_state_stack_.back();
+          graphics_state_stack_.pop_back();
+        }
+        add_canvas_command("restore");
+        return;
       }
     }
 
-    // Parse Form content
+    // No resources dict - still parse the Form content
+    {
     TokenizedStream form_stream = tokenize_content_stream(decoded.data);
     for (auto& img : form_stream.inline_images) {
       inline_images_.push_back(std::move(img));
     }
     parse_content_stream_from_tokens(form_stream.tokens);
+    }
 
     // Restore state
     if (!graphics_state_stack_.empty()) {
