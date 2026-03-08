@@ -244,6 +244,11 @@ private:
    Matrix2D text_matrix;
    Matrix2D text_line_matrix;
    double leading{0.0};
+   double char_spacing{0.0};      // Tc operator
+   double word_spacing{0.0};      // Tw operator
+   double horizontal_scaling{100.0}; // Tz operator (percentage)
+   double text_rise{0.0};         // Ts operator
+   int text_render_mode{0};       // Tr operator
     SoftMaskType soft_mask_type{SoftMaskType::None};
     Value soft_mask_value;
     std::string fill_color_space;    // Current nonstroking color space name
@@ -283,6 +288,14 @@ private:
   void parse_pattern_resources(const Pdf& pdf, const Dictionary& resources);
   std::map<std::string, Value> shading_resources_;
   std::map<std::string, Value> pattern_resources_;
+
+  // Color space resources: resolved ColorSpace objects by resource name
+  std::map<std::string, ColorSpace> color_space_resources_;
+  void parse_color_space_resources(const Pdf& pdf, const Dictionary& resources);
+  std::string resolve_color_with_space(const ColorSpace& cs,
+                                        const std::vector<std::string>& operands);
+  std::string lab_to_hex(double l_star, double a_star, double b_star,
+                          const ColorSpace& cs) const;
 };
 
 }  // namespace nanopdf

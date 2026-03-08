@@ -292,6 +292,7 @@ void CanvasExporter::reset_state() {
   svg_clip_counter_ = 0;
   shading_resources_.clear();
   pattern_resources_.clear();
+  color_space_resources_.clear();
 }
 
 CanvasExportResult CanvasExporter::export_page(const Pdf& pdf, const Page& page) {
@@ -327,6 +328,7 @@ CanvasExportResult CanvasExporter::export_page(const Pdf& pdf, const Page& page)
   ext_gstates_ = parse_extgstate_resources(pdf, page.resources);
   parse_shading_resources(pdf, page.resources);
   parse_pattern_resources(pdf, page.resources);
+  parse_color_space_resources(pdf, page.resources);
   inline_image_cursor_ = 0;
   TokenizedStream stream = tokenize_content_stream(content.data);
   inline_images_ = stream.inline_images;
@@ -389,6 +391,13 @@ void CanvasExporter::parse_content_stream_from_tokens(const std::vector<std::str
     } else if (token == "sh") {
       handle_shading_command(operand_stack);
       is_operator = true;
+    } else if (token == "d0" || token == "d1") {
+      // Type3 glyph width/bbox declarations - no visual effect
+      is_operator = true;
+    } else if (token == "BMC" || token == "BDC" || token == "EMC" ||
+               token == "MP" || token == "DP") {
+      // Marked content operators - handled for OCG visibility
+      is_operator = true;
     }
 
     if (is_operator) {
@@ -399,7 +408,7 @@ void CanvasExporter::parse_content_stream_from_tokens(const std::vector<std::str
   }
 }
 
-void CanvasExporter::process_pdf_command(const std::string& operator_name, 
+void CanvasExporter::process_pdf_command(const std::string& operator_name,
                                        const std::vector<std::string>& operands) {
 }
 
@@ -419,33 +428,89 @@ void CanvasExporter::handle_text_command(const std::string& op,
       state_.font_size = 12.0;
     }
     add_canvas_command("font", {double_to_string(state_.font_size) + "px Arial"});
+  } else if (op == "Tc" && operands.size() >= 1) {
+    try { state_.char_spacing = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Tw" && operands.size() >= 1) {
+    try { state_.word_spacing = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Tz" && operands.size() >= 1) {
+    try { state_.horizontal_scaling = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Ts" && operands.size() >= 1) {
+    try { state_.text_rise = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Tr" && operands.size() >= 1) {
+    try { state_.text_render_mode = static_cast<int>(std::stod(operands[0])); } catch (...) {}
+  } else if (op == "TL" && operands.size() >= 1) {
+    try { state_.leading = std::stod(operands[0]); } catch (...) {}
   } else if (op == "Td" && operands.size() >= 2) {
     try {
       double dx = std::stod(operands[0]);
       double dy = std::stod(operands[1]);
-      state_.text_x += dx;
-      state_.text_y += dy;
+      Matrix2D translation;
+      translation.e = dx;
+      translation.f = dy;
+      state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
+      state_.text_matrix = state_.text_line_matrix;
+      state_.text_x = state_.text_matrix.e;
+      state_.text_y = state_.text_matrix.f;
+    } catch (...) {}
+  } else if (op == "TD" && operands.size() >= 2) {
+    try {
+      double dx = std::stod(operands[0]);
+      double dy = std::stod(operands[1]);
+      state_.leading = -dy;
+      Matrix2D translation;
+      translation.e = dx;
+      translation.f = dy;
+      state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
+      state_.text_matrix = state_.text_line_matrix;
+      state_.text_x = state_.text_matrix.e;
+      state_.text_y = state_.text_matrix.f;
     } catch (...) {}
   } else if (op == "Tm" && operands.size() >= 6) {
     try {
-      state_.text_x = std::stod(operands[4]);
-      state_.text_y = std::stod(operands[5]);
+      state_.text_matrix.a = std::stod(operands[0]);
+      state_.text_matrix.b = std::stod(operands[1]);
+      state_.text_matrix.c = std::stod(operands[2]);
+      state_.text_matrix.d = std::stod(operands[3]);
+      state_.text_matrix.e = std::stod(operands[4]);
+      state_.text_matrix.f = std::stod(operands[5]);
+      state_.text_line_matrix = state_.text_matrix;
+      state_.text_x = state_.text_matrix.e;
+      state_.text_y = state_.text_matrix.f;
     } catch (...) {}
+  } else if (op == "T*") {
+    Matrix2D translation;
+    translation.e = 0.0;
+    translation.f = -state_.leading;
+    state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
+    state_.text_matrix = state_.text_line_matrix;
+    state_.text_x = state_.text_matrix.e;
+    state_.text_y = state_.text_matrix.f;
   } else if (op == "Tj" && operands.size() >= 1) {
     std::string text = operands[0];
     if (text.length() >= 2 && text[0] == '(' && text[text.length()-1] == ')') {
       text = text.substr(1, text.length()-2);
     }
-    
-    double canvas_x = state_.text_x;
-    double canvas_y = state_.text_y;
-    transform_coordinates(canvas_x, canvas_y);
-    
+
+    // Apply text matrix with CTM for final position
+    double tx = state_.text_matrix.e;
+    double ty = state_.text_matrix.f + state_.text_rise;
+    apply_matrix_to_point(state_.ctm, tx, ty);
+
     add_canvas_command("fillText", {
       "\"" + text + "\"",
-      double_to_string(canvas_x),
-      double_to_string(canvas_y)
+      double_to_string(tx),
+      double_to_string(page_height_ - ty)
     });
+  } else if (op == "'" && operands.size() >= 1) {
+    // Move to next line and show text
+    handle_text_command("T*", {});
+    handle_text_command("Tj", operands);
+  } else if (op == "\"" && operands.size() >= 3) {
+    // Set Tw, Tc, move to next line, show text
+    handle_text_command("Tw", {operands[0]});
+    handle_text_command("Tc", {operands[1]});
+    handle_text_command("T*", {});
+    handle_text_command("Tj", {operands[2]});
   }
 }
 
@@ -2128,6 +2193,7 @@ SvgExportResult CanvasExporter::export_page_to_svg(const Pdf& pdf, const Page& p
   ext_gstates_ = parse_extgstate_resources(pdf, page.resources);
   parse_shading_resources(pdf, page.resources);
   parse_pattern_resources(pdf, page.resources);
+  parse_color_space_resources(pdf, page.resources);
   inline_image_cursor_ = 0;
   TokenizedStream stream = tokenize_content_stream(content.data);
   inline_images_ = stream.inline_images;
@@ -2223,6 +2289,10 @@ void CanvasExporter::parse_content_stream_for_svg_from_tokens(const std::vector<
           ocg_skip_depth_--;
       }
       is_operator = true;
+    } else if (token == "d0" || token == "d1" ||
+               token == "MP" || token == "DP") {
+      // Type3 glyph declarations / marked content point - no visual effect
+      is_operator = true;
     }
 
     if (is_operator) {
@@ -2255,15 +2325,21 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
       state_.font_size = 12.0;
     }
   } else if (op == "TL" && operands.size() >= 1) {
-    try {
-      state_.leading = std::stod(operands[0]);
-    } catch (...) {}
+    try { state_.leading = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Tc" && operands.size() >= 1) {
+    try { state_.char_spacing = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Tw" && operands.size() >= 1) {
+    try { state_.word_spacing = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Tz" && operands.size() >= 1) {
+    try { state_.horizontal_scaling = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Ts" && operands.size() >= 1) {
+    try { state_.text_rise = std::stod(operands[0]); } catch (...) {}
+  } else if (op == "Tr" && operands.size() >= 1) {
+    try { state_.text_render_mode = static_cast<int>(std::stod(operands[0])); } catch (...) {}
   } else if (op == "Td" && operands.size() >= 2) {
     try {
       double dx = std::stod(operands[0]);
       double dy = std::stod(operands[1]);
-      state_.text_x += dx;
-      state_.text_y += dy;
       Matrix2D translation;
       translation.e = dx;
       translation.f = dy;
@@ -2276,8 +2352,6 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     try {
       double dx = std::stod(operands[0]);
       double dy = std::stod(operands[1]);
-      state_.text_x += dx;
-      state_.text_y += dy;
       state_.leading = -dy;
       Matrix2D translation;
       translation.e = dx;
@@ -2311,29 +2385,67 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     state_.text_matrix = state_.text_line_matrix;
     state_.text_x = state_.text_matrix.e;
     state_.text_y = state_.text_matrix.f;
+  } else if (op == "'" && operands.size() >= 1) {
+    handle_text_command_svg("T*", {});
+    handle_text_command_svg("Tj", operands);
+  } else if (op == "\"" && operands.size() >= 3) {
+    handle_text_command_svg("Tw", {operands[0]});
+    handle_text_command_svg("Tc", {operands[1]});
+    handle_text_command_svg("T*", {});
+    handle_text_command_svg("Tj", {operands[2]});
   } else if (op == "Tj" && operands.size() >= 1) {
     std::string text = operands[0];
     if (text.length() >= 2 && text[0] == '(' && text[text.length()-1] == ')') {
       text = text.substr(1, text.length()-2);
     }
 
-    double svg_x = state_.text_matrix.e;
-    double svg_y = state_.text_matrix.f;
-    transform_coordinates_svg(svg_x, svg_y);
-    
+    // Compute position: apply text matrix (with text rise) through CTM
+    double tx = state_.text_matrix.e;
+    double ty = state_.text_matrix.f + state_.text_rise;
+    apply_matrix_to_point(state_.ctm, tx, ty);
+    double svg_x = tx;
+    double svg_y = page_height_ - ty;
+
     std::map<std::string, std::string> attrs;
     attrs["x"] = double_to_string(svg_x);
     attrs["y"] = double_to_string(svg_y);
-    attrs["font-size"] = double_to_string(state_.font_size);
+
+    // Compute effective font size from text matrix scale
+    double text_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                   state_.text_matrix.b * state_.text_matrix.b);
+    double ctm_scale = std::sqrt(state_.ctm.a * state_.ctm.a + state_.ctm.b * state_.ctm.b);
+    double effective_size = std::abs(state_.font_size) * text_scale * ctm_scale;
+    attrs["font-size"] = double_to_string(effective_size);
     attrs["fill"] = state_.fill_color;
     if (std::abs(state_.fill_alpha - 1.0) > 1e-6) {
       attrs["fill-opacity"] = double_to_string(state_.fill_alpha);
+    }
+    // Apply horizontal scaling
+    if (std::abs(state_.horizontal_scaling - 100.0) > 0.1) {
+      double scale_factor = state_.horizontal_scaling / 100.0;
+      attrs["transform"] = "scale(" + double_to_string(scale_factor) + ",1)";
+    }
+    // Apply character spacing as SVG letter-spacing
+    if (std::abs(state_.char_spacing) > 0.01) {
+      attrs["letter-spacing"] = double_to_string(state_.char_spacing * ctm_scale);
+    }
+    // Apply word spacing
+    if (std::abs(state_.word_spacing) > 0.01) {
+      attrs["word-spacing"] = double_to_string(state_.word_spacing * ctm_scale);
+    }
+    // Text rendering mode
+    if (state_.text_render_mode == 1 || state_.text_render_mode == 2) {
+      attrs["stroke"] = state_.stroke_color;
+      attrs["stroke-width"] = double_to_string(state_.stroke_width);
+      if (state_.text_render_mode == 1) attrs["fill"] = "none";
+    } else if (state_.text_render_mode == 3) {
+      attrs["fill"] = "none";  // Invisible text
     }
     std::string css_mode = blend_mode_to_css(state_.blend_mode);
     if (!css_mode.empty()) {
       attrs["style"] = "mix-blend-mode:" + css_mode + ';';
     }
-    
+
     add_svg_element("text", attrs, text);
   } else if (op == "TJ" && !operands.empty()) {
     std::string combined;
@@ -2344,17 +2456,40 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     }
 
     if (!combined.empty()) {
-      double svg_x = state_.text_matrix.e;
-      double svg_y = state_.text_matrix.f;
-      transform_coordinates_svg(svg_x, svg_y);
+      double tx = state_.text_matrix.e;
+      double ty = state_.text_matrix.f + state_.text_rise;
+      apply_matrix_to_point(state_.ctm, tx, ty);
+      double svg_x = tx;
+      double svg_y = page_height_ - ty;
+
+      double text_scale = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                     state_.text_matrix.b * state_.text_matrix.b);
+      double ctm_scale = std::sqrt(state_.ctm.a * state_.ctm.a + state_.ctm.b * state_.ctm.b);
+      double effective_size = std::abs(state_.font_size) * text_scale * ctm_scale;
 
       std::map<std::string, std::string> attrs;
       attrs["x"] = double_to_string(svg_x);
       attrs["y"] = double_to_string(svg_y);
-      attrs["font-size"] = double_to_string(state_.font_size);
+      attrs["font-size"] = double_to_string(effective_size);
       attrs["fill"] = state_.fill_color;
       if (std::abs(state_.fill_alpha - 1.0) > 1e-6) {
         attrs["fill-opacity"] = double_to_string(state_.fill_alpha);
+      }
+      if (std::abs(state_.horizontal_scaling - 100.0) > 0.1) {
+        attrs["transform"] = "scale(" + double_to_string(state_.horizontal_scaling / 100.0) + ",1)";
+      }
+      if (std::abs(state_.char_spacing) > 0.01) {
+        attrs["letter-spacing"] = double_to_string(state_.char_spacing * ctm_scale);
+      }
+      if (std::abs(state_.word_spacing) > 0.01) {
+        attrs["word-spacing"] = double_to_string(state_.word_spacing * ctm_scale);
+      }
+      if (state_.text_render_mode == 1 || state_.text_render_mode == 2) {
+        attrs["stroke"] = state_.stroke_color;
+        attrs["stroke-width"] = double_to_string(state_.stroke_width);
+        if (state_.text_render_mode == 1) attrs["fill"] = "none";
+      } else if (state_.text_render_mode == 3) {
+        attrs["fill"] = "none";
       }
       std::string css_mode2 = blend_mode_to_css(state_.blend_mode);
       if (!css_mode2.empty()) {
@@ -2915,18 +3050,14 @@ std::string CanvasExporter::resolve_scn_color(const std::vector<std::string>& op
         return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
                            std::stod(operands[2]), std::stod(operands[3]));
       }
-    } else if (cs == "ICCBased" || cs == "Indexed" || cs == "Separation" || cs == "DeviceN") {
-      // Best effort: interpret based on operand count
-      if (operands.size() >= 4) {
-        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                           std::stod(operands[2]), std::stod(operands[3]));
-      } else if (operands.size() >= 3) {
-        return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
-      } else if (operands.size() >= 1) {
-        double gray = std::stod(operands[0]);
-        return rgb_to_hex(gray, gray, gray);
-      }
     } else {
+      // Try resolving via parsed ColorSpace resource
+      auto cs_it = color_space_resources_.find(cs);
+      if (cs_it != color_space_resources_.end()) {
+        std::string result = resolve_color_with_space(cs_it->second, operands);
+        if (!result.empty()) return result;
+      }
+      // Fallback:
       // Unknown color space - guess from operand count
       if (operands.size() >= 4) {
         return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
@@ -3760,6 +3891,128 @@ void CanvasExporter::parse_pattern_resources(const Pdf& pdf, const Dictionary& r
       pattern_resources_[entry.first] = entry.second;
     }
   }
+}
+
+void CanvasExporter::parse_color_space_resources(const Pdf& pdf, const Dictionary& resources) {
+  auto cs_it = resources.find("ColorSpace");
+  if (cs_it == resources.end()) return;
+
+  const Value* cs_dict = &cs_it->second;
+  Value cs_resolved;
+  if (cs_dict->type == Value::REFERENCE) {
+    auto res = resolve_reference(pdf, cs_dict->ref_object_number, cs_dict->ref_generation_number);
+    if (res.success) { cs_resolved = std::move(res.value); cs_dict = &cs_resolved; }
+  }
+  if (cs_dict->type != Value::DICTIONARY) return;
+
+  for (const auto& entry : cs_dict->dict) {
+    color_space_resources_[entry.first] = parse_color_space(pdf, entry.second);
+  }
+}
+
+std::string CanvasExporter::lab_to_hex(double l_star, double a_star, double b_star,
+                                        const ColorSpace& cs) const {
+  // Lab to XYZ conversion (CIE Lab D50 by default)
+  double xw = 0.9505, yw = 1.0, zw = 1.0890;  // D65 default
+  if (cs.white_point.size() >= 3) {
+    xw = cs.white_point[0]; yw = cs.white_point[1]; zw = cs.white_point[2];
+  }
+
+  double fy = (l_star + 16.0) / 116.0;
+  double fx = a_star / 500.0 + fy;
+  double fz = fy - b_star / 200.0;
+
+  auto f_inv = [](double t) -> double {
+    return (t > 6.0 / 29.0) ? t * t * t : (108.0 / 841.0) * (t - 4.0 / 29.0);
+  };
+
+  double x = xw * f_inv(fx);
+  double y = yw * f_inv(fy);
+  double z = zw * f_inv(fz);
+
+  // XYZ to sRGB (D65 matrix)
+  double r =  3.2406 * x - 1.5372 * y - 0.4986 * z;
+  double g = -0.9689 * x + 1.8758 * y + 0.0415 * z;
+  double b =  0.0557 * x - 0.2040 * y + 1.0570 * z;
+
+  // sRGB gamma
+  auto gamma = [](double v) -> double {
+    v = (v < 0.0) ? 0.0 : (v > 1.0) ? 1.0 : v;
+    return (v <= 0.0031308) ? 12.92 * v : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055;
+  };
+
+  return rgb_to_hex(gamma(r), gamma(g), gamma(b));
+}
+
+std::string CanvasExporter::resolve_color_with_space(const ColorSpace& cs,
+                                                      const std::vector<std::string>& operands) {
+  try {
+    if (cs.type == ColorSpaceType::Lab && operands.size() >= 3) {
+      return lab_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                        std::stod(operands[2]), cs);
+    }
+
+    if ((cs.type == ColorSpaceType::Separation || cs.type == ColorSpaceType::DeviceN) &&
+        !operands.empty() && current_pdf_) {
+      // Evaluate tint function to get alternate color space values
+      std::vector<double> inputs;
+      for (const auto& op : operands) inputs.push_back(std::stod(op));
+
+      std::vector<double> outputs;
+      if (pdfunc::evaluate(*current_pdf_, cs.tint_function, inputs, outputs) && !outputs.empty()) {
+        // Convert outputs based on alternate color space
+        if (cs.base_color_space) {
+          const auto& alt = *cs.base_color_space;
+          if ((alt.type == ColorSpaceType::DeviceGray || alt.type == ColorSpaceType::CalGray) &&
+              outputs.size() >= 1) {
+            return rgb_to_hex(outputs[0], outputs[0], outputs[0]);
+          } else if ((alt.type == ColorSpaceType::DeviceRGB || alt.type == ColorSpaceType::CalRGB) &&
+                     outputs.size() >= 3) {
+            return rgb_to_hex(outputs[0], outputs[1], outputs[2]);
+          } else if (alt.type == ColorSpaceType::DeviceCMYK && outputs.size() >= 4) {
+            return cmyk_to_hex(outputs[0], outputs[1], outputs[2], outputs[3]);
+          } else if (alt.type == ColorSpaceType::Lab && outputs.size() >= 3) {
+            return lab_to_hex(outputs[0], outputs[1], outputs[2], alt);
+          }
+        }
+        // Fallback: guess from output count
+        if (outputs.size() >= 4) return cmyk_to_hex(outputs[0], outputs[1], outputs[2], outputs[3]);
+        if (outputs.size() >= 3) return rgb_to_hex(outputs[0], outputs[1], outputs[2]);
+        if (outputs.size() >= 1) return rgb_to_hex(outputs[0], outputs[0], outputs[0]);
+      }
+    }
+
+    if (cs.type == ColorSpaceType::ICCBased) {
+      // Use num_components to interpret as device color
+      if (cs.num_components == 1 && operands.size() >= 1) {
+        double g = std::stod(operands[0]);
+        return rgb_to_hex(g, g, g);
+      } else if (cs.num_components == 3 && operands.size() >= 3) {
+        return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
+      } else if (cs.num_components == 4 && operands.size() >= 4) {
+        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
+                           std::stod(operands[2]), std::stod(operands[3]));
+      }
+    }
+
+    if (cs.type == ColorSpaceType::CalGray && operands.size() >= 1) {
+      double g = std::stod(operands[0]);
+      // Apply gamma if present
+      if (!cs.gamma.empty()) g = std::pow(g, cs.gamma[0]);
+      return rgb_to_hex(g, g, g);
+    }
+
+    if (cs.type == ColorSpaceType::CalRGB && operands.size() >= 3) {
+      double r = std::stod(operands[0]), gv = std::stod(operands[1]), b = std::stod(operands[2]);
+      if (cs.gamma.size() >= 3) {
+        r = std::pow(r, cs.gamma[0]);
+        gv = std::pow(gv, cs.gamma[1]);
+        b = std::pow(b, cs.gamma[2]);
+      }
+      return rgb_to_hex(r, gv, b);
+    }
+  } catch (...) {}
+  return "";
 }
 
 // Create SVG gradient from PDF shading dictionary

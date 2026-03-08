@@ -5464,6 +5464,13 @@ private:
   TextState text_state_;
   std::string extracted_text_;
 
+  // ActualText tracking: stack of (has_actual_text, actual_text_value)
+  struct MarkedContentEntry {
+    bool has_actual_text{false};
+    std::string actual_text;
+  };
+  std::vector<MarkedContentEntry> mc_stack_;
+
   void process_content_stream(const std::vector<uint8_t>& data) {
     std::string content(data.begin(), data.end());
     std::vector<std::string> tokens = tokenize_content(content);
@@ -5567,7 +5574,8 @@ private:
       "q", "Q", "cm", "w", "J", "j", "M", "d", "ri", "i", "gs",
       "m", "l", "c", "v", "y", "h", "re", "S", "s", "f", "F", "f*",
       "B", "B*", "b", "b*", "n", "W", "W*",
-      "CS", "cs", "SC", "SCN", "sc", "scn", "G", "g", "RG", "rg", "K", "k"
+      "CS", "cs", "SC", "SCN", "sc", "scn", "G", "g", "RG", "rg", "K", "k",
+      "BMC", "BDC", "EMC", "Do"
     };
     return operators.find(token) != operators.end();
   }
@@ -5616,33 +5624,35 @@ private:
       text_state_.line_matrix[5] -= text_state_.leading;
       std::copy(text_state_.line_matrix, text_state_.line_matrix + 6, text_state_.text_matrix);
     } else if (op == "Tj" && operands.size() >= 1) {
-      // Show text string
-      std::string text = decode_text_string(operands[0]);
-      text_state_.current_text += text;
+      // Show text string - suppress if inside ActualText span
+      if (!in_actual_text_span()) {
+        std::string text = decode_text_string(operands[0]);
+        text_state_.current_text += text;
+      }
     } else if (op == "TJ" && operands.size() >= 1) {
-      // Show text with individual positioning
-      std::string array_str = operands[0];
-      if (array_str.front() == '[' && array_str.back() == ']') {
-        array_str = array_str.substr(1, array_str.size() - 2);
-        // Parse array elements
-        std::vector<std::string> elements = parse_array_elements(array_str);
-        for (const auto& elem : elements) {
-          if (elem.front() == '(' || elem.front() == '<') {
-            text_state_.current_text += decode_text_string(elem);
+      // Show text with individual positioning - suppress if inside ActualText span
+      if (!in_actual_text_span()) {
+        std::string array_str = operands[0];
+        if (array_str.front() == '[' && array_str.back() == ']') {
+          array_str = array_str.substr(1, array_str.size() - 2);
+          std::vector<std::string> elements = parse_array_elements(array_str);
+          for (const auto& elem : elements) {
+            if (elem.front() == '(' || elem.front() == '<') {
+              text_state_.current_text += decode_text_string(elem);
+            }
           }
-          // Numbers adjust spacing, but we'll ignore for simple extraction
         }
       }
     } else if (op == "'" && operands.size() >= 1) {
       // Move to next line and show text
       execute_operator("T*", {});
-      execute_operator("Tj", operands);
+      if (!in_actual_text_span()) execute_operator("Tj", operands);
     } else if (op == "\"" && operands.size() >= 3) {
       // Set word/char spacing, move to next line, show text
       text_state_.word_spacing = parse_number(operands[0]);
       text_state_.char_spacing = parse_number(operands[1]);
       execute_operator("T*", {});
-      execute_operator("Tj", {operands[2]});
+      if (!in_actual_text_span()) execute_operator("Tj", {operands[2]});
     } else if (op == "Tc" && operands.size() >= 1) {
       text_state_.char_spacing = parse_number(operands[0]);
     } else if (op == "Tw" && operands.size() >= 1) {
@@ -5664,7 +5674,70 @@ private:
       }
     } else if (op == "Ts" && operands.size() >= 1) {
       text_state_.text_rise = parse_number(operands[0]);
+    } else if (op == "BDC") {
+      // Begin marked content with properties - check for ActualText
+      MarkedContentEntry entry;
+      // Look for ActualText in operands (inline properties dict)
+      for (size_t i = 0; i < operands.size(); ++i) {
+        if (operands[i] == "/ActualText" && i + 1 < operands.size()) {
+          entry.has_actual_text = true;
+          entry.actual_text = decode_pdf_string_raw(operands[i + 1]);
+          // ActualText may be UTF-16BE encoded
+          if (entry.actual_text.size() >= 2) {
+            unsigned char b0 = static_cast<unsigned char>(entry.actual_text[0]);
+            unsigned char b1 = static_cast<unsigned char>(entry.actual_text[1]);
+            if (b0 == 0xFE && b1 == 0xFF) {
+              entry.actual_text = decode_utf16be(entry.actual_text);
+            }
+          }
+          break;
+        }
+      }
+      mc_stack_.push_back(entry);
+    } else if (op == "BMC") {
+      mc_stack_.push_back(MarkedContentEntry{});
+    } else if (op == "EMC") {
+      if (!mc_stack_.empty()) {
+        auto& entry = mc_stack_.back();
+        if (entry.has_actual_text) {
+          text_state_.current_text += entry.actual_text;
+        }
+        mc_stack_.pop_back();
+      }
+    } else if (op == "Do" && operands.size() >= 1) {
+      // Invoke XObject - recurse into Form XObjects for text extraction
+      std::string xobj_name = operands[0];
+      if (xobj_name.size() > 1 && xobj_name[0] == '/') xobj_name = xobj_name.substr(1);
+      auto xobj_it = page_.resources.find("XObject");
+      if (xobj_it != page_.resources.end() && xobj_it->second.type == Value::DICTIONARY) {
+        auto obj_it = xobj_it->second.dict.find(xobj_name);
+        if (obj_it != xobj_it->second.dict.end()) {
+          Value xobj_val = obj_it->second;
+          if (xobj_val.type == Value::REFERENCE) {
+            auto res = resolve_reference(pdf_, xobj_val.ref_object_number, xobj_val.ref_generation_number);
+            if (res.success) xobj_val = res.value;
+          }
+          if (xobj_val.type == Value::STREAM) {
+            auto subtype_it = xobj_val.stream.dict.find("Subtype");
+            if (subtype_it != xobj_val.stream.dict.end() &&
+                subtype_it->second.type == Value::NAME &&
+                subtype_it->second.name == "Form") {
+              auto decoded = decode_stream(pdf_, xobj_val);
+              if (decoded.success && !decoded.data.empty()) {
+                process_content_stream(decoded.data);
+              }
+            }
+          }
+        }
+      }
     }
+  }
+
+  bool in_actual_text_span() const {
+    for (auto it = mc_stack_.rbegin(); it != mc_stack_.rend(); ++it) {
+      if (it->has_actual_text) return true;
+    }
+    return false;
   }
 
   double parse_number(const std::string& str) {
@@ -7225,6 +7298,18 @@ std::unique_ptr<BaseFont> parse_type3_font(const Pdf& pdf, const Dictionary& fon
   auto last_it = font_dict.find("LastChar");
   if (last_it != font_dict.end() && last_it->second.type == Value::NUMBER) {
     font->last_char = static_cast<int>(last_it->second.number);
+  }
+
+  // Parse Encoding (critical for text extraction from Type3 fonts)
+  auto enc_it = font_dict.find("Encoding");
+  if (enc_it != font_dict.end()) {
+    parse_simple_font_encoding(pdf, enc_it->second, font.get());
+  }
+
+  // Parse ToUnicode CMap
+  auto tounicode_it = font_dict.find("ToUnicode");
+  if (tounicode_it != font_dict.end()) {
+    parse_cmap_value(pdf, tounicode_it->second, &font->to_unicode_cmap);
   }
 
   return font;
