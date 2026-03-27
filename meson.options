@@ -1,0 +1,18 @@
+option('use_stb_truetype', type: 'boolean', value: true,
+       description: 'Use stb_truetype for TrueType font loading')
+option('use_nanostl', type: 'boolean', value: false,
+       description: 'Use bundled nanostl instead of system STL')
+option('use_thorvg', type: 'boolean', value: false,
+       description: 'Enable ThorVG rendering backend')
+option('use_blend2d', type: 'boolean', value: false,
+       description: 'Enable Blend2D rendering backend')
+option('use_libtiff', type: 'boolean', value: false,
+       description: 'Use libtiff for CCITT/Fax decoding')
+option('use_builtin_ccitt', type: 'boolean', value: false,
+       description: 'Use built-in CCITT decoder instead of PDFium-based')
+option('build_tests', type: 'boolean', value: true,
+       description: 'Build unit, integration, and validation tests')
+option('build_mcp', type: 'boolean', value: true,
+       description: 'Build MCP (Model Context Protocol) server')
+option('log_level', type: 'integer', value: 3, min: 0, max: 5,
+       description: 'Log level (0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace)')
