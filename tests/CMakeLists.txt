@@ -47,6 +47,9 @@ endfunction()
 
 # Unit test suite: single binary target.
 set(NANOPDF_UNIT_TEST_SOURCES
+    unit/core/test_value.cc
+    unit/core/test_xref.cc
+    unit/core/test_pdf_parsing.cc
     unit/annotations/test_annotation_types.cc
     unit/annotations/test_freetext_annotation.cc
     unit/annotations/test_link_annotation.cc
@@ -79,6 +82,14 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/security/test_rc4.cc
     unit/text/test_text_extraction.cc
     unit/text/test_text_state.cc
+    unit/text/test_text_layout.cc
+    unit/text/test_table_extraction.cc
+    unit/document/test_attachments.cc
+    unit/document/test_document_structure.cc
+    unit/document/test_pdfa_validation.cc
+    unit/graphics/test_color_transform.cc
+    unit/filters/test_tiff_decode.cc
+    unit/forms/test_form_manipulation.cc
 )
 
 add_executable(nanopdf_unit_suite
@@ -90,6 +101,7 @@ target_link_libraries(nanopdf_unit_suite PRIVATE nanopdf nanopdf_mcp nanotest te
 target_include_directories(nanopdf_unit_suite PRIVATE
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

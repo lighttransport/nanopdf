@@ -4,7 +4,7 @@
 //
 // Simple test for MCP JSON parser
 
-#include "../../src/mcp-json.hh"
+#include "../../src/mcp/mcp-json.hh"
 
 #include <cassert>
 #include <iostream>

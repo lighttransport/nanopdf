@@ -31,7 +31,7 @@
 
 #include "../../src/nanopdf.hh"
 #include "../../src/crypto.hh"
-#include "../../src/stb_image_write.h"
+#include "../../src/third_party/stb_image_write.h"
 
 #include <sys/stat.h>
 

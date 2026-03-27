@@ -7,6 +7,7 @@
 
 #include "nanotest.hh"
 #include "nanopdf.hh"
+#include "miniz.h"
 #include "test_helpers.hh"
 
 using namespace nanopdf;
@@ -107,8 +108,54 @@ TEST_SUITE("FlateDecode") {
         CHECK_FALSE(result.success);
     }
 
-    // TODO: Add test for larger data decompression
-    // Need to generate proper zlib-compressed test data
+    TEST_CASE("Large data decompression (4KB)") {
+        // Generate 4096 bytes of patterned data, compress with zlib, decompress
+        std::vector<uint8_t> original(4096);
+        for (size_t i = 0; i < original.size(); ++i) {
+            original[i] = static_cast<uint8_t>((i * 7 + 13) & 0xFF);
+        }
+
+        // Compress using miniz (which nanopdf bundles)
+        // zlib compress2: output must be at least compressBound(sourceLen)
+        unsigned long compressed_size = original.size() + 512;
+        std::vector<uint8_t> compressed(compressed_size);
+        int ret = compress2(compressed.data(), &compressed_size,
+                           original.data(), original.size(), 6);
+        REQUIRE(ret == 0);  // Z_OK
+
+        filters::DecodeParams params;
+        DecodedStream result =
+            filters::decode_flate(compressed.data(), compressed_size, params);
+
+        REQUIRE(result.success);
+        REQUIRE(result.data.size() == original.size());
+        for (size_t i = 0; i < original.size(); ++i) {
+            if (result.data[i] != original[i]) {
+                CHECK_EQ(result.data[i], original[i]);
+                break;
+            }
+        }
+    }
+
+    TEST_CASE("Large data decompression (64KB)") {
+        std::vector<uint8_t> original(65536);
+        for (size_t i = 0; i < original.size(); ++i) {
+            original[i] = static_cast<uint8_t>(i % 256);
+        }
+
+        unsigned long compressed_size = original.size() + 1024;
+        std::vector<uint8_t> compressed(compressed_size);
+        int ret = compress2(compressed.data(), &compressed_size,
+                           original.data(), original.size(), 6);
+        REQUIRE(ret == 0);
+
+        filters::DecodeParams params;
+        DecodedStream result =
+            filters::decode_flate(compressed.data(), compressed_size, params);
+
+        REQUIRE(result.success);
+        CHECK_EQ(result.data.size(), original.size());
+    }
 
     TEST_CASE("DecodeParams predictor (not supported yet)") {
         // When predictor is specified but not supported, should either:

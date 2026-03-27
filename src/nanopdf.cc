@@ -800,9 +800,13 @@ static bool parse_linearization_dict(const uint8_t* data, size_t data_size,
   return true;
 }
 
-bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
-  if (!addr || (size < 8) || !out_pdf) {
-    return false;
+ParseResult parse_pdf(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
+  if (!addr || !out_pdf) {
+    return ParseResult::Fail(ErrorKind::IOError, "null input");
+  }
+
+  if (size < 8) {
+    return ParseResult::Fail(ErrorKind::Malformed, "data too small");
   }
 
   // Find %PDF header — PDF spec allows up to 1024 bytes before it;
@@ -823,7 +827,7 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
       }
     }
     if (!found) {
-      return false;
+      return ParseResult::Fail(ErrorKind::Malformed, "PDF header not found");
     }
   }
 
@@ -835,7 +839,29 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
   out_pdf->version_major = static_cast<int>(out_pdf->data[5] - '0');
   out_pdf->version_minor = static_cast<int>(out_pdf->data[7] - '0');
 
-  return out_pdf->load_document_structure();
+  if (!out_pdf->load_document_structure()) {
+    // Check if failure is due to encryption
+    if (out_pdf->encrypt != 0 && !out_pdf->security.authenticated) {
+      return ParseResult::Fail(ErrorKind::Encrypted, "PDF is encrypted");
+    }
+    // Check if xref parsing failed (no xref sections loaded)
+    if (out_pdf->xref_sections.empty()) {
+      return ParseResult::Fail(ErrorKind::Malformed, "failed to parse xref");
+    }
+    return ParseResult::Fail(ErrorKind::Internal,
+                             "failed to load document structure");
+  }
+
+  // Check for encrypted PDF that requires authentication
+  if (out_pdf->encrypt != 0 && !out_pdf->security.authenticated) {
+    return ParseResult::Fail(ErrorKind::Encrypted, "PDF is encrypted");
+  }
+
+  return ParseResult::Ok();
+}
+
+bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
+  return parse_pdf(addr, size, out_pdf).success;
 }
 
 // Scan for "endstream" to recover a stream's actual length
@@ -1091,22 +1117,33 @@ next_iter:
   return out_pdf->load_document_structure();
 }
 
-// parse_from_memory with ParseOptions
-bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf,
-                       const ParseOptions& options) {
+// parse_pdf with ParseOptions
+ParseResult parse_pdf(const uint8_t *addr, const size_t size, Pdf *out_pdf,
+                      const ParseOptions& options) {
   // Try normal parsing first
-  if (parse_from_memory(addr, size, out_pdf)) {
-    return true;
+  ParseResult result = parse_pdf(addr, size, out_pdf);
+  if (result.success) {
+    return result;
   }
 
   // If auto_repair is enabled, try xref repair
   if (options.auto_repair) {
-    // Reset the pdf struct
-    *out_pdf = Pdf{};
-    return repair_xref(addr, size, out_pdf);
+    // Reset the pdf struct (Pdf is not move-assignable due to std::mutex)
+    out_pdf->~Pdf();
+    new (out_pdf) Pdf{};
+    if (repair_xref(addr, size, out_pdf)) {
+      return ParseResult::Ok();
+    }
+    // Repair also failed; return the original error
   }
 
-  return false;
+  return result;
+}
+
+// parse_from_memory with ParseOptions
+bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf,
+                       const ParseOptions& options) {
+  return parse_pdf(addr, size, out_pdf, options).success;
 }
 
 namespace filters {
@@ -1931,7 +1968,19 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
   uint16_t compression = (params.k < 0) ? COMPRESSION_CCITT_T6 : COMPRESSION_CCITT_T4;
 
   // Use temporary file approach (simpler and more reliable)
-  char temp_path[] = "/tmp/nanopdf_ccitt_XXXXXX";
+  std::string temp_dir;
+#ifdef _WIN32
+  const char* tmp = std::getenv("TEMP");
+  if (!tmp) tmp = std::getenv("TMP");
+  if (!tmp) tmp = ".";
+  temp_dir = tmp;
+#else
+  temp_dir = "/tmp";
+#endif
+  std::string temp_template = temp_dir + "/nanopdf_ccitt_XXXXXX";
+  std::vector<char> temp_buf(temp_template.begin(), temp_template.end());
+  temp_buf.push_back('\0');
+  char* temp_path = temp_buf.data();
   int fd = mkstemp(temp_path);
   if (fd < 0) {
     result.success = false;
@@ -3369,25 +3418,28 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   uint64_t cache_key = 0;
   if (obj_num > 0) {
     cache_key = make_decoded_stream_cache_key(obj_num, gen_num);
-    auto cache_it = pdf.decoded_stream_cache.find(cache_key);
-    if (cache_it != pdf.decoded_stream_cache.end()) {
-      // Cache hit - return cached result
-      const auto& entry = cache_it->second;
-      result.data = entry.data;
-      result.success = entry.success;
-      result.error = entry.error;
-      result.width = entry.width;
-      result.height = entry.height;
-      result.bits_per_component = entry.bits_per_component;
+    {
+      std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+      auto cache_it = pdf.decoded_stream_cache.find(cache_key);
+      if (cache_it != pdf.decoded_stream_cache.end()) {
+        // Cache hit - return cached result
+        const auto& entry = cache_it->second;
+        result.data = entry.data;
+        result.success = entry.success;
+        result.error = entry.error;
+        result.width = entry.width;
+        result.height = entry.height;
+        result.bits_per_component = entry.bits_per_component;
 
-      // Move to back of LRU order
-      auto& order = pdf.decoded_stream_cache_order;
-      auto it = std::find(order.begin(), order.end(), cache_key);
-      if (it != order.end()) {
-        order.erase(it);
-        order.push_back(cache_key);
+        // Move to back of LRU order
+        auto& order = pdf.decoded_stream_cache_order;
+        auto it = std::find(order.begin(), order.end(), cache_key);
+        if (it != order.end()) {
+          order.erase(it);
+          order.push_back(cache_key);
+        }
+        return result;
       }
-      return result;
     }
   }
 
@@ -3584,14 +3636,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   // Store in cache (only if we have a valid object number)
   if (obj_num > 0 && cache_key != 0) {
-    // Evict oldest entries if at capacity
-    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
-      uint64_t evict = pdf.decoded_stream_cache_order.front();
-      pdf.decoded_stream_cache_order.pop_front();
-      pdf.decoded_stream_cache.erase(evict);
-    }
-
-    // Store in cache
+    // Prepare entry outside the lock
     Pdf::DecodedStreamCacheEntry entry;
     entry.data = result.data;  // Copy for cache
     entry.success = result.success;
@@ -3599,6 +3644,15 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     entry.width = result.width;
     entry.height = result.height;
     entry.bits_per_component = result.bits_per_component;
+
+    std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+    // Evict oldest entries if at capacity
+    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
+      uint64_t evict = pdf.decoded_stream_cache_order.front();
+      pdf.decoded_stream_cache_order.pop_front();
+      pdf.decoded_stream_cache.erase(evict);
+    }
+
     pdf.decoded_stream_cache[cache_key] = std::move(entry);
     pdf.decoded_stream_cache_order.push_back(cache_key);
   }
@@ -3621,25 +3675,28 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   uint64_t cache_key = 0;
   if (obj_num > 0) {
     cache_key = make_decoded_stream_cache_key(obj_num, gen_num, image_width, image_height);
-    auto cache_it = pdf.decoded_stream_cache.find(cache_key);
-    if (cache_it != pdf.decoded_stream_cache.end()) {
-      // Cache hit - return cached result
-      const auto& entry = cache_it->second;
-      result.data = entry.data;
-      result.success = entry.success;
-      result.error = entry.error;
-      result.width = entry.width;
-      result.height = entry.height;
-      result.bits_per_component = entry.bits_per_component;
+    {
+      std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+      auto cache_it = pdf.decoded_stream_cache.find(cache_key);
+      if (cache_it != pdf.decoded_stream_cache.end()) {
+        // Cache hit - return cached result
+        const auto& entry = cache_it->second;
+        result.data = entry.data;
+        result.success = entry.success;
+        result.error = entry.error;
+        result.width = entry.width;
+        result.height = entry.height;
+        result.bits_per_component = entry.bits_per_component;
 
-      // Move to back of LRU order
-      auto& order = pdf.decoded_stream_cache_order;
-      auto it = std::find(order.begin(), order.end(), cache_key);
-      if (it != order.end()) {
-        order.erase(it);
-        order.push_back(cache_key);
+        // Move to back of LRU order
+        auto& order = pdf.decoded_stream_cache_order;
+        auto it = std::find(order.begin(), order.end(), cache_key);
+        if (it != order.end()) {
+          order.erase(it);
+          order.push_back(cache_key);
+        }
+        return result;
       }
-      return result;
     }
   }
 
@@ -3858,14 +3915,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   // Store in cache (only if we have a valid object number)
   if (obj_num > 0 && cache_key != 0) {
-    // Evict oldest entries if at capacity
-    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
-      uint64_t evict = pdf.decoded_stream_cache_order.front();
-      pdf.decoded_stream_cache_order.pop_front();
-      pdf.decoded_stream_cache.erase(evict);
-    }
-
-    // Store in cache
+    // Prepare entry outside the lock
     Pdf::DecodedStreamCacheEntry entry;
     entry.data = result.data;  // Copy for cache
     entry.success = result.success;
@@ -3873,6 +3923,15 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     entry.width = result.width;
     entry.height = result.height;
     entry.bits_per_component = result.bits_per_component;
+
+    std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+    // Evict oldest entries if at capacity
+    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
+      uint64_t evict = pdf.decoded_stream_cache_order.front();
+      pdf.decoded_stream_cache_order.pop_front();
+      pdf.decoded_stream_cache.erase(evict);
+    }
+
     pdf.decoded_stream_cache[cache_key] = std::move(entry);
     pdf.decoded_stream_cache_order.push_back(cache_key);
   }
@@ -4775,48 +4834,89 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
 
   uint64_t key = (static_cast<uint64_t>(obj_num) << 32) |
                  static_cast<uint64_t>(gen_num);
-  auto cached = object_cache.find(key);
-  if (cached != object_cache.end()) {
-    result.success = true;
-    result.value = cached->second;
-    return result;
-  }
 
-  if (!object_offsets_built && !object_offsets_failed) {
-    if (build_object_offset_cache()) {
-      object_offsets_built = true;
-    } else {
-      object_offsets_failed = true;
+  // Check object_cache under lock
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto cached = object_cache.find(key);
+    if (cached != object_cache.end()) {
+      result.success = true;
+      result.value = cached->second;
+      return result;
     }
   }
+
+  // Check if we need to build the offset cache.
+  // Set object_offsets_failed optimistically to prevent concurrent builds,
+  // then correct to object_offsets_built on success.
+  {
+    bool need_build = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      if (!object_offsets_built && !object_offsets_failed) {
+        need_build = true;
+        object_offsets_failed = true;  // Prevent other threads from also building
+      }
+    }
+    // build_object_offset_cache accesses caches internally (and may call
+    // decode_stream), so we must not hold the lock across this call.
+    if (need_build) {
+      if (build_object_offset_cache()) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_offsets_built = true;
+        object_offsets_failed = false;
+      }
+      // If build failed, object_offsets_failed remains true (set above)
+    }
+  }
+
   uint64_t body_offset = 0;
   bool have_offset = false;
 
-  if (object_offsets_built) {
-    auto found = object_offsets.find(key);
-    if (found != object_offsets.end()) {
-      body_offset = found->second;
-      have_offset = true;
-    } else if (gen_num != 0) {
-      uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
-      auto zero_found = object_offsets.find(zero_key);
-      if (zero_found != object_offsets.end()) {
-        body_offset = zero_found->second;
+  // Read from offset cache under lock
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    if (object_offsets_built) {
+      auto found = object_offsets.find(key);
+      if (found != object_offsets.end()) {
+        body_offset = found->second;
         have_offset = true;
+      } else if (gen_num != 0) {
+        uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
+        auto zero_found = object_offsets.find(zero_key);
+        if (zero_found != object_offsets.end()) {
+          body_offset = zero_found->second;
+          have_offset = true;
+        }
       }
     }
   }
 
   if (!have_offset) {
-    auto stream_it = object_stream_entries.find(key);
-    if (stream_it == object_stream_entries.end() && gen_num != 0) {
-      uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
-      stream_it = object_stream_entries.find(zero_key);
+    // Check object_stream_entries under lock, copy out the entry info
+    bool found_stream_entry = false;
+    uint32_t stream_obj_num = 0;
+    uint32_t stream_index = 0;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      auto stream_it = object_stream_entries.find(key);
+      if (stream_it == object_stream_entries.end() && gen_num != 0) {
+        uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
+        stream_it = object_stream_entries.find(zero_key);
+      }
+      if (stream_it != object_stream_entries.end()) {
+        found_stream_entry = true;
+        stream_obj_num = stream_it->second.first;
+        stream_index = stream_it->second.second;
+      }
     }
-    if (stream_it != object_stream_entries.end()) {
+
+    if (found_stream_entry) {
       Value from_stream;
-      if (load_object_from_stream(obj_num, gen_num, stream_it->second.first,
-                                  stream_it->second.second, &from_stream)) {
+      // load_object_from_stream may recursively call load_object, so no lock held here
+      if (load_object_from_stream(obj_num, gen_num, stream_obj_num,
+                                  stream_index, &from_stream)) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
         object_cache[key] = from_stream;
         result.success = true;
         result.value = std::move(from_stream);
@@ -4876,15 +4976,21 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
   }
 
   result.success = true;
-  object_cache[key] = result.value;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    object_cache[key] = result.value;
+  }
   return result;
 }
 
 bool Pdf::build_object_offset_cache() const {
-  object_offsets.clear();
-  object_stream_entries.clear();
-  object_stream_cache.clear();
-  object_stream_cache_order.clear();
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    object_offsets.clear();
+    object_stream_entries.clear();
+    object_stream_cache.clear();
+    object_stream_cache_order.clear();
+  }
 
   if (!data || data_size == 0) {
     return false;
@@ -5021,6 +5127,7 @@ bool Pdf::build_object_offset_cache() const {
                                    generation, &body_offset)) {
       uint64_t key = (static_cast<uint64_t>(object_number) << 32) |
                      static_cast<uint64_t>(generation);
+      std::lock_guard<std::mutex> lock(cache_mutex);
       object_offsets[key] = body_offset;
     }
   };
@@ -5168,7 +5275,10 @@ bool Pdf::build_object_offset_cache() const {
         }
 
         handle_trailer_offsets(trailer_val.dict, worklist);
-        any_entries = any_entries || !object_offsets.empty();
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex);
+          any_entries = any_entries || !object_offsets.empty();
+        }
           return true;
         }
 
@@ -5362,7 +5472,10 @@ bool Pdf::build_object_offset_cache() const {
             uint32_t stream_object = static_cast<uint32_t>(field2);
             uint32_t index = static_cast<uint32_t>(field3);
             uint64_t key = (static_cast<uint64_t>(obj) << 32);
-            object_stream_entries[key] = {stream_object, index};
+            {
+              std::lock_guard<std::mutex> lock(cache_mutex);
+              object_stream_entries[key] = {stream_object, index};
+            }
             any_entries = true;
           }
         }
@@ -5380,7 +5493,12 @@ bool Pdf::build_object_offset_cache() const {
     }
   }
 
-  if (!any_entries && object_offsets.empty() && object_stream_entries.empty()) {
+  bool need_fallback = false;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    need_fallback = !any_entries && object_offsets.empty() && object_stream_entries.empty();
+  }
+  if (need_fallback) {
     // Fallback scanning for traditional PDFs without xref tables.
     auto update_trailer_fallback = [&]() {
       const char trailer_kw[] = "trailer";
@@ -5475,12 +5593,16 @@ bool Pdf::build_object_offset_cache() const {
 
       uint64_t key = (static_cast<uint64_t>(obj) << 32) |
                      static_cast<uint64_t>(gen);
-      object_offsets[key] = static_cast<uint64_t>(body_ptr - begin);
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_offsets[key] = static_cast<uint64_t>(body_ptr - begin);
+      }
       any_entries = true;
       ptr = body_ptr;
     }
 
     if (root == 0) {
+      std::lock_guard<std::mutex> lock(cache_mutex);
       uint32_t catalog_obj = 0;
       for (const auto& entry : object_offsets) {
         uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
@@ -5505,20 +5627,26 @@ bool Pdf::build_object_offset_cache() const {
       }
     }
 
-    if (size == 0 && !object_offsets.empty()) {
-      uint32_t max_obj = 0;
-      for (const auto& entry : object_offsets) {
-        uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
-        if (obj_num > max_obj) {
-          max_obj = obj_num;
+    if (size == 0) {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      if (!object_offsets.empty()) {
+        uint32_t max_obj = 0;
+        for (const auto& entry : object_offsets) {
+          uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
+          if (obj_num > max_obj) {
+            max_obj = obj_num;
+          }
         }
+        Pdf* self = const_cast<Pdf*>(this);
+        self->size = max_obj + 1;
       }
-      Pdf* self = const_cast<Pdf*>(this);
-      self->size = max_obj + 1;
     }
   }
 
-  return any_entries && (!object_offsets.empty() || !object_stream_entries.empty());
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    return any_entries && (!object_offsets.empty() || !object_stream_entries.empty());
+  }
 }
 
 bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
@@ -5554,7 +5682,7 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
     return false;
   }
 
-  const std::vector<uint8_t>* data_ptr = nullptr;
+  // Lambda to touch LRU order for object_stream_cache (must be called with cache_mutex held)
   auto touch_cache_entry = [&](uint32_t key, bool inserted) {
     if (!inserted) {
       for (auto it = object_stream_cache_order.begin();
@@ -5573,23 +5701,37 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
     }
   };
 
-  auto cache_it = object_stream_cache.find(stream_object_number);
-  if (cache_it == object_stream_cache.end()) {
-    // Use overload with object number for proper decryption
-    DecodedStream decoded = decode_stream(*this, stream_obj.value,
-                                          stream_object_number, 0);
-    if (!decoded.success) {
-      return false;
+  // Check object_stream_cache; if miss, decode outside the lock, then insert.
+  // Copy the data locally so we don't hold references into the cache across
+  // unlocked regions.
+  std::vector<uint8_t> local_stream_data;
+  {
+    bool cache_hit = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      auto cache_it = object_stream_cache.find(stream_object_number);
+      if (cache_it != object_stream_cache.end()) {
+        cache_hit = true;
+        local_stream_data = cache_it->second;  // copy
+        touch_cache_entry(stream_object_number, false);
+      }
     }
-    cache_it = object_stream_cache
-                   .emplace(stream_object_number, std::move(decoded.data))
-                   .first;
-    touch_cache_entry(stream_object_number, true);
-  } else {
-    touch_cache_entry(stream_object_number, false);
+    if (!cache_hit) {
+      // decode_stream accesses decoded_stream_cache, so no lock held here
+      DecodedStream decoded = decode_stream(*this, stream_obj.value,
+                                            stream_object_number, 0);
+      if (!decoded.success) {
+        return false;
+      }
+      local_stream_data = decoded.data;  // keep a local copy
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_stream_cache.emplace(stream_object_number, std::move(decoded.data));
+        touch_cache_entry(stream_object_number, true);
+      }
+    }
   }
-  data_ptr = &cache_it->second;
-  const std::vector<uint8_t>& data = *data_ptr;
+  const std::vector<uint8_t>& data = local_stream_data;
   if (first_offset > data.size()) {
     return false;
   }
@@ -5685,6 +5827,7 @@ void Pdf::set_object_stream_cache_capacity(size_t capacity) const {
   if (capacity == 0) {
     capacity = 1;
   }
+  std::lock_guard<std::mutex> lock(cache_mutex);
   object_stream_cache_capacity = capacity;
 
   while (object_stream_cache_order.size() > object_stream_cache_capacity) {
@@ -5698,6 +5841,7 @@ void Pdf::set_decoded_stream_cache_capacity(size_t capacity) const {
   if (capacity == 0) {
     capacity = 1;
   }
+  std::lock_guard<std::mutex> lock(cache_mutex);
   decoded_stream_cache_capacity = capacity;
 
   while (decoded_stream_cache_order.size() > decoded_stream_cache_capacity) {
@@ -5708,6 +5852,7 @@ void Pdf::set_decoded_stream_cache_capacity(size_t capacity) const {
 }
 
 void Pdf::clear_decoded_stream_cache() const {
+  std::lock_guard<std::mutex> lock(cache_mutex);
   decoded_stream_cache.clear();
   decoded_stream_cache_order.clear();
 }
@@ -5716,11 +5861,22 @@ bool Pdf::load_document_structure() {
   // Detect linearization (must be done before other parsing)
   parse_linearization_dict(data, data_size, &linearization);
 
-  if (!object_offsets_built && !object_offsets_failed) {
-    if (build_object_offset_cache()) {
-      object_offsets_built = true;
-    } else {
-      object_offsets_failed = true;
+  {
+    bool need_build = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      if (!object_offsets_built && !object_offsets_failed) {
+        need_build = true;
+        object_offsets_failed = true;  // Prevent concurrent builds
+      }
+    }
+    if (need_build) {
+      if (build_object_offset_cache()) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_offsets_built = true;
+        object_offsets_failed = false;
+      }
+      // If build failed, object_offsets_failed remains true
     }
   }
 
@@ -12071,6 +12227,225 @@ SignatureValidationResult validate_signature(const Pdf& pdf,
   // over the authenticated attributes.
   result.signature_valid = result.integrity_valid;
   result.success = result.integrity_valid;
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// PDF/A Conformance Validation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The standard 14 PDF fonts that may be unembedded in some profiles.
+// PDF/A-1 technically requires all fonts to be embedded, but we still
+// identify them so the violation detail is informative.
+static const char* kStandard14Fonts[] = {
+    "Courier",
+    "Courier-Bold",
+    "Courier-Oblique",
+    "Courier-BoldOblique",
+    "Helvetica",
+    "Helvetica-Bold",
+    "Helvetica-Oblique",
+    "Helvetica-BoldOblique",
+    "Times-Roman",
+    "Times-Bold",
+    "Times-Italic",
+    "Times-BoldItalic",
+    "Symbol",
+    "ZapfDingbats",
+};
+
+static bool is_standard_14_font(const std::string& name) {
+  for (const auto* std_name : kStandard14Fonts) {
+    if (name == std_name) return true;
+  }
+  return false;
+}
+
+}  // anonymous namespace
+
+PdfAValidationResult validate_pdfa(const Pdf& pdf) {
+  PdfAValidationResult result;
+
+  // 1. Check XMP metadata with PDF/A identification
+  const XMPMetadata& xmp = pdf.catalog.xmp_metadata;
+  if (!xmp.is_pdfa()) {
+    PdfAViolation v;
+    v.rule = PdfAViolation::Rule::MissingXMPMetadata;
+    v.message = "XMP metadata does not contain PDF/A identification";
+    v.detail = "pdfaid:part is missing or zero";
+    result.violations.push_back(std::move(v));
+    // Without a claimed level we cannot validate further, but we still
+    // run the remaining checks so callers get a full report.
+  }
+
+  result.claimed_level = xmp.pdfa_level();
+
+  // 2. Check OutputIntent with GTS_PDFA1 subtype (required for PDF/A-1;
+  //    PDF/A-2/3 accept GTS_PDFA1 as well).
+  {
+    bool has_pdfa_output_intent = false;
+    for (const auto& oi : pdf.catalog.output_intents) {
+      if (oi.subtype == "GTS_PDFA1") {
+        has_pdfa_output_intent = true;
+        break;
+      }
+    }
+    if (!has_pdfa_output_intent) {
+      PdfAViolation v;
+      v.rule = PdfAViolation::Rule::MissingOutputIntent;
+      v.message = "No OutputIntent with subtype GTS_PDFA1 found";
+      v.detail = "output_intents count: " +
+                 std::to_string(pdf.catalog.output_intents.size());
+      result.violations.push_back(std::move(v));
+    }
+  }
+
+  // 3. Check that all fonts are embedded
+  for (size_t pi = 0; pi < pdf.catalog.pages.size(); ++pi) {
+    const Page& page = pdf.catalog.pages[pi];
+    for (const auto& kv : page.fonts) {
+      const std::string& font_name = kv.first;
+      const BaseFont* font = kv.second.get();
+      if (!font) continue;
+
+      bool embedded = false;
+      if (font->descriptor) {
+        // A font is considered embedded when the descriptor carries a
+        // non-None font file type (FontFile, FontFile2, or FontFile3).
+        if (font->descriptor->font_file_type != FontFileType::None) {
+          embedded = true;
+        }
+      }
+
+      if (!embedded) {
+        const std::string& base = font->base_font.empty() ? font_name
+                                                           : font->base_font;
+        PdfAViolation v;
+        v.rule = PdfAViolation::Rule::FontNotEmbedded;
+        if (is_standard_14_font(base)) {
+          v.message =
+              "Standard 14 font is not embedded (required by PDF/A)";
+        } else {
+          v.message = "Font is not embedded";
+        }
+        v.detail = "font=" + base + " page=" + std::to_string(pi + 1);
+        result.violations.push_back(std::move(v));
+      }
+    }
+  }
+
+  // 4. No encryption allowed
+  if (pdf.encrypt != 0) {
+    PdfAViolation v;
+    v.rule = PdfAViolation::Rule::EncryptionPresent;
+    v.message = "PDF/A documents must not be encrypted";
+    v.detail = "encrypt object number: " + std::to_string(pdf.encrypt);
+    result.violations.push_back(std::move(v));
+  }
+
+  // 5. Document info present (title required for conformance level A)
+  {
+    const DocumentInfo& info = pdf.catalog.document_info;
+    if (info.title.empty()) {
+      PdfAViolation v;
+      v.rule = PdfAViolation::Rule::MissingDocumentInfo;
+      v.message = "Document title is empty (required for PDF/A level A)";
+      result.violations.push_back(std::move(v));
+    }
+  }
+
+  // 6. Transparency check for PDF/A-1 (parts 2/3 allow transparency)
+  if (xmp.pdfa_part == 1 || xmp.pdfa_part == 0) {
+    for (size_t pi = 0; pi < pdf.catalog.pages.size(); ++pi) {
+      const Page& page = pdf.catalog.pages[pi];
+      const Dictionary& res = page.resources;
+      auto ext_it = res.find("ExtGState");
+      if (ext_it == res.end()) continue;
+
+      // Resolve the ExtGState dictionary
+      Dictionary ext_dict;
+      if (ext_it->second.type == Value::DICTIONARY) {
+        ext_dict = ext_it->second.dict;
+      } else if (ext_it->second.type == Value::REFERENCE) {
+        ResolvedObject resolved =
+            resolve_reference(pdf, ext_it->second.ref_object_number,
+                              ext_it->second.ref_generation_number);
+        if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+          ext_dict = resolved.value.dict;
+        }
+      }
+
+      for (const auto& gs_entry : ext_dict) {
+        Dictionary gs_dict;
+        if (gs_entry.second.type == Value::DICTIONARY) {
+          gs_dict = gs_entry.second.dict;
+        } else if (gs_entry.second.type == Value::REFERENCE) {
+          ResolvedObject resolved =
+              resolve_reference(pdf, gs_entry.second.ref_object_number,
+                                gs_entry.second.ref_generation_number);
+          if (resolved.success &&
+              resolved.value.type == Value::DICTIONARY) {
+            gs_dict = resolved.value.dict;
+          }
+        }
+        if (gs_dict.empty()) continue;
+
+        // Check for stroking alpha (CA) < 1.0
+        auto ca_it = gs_dict.find("CA");
+        if (ca_it != gs_dict.end() && ca_it->second.type == Value::NUMBER) {
+          if (ca_it->second.number < 1.0) {
+            PdfAViolation v;
+            v.rule = PdfAViolation::Rule::TransparencyUsed;
+            v.message =
+                "Transparency (non-stroking alpha CA) used on page";
+            v.detail = "page=" + std::to_string(pi + 1) +
+                       " CA=" + std::to_string(ca_it->second.number);
+            result.violations.push_back(std::move(v));
+          }
+        }
+
+        // Check for non-stroking alpha (ca) < 1.0
+        auto ca_lower_it = gs_dict.find("ca");
+        if (ca_lower_it != gs_dict.end() &&
+            ca_lower_it->second.type == Value::NUMBER) {
+          if (ca_lower_it->second.number < 1.0) {
+            PdfAViolation v;
+            v.rule = PdfAViolation::Rule::TransparencyUsed;
+            v.message =
+                "Transparency (stroking alpha ca) used on page";
+            v.detail = "page=" + std::to_string(pi + 1) +
+                       " ca=" + std::to_string(ca_lower_it->second.number);
+            result.violations.push_back(std::move(v));
+          }
+        }
+
+        // Check for SMask
+        auto smask_it = gs_dict.find("SMask");
+        if (smask_it != gs_dict.end()) {
+          // SMask can be /None (a name) which is acceptable
+          bool has_smask = true;
+          if (smask_it->second.type == Value::NAME &&
+              smask_it->second.name == "None") {
+            has_smask = false;
+          }
+          if (has_smask) {
+            PdfAViolation v;
+            v.rule = PdfAViolation::Rule::TransparencyUsed;
+            v.message = "Soft mask (SMask) used on page";
+            v.detail = "page=" + std::to_string(pi + 1);
+            result.violations.push_back(std::move(v));
+          }
+        }
+      }
+    }
+  }
+
+  // Determine overall validity: valid only if no violations and the PDF
+  // actually claims to be PDF/A.
+  result.valid = result.violations.empty() && xmp.is_pdfa();
 
   return result;
 }

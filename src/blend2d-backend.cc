@@ -1474,15 +1474,27 @@ Blend2DBackend::FontCache* Blend2DBackend::get_font(const std::string& font_name
   return nullptr;
 }
 
+bool Blend2DBackend::draw_missing_glyph_placeholder(float x, float y, float size,
+                                                     uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  float glyph_width = size * 0.5f;
+  float box_margin = size * 0.05f;
+  float stroke_width = size * 0.04f;
+
+  ctx_.set_stroke_style(BLRgba32(r, g, b, static_cast<uint8_t>(a * 0.4f)));
+  ctx_.set_stroke_width(stroke_width);
+  ctx_.stroke_rect(x + box_margin, y - size + box_margin,
+                   glyph_width - 2 * box_margin, size - 2 * box_margin);
+  return true;
+}
+
 bool Blend2DBackend::draw_glyph(int codepoint, float x, float y, float size,
                                  uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   if (!initialized_) return false;
 
   FontCache* font = get_font(current_font_name_);
   if (!font) {
-    // Fallback to placeholder
-    ctx_.set_fill_style(BLRgba32(r, g, b, a));
-    ctx_.fill_rect(x, y - size, size * 0.5f, size);
+    // Fallback to tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -1490,9 +1502,8 @@ bool Blend2DBackend::draw_glyph(int codepoint, float x, float y, float size,
   int num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
 
   if (num_verts == 0 || !vertices) {
-    // Glyph not found in font - draw placeholder
-    ctx_.set_fill_style(BLRgba32(r, g, b, a));
-    ctx_.fill_rect(x, y - size, size * 0.5f, size);
+    // Glyph not found in font - draw tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -1582,8 +1593,8 @@ bool Blend2DBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
 
   FontCache* font = get_font(current_font_name_);
   if (!font) {
-    ctx_.set_fill_style(BLRgba32(r, g, b, a));
-    ctx_.fill_rect(x, y - size, size * 0.5f, size);
+    // Fallback to tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -1591,9 +1602,8 @@ bool Blend2DBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
   int num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
 
   if (num_verts == 0 || !vertices) {
-    // Glyph not found - draw placeholder rectangle
-    ctx_.set_fill_style(BLRgba32(r, g, b, a));
-    ctx_.fill_rect(x, y - size, size * 0.5f, size);
+    // Glyph not found - draw tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -1691,9 +1701,8 @@ bool Blend2DBackend::render_type3_glyph(const Type3Font* type3_font, const std::
   // Look up the glyph procedure in CharProcs
   auto proc_it = type3_font->char_procs.find(glyph_name);
   if (proc_it == type3_font->char_procs.end()) {
-    // Glyph not found - draw placeholder rectangle
-    ctx_.set_fill_style(BLRgba32(r, g, b, static_cast<uint8_t>(a * 0.3f)));
-    ctx_.fill_rect(x, y - size, size * 0.5f, size);
+    // Glyph not found - draw tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -1864,9 +1873,8 @@ float Blend2DBackend::render_text_string(const std::string& text,
       }
 
       if (glyph_name.empty() || glyph_name == ".notdef") {
-        // No glyph - draw placeholder and advance
-        ctx_.set_fill_style(BLRgba32(r, g, b, static_cast<uint8_t>(a * 0.2f)));
-        ctx_.fill_rect(cursor_x, y - font_size, font_size * 0.5f, font_size);
+        // No glyph - draw tofu box placeholder and advance
+        draw_missing_glyph_placeholder(cursor_x, y, font_size, r, g, b, a);
         cursor_x += font_size * 0.6f;
         continue;
       }
@@ -1890,12 +1898,11 @@ float Blend2DBackend::render_text_string(const std::string& text,
   float cursor_x = x;
 
   if (!font) {
-    // Fallback: draw placeholder rectangles for each character
-    float char_width = font_size * 0.6f;
+    // Fallback: draw per-character tofu box placeholders
+    float char_width = font_size * 0.5f;
     for (size_t i = 0; i < text.length(); i++) {
-      draw_rectangle(cursor_x, y - font_size, char_width * 0.8f, font_size,
-                    200, 200, 200, a);
-      cursor_x += char_width;
+      draw_missing_glyph_placeholder(cursor_x, y, font_size, r, g, b, a);
+      cursor_x += char_width * 1.2f;
     }
     return cursor_x - x;
   }

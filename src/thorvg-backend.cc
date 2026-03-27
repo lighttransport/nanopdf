@@ -1195,14 +1195,8 @@ bool ThorVGBackend::render_type3_glyph(const Type3Font* type3_font, const std::s
   // Look up the glyph procedure in CharProcs
   auto proc_it = type3_font->char_procs.find(glyph_name);
   if (proc_it == type3_font->char_procs.end()) {
-    // Glyph not found - draw placeholder rectangle
-    auto shape = tvg::Shape::gen();
-    if (shape) {
-      float glyph_width = size * 0.5f;
-      shape->appendRect(x, y - size, glyph_width, size, 0, 0);
-      shape->fill(r, g, b, static_cast<uint8_t>(a * 0.3f));  // Semi-transparent
-      push_with_clip(shape);
-    }
+    // Glyph not found - draw tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -1310,14 +1304,8 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
       }
 
       if (glyph_name.empty() || glyph_name == ".notdef") {
-        // No glyph - draw placeholder and advance
-        auto shape = tvg::Shape::gen();
-        if (shape) {
-          float glyph_width = size * 0.5f;
-          shape->appendRect(cursor_x, cursor_y - size, glyph_width, size, 0, 0);
-          shape->fill(r, g, b, static_cast<uint8_t>(a * 0.2f));
-          push_with_clip(shape);
-        }
+        // No glyph - draw tofu box placeholder and advance
+        draw_missing_glyph_placeholder(cursor_x, cursor_y, size, r, g, b, a);
         float adv = size * 0.6f;
         cursor_x += adv * cos_tm_outer;
         cursor_y -= adv * sin_tm_outer;
@@ -1533,21 +1521,10 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
       i += bytes_consumed;
     }
   } else {
-    // Fallback: draw a placeholder rectangle for text
-    float text_width = text.length() * size * 0.5f;
-    float text_height = size;
-
-    auto shape = tvg::Shape::gen();
-    if (!shape) {
-      return false;
-    }
-
-    // Draw filled rectangle as text placeholder
-    shape->appendRect(x, y - text_height, text_width, text_height, 0, 0);
-    shape->fill(r, g, b, a);
-
-    if (scene_->push(shape) != tvg::Result::Success) {
-      return false;
+    // Fallback: draw per-character tofu box placeholders for text
+    float char_width = size * 0.5f;
+    for (size_t i = 0; i < text.length(); ++i) {
+      draw_missing_glyph_placeholder(x + i * char_width * 1.2f, y, size, r, g, b, a);
     }
   }
 
@@ -4889,6 +4866,21 @@ fallback:
   return true;
 }
 
+bool ThorVGBackend::draw_missing_glyph_placeholder(float x, float y, float size,
+                                                    uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  auto shape = tvg::Shape::gen();
+  if (!shape) return false;
+  float glyph_width = size * 0.5f;
+  float box_margin = size * 0.05f;
+  shape->appendRect(x + box_margin, y - size + box_margin,
+                    glyph_width - 2 * box_margin, size - 2 * box_margin, 0, 0);
+  shape->fill(0, 0, 0, 0);  // transparent fill
+  shape->strokeFill(r, g, b, static_cast<uint8_t>(a * 0.4f));
+  shape->strokeWidth(size * 0.04f);  // thin stroke relative to font size
+  push_with_clip(shape);
+  return true;
+}
+
 bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
                                uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   if (!scene_) {
@@ -4898,13 +4890,8 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   // Get current font
   FontCache* font = get_font(current_font_name_);
   if (!font) {
-    // Fallback to placeholder rectangle
-    auto shape = tvg::Shape::gen();
-    if (!shape) return false;
-    float glyph_width = size * 0.5f;
-    shape->appendRect(x, y - size, glyph_width, size, 0, 0);
-    shape->fill(r, g, b, a);
-    push_with_clip(shape);
+    // Fallback to tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -4932,13 +4919,8 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   int num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
 
   if (num_verts == 0 || !vertices) {
-    // Glyph not found, draw placeholder
-    auto shape = tvg::Shape::gen();
-    if (!shape) return false;
-    float glyph_width = size * 0.5f;
-    shape->appendRect(x, y - size, glyph_width, size, 0, 0);
-    shape->fill(r, g, b, a);
-    push_with_clip(shape);
+    // Glyph not found - draw tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -5131,13 +5113,8 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
   // Get current font
   FontCache* font = get_font(current_font_name_);
   if (!font) {
-    // Fallback to placeholder rectangle
-    auto shape = tvg::Shape::gen();
-    if (!shape) return false;
-    float glyph_width = size * 0.5f;
-    shape->appendRect(x, y - size, glyph_width, size, 0, 0);
-    shape->fill(r, g, b, a);
-    push_with_clip(shape);
+    // Fallback to tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 
@@ -5165,13 +5142,8 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
   int num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
 
   if (num_verts == 0 || !vertices) {
-    // Glyph not found, draw placeholder
-    auto shape = tvg::Shape::gen();
-    if (!shape) return false;
-    float glyph_width = size * 0.5f;
-    shape->appendRect(x, y - size, glyph_width, size, 0, 0);
-    shape->fill(r, g, b, a);
-    push_with_clip(shape);
+    // Glyph not found - draw tofu box placeholder
+    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
 

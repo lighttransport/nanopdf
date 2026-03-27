@@ -18,6 +18,7 @@ using namespace nanostl;
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -784,11 +785,67 @@ struct Type3Font : public BaseFont {
   }
 };
 
+/// Error classification for parse/decode operations
+enum class ErrorKind {
+  None,        /// No error
+  Malformed,   /// Input data is structurally invalid
+  Unsupported, /// Valid PDF but uses unsupported features
+  Encrypted,   /// PDF is encrypted and password not provided/incorrect
+  IOError,     /// Data access or memory error
+  Internal     /// Internal library error (bug)
+};
+
+/// PDF/A validation violation
+struct PdfAViolation {
+  enum class Rule {
+    MissingXMPMetadata,
+    MissingOutputIntent,
+    FontNotEmbedded,
+    TransparencyUsed,        // PDF/A-1 forbids transparency
+    MissingDocumentInfo,
+    EncryptionPresent,       // PDF/A forbids standard encryption
+    InvalidColorSpace,       // DeviceCMYK without OutputIntent
+  };
+  Rule rule;
+  std::string message;
+  std::string detail;        // e.g., font name, page number
+};
+
+/// PDF/A validation result
+struct PdfAValidationResult {
+  bool valid{false};
+  std::string claimed_level;  // e.g., "PDF/A-1b"
+  std::vector<PdfAViolation> violations;
+};
+
+/// Result of a PDF parse operation
+struct ParseResult {
+  bool success{false};
+  std::string error;
+  ErrorKind kind{ErrorKind::None};
+
+  /// Implicit conversion to bool for backward compatibility
+  operator bool() const { return success; }
+
+  static ParseResult Ok() {
+    ParseResult r;
+    r.success = true;
+    return r;
+  }
+  static ParseResult Fail(ErrorKind k, const std::string& msg) {
+    ParseResult r;
+    r.kind = k;
+    r.error = msg;
+    return r;
+  }
+};
+
 // Result types declared before they are used
 struct DecodedStream {
   std::vector<uint8_t> data;
   bool success{false};
   std::string error;
+  ErrorKind kind{ErrorKind::None};
 
   // Image metadata (for image decoders like JBIG2, JPX)
   int width{0};
@@ -1231,6 +1288,7 @@ struct Pdf {
   DocumentCatalog catalog;
   SecurityHandler security;
   LinearizationParams linearization;
+  mutable std::mutex cache_mutex;
   mutable std::map<uint64_t, Value> object_cache;
   mutable std::unordered_map<uint64_t, uint64_t> object_offsets;
   mutable bool object_offsets_built{false};
@@ -1314,6 +1372,9 @@ class Parser;
 bool parse_from_memory(const uint8_t* addr, const size_t size, Pdf* out_pdf);
 bool parse_from_memory(const uint8_t* addr, const size_t size, Pdf* out_pdf,
                        const ParseOptions& options);
+ParseResult parse_pdf(const uint8_t* addr, size_t size, Pdf* out_pdf);
+ParseResult parse_pdf(const uint8_t* addr, size_t size, Pdf* out_pdf,
+                      const ParseOptions& options);
 bool repair_xref(const uint8_t* data, size_t size, Pdf* out_pdf);
 bool recover_stream_length(const uint8_t* data, size_t size, size_t stream_start,
                            size_t* out_length);
@@ -1410,6 +1471,11 @@ void parse_document_info(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_xmp_metadata(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_optional_content(const Pdf& pdf, DocumentCatalog& catalog);
 void parse_output_intents(const Pdf& pdf, DocumentCatalog& catalog);
+
+/// Validate PDF/A conformance. The PDF must have been parsed and
+/// document structure loaded before calling this.
+PdfAValidationResult validate_pdfa(const Pdf& pdf);
+
 Action parse_action(const Pdf& pdf, const Dictionary& action_dict);
 Action parse_action(const Pdf& pdf, const Value& action_val);
 AdditionalActions parse_additional_actions(const Pdf& pdf, const Dictionary& aa_dict);
