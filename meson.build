@@ -220,6 +220,7 @@ if opt_build_tests
     'tests/unit/filters/test_runlength_decode.cc',
     'tests/unit/filters/test_tiff_decode.cc',
     'tests/unit/fonts/test_cmap.cc',
+    'tests/unit/fonts/test_cff_wrapper.cc',
     'tests/unit/fonts/test_font_substitution.cc',
     'tests/unit/fonts/test_type0_font.cc',
     'tests/unit/fonts/test_type3_font.cc',

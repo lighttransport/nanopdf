@@ -70,6 +70,7 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/filters/test_png_predictors.cc
     unit/filters/test_runlength_decode.cc
     unit/fonts/test_cmap.cc
+    unit/fonts/test_cff_wrapper.cc
     unit/fonts/test_font_substitution.cc
     unit/fonts/test_type0_font.cc
     unit/fonts/test_type3_font.cc
