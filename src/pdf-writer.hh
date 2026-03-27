@@ -12,10 +12,16 @@
 
 namespace nanopdf {
 
+// Forward-declare ErrorKind if nanopdf.hh was not included first
+#ifndef NANOPDF_HH_INCLUDED
+enum class ErrorKind { None, Malformed, Unsupported, Encrypted, IOError, Internal };
+#endif
+
 /// Result of a write operation
 struct WriteResult {
   bool success = false;
   std::string error;
+  ErrorKind kind{ErrorKind::None};
   size_t bytes_written = 0;
 };
 

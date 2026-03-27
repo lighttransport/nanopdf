@@ -856,6 +856,7 @@ struct DecodedStream {
 struct ResolvedObject {
   bool success{false};
   std::string error;
+  ErrorKind kind{ErrorKind::None};
   Value value;
 
   ResolvedObject() = default;
@@ -864,6 +865,7 @@ struct ResolvedObject {
   ResolvedObject(ResolvedObject&& other) noexcept
       : success(other.success),
         error(std::move(other.error)),
+        kind(other.kind),
         value(std::move(other.value)) {
     other.success = false;
   }
@@ -872,6 +874,7 @@ struct ResolvedObject {
     if (this != &other) {
       success = other.success;
       error = std::move(other.error);
+      kind = other.kind;
       value = std::move(other.value);
       other.success = false;
     }
@@ -1318,6 +1321,17 @@ struct Pdf {
   void set_decoded_stream_cache_capacity(size_t capacity) const;
   void clear_decoded_stream_cache() const;
 
+  // Error state for bool-returning APIs (set on failure, cleared on success)
+  mutable std::string last_error;
+  mutable ErrorKind last_error_kind{ErrorKind::None};
+
+  /// Get the last error message (empty if last operation succeeded)
+  const std::string& get_last_error() const { return last_error; }
+  /// Get the last error kind (None if last operation succeeded)
+  ErrorKind get_last_error_kind() const { return last_error_kind; }
+  /// Clear error state
+  void clear_error() const { last_error.clear(); last_error_kind = ErrorKind::None; }
+
   // Lazy loading state flags
   mutable bool pages_loaded{false};
   mutable bool acro_form_loaded{false};
@@ -1361,6 +1375,10 @@ struct Pdf {
   static SignatureField parse_signature_field(const Pdf& pdf, const Dictionary& field_dict);
 
  private:
+  void set_error(ErrorKind kind, const std::string& msg) const {
+    last_error_kind = kind;
+    last_error = msg;
+  }
   bool parse_font_resources(Page& page, const Dictionary& resources) const;
   std::unique_ptr<BaseFont> parse_font(const Value& font_val) const;
   std::unique_ptr<FontDescriptor> parse_font_descriptor(const Value& font_dict) const;

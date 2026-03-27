@@ -844,6 +844,10 @@ ParseResult parse_pdf(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
     if (out_pdf->encrypt != 0 && !out_pdf->security.authenticated) {
       return ParseResult::Fail(ErrorKind::Encrypted, "PDF is encrypted");
     }
+    // Propagate structured error from load_document_structure if available
+    if (out_pdf->last_error_kind != ErrorKind::None) {
+      return ParseResult::Fail(out_pdf->last_error_kind, out_pdf->last_error);
+    }
     // Check if xref parsing failed (no xref sections loaded)
     if (out_pdf->xref_sections.empty()) {
       return ParseResult::Fail(ErrorKind::Malformed, "failed to parse xref");
@@ -898,7 +902,11 @@ bool recover_stream_length(const uint8_t* data, size_t size,
 
 // Repair xref by scanning the entire file for "N G obj" patterns
 bool repair_xref(const uint8_t* data, size_t size, Pdf* out_pdf) {
-  if (!data || size < 20 || !out_pdf) return false;
+  if (!data || size < 20 || !out_pdf) {
+    NANOPDF_LOG_WARN("repair", "Invalid arguments for xref repair (data=%p, size=%zu)",
+                     static_cast<const void*>(data), size);
+    return false;
+  }
 
   out_pdf->data = data;
   out_pdf->data_size = size;
@@ -1111,7 +1119,10 @@ next_iter:
     }
   }
 
-  if (out_pdf->root == 0) return false;
+  if (out_pdf->root == 0) {
+    NANOPDF_LOG_WARN("repair", "Repair failed: could not find /Root catalog object");
+    return false;
+  }
 
   // Try loading document structure
   return out_pdf->load_document_structure();
@@ -1556,6 +1567,7 @@ DecodedStream decode_ascii85(const uint8_t *data, size_t size,
     // Process regular ASCII85 character
     if (c < '!' || c > 'u') {
       result.error = "Invalid ASCII85 character";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
@@ -1619,6 +1631,7 @@ DecodedStream decode_asciihex(const uint8_t *data, size_t size,
     int value = hex_value(c);
     if (value < 0) {
       result.error = "ASCIIHexDecode: invalid hex digit";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
@@ -1647,6 +1660,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
 
   if (size == 0) {
     result.error = "FlateDecode: empty input data";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1658,6 +1672,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
 
   if (inflateInit(&strm) != Z_OK) {
     result.error = "FlateDecode: failed to initialize zlib decompressor";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1668,6 +1683,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
       inflateEnd(&strm);
       result.error = "FlateDecode: output exceeds maximum size limit (" +
                      std::to_string(kMaxDecodedSize / (1024 * 1024)) + " MB)";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
@@ -1700,6 +1716,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
       }
       inflateEnd(&strm);
       result.error = "FlateDecode: " + zlib_error;
+      result.kind = ErrorKind::Malformed;
       return result;
     }
   } while (ret != Z_STREAM_END);
@@ -1711,6 +1728,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
   std::string predictor_error;
   if (!apply_predictor(output, params, predictor_error)) {
     result.error = "FlateDecode: " + predictor_error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1728,12 +1746,14 @@ DecodedStream decode_lzw(const uint8_t *data, size_t size,
   LZWDecoder decoder;
   if (!decoder.init(data, size, params.early_change)) {
     result.error = "LZWDecode: failed to initialize decoder (empty or invalid data)";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   // Decode data
   if (!decoder.decode(output)) {
     result.error = "LZWDecode: failed to decode data (invalid code sequence)";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1741,6 +1761,7 @@ DecodedStream decode_lzw(const uint8_t *data, size_t size,
   std::string predictor_error;
   if (!apply_predictor(output, params, predictor_error)) {
     result.error = "LZWDecode: " + predictor_error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1771,12 +1792,14 @@ DecodedStream decode_jbig2(const uint8_t *data, size_t size,
   if (!decodeResult.success) {
     result.success = false;
     result.error = "JBIG2Decode: " + decodeResult.error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!decodeResult.image || !decodeResult.image->has_data()) {
     result.success = false;
     result.error = "JBIG2Decode: No image data decoded";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1819,6 +1842,7 @@ DecodedStream decode_runlength(const uint8_t *data, size_t size,
       size_t count = length + 1;
       if (pos + count > size) {
         result.error = "RunLengthDecode: Unexpected end of data";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
       for (size_t i = 0; i < count; i++) {
@@ -1828,6 +1852,7 @@ DecodedStream decode_runlength(const uint8_t *data, size_t size,
       // Repeat the next byte (257-length) times
       if (pos >= size) {
         result.error = "RunLengthDecode: Unexpected end of data";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
       uint8_t byte = data[pos++];
@@ -1854,6 +1879,7 @@ DecodedStream decode_dct(const uint8_t *data, size_t size,
                                                   &width, &height, &channels, 0);
   if (!decoded) {
     result.error = "DCTDecode: Failed to decode JPEG data";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1879,6 +1905,7 @@ DecodedStream decode_jpx(const uint8_t *data, size_t size,
 
   if (!decode_result.success) {
     result.error = "JPXDecode: " + decode_result.error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1985,6 +2012,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
   if (fd < 0) {
     result.success = false;
     result.error = "Failed to create temporary file";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -1996,6 +2024,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
     unlink(temp_path);
     result.success = false;
     result.error = "Failed to create TIFF file";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -2030,6 +2059,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
     unlink(temp_path);
     result.success = false;
     result.error = "Failed to write CCITT data to TIFF strip";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -2042,6 +2072,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
     unlink(temp_path);
     result.success = false;
     result.error = "Failed to reopen TIFF file for reading";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -2060,6 +2091,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
   if (read_bytes < 0) {
     result.success = false;
     result.error = "libtiff failed to decode CCITT data";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -2088,6 +2120,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 
   if (!data || size == 0) {
     result.error = "CCITTFaxDecode: Empty stream";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -3173,6 +3206,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
     if (params.end_of_line) {
       if (!reader.skip_eol()) {
         result.error = "CCITTFaxDecode: Missing EOL";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
     } else if (params.encoded_byte_align) {
@@ -3187,6 +3221,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
       int mode = reader.get_bit();
       if (mode < 0) {
         result.error = "CCITTFaxDecode: Unexpected EOF while reading row mode";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
       row_is_1d = (mode != 0);
@@ -3258,6 +3293,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
             line = prev_line;
           } else {
             result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+            result.kind = ErrorKind::Malformed;
             NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
                               decoded_rows, result.error.c_str());
             return result;
@@ -3278,6 +3314,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
           line = prev_line;
         } else {
           result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+          result.kind = ErrorKind::Malformed;
           NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
                             decoded_rows, result.error.c_str());
           return result;
@@ -3345,6 +3382,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                                params.black_is_1 != 0,
                                result.data, &error)) {
     result.error = error.empty() ? "CCITTFaxDecode: Decode failed" : error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
   result.success = true;
@@ -3388,6 +3426,7 @@ static DecodedStream apply_single_filter(const std::string &filter_name,
   }
 
   result.error = "Unsupported filter type: " + filter_name;
+  result.kind = ErrorKind::Unsupported;
   return result;
 }
 
@@ -3411,6 +3450,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -3531,12 +3571,14 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
         filter_names.push_back(item.name);
       } else {
         result.error = "decode_stream: Filter array contains non-name element";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
     }
   } else {
     result.error = "decode_stream: Filter must be a name or array, got type " +
                    std::to_string(static_cast<int>(filter_it->second.type));
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -3557,11 +3599,13 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
           params_list.push_back(filters::DecodeParams{});
         } else {
           result.error = "decode_stream: DecodeParms array contains invalid element";
+          result.kind = ErrorKind::Malformed;
           return result;
         }
       }
     } else if (params_it->second.type != Value::NULL_OBJ) {
       result.error = "decode_stream: DecodeParms must be dictionary, array, or null";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
   }
@@ -3625,6 +3669,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
       } else {
         result.error = step_result.error;
       }
+      result.kind = step_result.kind;
       return result;
     }
 
@@ -3668,6 +3713,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -3788,12 +3834,14 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
         filter_names.push_back(item.name);
       } else {
         result.error = "decode_stream: Filter array contains non-name element";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
     }
   } else {
     result.error = "decode_stream: Filter must be a name or array, got type " +
                    std::to_string(static_cast<int>(filter_it->second.type));
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -3814,11 +3862,13 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
           params_list.push_back(filters::DecodeParams{});
         } else {
           result.error = "decode_stream: DecodeParms array contains invalid element";
+          result.kind = ErrorKind::Malformed;
           return result;
         }
       }
     } else if (params_it->second.type != Value::NULL_OBJ) {
       result.error = "decode_stream: DecodeParms must be dictionary, array, or null";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
   }
@@ -3904,6 +3954,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
       } else {
         result.error = step_result.error;
       }
+      result.kind = step_result.kind;
       return result;
     }
 
@@ -4924,12 +4975,15 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
       }
       result.success = false;
       result.error = "Failed to load object from object stream";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
     if (!find_indirect_object_body_offset(*this, obj_num, gen_num, &body_offset)) {
       result.success = false;
       result.error = "Failed to locate object";
+      result.kind = ErrorKind::Malformed;
+      NANOPDF_LOG_WARN("load_object", "Failed to locate object %u %u", obj_num, gen_num);
       return result;
     }
   }
@@ -4940,17 +4994,20 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
   if (!sr.seek_set(body_offset)) {
     result.success = false;
     result.error = "Invalid object offset";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!parser.skip_whitespace(sr)) {
     result.success = false;
     result.error = "Failed to prepare object stream";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!parse_object(sr, parser, &result.value)) {
     result.success = false;
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_WARN("load_object",
                      "Failed to parse object %u %u at body_offset=%lu have_offset=%d",
                      obj_num, gen_num, (unsigned long)body_offset, have_offset);
@@ -4966,12 +5023,14 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
   if (!parser.skip_whitespace(sr)) {
     result.success = false;
     result.error = "Failed to parse object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!parser.consume_keyword(sr, "endobj")) {
     result.success = false;
     result.error = "Missing endobj for object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -4993,6 +5052,8 @@ bool Pdf::build_object_offset_cache() const {
   }
 
   if (!data || data_size == 0) {
+    NANOPDF_LOG_WARN("xref", "No data for xref offset cache");
+    set_error(ErrorKind::Malformed, "no data for xref offset cache");
     return false;
   }
 
@@ -5002,6 +5063,8 @@ bool Pdf::build_object_offset_cache() const {
   const size_t keyword_len = sizeof(keyword) - 1;
 
   if (data_size < keyword_len) {
+    NANOPDF_LOG_WARN("xref", "PDF data too small for xref (%zu bytes)", data_size);
+    set_error(ErrorKind::Malformed, "PDF data too small for xref");
     return false;
   }
 
@@ -5017,6 +5080,8 @@ bool Pdf::build_object_offset_cache() const {
   }
 
   if (!startxref_pos) {
+    NANOPDF_LOG_WARN("xref", "startxref keyword not found");
+    set_error(ErrorKind::Malformed, "startxref keyword not found");
     return false;
   }
 
@@ -5025,6 +5090,8 @@ bool Pdf::build_object_offset_cache() const {
     cursor++;
   }
   if (cursor >= end) {
+    NANOPDF_LOG_WARN("xref", "Unexpected end of data after startxref");
+    set_error(ErrorKind::Malformed, "unexpected end of data after startxref");
     return false;
   }
 
@@ -5036,6 +5103,9 @@ bool Pdf::build_object_offset_cache() const {
     cursor++;
   }
   if (!has_digit || initial_xref >= data_size) {
+    NANOPDF_LOG_WARN("xref", "startxref offset beyond file size (offset=%llu, size=%zu)",
+                     (unsigned long long)initial_xref, data_size);
+    set_error(ErrorKind::Malformed, "startxref offset beyond file size");
     return false;
   }
 
@@ -5664,6 +5734,8 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
 
   ResolvedObject stream_obj = load_object(stream_object_number, 0);
   if (!stream_obj.success || stream_obj.value.type != Value::STREAM) {
+    NANOPDF_LOG_WARN("obj_stream", "Stream object %u not found or not a stream",
+                     stream_object_number);
     return false;
   }
 
@@ -5721,6 +5793,8 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
       DecodedStream decoded = decode_stream(*this, stream_obj.value,
                                             stream_object_number, 0);
       if (!decoded.success) {
+        NANOPDF_LOG_WARN("obj_stream", "Failed to decode object stream %u: %s",
+                         stream_object_number, decoded.error.c_str());
         return false;
       }
       local_stream_data = decoded.data;  // keep a local copy
@@ -5790,6 +5864,9 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
   uint32_t object_id_from_stream = entries[index].first;
   if (object_id_from_stream != object_number) {
     // mismatch, treat as failure
+    NANOPDF_LOG_WARN("obj_stream",
+                     "Object ID mismatch in stream %u: expected %u, got %u at index %u",
+                     stream_object_number, object_number, object_id_from_stream, index);
     return false;
   }
 
@@ -5858,6 +5935,8 @@ void Pdf::clear_decoded_stream_cache() const {
 }
 
 bool Pdf::load_document_structure() {
+  clear_error();
+
   // Detect linearization (must be done before other parsing)
   parse_linearization_dict(data, data_size, &linearization);
 
@@ -5911,11 +5990,15 @@ bool Pdf::load_document_structure() {
   catalog.pages_count = 0;
 
   if (root == 0) {
+    NANOPDF_LOG_ERROR("load", "No /Root entry in trailer");
+    set_error(ErrorKind::Malformed, "no /Root entry in trailer");
     return false;
   }
 
   ResolvedObject root_obj = load_object(root, 0);
   if (!root_obj.success || root_obj.value.type != Value::DICTIONARY) {
+    NANOPDF_LOG_ERROR("load", "Root catalog object %u is not a dictionary", root);
+    set_error(ErrorKind::Malformed, "root catalog object is not a dictionary");
     return false;
   }
 

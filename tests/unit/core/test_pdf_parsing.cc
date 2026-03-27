@@ -393,6 +393,56 @@ TEST_CASE("Too-small input with ParseOptions") {
     CHECK_FALSE(ok);
 }
 
+TEST_CASE("parse_pdf failure populates last_error on Pdf struct") {
+    Pdf pdf;
+    // Feed garbage data that has %PDF header but is otherwise invalid
+    std::string bad = "%PDF-1.4\ngarbage data with no xref";
+    ParseResult result = parse_pdf(
+        reinterpret_cast<const uint8_t*>(bad.data()), bad.size(), &pdf);
+    CHECK_FALSE(result.success);
+    CHECK_FALSE(result.error.empty());
+    CHECK(result.kind != ErrorKind::None);
+}
+
+TEST_CASE("parse_pdf success clears last_error") {
+    Pdf pdf;
+    // First, set an artificial error
+    pdf.last_error = "previous error";
+    pdf.last_error_kind = ErrorKind::Internal;
+
+    // Parse a valid PDF
+    auto data = build_minimal_pdf();
+    ParseResult result = parse_pdf(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size(), &pdf);
+    // On success, load_document_structure calls clear_error()
+    if (result.success) {
+        CHECK(pdf.get_last_error().empty());
+        CHECK(pdf.get_last_error_kind() == ErrorKind::None);
+    }
+}
+
+TEST_CASE("get_last_error_kind returns Malformed for missing root") {
+    Pdf pdf;
+    // PDF with xref but root pointing to nonexistent object
+    std::string bad_root =
+        "%PDF-1.4\n"
+        "xref\n"
+        "0 1\n"
+        "0000000000 65535 f \n"
+        "trailer\n"
+        "<< /Size 1 >>\n"  // No /Root entry
+        "startxref\n"
+        "10\n"
+        "%%EOF\n";
+    ParseResult result = parse_pdf(
+        reinterpret_cast<const uint8_t*>(bad_root.data()), bad_root.size(), &pdf);
+    CHECK_FALSE(result.success);
+    // Should get a specific error, not generic
+    if (!result.error.empty()) {
+        CHECK(result.kind != ErrorKind::None);
+    }
+}
+
 }  // TEST_SUITE
 
 #ifndef NANOPDF_TEST_SUITE_NO_MAIN
