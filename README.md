@@ -89,6 +89,7 @@ the bundled miniz library).
 - SVG export (paths, text, gradients, patterns)
 - ThorVG vector graphics backend (optional)
 - Blend2D rasterization backend (optional)
+- Render progress callbacks for dense pages (1% steps once the object threshold is reached)
 
 ### Other
 - MCP (Model Context Protocol) server for AI integration

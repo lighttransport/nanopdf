@@ -62,6 +62,11 @@ struct RenderOptions {
 
   // Background color (RGBA)
   uint8_t bg_r{255}, bg_g{255}, bg_b{255}, bg_a{255};
+
+  // Optional progress reporting for dense pages.
+  RenderProgressCallback progress_callback;
+  size_t progress_object_threshold{100};
+  uint32_t progress_percent_step{1};
 };
 
 class Blend2DBackend {
@@ -74,6 +79,10 @@ public:
 
   // Render a PDF page
   Blend2DRenderResult render_page(const Pdf& pdf, const Page& page);
+  void set_progress_callback(RenderProgressCallback callback,
+                             size_t object_threshold = 100,
+                             uint32_t percent_step = 1);
+  void clear_progress_callback();
 
   // Direct drawing API for testing
   bool begin_scene();
@@ -285,6 +294,29 @@ private:
   // Apply soft mask to current rendering (if active)
   void apply_soft_mask_to_context();
 
+  void begin_progress(const RenderProgressCallback& callback,
+                      size_t total_objects,
+                      size_t object_threshold,
+                      uint32_t percent_step);
+  void advance_progress(size_t processed_objects = 1);
+  void finish_progress();
+  static size_t count_render_objects(const std::vector<uint8_t>& content_data);
+
+  struct RenderProgressState {
+    RenderProgressCallback callback;
+    size_t total_objects{0};
+    size_t processed_objects{0};
+    uint32_t percent_step{1};
+    uint32_t last_percent{0};
+    bool enabled{false};
+  };
+
+  struct RenderProgressConfig {
+    RenderProgressCallback callback;
+    size_t object_threshold{100};
+    uint32_t percent_step{1};
+  };
+
   BLImage image_;
   BLContext ctx_;
   uint32_t width_{0};
@@ -302,6 +334,8 @@ private:
   // Pointer to current PDF and Page for font access
   const Pdf* current_pdf_{nullptr};
   const Page* current_page_{nullptr};
+  RenderProgressConfig progress_config_;
+  RenderProgressState progress_;
 
   // Form XObject resource stack for nested Form XObjects
   // Each entry contains resources from a Form XObject

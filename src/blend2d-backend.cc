@@ -12,6 +12,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <string_view>
 
 // For PNG saving
 #include "stb_image_write.h"
@@ -26,6 +27,143 @@
 extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
+
+static bool is_pdf_content_delimiter(char c) {
+  return std::isspace(static_cast<unsigned char>(c)) || c == '/' || c == '[' ||
+         c == ']' || c == '(' || c == ')' || c == '<' || c == '>' ||
+         c == '{' || c == '}';
+}
+
+static bool is_render_progress_operator(std::string_view token) {
+  return token == "f" || token == "F" || token == "f*" || token == "S" ||
+         token == "s" || token == "B" || token == "B*" || token == "b" ||
+         token == "b*" || token == "Tj" || token == "TJ" || token == "'" ||
+         token == "\"" || token == "Do" || token == "BI" || token == "sh";
+}
+
+static void skip_inline_image_payload(std::string_view content, size_t& pos) {
+  const size_t size = content.size();
+
+  while (pos < size && std::isspace(static_cast<unsigned char>(content[pos]))) {
+    pos++;
+  }
+
+  while (pos < size) {
+    while (pos < size && std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+    if (pos >= size) break;
+
+    if ((pos + 1) < size && content[pos] == 'I' && content[pos + 1] == 'D' &&
+        ((pos + 2) >= size ||
+         std::isspace(static_cast<unsigned char>(content[pos + 2])))) {
+      pos += 2;
+      if (pos < size &&
+          std::isspace(static_cast<unsigned char>(content[pos]))) {
+        pos++;
+      }
+      break;
+    }
+
+    while (pos < size &&
+           !std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+  }
+
+  while ((pos + 1) < size) {
+    if (content[pos] == 'E' && content[pos + 1] == 'I' &&
+        (pos == 0 ||
+         std::isspace(static_cast<unsigned char>(content[pos - 1]))) &&
+        ((pos + 2) >= size ||
+         std::isspace(static_cast<unsigned char>(content[pos + 2])))) {
+      pos += 2;
+      return;
+    }
+    pos++;
+  }
+}
+
+static size_t count_render_objects_impl(std::string_view content) {
+  size_t count = 0;
+  size_t pos = 0;
+
+  while (pos < content.size()) {
+    while (pos < content.size() &&
+           std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+    if (pos >= content.size()) break;
+
+    if (content[pos] == '%') {
+      while (pos < content.size() && content[pos] != '\n' &&
+             content[pos] != '\r') {
+        pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '(') {
+      int depth = 1;
+      pos++;
+      while (pos < content.size() && depth > 0) {
+        if (content[pos] == '\\' && (pos + 1) < content.size()) {
+          pos += 2;
+        } else if (content[pos] == '(') {
+          depth++;
+          pos++;
+        } else if (content[pos] == ')') {
+          depth--;
+          pos++;
+        } else {
+          pos++;
+        }
+      }
+      continue;
+    }
+
+    if (content[pos] == '<') {
+      if ((pos + 1) < content.size() && content[pos + 1] == '<') {
+        pos += 2;
+      } else {
+        pos++;
+        while (pos < content.size() && content[pos] != '>') {
+          pos++;
+        }
+        if (pos < content.size()) pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '[' || content[pos] == ']' || content[pos] == '{' ||
+        content[pos] == '}') {
+      pos++;
+      continue;
+    }
+
+    size_t start = pos;
+    while (pos < content.size() && !is_pdf_content_delimiter(content[pos])) {
+      pos++;
+    }
+
+    if (start == pos) {
+      pos++;
+      continue;
+    }
+
+    std::string_view token = content.substr(start, pos - start);
+    if (!is_render_progress_operator(token)) {
+      continue;
+    }
+
+    count++;
+    if (token == "BI") {
+      skip_inline_image_payload(content, pos);
+    }
+  }
+
+  return count;
+}
 
 // Helper function to convert glyph name to Unicode codepoint
 static uint32_t glyph_name_to_unicode(const std::string& name) {
@@ -985,6 +1123,77 @@ bool Blend2DBackend::save_to_file(const std::string& filename, const RenderOptio
   return ret != 0;
 }
 
+size_t Blend2DBackend::count_render_objects(
+    const std::vector<uint8_t>& content_data) {
+  return count_render_objects_impl(
+      std::string_view(reinterpret_cast<const char*>(content_data.data()),
+                       content_data.size()));
+}
+
+void Blend2DBackend::begin_progress(const RenderProgressCallback& callback,
+                                    size_t total_objects,
+                                    size_t object_threshold,
+                                    uint32_t percent_step) {
+  progress_ = RenderProgressState();
+  if (!callback || total_objects < object_threshold) {
+    return;
+  }
+
+  progress_.callback = callback;
+  progress_.total_objects = total_objects;
+  progress_.percent_step = std::max<uint32_t>(1, percent_step);
+  progress_.enabled = true;
+  progress_.callback(RenderProgressInfo{0, progress_.total_objects, 0});
+}
+
+void Blend2DBackend::advance_progress(size_t processed_objects) {
+  if (!progress_.enabled || processed_objects == 0) {
+    return;
+  }
+
+  progress_.processed_objects =
+      std::min(progress_.processed_objects + processed_objects,
+               progress_.total_objects);
+
+  const uint32_t current_percent = static_cast<uint32_t>(
+      (progress_.processed_objects * 100) / progress_.total_objects);
+
+  for (uint32_t percent = progress_.last_percent + progress_.percent_step;
+       percent <= current_percent && percent <= 100;
+       percent += progress_.percent_step) {
+    progress_.callback(
+        RenderProgressInfo{progress_.processed_objects, progress_.total_objects,
+                           percent});
+    progress_.last_percent = percent;
+  }
+}
+
+void Blend2DBackend::finish_progress() {
+  if (!progress_.enabled) {
+    progress_ = RenderProgressState();
+    return;
+  }
+
+  progress_.processed_objects = progress_.total_objects;
+  if (progress_.last_percent < 100) {
+    progress_.callback(RenderProgressInfo{progress_.processed_objects,
+                                          progress_.total_objects, 100});
+  }
+  progress_ = RenderProgressState();
+}
+
+void Blend2DBackend::set_progress_callback(RenderProgressCallback callback,
+                                          size_t object_threshold,
+                                          uint32_t percent_step) {
+  progress_config_.callback = std::move(callback);
+  progress_config_.object_threshold = object_threshold;
+  progress_config_.percent_step = std::max<uint32_t>(1, percent_step);
+}
+
+void Blend2DBackend::clear_progress_callback() {
+  progress_config_ = RenderProgressConfig();
+}
+
 Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page, 
                                                  const RenderOptions& options) {
   Blend2DRenderResult result;
@@ -1026,13 +1235,10 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
   current_pdf_ = &pdf;
   current_page_ = &page;
 
-  // Clear canvas with background color
-  ctx_.set_comp_op(BL_COMP_OP_SRC_COPY);
-  ctx_.set_fill_style(BLRgba32(options.bg_r, options.bg_g, options.bg_b, options.bg_a));
-  ctx_.fill_all();
-  ctx_.set_comp_op(BL_COMP_OP_SRC_OVER);
+  std::vector<std::vector<uint8_t>> decoded_contents;
+  decoded_contents.reserve(page.contents.size());
+  size_t total_render_objects = 0;
 
-  // Process each content stream
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
     uint32_t obj_num = 0;
@@ -1042,26 +1248,51 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
       obj_num = content_obj.ref_object_number;
       gen_num = content_obj.ref_generation_number;
       auto resolved = resolve_reference(pdf, obj_num, gen_num);
-      if (resolved.success) {
-        resolved_obj = resolved.value;
-      } else {
+      if (!resolved.success) {
         continue;
       }
+      resolved_obj = std::move(resolved.value);
     }
 
-    if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
-      if (decoded_result.success) {
-        state_ = GraphicsState();
-        state_.page_width = page_width;
-        state_.page_height = page_height;
-        state_.scale = scale;
-        parse_pdf_content(decoded_result.data);
-      }
+    if (resolved_obj.type != Value::STREAM) {
+      continue;
     }
+
+    auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
+    if (!decoded_result.success) {
+      continue;
+    }
+
+    total_render_objects += count_render_objects(decoded_result.data);
+    decoded_contents.push_back(std::move(decoded_result.data));
+  }
+
+  const bool has_explicit_progress = static_cast<bool>(options.progress_callback);
+  begin_progress(has_explicit_progress ? options.progress_callback
+                                       : progress_config_.callback,
+                 total_render_objects,
+                 has_explicit_progress ? options.progress_object_threshold
+                                       : progress_config_.object_threshold,
+                 has_explicit_progress ? options.progress_percent_step
+                                       : progress_config_.percent_step);
+
+  // Clear canvas with background color
+  ctx_.set_comp_op(BL_COMP_OP_SRC_COPY);
+  ctx_.set_fill_style(BLRgba32(options.bg_r, options.bg_g, options.bg_b, options.bg_a));
+  ctx_.fill_all();
+  ctx_.set_comp_op(BL_COMP_OP_SRC_OVER);
+
+  // Process each decoded content stream
+  for (const auto& decoded_content : decoded_contents) {
+    state_ = GraphicsState();
+    state_.page_width = page_width;
+    state_.page_height = page_height;
+    state_.scale = scale;
+    parse_pdf_content(decoded_content);
   }
 
   ctx_.flush(BL_CONTEXT_FLUSH_SYNC);
+  finish_progress();
 
   current_pdf_ = nullptr;
   current_page_ = nullptr;
@@ -1759,7 +1990,10 @@ bool Blend2DBackend::render_type3_glyph(const Type3Font* type3_font, const std::
   }
 
   // Parse and render the glyph content stream
+  bool progress_enabled = progress_.enabled;
+  progress_.enabled = false;
   parse_pdf_content(decoded.data);
+  progress_.enabled = progress_enabled;
 
   // Pop resources
   if (!type3_font->resources.empty() && !form_resources_stack_.empty()) {
@@ -4042,6 +4276,8 @@ static bool is_rectangular_path(const BLPath& path, BLBox& out_rect) {
 
 bool Blend2DBackend::push_with_clip(BLPath& path, bool fill, bool stroke) {
   if (!initialized_) return false;
+  BLBox rect_box;
+  const bool is_rect_path = is_rectangular_path(path, rect_box);
 
   // Apply clipping path if set
   if (state_.has_clip && !state_.clip_path.is_empty()) {
@@ -4070,7 +4306,12 @@ bool Blend2DBackend::push_with_clip(BLPath& path, bool fill, bool stroke) {
   if (fill) {
     uint8_t fill_alpha = static_cast<uint8_t>(state_.fill_a * state_.fill_opacity);
     ctx_.set_fill_style(BLRgba32(state_.fill_r, state_.fill_g, state_.fill_b, fill_alpha));
-    ctx_.fill_path(path);
+    if (is_rect_path) {
+      ctx_.fill_rect(rect_box.x0, rect_box.y0, rect_box.x1 - rect_box.x0,
+                     rect_box.y1 - rect_box.y0);
+    } else {
+      ctx_.fill_path(path);
+    }
   }
 
   if (stroke) {
@@ -4102,7 +4343,12 @@ bool Blend2DBackend::push_with_clip(BLPath& path, bool fill, bool stroke) {
       ctx_.set_stroke_dash_offset(static_cast<double>(state_.dash_phase * state_.scale));
     }
 
-    ctx_.stroke_path(path);
+    if (is_rect_path) {
+      ctx_.stroke_rect(rect_box.x0, rect_box.y0, rect_box.x1 - rect_box.x0,
+                       rect_box.y1 - rect_box.y0);
+    } else {
+      ctx_.stroke_path(path);
+    }
   }
 
   if (state_.has_clip) {
@@ -4141,41 +4387,56 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
   // Ensure page fonts are loaded
   page.ensure_fonts_loaded(pdf);
 
-  // Clear canvas
-  begin_scene();
+  std::vector<std::vector<uint8_t>> decoded_contents;
+  decoded_contents.reserve(page.contents.size());
+  size_t total_render_objects = 0;
 
-  // Process each content stream
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
     uint32_t obj_num = 0;
     uint16_t gen_num = 0;
 
-    // Resolve reference if needed
     if (content_obj.type == Value::REFERENCE) {
       obj_num = content_obj.ref_object_number;
       gen_num = content_obj.ref_generation_number;
       auto resolved = resolve_reference(pdf, obj_num, gen_num);
-      if (resolved.success) {
-        resolved_obj = resolved.value;
-      } else {
+      if (!resolved.success) {
         continue;
       }
+      resolved_obj = std::move(resolved.value);
     }
 
-    if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
-      if (decoded_result.success) {
-        state_ = GraphicsState();  // Reset state
-        // Set page coordinate info
-        state_.page_width = page_width;
-        state_.page_height = page_height;
-        state_.scale = scale;
-        parse_pdf_content(decoded_result.data);
-      }
+    if (resolved_obj.type != Value::STREAM) {
+      continue;
     }
+
+    auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
+    if (!decoded_result.success) {
+      continue;
+    }
+
+    total_render_objects += count_render_objects(decoded_result.data);
+    decoded_contents.push_back(std::move(decoded_result.data));
+  }
+
+  begin_progress(progress_config_.callback, total_render_objects,
+                 progress_config_.object_threshold,
+                 progress_config_.percent_step);
+
+  // Clear canvas
+  begin_scene();
+
+  // Process each content stream
+  for (const auto& decoded_content : decoded_contents) {
+    state_ = GraphicsState();  // Reset state
+    state_.page_width = page_width;
+    state_.page_height = page_height;
+    state_.scale = scale;
+    parse_pdf_content(decoded_content);
   }
 
   end_scene();
+  finish_progress();
 
   current_pdf_ = nullptr;
   current_page_ = nullptr;
@@ -4189,6 +4450,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
   std::string content(content_data.begin(), content_data.end());
   std::vector<std::string> operands;
   std::vector<GraphicsState> state_stack;
+  operands.reserve(16);
+  state_stack.reserve(16);
 
   size_t pos = 0;
   while (pos < content.length()) {
@@ -4412,12 +4675,14 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           push_with_clip(state_.current_path, true, false);
           state_.current_path.reset();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "S") {  // stroke
         if (state_.in_path) {
           push_with_clip(state_.current_path, false, true);
           state_.current_path.reset();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "s") {  // close and stroke
         if (state_.in_path) {
@@ -4425,6 +4690,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           push_with_clip(state_.current_path, false, true);
           state_.current_path.reset();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "B" || token == "B*") {  // fill and stroke
         if (state_.in_path) {
@@ -4433,6 +4699,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           push_with_clip(state_.current_path, true, true);
           state_.current_path.reset();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "b" || token == "b*") {  // close, fill and stroke
         if (state_.in_path) {
@@ -4442,6 +4709,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           push_with_clip(state_.current_path, true, true);
           state_.current_path.reset();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "n") {  // end path
         state_.current_path.reset();
@@ -4940,6 +5208,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
 
           // Update text matrix with actual rendered width (convert back to text space)
           state_.text_matrix.e += text_width / state_.scale;
+          advance_progress();
         }
       } else if (token == "TJ") {
         // Show text with positioning (CMap-aware)
@@ -4970,6 +5239,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             }
           }
           state_.text_matrix.e += total_advance;
+          advance_progress();
         }
       } else if (token == "'" || token == "\"") {
         // ' = T* + Tj (move to next line, show text)
@@ -4998,6 +5268,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             float text_width = render_text_string(text, x, y, font_size,
                 state_.fill_r, state_.fill_g, state_.fill_b, fill_alpha);
             state_.text_matrix.e += text_width / state_.scale;
+            advance_progress();
           }
         }
       }
@@ -5009,17 +5280,20 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             shading_name = shading_name.substr(1);
           }
           draw_shading(shading_name);
+          advance_progress();
         }
       }
       // Inline image (BI ... ID data EI)
       else if (token == "BI") {
         parse_inline_image(content, pos);
+        advance_progress();
         operands.clear();
         continue;  // Skip normal operand clearing
       }
       // XObject (Do operator for images/forms)
       else if (token == "Do") {
         if (operands.size() >= 1 && current_pdf_ && current_page_) {
+          bool rendered_xobject = false;
           std::string xobj_name = operands[0];
           if (!xobj_name.empty() && xobj_name[0] == '/') {
             xobj_name = xobj_name.substr(1);
@@ -5063,6 +5337,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                     img_y = (state_.page_height - img_y) * state_.scale - img_height;
                     draw_image(image, img_x, img_y, img_width, img_height,
                         state_.fill_r, state_.fill_g, state_.fill_b);
+                    rendered_xobject = true;
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream
                     auto decoded = decode_stream(*current_pdf_, xobj_value,
@@ -5140,7 +5415,11 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                         }
                       }
 
+                      bool progress_enabled = progress_.enabled;
+                      progress_.enabled = false;
                       parse_pdf_content(decoded.data);
+                      progress_.enabled = progress_enabled;
+                      rendered_xobject = true;
 
                       // Restore BBox clipping
                       if (has_bbox_clip) {
@@ -5158,6 +5437,9 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                 }
               }
             }
+          }
+          if (rendered_xobject) {
+            advance_progress();
           }
         }
       }
@@ -5705,7 +5987,10 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
     }
 
     // Parse and render the tile content stream
+    bool progress_enabled = progress_.enabled;
+    progress_.enabled = false;
     parse_pdf_content(tiling.content_stream);
+    progress_.enabled = progress_enabled;
 
     // Pop pattern resources
     if (!tiling.resources.empty() && !form_resources_stack_.empty()) {
@@ -5865,7 +6150,10 @@ bool Blend2DBackend::render_soft_mask_group(const Value& group_xobject, int mask
   state_.scale = static_cast<float>(mask_width) / state_.page_width;
 
   // Parse and render the XObject content to the mask context
+  bool progress_enabled = progress_.enabled;
+  progress_.enabled = false;
   parse_pdf_content(decoded.data);
+  progress_.enabled = progress_enabled;
 
   // Flush rendering
   ctx_.flush(BL_CONTEXT_FLUSH_SYNC);

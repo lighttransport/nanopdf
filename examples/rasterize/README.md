@@ -9,6 +9,7 @@ A command-line tool that converts PDF pages to PNG images using nanopdf and the 
 - Maintains aspect ratio by default
 - Batch processing for multi-page documents
 - Verbose output mode for debugging
+- Progress updates for dense pages while rendering (`--verbose`)
 
 ## Prerequisites
 
@@ -76,6 +77,7 @@ This creates: `output_page001.png`, `output_page002.png`, etc.
 ```bash
 ./rasterize document.pdf output.png --verbose
 ```
+When the page contains many render objects, verbose mode prints render progress in 1% steps.
 
 ## Output Format
 

@@ -290,6 +290,19 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     return false;
   }
 
+  if (options.verbose) {
+    backend.set_progress_callback(
+        [page_num](const nanopdf::RenderProgressInfo& progress) {
+          std::cout << "\r  Rendering page " << page_num << ": "
+                    << std::setw(3) << progress.percent << "%" << std::flush;
+          if (progress.percent == 100) {
+            std::cout << "\n";
+          }
+        });
+  } else {
+    backend.clear_progress_callback();
+  }
+
   // Render the page
   if (options.verbose) {
     std::cout << "  Rendering page " << page_num << "...\n";

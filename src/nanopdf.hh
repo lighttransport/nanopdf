@@ -71,6 +71,14 @@ struct ParseOptions {
   size_t max_repair_scan{0};         // Max bytes to scan during repair (0 = entire file)
 };
 
+struct RenderProgressInfo {
+  size_t processed_objects{0};
+  size_t total_objects{0};
+  uint32_t percent{0};
+};
+
+using RenderProgressCallback = std::function<void(const RenderProgressInfo&)>;
+
 bool parse_from_memory(const uint8_t* addr, const size_t size);
 
 struct StreamValue {

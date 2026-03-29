@@ -8,6 +8,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 
 #include "nanopdf-log.hh"
 #include "color-transform.hh"
@@ -29,6 +30,212 @@
 extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
+
+struct ThorVGRect {
+  float x{0.0f};
+  float y{0.0f};
+  float w{0.0f};
+  float h{0.0f};
+};
+
+static bool is_pdf_content_delimiter(char c) {
+  return std::isspace(static_cast<unsigned char>(c)) || c == '/' || c == '[' ||
+         c == ']' || c == '(' || c == ')' || c == '<' || c == '>' ||
+         c == '{' || c == '}';
+}
+
+static bool is_render_progress_operator(std::string_view token) {
+  return token == "f" || token == "F" || token == "f*" || token == "S" ||
+         token == "s" || token == "B" || token == "B*" || token == "b" ||
+         token == "b*" || token == "Tj" || token == "TJ" || token == "'" ||
+         token == "\"" || token == "Do" || token == "BI" || token == "sh";
+}
+
+static void skip_inline_image_payload(std::string_view content, size_t& pos) {
+  const size_t size = content.size();
+
+  while (pos < size && std::isspace(static_cast<unsigned char>(content[pos]))) {
+    pos++;
+  }
+
+  while (pos < size) {
+    while (pos < size && std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+    if (pos >= size) break;
+
+    if ((pos + 1) < size && content[pos] == 'I' && content[pos + 1] == 'D' &&
+        ((pos + 2) >= size ||
+         std::isspace(static_cast<unsigned char>(content[pos + 2])))) {
+      pos += 2;
+      if (pos < size &&
+          std::isspace(static_cast<unsigned char>(content[pos]))) {
+        pos++;
+      }
+      break;
+    }
+
+    while (pos < size &&
+           !std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+  }
+
+  while ((pos + 1) < size) {
+    if (content[pos] == 'E' && content[pos + 1] == 'I' &&
+        (pos == 0 ||
+         std::isspace(static_cast<unsigned char>(content[pos - 1]))) &&
+        ((pos + 2) >= size ||
+         std::isspace(static_cast<unsigned char>(content[pos + 2])))) {
+      pos += 2;
+      return;
+    }
+    pos++;
+  }
+}
+
+static size_t count_render_objects_impl(std::string_view content) {
+  size_t count = 0;
+  size_t pos = 0;
+
+  while (pos < content.size()) {
+    while (pos < content.size() &&
+           std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+    if (pos >= content.size()) break;
+
+    if (content[pos] == '%') {
+      while (pos < content.size() && content[pos] != '\n' &&
+             content[pos] != '\r') {
+        pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '(') {
+      int depth = 1;
+      pos++;
+      while (pos < content.size() && depth > 0) {
+        if (content[pos] == '\\' && (pos + 1) < content.size()) {
+          pos += 2;
+        } else if (content[pos] == '(') {
+          depth++;
+          pos++;
+        } else if (content[pos] == ')') {
+          depth--;
+          pos++;
+        } else {
+          pos++;
+        }
+      }
+      continue;
+    }
+
+    if (content[pos] == '<') {
+      if ((pos + 1) < content.size() && content[pos + 1] == '<') {
+        pos += 2;
+      } else {
+        pos++;
+        while (pos < content.size() && content[pos] != '>') {
+          pos++;
+        }
+        if (pos < content.size()) pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '[' || content[pos] == ']' || content[pos] == '{' ||
+        content[pos] == '}') {
+      pos++;
+      continue;
+    }
+
+    size_t start = pos;
+    while (pos < content.size() && !is_pdf_content_delimiter(content[pos])) {
+      pos++;
+    }
+
+    if (start == pos) {
+      pos++;
+      continue;
+    }
+
+    std::string_view token = content.substr(start, pos - start);
+    if (!is_render_progress_operator(token)) {
+      continue;
+    }
+
+    count++;
+    if (token == "BI") {
+      skip_inline_image_payload(content, pos);
+    }
+  }
+
+  return count;
+}
+
+static bool is_rectangular_path(const std::vector<tvg::PathCommand>& commands,
+                                const std::vector<tvg::Point>& points,
+                                ThorVGRect& rect) {
+  if (commands.size() != 5 || points.size() != 4) {
+    return false;
+  }
+
+  if (commands[0] != tvg::PathCommand::MoveTo ||
+      commands[1] != tvg::PathCommand::LineTo ||
+      commands[2] != tvg::PathCommand::LineTo ||
+      commands[3] != tvg::PathCommand::LineTo ||
+      commands[4] != tvg::PathCommand::Close) {
+    return false;
+  }
+
+  float min_x = points[0].x;
+  float max_x = points[0].x;
+  float min_y = points[0].y;
+  float max_y = points[0].y;
+  for (size_t i = 1; i < points.size(); i++) {
+    min_x = std::min(min_x, points[i].x);
+    max_x = std::max(max_x, points[i].x);
+    min_y = std::min(min_y, points[i].y);
+    max_y = std::max(max_y, points[i].y);
+  }
+
+  int corners_at_edges = 0;
+  constexpr float kEps = 0.01f;
+  for (const auto& point : points) {
+    bool at_x_edge = (std::abs(point.x - min_x) < kEps) ||
+                     (std::abs(point.x - max_x) < kEps);
+    bool at_y_edge = (std::abs(point.y - min_y) < kEps) ||
+                     (std::abs(point.y - max_y) < kEps);
+    if (at_x_edge && at_y_edge) {
+      corners_at_edges++;
+    }
+  }
+
+  if (corners_at_edges != 4) {
+    return false;
+  }
+
+  rect.x = min_x;
+  rect.y = min_y;
+  rect.w = max_x - min_x;
+  rect.h = max_y - min_y;
+  return rect.w > 0.0f && rect.h > 0.0f;
+}
+
+static void append_shape_geometry(tvg::Shape* shape,
+                                  const std::vector<tvg::PathCommand>& commands,
+                                  const std::vector<tvg::Point>& points) {
+  ThorVGRect rect;
+  if (is_rectangular_path(commands, points, rect)) {
+    shape->appendRect(rect.x, rect.y, rect.w, rect.h, 0, 0);
+    return;
+  }
+
+  shape->appendPath(commands.data(), commands.size(), points.data(),
+                    points.size());
+}
 
 // C++17 clamp wrapper
 template<typename T>
@@ -1174,8 +1381,7 @@ bool ThorVGBackend::draw_path(const std::vector<tvg::PathCommand>& cmds,
     return false;
   }
 
-  // Append path
-  shape->appendPath(cmds.data(), cmds.size(), pts.data(), pts.size());
+  append_shape_geometry(shape, cmds, pts);
 
   // Set fill color
   shape->fill(r, g, b, a);
@@ -1257,7 +1463,10 @@ bool ThorVGBackend::render_type3_glyph(const Type3Font* type3_font, const std::s
 
   // Parse and render the glyph content stream
   // Type 3 glyphs use d0/d1 operators for metrics, then standard path operators
+  bool progress_enabled = progress_.enabled;
+  progress_.enabled = false;
   parse_pdf_content(decoded.data);
+  progress_.enabled = progress_enabled;
 
   // Pop resources
   if (!type3_font->resources.empty() && !form_resources_stack_.empty()) {
@@ -2301,8 +2510,7 @@ bool ThorVGBackend::push_with_clip(tvg::Shape* shape) {
 
     // The clip_points are already in canvas coordinates (Y-flip and scale were
     // applied when the path was constructed in parse_pdf_content)
-    clipper->appendPath(state_.clip_commands.data(), state_.clip_commands.size(),
-                        state_.clip_points.data(), state_.clip_points.size());
+    append_shape_geometry(clipper, state_.clip_commands, state_.clip_points);
 
     // Set fill rule for clipping
     if (state_.clip_even_odd) {
@@ -4699,7 +4907,10 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     }
 
     // Parse and render the tile content
+    bool progress_enabled = progress_.enabled;
+    progress_.enabled = false;
     parse_pdf_content(tiling->content_stream);
+    progress_.enabled = progress_enabled;
 
     // Pop pattern resources
     if (!tiling->resources.empty() && !form_resources_stack_.empty()) {
@@ -5455,10 +5666,7 @@ bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   // Apply clipping if active
   if (state_.has_clip && !state_.clip_commands.empty()) {
     auto clipper = tvg::Shape::gen();
-    clipper->appendPath(state_.clip_commands.data(),
-                        state_.clip_commands.size(),
-                        state_.clip_points.data(),
-                        state_.clip_points.size());
+    append_shape_geometry(clipper, state_.clip_commands, state_.clip_points);
     if (state_.clip_even_odd) {
       clipper->fillRule(tvg::FillRule::EvenOdd);
     } else {
@@ -5552,6 +5760,77 @@ bool ThorVGBackend::save_to_file(const std::string& filename, const ThorVGRender
   return ret != 0;
 }
 
+size_t ThorVGBackend::count_render_objects(
+    const std::vector<uint8_t>& content_data) {
+  return count_render_objects_impl(
+      std::string_view(reinterpret_cast<const char*>(content_data.data()),
+                       content_data.size()));
+}
+
+void ThorVGBackend::begin_progress(const RenderProgressCallback& callback,
+                                   size_t total_objects,
+                                   size_t object_threshold,
+                                   uint32_t percent_step) {
+  progress_ = RenderProgressState();
+  if (!callback || total_objects < object_threshold) {
+    return;
+  }
+
+  progress_.callback = callback;
+  progress_.total_objects = total_objects;
+  progress_.percent_step = std::max<uint32_t>(1, percent_step);
+  progress_.enabled = true;
+  progress_.callback(RenderProgressInfo{0, progress_.total_objects, 0});
+}
+
+void ThorVGBackend::advance_progress(size_t processed_objects) {
+  if (!progress_.enabled || processed_objects == 0) {
+    return;
+  }
+
+  progress_.processed_objects =
+      std::min(progress_.processed_objects + processed_objects,
+               progress_.total_objects);
+
+  const uint32_t current_percent = static_cast<uint32_t>(
+      (progress_.processed_objects * 100) / progress_.total_objects);
+
+  for (uint32_t percent = progress_.last_percent + progress_.percent_step;
+       percent <= current_percent && percent <= 100;
+       percent += progress_.percent_step) {
+    progress_.callback(
+        RenderProgressInfo{progress_.processed_objects, progress_.total_objects,
+                           percent});
+    progress_.last_percent = percent;
+  }
+}
+
+void ThorVGBackend::finish_progress() {
+  if (!progress_.enabled) {
+    progress_ = RenderProgressState();
+    return;
+  }
+
+  progress_.processed_objects = progress_.total_objects;
+  if (progress_.last_percent < 100) {
+    progress_.callback(RenderProgressInfo{progress_.processed_objects,
+                                          progress_.total_objects, 100});
+  }
+  progress_ = RenderProgressState();
+}
+
+void ThorVGBackend::set_progress_callback(RenderProgressCallback callback,
+                                         size_t object_threshold,
+                                         uint32_t percent_step) {
+  progress_config_.callback = std::move(callback);
+  progress_config_.object_threshold = object_threshold;
+  progress_config_.percent_step = std::max<uint32_t>(1, percent_step);
+}
+
+void ThorVGBackend::clear_progress_callback() {
+  progress_config_ = RenderProgressConfig();
+}
+
 ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
                                                const ThorVGRenderOptions& options) {
   ThorVGRenderResult result;
@@ -5606,13 +5885,12 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
   // Clear glyph bitmap cache for fresh page
   glyph_bitmap_cache_.clear();
 
-  // Draw background
-  draw_rectangle(0, 0, width_, height_, options.bg_r, options.bg_g, options.bg_b, options.bg_a);
+  std::vector<std::vector<uint8_t>> decoded_contents;
+  decoded_contents.reserve(page.contents.size());
+  size_t total_render_objects = 0;
 
-  // Process content streams
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
-
     uint32_t obj_num = 0;
     uint16_t gen_num = 0;
 
@@ -5620,29 +5898,55 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
       obj_num = content_obj.ref_object_number;
       gen_num = content_obj.ref_generation_number;
       auto resolved = resolve_reference(pdf, obj_num, gen_num);
-      if (resolved.success) {
-        resolved_obj = resolved.value;
-      } else {
+      if (!resolved.success) {
         continue;
       }
+      resolved_obj = std::move(resolved.value);
     }
 
-    if (resolved_obj.type == Value::STREAM) {
-      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
-      if (decoded_result.success) {
-        state_ = GraphicsState();
-        state_.page_width = page_width;
-        state_.page_height = page_height;
-        state_.scale = scale;
-        parse_pdf_content(decoded_result.data);
-      }
+    if (resolved_obj.type != Value::STREAM) {
+      continue;
     }
+
+    auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
+    if (!decoded_result.success) {
+      continue;
+    }
+
+    total_render_objects += count_render_objects(decoded_result.data);
+    decoded_contents.push_back(std::move(decoded_result.data));
+  }
+
+  const bool has_explicit_progress = static_cast<bool>(options.progress_callback);
+  begin_progress(has_explicit_progress ? options.progress_callback
+                                       : progress_config_.callback,
+                 total_render_objects,
+                 has_explicit_progress ? options.progress_object_threshold
+                                       : progress_config_.object_threshold,
+                 has_explicit_progress ? options.progress_percent_step
+                                       : progress_config_.percent_step);
+
+  // Draw background
+  draw_rectangle(0, 0, width_, height_, options.bg_r, options.bg_g, options.bg_b, options.bg_a);
+
+  // Process content streams
+  for (const auto& decoded_content : decoded_contents) {
+    state_ = GraphicsState();
+    state_.page_width = page_width;
+    state_.page_height = page_height;
+    state_.scale = scale;
+    parse_pdf_content(decoded_content);
   }
 
   if (!end_scene()) {
     result.error = "Failed to end scene";
+    finish_progress();
+    current_pdf_ = nullptr;
+    current_page_ = nullptr;
     return result;
   }
+
+  finish_progress();
 
   current_pdf_ = nullptr;
   current_page_ = nullptr;
@@ -5747,10 +6051,10 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
   // Clear glyph bitmap cache for fresh page
   glyph_bitmap_cache_.clear();
 
-  // Draw white background
-  draw_rectangle(0, 0, width_, height_, 255, 255, 255, 255);
+  std::vector<std::vector<uint8_t>> decoded_contents;
+  decoded_contents.reserve(page.contents.size());
+  size_t total_render_objects = page.annotations.size();
 
-  // Parse and render page content
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
     uint32_t obj_num = 0;
@@ -5761,25 +6065,39 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
       obj_num = content_obj.ref_object_number;
       gen_num = content_obj.ref_generation_number;
       auto resolved = resolve_reference(pdf, obj_num, gen_num);
-      if (resolved.success) {
-        resolved_obj = resolved.value;
-      } else {
+      if (!resolved.success) {
         continue;
       }
+      resolved_obj = std::move(resolved.value);
     }
 
-    if (resolved_obj.type == Value::STREAM) {
-      // Pass object numbers for proper decryption
-      auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
-      if (decoded_result.success) {
-        state_ = GraphicsState();  // Reset state
-        // Set page coordinate info
-        state_.page_width = page_width;
-        state_.page_height = page_height;
-        state_.scale = scale;
-        parse_pdf_content(decoded_result.data);
-      }
+    if (resolved_obj.type != Value::STREAM) {
+      continue;
     }
+
+    auto decoded_result = decode_stream(pdf, resolved_obj, obj_num, gen_num);
+    if (!decoded_result.success) {
+      continue;
+    }
+
+    total_render_objects += count_render_objects(decoded_result.data);
+    decoded_contents.push_back(std::move(decoded_result.data));
+  }
+
+  begin_progress(progress_config_.callback, total_render_objects,
+                 progress_config_.object_threshold,
+                 progress_config_.percent_step);
+
+  // Draw white background
+  draw_rectangle(0, 0, width_, height_, 255, 255, 255, 255);
+
+  // Parse and render page content
+  for (const auto& decoded_content : decoded_contents) {
+    state_ = GraphicsState();  // Reset state
+    state_.page_width = page_width;
+    state_.page_height = page_height;
+    state_.scale = scale;
+    parse_pdf_content(decoded_content);
   }
 
   // Render page annotations (including form widgets)
@@ -5826,9 +6144,13 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
           state_.transform.e = ax1;
           state_.transform.f = ay1;
 
+          bool progress_enabled = progress_.enabled;
+          progress_.enabled = false;
           parse_pdf_content(decoded.data);
+          progress_.enabled = progress_enabled;
 
           state_ = saved_state;
+          advance_progress();
         }
       }
       continue;
@@ -5836,6 +6158,7 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
 
     // No appearance stream - render default appearance based on type
     if (annot->type == AnnotationType::Widget) {
+      bool rendered_annotation = false;
       auto* widget = static_cast<WidgetAnnotation*>(annot.get());
 
       // Draw widget border
@@ -5849,6 +6172,7 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
         shape->strokeFill(128, 128, 128, 255);
 
         scene_->add(shape);
+        rendered_annotation = true;
       }
 
       // Render field value for text fields
@@ -5884,14 +6208,20 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
           }
         }
       }
+      if (rendered_annotation) {
+        advance_progress();
+      }
     }
     // Other annotation types could be rendered here (links, highlights, etc.)
   }
 
   if (!end_scene()) {
     result.error = "Failed to end scene";
+    finish_progress();
     return result;
   }
+
+  finish_progress();
 
   return get_buffer();
 }
@@ -5903,6 +6233,16 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
 
   std::vector<std::string> operands;
   std::vector<GraphicsState> state_stack;  // For save/restore state
+  operands.reserve(16);
+  state_stack.reserve(16);
+  const size_t estimated_segments =
+      std::max<size_t>(16, content_data.size() / 12);
+  if (state_.path_commands.capacity() < estimated_segments) {
+    state_.path_commands.reserve(estimated_segments);
+  }
+  if (state_.path_points.capacity() < estimated_segments) {
+    state_.path_points.reserve(estimated_segments);
+  }
 
   size_t pos = 0;
   while (pos < content.size()) {
@@ -6135,8 +6475,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         if (!state_.path_commands.empty()) {
           auto shape = tvg::Shape::gen();
           if (shape) {
-            shape->appendPath(state_.path_commands.data(), state_.path_commands.size(),
-                             state_.path_points.data(), state_.path_points.size());
+            append_shape_geometry(shape, state_.path_commands, state_.path_points);
 
             // Set fill rule: f*/F* use even-odd, f/F use non-zero
             if (token == "f*") {
@@ -6158,6 +6497,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           state_.path_commands.clear();
           state_.path_points.clear();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "s") {  // close and stroke
         if (state_.in_path) {
@@ -6199,8 +6539,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           // Create stroked shape
           auto shape = tvg::Shape::gen();
           if (shape) {
-            shape->appendPath(state_.path_commands.data(), state_.path_commands.size(),
-                             state_.path_points.data(), state_.path_points.size());
+            append_shape_geometry(shape, state_.path_commands, state_.path_points);
             // Apply stroke style from graphics state
             shape->strokeWidth(state_.stroke_width * state_.scale);
 
@@ -6236,6 +6575,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           state_.path_commands.clear();
           state_.path_points.clear();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "b" || token == "b*") {  // close, fill and stroke
         if (state_.in_path) {
@@ -6246,8 +6586,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           {
             auto fill_shape = tvg::Shape::gen();
             if (fill_shape) {
-              fill_shape->appendPath(state_.path_commands.data(), state_.path_commands.size(),
-                                    state_.path_points.data(), state_.path_points.size());
+              append_shape_geometry(fill_shape, state_.path_commands,
+                                    state_.path_points);
               // Set fill rule
               if (token == "b*") {
                 fill_shape->fillRule(tvg::FillRule::EvenOdd);
@@ -6268,8 +6608,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           // Stroke with style
           auto shape = tvg::Shape::gen();
           if (shape) {
-            shape->appendPath(state_.path_commands.data(), state_.path_commands.size(),
-                             state_.path_points.data(), state_.path_points.size());
+            append_shape_geometry(shape, state_.path_commands, state_.path_points);
             shape->strokeWidth(state_.stroke_width * state_.scale);
             // Check for stroke pattern
             if (!state_.stroke_pattern.empty()) {
@@ -6301,6 +6640,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           state_.path_commands.clear();
           state_.path_points.clear();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "B" || token == "B*") {  // fill and stroke
         if (!state_.path_commands.empty()) {
@@ -6308,8 +6648,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           {
             auto fill_shape = tvg::Shape::gen();
             if (fill_shape) {
-              fill_shape->appendPath(state_.path_commands.data(), state_.path_commands.size(),
-                                    state_.path_points.data(), state_.path_points.size());
+              append_shape_geometry(fill_shape, state_.path_commands,
+                                    state_.path_points);
               // Set fill rule
               if (token == "B*") {
                 fill_shape->fillRule(tvg::FillRule::EvenOdd);
@@ -6330,8 +6670,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           // Stroke with style
           auto shape = tvg::Shape::gen();
           if (shape) {
-            shape->appendPath(state_.path_commands.data(), state_.path_commands.size(),
-                             state_.path_points.data(), state_.path_points.size());
+            append_shape_geometry(shape, state_.path_commands, state_.path_points);
             shape->strokeWidth(state_.stroke_width * state_.scale);
             // Check for stroke pattern
             if (!state_.stroke_pattern.empty()) {
@@ -6363,6 +6702,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           state_.path_commands.clear();
           state_.path_points.clear();
           state_.in_path = false;
+          advance_progress();
         }
       } else if (token == "n") {  // End path without fill or stroke
         state_.path_commands.clear();
@@ -6941,6 +7281,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             state_.text_matrix.e += text_advance * state_.text_matrix.a;
             state_.text_matrix.f += text_advance * state_.text_matrix.b;
           }
+          advance_progress();
         }
       } else if (token == "TJ") {  // Show text with positioning array
         // TJ takes an array of strings and positioning adjustments
@@ -7018,6 +7359,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
               }
             }
           }
+          advance_progress();
         }
       } else if (token == "'" || token == "\"") {  // Move to next line and show text
         if (operands.size() >= 1 && state_.in_text_block) {
@@ -7084,6 +7426,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             state_.text_matrix.e += text_advance * state_.text_matrix.a;
             state_.text_matrix.f += text_advance * state_.text_matrix.b;
           }
+          advance_progress();
         }
       }
       // Extended graphics state operator
@@ -7168,12 +7511,14 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
       // Inline image (BI ... ID data EI)
       else if (token == "BI") {
         parse_inline_image(content, pos);
+        advance_progress();
         operands.clear();
         continue;  // Skip normal operand clearing
       }
       // XObject (Do operator for images/forms)
       else if (token == "Do") {  // Paint XObject
         if (operands.size() >= 1 && current_pdf_ && current_page_) {
+          bool rendered_xobject = false;
           std::string xobj_name = operands[0];
           // Remove leading '/' if present
           if (!xobj_name.empty() && xobj_name[0] == '/') {
@@ -7225,6 +7570,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                       }
                       draw_image(image, img_x, img_y, img_width, img_height,
                           state_.fill_r, state_.fill_g, state_.fill_b);
+                      rendered_xobject = true;
                     } else if (subtype_it->second.name == "Form") {
                       // Form XObject - decode and parse its content stream
                       auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
@@ -7270,7 +7616,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                         }
 
                         // Parse the Form's content stream
+                        bool progress_enabled = progress_.enabled;
+                        progress_.enabled = false;
                         parse_pdf_content(decoded.data);
+                        progress_.enabled = progress_enabled;
+                        rendered_xobject = true;
 
                         // Pop Form resources from stack
                         if (has_form_resources) {
@@ -7326,6 +7676,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
 
                     draw_image(image, img_x, img_y, img_width, img_height,
                           state_.fill_r, state_.fill_g, state_.fill_b);
+                    rendered_xobject = true;
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream
                     auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
@@ -7369,7 +7720,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                       }
 
                       // Parse the Form's content stream
+                      bool progress_enabled = progress_.enabled;
+                      progress_.enabled = false;
                       parse_pdf_content(decoded.data);
+                      progress_.enabled = progress_enabled;
+                      rendered_xobject = true;
 
                       // Pop Form resources from stack
                       if (has_form_resources) {
@@ -7383,6 +7738,9 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                 }
               }
             }
+          }
+          if (rendered_xobject) {
+            advance_progress();
           }
         }
       }
@@ -7409,6 +7767,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             shading_name = shading_name.substr(1);
           }
           draw_shading(shading_name);
+          advance_progress();
         }
       }
 
@@ -7529,7 +7888,10 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
   state_.scale = static_cast<float>(mask_width) / state_.page_width;
 
   // Parse and render the XObject content to the mask canvas
+  bool progress_enabled = progress_.enabled;
+  progress_.enabled = false;
   parse_pdf_content(decoded.data);
+  progress_.enabled = progress_enabled;
 
   // Finalize rendering
   if (mask_canvas->add(mask_scene) == tvg::Result::Success) {
