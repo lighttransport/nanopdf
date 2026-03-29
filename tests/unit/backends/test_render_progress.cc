@@ -91,3 +91,40 @@ TEST_CASE_IN_SUITE("backends", "ThorVG progress callback respects threshold") {
   backend.clear_progress_callback();
 #endif
 }
+
+TEST_CASE_IN_SUITE("backends",
+                   "ThorVG per-render progress options override backend callback") {
+#if !defined(NANOPDF_USE_THORVG)
+  SKIP_IF(true, "ThorVG backend is not enabled");
+#else
+  nanopdf::Pdf pdf;
+  auto page = make_rect_page(25);
+
+  nanopdf::ThorVGBackend backend;
+  REQUIRE(backend.initialize(64, 64));
+
+  size_t backend_callback_count = 0;
+  backend.set_progress_callback(
+      [&](const nanopdf::RenderProgressInfo&) { backend_callback_count++; },
+      1, 1);
+
+  nanopdf::ThorVGRenderOptions options;
+  std::vector<uint32_t> reported_percents;
+  options.progress_callback = [&](const nanopdf::RenderProgressInfo& progress) {
+    reported_percents.push_back(progress.percent);
+  };
+  options.progress_object_threshold = 1;
+  options.progress_percent_step = 10;
+
+  auto result = backend.render_page(pdf, page, options);
+  REQUIRE(result.success);
+
+  CHECK_EQ(backend_callback_count, size_t(0));
+  REQUIRE_EQ(reported_percents.size(), size_t(11));
+  for (size_t i = 0; i < reported_percents.size(); ++i) {
+    CHECK_EQ(reported_percents[i], static_cast<uint32_t>(i * 10));
+  }
+
+  backend.clear_progress_callback();
+#endif
+}
