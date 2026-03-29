@@ -177,7 +177,7 @@ The implementation is fully portable across:
 
 - CMake 3.16+
 - Python 3.6+
-- C++14 compiler
+- C++17 compiler
 
 ## Build Examples
 
@@ -302,7 +302,7 @@ Fonts are stored as:
 This format is:
 - Portable across compilers
 - Optimizable by the linker
-- Compatible with C++14
+- Compatible with C++17
 - Zero runtime cost
 
 ## See Also

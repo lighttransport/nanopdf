@@ -1,6 +1,7 @@
 # Build directories
 build/
 build_*/
+build-mingw-*/
 **/build/
 
 # CMake
@@ -60,3 +61,16 @@ data/external/
 # Generated font embedding headers
 embedded-fonts.hh
 **/embedded-fonts.hh
+
+# Reference source and images (large, local-only)
+ref/
+ref_images/
+
+# ThorVG local install directory
+third_party/thorvg_install/
+
+# Visual regression output
+visual_regression_output/
+
+# AI/tool artifacts
+.gemini-answer.txt

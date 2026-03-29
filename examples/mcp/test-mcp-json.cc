@@ -4,7 +4,7 @@
 //
 // Simple test for MCP JSON parser
 
-#include "../../src/mcp-json.hh"
+#include "../../src/mcp/mcp-json.hh"
 
 #include <cassert>
 #include <iostream>
@@ -126,6 +126,7 @@ void test_unicode() {
   std::cout << "✓ Unicode tests passed" << std::endl;
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
   std::cout << "Running MCP JSON tests..." << std::endl << std::endl;
 
@@ -144,3 +145,5 @@ int main() {
     return 1;
   }
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

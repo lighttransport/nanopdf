@@ -30,7 +30,7 @@ find_package(Sanitizers) # Address sanitizer (-DSANITIZE_ADDRESS=ON)
 #set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -D_GLIBCXX_DEBUG -D_LIBCPP_DEBUG")
 #set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -D_GLIBCXX_DEBUG -D_LIBCPP_DEBUG")
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -111,10 +111,10 @@ set(NANOPDF_SOURCES
   src/form-manipulation.cc
   src/document-structure.cc
   src/pdf-writer.cc
-  src/stb_image_impl.cc
-  src/stb_image_write_impl.cc
-  src/stb_truetype_impl.cc
-  src/tiny_dng_impl.cc
+  src/third_party/stb_image_impl.cc
+  src/third_party/stb_image_write_impl.cc
+  src/third_party/stb_truetype_impl.cc
+  src/third_party/tiny_dng_impl.cc
   # JBIG2 decoder infrastructure (Phase 1.4)
   src/jbig2/JBig2_BitStream.cc
   src/jbig2/JBig2_Image.cc
@@ -236,6 +236,7 @@ if(NANOPDF_BUILD_WASM)
 else()
   add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
 endif()
+target_include_directories(${BUILD_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party)
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_LOG_LEVEL=${NANOPDF_LOG_LEVEL}")
 
 # Add embedded fonts support
@@ -264,7 +265,7 @@ if(NANOPDF_BUILD_WASM)
   target_link_options(${BUILD_TARGET} PRIVATE "SHELL:-s USE_ZLIB=1")
 else()
   # Always use embedded miniz as zlib replacement (no external dependencies)
-  target_sources(${BUILD_TARGET} PRIVATE src/miniz.c)
+  target_sources(${BUILD_TARGET} PRIVATE src/third_party/miniz.c)
   target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_MINIZ")
   message(STATUS "Using embedded miniz (no system zlib dependency)")
 endif()
@@ -299,7 +300,37 @@ if (NANOPDF_USE_THORVG)
     endif()
   endif()
 
-  # Check dist/ directory (skip for WASM builds where we already found ThorVG)
+  # Check third_party/thorvg_install/ directory (skip for WASM builds where we already found ThorVG)
+  if (NOT THORVG_FOUND)
+    set(_THORVG_THIRD_PARTY_DIR ${CMAKE_SOURCE_DIR}/third_party/thorvg_install)
+    if(EXISTS ${_THORVG_THIRD_PARTY_DIR}/include/thorvg.h)
+      set(_THORVG_DIST_INCLUDE ${_THORVG_THIRD_PARTY_DIR}/include)
+    elseif(EXISTS ${_THORVG_THIRD_PARTY_DIR}/include/thorvg-1/thorvg.h)
+      set(_THORVG_DIST_INCLUDE ${_THORVG_THIRD_PARTY_DIR}/include/thorvg-1)
+    endif()
+    if(_THORVG_DIST_INCLUDE)
+      set(THORVG_INCLUDE_DIRS ${_THORVG_DIST_INCLUDE})
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+        set(_THORVG_LIB_SEARCH_DIRS ${_THORVG_THIRD_PARTY_DIR}/lib ${_THORVG_THIRD_PARTY_DIR}/lib/x86_64-linux-gnu)
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        set(_THORVG_LIB_SEARCH_DIRS ${_THORVG_THIRD_PARTY_DIR}/lib ${_THORVG_THIRD_PARTY_DIR}/lib/aarch64-linux-gnu)
+      else()
+        set(_THORVG_LIB_SEARCH_DIRS ${_THORVG_THIRD_PARTY_DIR}/lib ${_THORVG_THIRD_PARTY_DIR}/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+      endif()
+      find_library(THORVG_LIBRARY NAMES thorvg-1 thorvg
+        PATHS ${_THORVG_LIB_SEARCH_DIRS}
+        NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+      if(THORVG_LIBRARY)
+        set(THORVG_FOUND TRUE)
+        set(THORVG_LIBRARIES ${THORVG_LIBRARY})
+        get_filename_component(THORVG_LIBRARY_DIRS ${THORVG_LIBRARY} DIRECTORY)
+        message(STATUS "Found ThorVG in third_party/: ${THORVG_LIBRARY}")
+      endif()
+    endif()
+    unset(_THORVG_DIST_INCLUDE)
+  endif()
+
+  # Check dist/ directory
   if (NOT THORVG_FOUND)
     set(THORVG_DIST_DIR ${CMAKE_SOURCE_DIR}/dist)
     # Check dist/include/ for thorvg.h (with or without thorvg-1 subdirectory)
@@ -476,30 +507,24 @@ endif()
 if(NOT NANOPDF_BUILD_WASM)
   # MCP library
   add_library(nanopdf_mcp
-    src/mcp-json.cc
-    src/mcp-protocol.cc
-    src/mcp-transport.cc
-    src/mcp-tools.cc
+    src/mcp/mcp-json.cc
+    src/mcp/mcp-protocol.cc
+    src/mcp/mcp-transport.cc
+    src/mcp/mcp-tools.cc
   )
   target_link_libraries(nanopdf_mcp PUBLIC ${BUILD_TARGET})
-  target_include_directories(nanopdf_mcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_include_directories(nanopdf_mcp PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/mcp)
   add_sanitizers(nanopdf_mcp)
 
   # MCP server executable
-  add_executable(nanopdf-mcp src/mcp-server.cc)
+  add_executable(nanopdf-mcp src/mcp/mcp-server.cc)
   target_link_libraries(nanopdf-mcp PRIVATE nanopdf_mcp)
   add_sanitizers(nanopdf-mcp)
 
   # Install MCP server
   install(TARGETS nanopdf-mcp DESTINATION bin)
-
-  # MCP JSON test (optional)
-  if(NANOPDF_BUILD_TESTS)
-    add_executable(test_mcp_json examples/mcp/test-mcp-json.cc)
-    target_link_libraries(test_mcp_json PRIVATE nanopdf_mcp)
-    add_sanitizers(test_mcp_json)
-    add_test(NAME test_mcp_json COMMAND test_mcp_json)
-  endif()
 
   message(STATUS "MCP server target enabled: nanopdf-mcp")
 endif()
@@ -508,105 +533,25 @@ endif()
 if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   enable_testing()
 
-  # ============================================================================
-  # New test infrastructure with doctest framework
-  # ============================================================================
-  option(NANOPDF_BUILD_LEGACY_TESTS "Build legacy phase tests" ON)
-
-  # Add new test infrastructure (doctest-based, feature-organized)
+  # Feature-organized test infrastructure (nanotest-based)
   add_subdirectory(tests)
 
-  # ============================================================================
-  # Legacy test infrastructure (to be phased out after migration)
-  # ============================================================================
-  if(NANOPDF_BUILD_LEGACY_TESTS)
-    message(STATUS "Building legacy phase tests (can be disabled with -DNANOPDF_BUILD_LEGACY_TESTS=OFF)")
-  endif()
-
-  if(NANOPDF_BUILD_LEGACY_TESTS)
-    function(add_nanopdf_test target source)
-      add_executable(${target} ${source})
-      target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
-      add_sanitizers(${target})
-      if(ARGC GREATER 2)
-        add_test(NAME ${target} COMMAND ${target} ${ARGN})
-      else()
-        add_test(NAME ${target} COMMAND ${target})
-      endif()
-      # Mark legacy tests with label for filtering
-      set_tests_properties(${target} PROPERTIES LABELS "legacy")
-    endfunction()
-
-    add_nanopdf_test(${TEST_TARGET} src/test-nanopdf.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
-
-  set(_NANOPDF_PHASE_TEST_SPECS
-    "test_phase1|src/test-phase1-features.cc"
-    "test_phase1_simple|src/test-phase1-simple.cc"
-    #"test_phase1_attachments|test_phase1_attachments.cc"  # requires PDF arg not provided by CTest
-    "test_phase1_color|test_phase1_color.cc"
-    "test_phase1_tiff|test_phase1_tiff.cc"
-    "test_phase2|src/test-phase2-features.cc"
-    "test_phase2_standardencoding|src/test-phase2-standardencoding.cc"
-    "test_phase2_rendering|src/test-phase2-rendering.cc"
-    "test_phase2_realpdf|src/test-phase2-real-pdfs.cc"
-    "test_phase2_text|src/test-phase2-text-extraction.cc"
-    "test_phase2_text_layout|test_phase2_text_layout.cc"
-    "test_phase2_text_layout_integration|test_phase2_text_layout_integration.cc"
-    "test_phase2_table_extraction|test_phase2_table_extraction.cc"
-    "test_phase3|src/test-phase3-features.cc"
-    "test_phase3_form_manipulation|test_phase3_form_manipulation.cc"
-    "test_phase4|src/test-phase4-features.cc"
-    "test_phase4_document_structure|test_phase4_document_structure.cc"
-    "test_phase5|src/test-phase5-features.cc"
-    "test_phase6|src/test-phase6-features.cc"
-    "test_pdf_parsing|src/test-pdf-parsing.cc"
-    #"test_phase7|src/test-phase7-features.cc"  # requires CCITT samples not in repo
-  )
-
-  foreach(_spec ${_NANOPDF_PHASE_TEST_SPECS})
-    string(REPLACE "|" ";" _spec_items "${_spec}")
-    list(GET _spec_items 0 _test_name)
-    list(GET _spec_items 1 _test_source)
-    add_nanopdf_test(${_test_name} ${_test_source})
-  endforeach()
-
-  if(TARGET test_phase2_realpdf)
-    target_compile_definitions(test_phase2_realpdf PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-  endif()
-  if(TARGET test_pdf_parsing)
-    target_compile_definitions(test_pdf_parsing PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-  endif()
-  if(TARGET test_phase4)
-    target_compile_definitions(test_phase4 PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-  endif()
-  # test_phase7 disabled — requires CCITT samples not in repo
-  #if(TARGET test_phase7)
-  #  target_compile_definitions(test_phase7 PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-  #endif()
-
-  # ThorVG backend test
-  if(NANOPDF_USE_THORVG AND THORVG_FOUND)
-    add_nanopdf_test(test_thorvg src/test-thorvg-backend.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
-    if (TARGET PkgConfig::THORVG)
-      target_link_libraries(test_thorvg PRIVATE PkgConfig::THORVG)
+  # Helper function for standalone test executables (visual regression, etc.)
+  function(add_nanopdf_test target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE ${BUILD_TARGET})
+    target_include_directories(${target} PRIVATE
+      ${PROJECT_SOURCE_DIR}
+      ${PROJECT_SOURCE_DIR}/src
+      ${PROJECT_SOURCE_DIR}/src/third_party
+    )
+    add_sanitizers(${target})
+    if(ARGC GREATER 2)
+      add_test(NAME ${target} COMMAND ${target} ${ARGN})
     else()
-      target_include_directories(test_thorvg PRIVATE ${THORVG_INCLUDE_DIRS})
-      target_link_libraries(test_thorvg PRIVATE ${THORVG_LIBRARIES})
+      add_test(NAME ${target} COMMAND ${target})
     endif()
-    # ThorVG may require OpenMP
-    find_package(OpenMP)
-    if(OpenMP_CXX_FOUND)
-      target_link_libraries(test_thorvg PRIVATE OpenMP::OpenMP_CXX)
-    endif()
-  endif()
-
-  # Blend2D backend test
-  if(NANOPDF_USE_BLEND2D)
-    add_nanopdf_test(test_blend2d src/test-blend2d-backend.cc ${PROJECT_SOURCE_DIR}/data/blank.pdf)
-    target_link_libraries(test_blend2d PRIVATE blend2d::blend2d)
-  endif()
-
-  endif()  # NANOPDF_BUILD_LEGACY_TESTS
+  endfunction()
 
   # ============================================================================
   # Tools and benchmarks (not tests)
@@ -635,7 +580,9 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
 
   # Standalone visual comparison tool
   add_executable(visual_compare tools/visual_compare.cc)
-  target_include_directories(visual_compare PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_include_directories(visual_compare PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/third_party)
   add_sanitizers(visual_compare)
 
   # Visual regression test (ThorVG backend)

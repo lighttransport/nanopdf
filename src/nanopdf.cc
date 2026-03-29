@@ -800,9 +800,13 @@ static bool parse_linearization_dict(const uint8_t* data, size_t data_size,
   return true;
 }
 
-bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
-  if (!addr || (size < 8) || !out_pdf) {
-    return false;
+ParseResult parse_pdf(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
+  if (!addr || !out_pdf) {
+    return ParseResult::Fail(ErrorKind::IOError, "null input");
+  }
+
+  if (size < 8) {
+    return ParseResult::Fail(ErrorKind::Malformed, "data too small");
   }
 
   // Find %PDF header — PDF spec allows up to 1024 bytes before it;
@@ -823,7 +827,7 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
       }
     }
     if (!found) {
-      return false;
+      return ParseResult::Fail(ErrorKind::Malformed, "PDF header not found");
     }
   }
 
@@ -835,7 +839,33 @@ bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
   out_pdf->version_major = static_cast<int>(out_pdf->data[5] - '0');
   out_pdf->version_minor = static_cast<int>(out_pdf->data[7] - '0');
 
-  return out_pdf->load_document_structure();
+  if (!out_pdf->load_document_structure()) {
+    // Check if failure is due to encryption
+    if (out_pdf->encrypt != 0 && !out_pdf->security.authenticated) {
+      return ParseResult::Fail(ErrorKind::Encrypted, "PDF is encrypted");
+    }
+    // Propagate structured error from load_document_structure if available
+    if (out_pdf->last_error_kind != ErrorKind::None) {
+      return ParseResult::Fail(out_pdf->last_error_kind, out_pdf->last_error);
+    }
+    // Check if xref parsing failed (no xref sections loaded)
+    if (out_pdf->xref_sections.empty()) {
+      return ParseResult::Fail(ErrorKind::Malformed, "failed to parse xref");
+    }
+    return ParseResult::Fail(ErrorKind::Internal,
+                             "failed to load document structure");
+  }
+
+  // Check for encrypted PDF that requires authentication
+  if (out_pdf->encrypt != 0 && !out_pdf->security.authenticated) {
+    return ParseResult::Fail(ErrorKind::Encrypted, "PDF is encrypted");
+  }
+
+  return ParseResult::Ok();
+}
+
+bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf) {
+  return parse_pdf(addr, size, out_pdf).success;
 }
 
 // Scan for "endstream" to recover a stream's actual length
@@ -872,7 +902,11 @@ bool recover_stream_length(const uint8_t* data, size_t size,
 
 // Repair xref by scanning the entire file for "N G obj" patterns
 bool repair_xref(const uint8_t* data, size_t size, Pdf* out_pdf) {
-  if (!data || size < 20 || !out_pdf) return false;
+  if (!data || size < 20 || !out_pdf) {
+    NANOPDF_LOG_WARN("repair", "Invalid arguments for xref repair (data=%p, size=%zu)",
+                     static_cast<const void*>(data), size);
+    return false;
+  }
 
   out_pdf->data = data;
   out_pdf->data_size = size;
@@ -1085,28 +1119,42 @@ next_iter:
     }
   }
 
-  if (out_pdf->root == 0) return false;
+  if (out_pdf->root == 0) {
+    NANOPDF_LOG_WARN("repair", "Repair failed: could not find /Root catalog object");
+    return false;
+  }
 
   // Try loading document structure
   return out_pdf->load_document_structure();
 }
 
-// parse_from_memory with ParseOptions
-bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf,
-                       const ParseOptions& options) {
+// parse_pdf with ParseOptions
+ParseResult parse_pdf(const uint8_t *addr, const size_t size, Pdf *out_pdf,
+                      const ParseOptions& options) {
   // Try normal parsing first
-  if (parse_from_memory(addr, size, out_pdf)) {
-    return true;
+  ParseResult result = parse_pdf(addr, size, out_pdf);
+  if (result.success) {
+    return result;
   }
 
   // If auto_repair is enabled, try xref repair
   if (options.auto_repair) {
-    // Reset the pdf struct
-    *out_pdf = Pdf{};
-    return repair_xref(addr, size, out_pdf);
+    // Reset the pdf struct (Pdf is not move-assignable due to std::mutex)
+    out_pdf->~Pdf();
+    new (out_pdf) Pdf{};
+    if (repair_xref(addr, size, out_pdf)) {
+      return ParseResult::Ok();
+    }
+    // Repair also failed; return the original error
   }
 
-  return false;
+  return result;
+}
+
+// parse_from_memory with ParseOptions
+bool parse_from_memory(const uint8_t *addr, const size_t size, Pdf *out_pdf,
+                       const ParseOptions& options) {
+  return parse_pdf(addr, size, out_pdf, options).success;
 }
 
 namespace filters {
@@ -1519,6 +1567,7 @@ DecodedStream decode_ascii85(const uint8_t *data, size_t size,
     // Process regular ASCII85 character
     if (c < '!' || c > 'u') {
       result.error = "Invalid ASCII85 character";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
@@ -1582,6 +1631,7 @@ DecodedStream decode_asciihex(const uint8_t *data, size_t size,
     int value = hex_value(c);
     if (value < 0) {
       result.error = "ASCIIHexDecode: invalid hex digit";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
@@ -1610,6 +1660,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
 
   if (size == 0) {
     result.error = "FlateDecode: empty input data";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1621,6 +1672,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
 
   if (inflateInit(&strm) != Z_OK) {
     result.error = "FlateDecode: failed to initialize zlib decompressor";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1631,6 +1683,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
       inflateEnd(&strm);
       result.error = "FlateDecode: output exceeds maximum size limit (" +
                      std::to_string(kMaxDecodedSize / (1024 * 1024)) + " MB)";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
@@ -1663,6 +1716,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
       }
       inflateEnd(&strm);
       result.error = "FlateDecode: " + zlib_error;
+      result.kind = ErrorKind::Malformed;
       return result;
     }
   } while (ret != Z_STREAM_END);
@@ -1674,6 +1728,7 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
   std::string predictor_error;
   if (!apply_predictor(output, params, predictor_error)) {
     result.error = "FlateDecode: " + predictor_error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1691,12 +1746,14 @@ DecodedStream decode_lzw(const uint8_t *data, size_t size,
   LZWDecoder decoder;
   if (!decoder.init(data, size, params.early_change)) {
     result.error = "LZWDecode: failed to initialize decoder (empty or invalid data)";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   // Decode data
   if (!decoder.decode(output)) {
     result.error = "LZWDecode: failed to decode data (invalid code sequence)";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1704,6 +1761,7 @@ DecodedStream decode_lzw(const uint8_t *data, size_t size,
   std::string predictor_error;
   if (!apply_predictor(output, params, predictor_error)) {
     result.error = "LZWDecode: " + predictor_error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1734,12 +1792,14 @@ DecodedStream decode_jbig2(const uint8_t *data, size_t size,
   if (!decodeResult.success) {
     result.success = false;
     result.error = "JBIG2Decode: " + decodeResult.error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!decodeResult.image || !decodeResult.image->has_data()) {
     result.success = false;
     result.error = "JBIG2Decode: No image data decoded";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1782,6 +1842,7 @@ DecodedStream decode_runlength(const uint8_t *data, size_t size,
       size_t count = length + 1;
       if (pos + count > size) {
         result.error = "RunLengthDecode: Unexpected end of data";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
       for (size_t i = 0; i < count; i++) {
@@ -1791,6 +1852,7 @@ DecodedStream decode_runlength(const uint8_t *data, size_t size,
       // Repeat the next byte (257-length) times
       if (pos >= size) {
         result.error = "RunLengthDecode: Unexpected end of data";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
       uint8_t byte = data[pos++];
@@ -1817,6 +1879,7 @@ DecodedStream decode_dct(const uint8_t *data, size_t size,
                                                   &width, &height, &channels, 0);
   if (!decoded) {
     result.error = "DCTDecode: Failed to decode JPEG data";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1842,6 +1905,7 @@ DecodedStream decode_jpx(const uint8_t *data, size_t size,
 
   if (!decode_result.success) {
     result.error = "JPXDecode: " + decode_result.error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -1931,11 +1995,24 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
   uint16_t compression = (params.k < 0) ? COMPRESSION_CCITT_T6 : COMPRESSION_CCITT_T4;
 
   // Use temporary file approach (simpler and more reliable)
-  char temp_path[] = "/tmp/nanopdf_ccitt_XXXXXX";
+  std::string temp_dir;
+#ifdef _WIN32
+  const char* tmp = std::getenv("TEMP");
+  if (!tmp) tmp = std::getenv("TMP");
+  if (!tmp) tmp = ".";
+  temp_dir = tmp;
+#else
+  temp_dir = "/tmp";
+#endif
+  std::string temp_template = temp_dir + "/nanopdf_ccitt_XXXXXX";
+  std::vector<char> temp_buf(temp_template.begin(), temp_template.end());
+  temp_buf.push_back('\0');
+  char* temp_path = temp_buf.data();
   int fd = mkstemp(temp_path);
   if (fd < 0) {
     result.success = false;
     result.error = "Failed to create temporary file";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -1947,6 +2024,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
     unlink(temp_path);
     result.success = false;
     result.error = "Failed to create TIFF file";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -1981,6 +2059,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
     unlink(temp_path);
     result.success = false;
     result.error = "Failed to write CCITT data to TIFF strip";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -1993,6 +2072,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
     unlink(temp_path);
     result.success = false;
     result.error = "Failed to reopen TIFF file for reading";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -2011,6 +2091,7 @@ DecodedStream decode_ccittfax_libtiff(const uint8_t* data, size_t size,
   if (read_bytes < 0) {
     result.success = false;
     result.error = "libtiff failed to decode CCITT data";
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_ERROR("CCITTFaxDecode_libtiff", "%s", result.error.c_str());
     return result;
   }
@@ -2039,6 +2120,7 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
 
   if (!data || size == 0) {
     result.error = "CCITTFaxDecode: Empty stream";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -2046,8 +2128,1244 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
   // Use libtiff for CCITT decoding if available
   NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using libtiff decoder");
   return decode_ccittfax_libtiff(data, size, params);
+#elif defined(NANOPDF_USE_BUILTIN_CCITT)
+  // Built-in fallback decoder (less accurate, for compatibility)
+  if (size >= 8) {
+    NANOPDF_LOG_TRACE("CCITTFaxDecode", "First bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+                      data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+  }
+
+  struct BitReader {
+    const uint8_t* data{nullptr};
+    size_t size{0};
+    size_t byte_pos{0};
+    int bit_pos{7};
+
+    BitReader(const uint8_t* d, size_t s) : data(d), size(s) {}
+
+    struct State {
+      size_t byte_pos;
+      int bit_pos;
+    };
+
+    State save() const { return State{byte_pos, bit_pos}; }
+
+    void restore(const State& state) {
+      byte_pos = state.byte_pos;
+      bit_pos = state.bit_pos;
+      if (bit_pos < 0) bit_pos = 0;
+      if (bit_pos > 7) bit_pos = 7;
+      if (byte_pos > size) byte_pos = size;
+    }
+
+    int get_bit() {
+      if (byte_pos >= size) {
+        return -1;
+      }
+      int bit = (data[byte_pos] >> bit_pos) & 1;
+      if (bit_pos == 0) {
+        bit_pos = 7;
+        byte_pos++;
+      } else {
+        bit_pos--;
+      }
+      return bit;
+    }
+
+    // Poppler-style: Look ahead n bits, returning partial data if EOF reached
+    // Returns -1 if no bits available, otherwise returns available bits left-shifted
+    int look_bits_partial(int n, int* bits_available) {
+      if (byte_pos >= size) {
+        if (bits_available) *bits_available = 0;
+        return -1;
+      }
+
+      uint32_t result = 0;
+      int count = 0;
+      size_t saved_byte = byte_pos;
+      int saved_bit = bit_pos;
+
+      while (count < n) {
+        if (byte_pos >= size) {
+          // Near EOF - return whatever bits we have, left-shifted
+          byte_pos = saved_byte;
+          bit_pos = saved_bit;
+          if (bits_available) *bits_available = count;
+          if (count == 0) return -1;
+          // Left-shift to fill the requested bit width
+          return static_cast<int>(result << (n - count));
+        }
+        int bit = (data[byte_pos] >> bit_pos) & 1;
+        result = (result << 1) | static_cast<uint32_t>(bit);
+        count++;
+        if (bit_pos == 0) {
+          bit_pos = 7;
+          byte_pos++;
+        } else {
+          bit_pos--;
+        }
+      }
+
+      // Restore position (peek only)
+      byte_pos = saved_byte;
+      bit_pos = saved_bit;
+      if (bits_available) *bits_available = count;
+      return static_cast<int>(result);
+    }
+
+    int look_bits(int n) {
+      int bits_available = 0;
+      int value = look_bits_partial(n, &bits_available);
+      if (bits_available == 0) {
+        return -1;
+      }
+      return value;
+    }
+
+    void eat_bits(int n) {
+      for (int i = 0; i < n; ++i) {
+        if (get_bit() < 0) {
+          break;
+        }
+      }
+    }
+
+    bool align_to_byte() {
+      if (byte_pos >= size) {
+        return false;
+      }
+      if (bit_pos != 7) {
+        bit_pos = 7;
+        ++byte_pos;
+      }
+      return byte_pos <= size;
+    }
+
+    bool skip_eol() {
+      int zero_count = 0;
+      while (byte_pos < size) {
+        int bit = get_bit();
+        if (bit < 0) {
+          return false;
+        }
+        if (bit == 0) {
+          zero_count++;
+        } else {
+          if (zero_count >= 11) {
+            return true;
+          }
+          zero_count = 0;
+        }
+      }
+      return false;
+    }
+  };
+
+  struct CCITTCode {
+    int16_t bits;
+    int16_t run;
+  };
+
+  static constexpr int kCcittEol = -2;
+
+  // Poppler CCITT tables (from ref/poppler/poppler/Stream-CCITT.h).
+  static const CCITTCode kWhiteTab1[32] = {
+      { -1, -1 }, // 00000
+      { 12, kCcittEol }, // 00001
+      { -1, -1 },       { -1, -1 }, // 0001x
+      { -1, -1 },       { -1, -1 },   { -1, -1 }, { -1, -1 }, // 001xx
+      { -1, -1 },       { -1, -1 },   { -1, -1 }, { -1, -1 }, // 010xx
+      { -1, -1 },       { -1, -1 },   { -1, -1 }, { -1, -1 }, // 011xx
+      { 11, 1792 },     { 11, 1792 }, // 1000x
+      { 12, 1984 }, // 10010
+      { 12, 2048 }, // 10011
+      { 12, 2112 }, // 10100
+      { 12, 2176 }, // 10101
+      { 12, 2240 }, // 10110
+      { 12, 2304 }, // 10111
+      { 11, 1856 },     { 11, 1856 }, // 1100x
+      { 11, 1920 },     { 11, 1920 }, // 1101x
+      { 12, 2368 }, // 11100
+      { 12, 2432 }, // 11101
+      { 12, 2496 }, // 11110
+      { 12, 2560 } // 11111
+  };
+
+  static const CCITTCode kWhiteTab2[512] = {
+      { -1, -1 },  { -1, -1 },  { -1, -1 },  { -1, -1 }, // 0000000xx
+      { 8, 29 },   { 8, 29 }, // 00000010x
+      { 8, 30 },   { 8, 30 }, // 00000011x
+      { 8, 45 },   { 8, 45 }, // 00000100x
+      { 8, 46 },   { 8, 46 }, // 00000101x
+      { 7, 22 },   { 7, 22 },   { 7, 22 },   { 7, 22 }, // 0000011xx
+      { 7, 23 },   { 7, 23 },   { 7, 23 },   { 7, 23 }, // 0000100xx
+      { 8, 47 },   { 8, 47 }, // 00001010x
+      { 8, 48 },   { 8, 48 }, // 00001011x
+      { 6, 13 },   { 6, 13 },   { 6, 13 },   { 6, 13 }, // 000011xxx
+      { 6, 13 },   { 6, 13 },   { 6, 13 },   { 6, 13 },   { 7, 20 },   { 7, 20 },   { 7, 20 },   { 7, 20 }, // 0001000xx
+      { 8, 33 },   { 8, 33 }, // 00010010x
+      { 8, 34 },   { 8, 34 }, // 00010011x
+      { 8, 35 },   { 8, 35 }, // 00010100x
+      { 8, 36 },   { 8, 36 }, // 00010101x
+      { 8, 37 },   { 8, 37 }, // 00010110x
+      { 8, 38 },   { 8, 38 }, // 00010111x
+      { 7, 19 },   { 7, 19 },   { 7, 19 },   { 7, 19 }, // 0001100xx
+      { 8, 31 },   { 8, 31 }, // 00011010x
+      { 8, 32 },   { 8, 32 }, // 00011011x
+      { 6, 1 },    { 6, 1 },    { 6, 1 },    { 6, 1 }, // 000111xxx
+      { 6, 1 },    { 6, 1 },    { 6, 1 },    { 6, 1 },    { 6, 12 },   { 6, 12 },   { 6, 12 },   { 6, 12 }, // 001000xxx
+      { 6, 12 },   { 6, 12 },   { 6, 12 },   { 6, 12 },   { 8, 53 },   { 8, 53 }, // 00100100x
+      { 8, 54 },   { 8, 54 }, // 00100101x
+      { 7, 26 },   { 7, 26 },   { 7, 26 },   { 7, 26 }, // 0010011xx
+      { 8, 39 },   { 8, 39 }, // 00101000x
+      { 8, 40 },   { 8, 40 }, // 00101001x
+      { 8, 41 },   { 8, 41 }, // 00101010x
+      { 8, 42 },   { 8, 42 }, // 00101011x
+      { 8, 43 },   { 8, 43 }, // 00101100x
+      { 8, 44 },   { 8, 44 }, // 00101101x
+      { 7, 21 },   { 7, 21 },   { 7, 21 },   { 7, 21 }, // 0010111xx
+      { 7, 28 },   { 7, 28 },   { 7, 28 },   { 7, 28 }, // 0011000xx
+      { 8, 61 },   { 8, 61 }, // 00110010x
+      { 8, 62 },   { 8, 62 }, // 00110011x
+      { 8, 63 },   { 8, 63 }, // 00110100x
+      { 8, 0 },    { 8, 0 }, // 00110101x
+      { 8, 320 },  { 8, 320 }, // 00110110x
+      { 8, 384 },  { 8, 384 }, // 00110111x
+      { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 }, // 00111xxxx
+      { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },   { 5, 10 },  { 5, 10 },  { 5, 10 },  { 5, 10 },  { 5, 11 },  { 5, 11 },  { 5, 11 },  { 5, 11 }, // 01000xxxx
+      { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },   { 5, 11 },  { 5, 11 },  { 5, 11 },  { 5, 11 },  { 7, 27 },  { 7, 27 },  { 7, 27 },  { 7, 27 }, // 0100100xx
+      { 8, 59 },   { 8, 59 }, // 01001010x
+      { 8, 60 },   { 8, 60 }, // 01001011x
+      { 9, 1472 }, // 010011000
+      { 9, 1536 }, // 010011001
+      { 9, 1600 }, // 010011010
+      { 9, 1728 }, // 010011011
+      { 7, 18 },   { 7, 18 },   { 7, 18 },   { 7, 18 }, // 0100111xx
+      { 7, 24 },   { 7, 24 },   { 7, 24 },   { 7, 24 }, // 0101000xx
+      { 8, 49 },   { 8, 49 }, // 01010010x
+      { 8, 50 },   { 8, 50 }, // 01010011x
+      { 8, 51 },   { 8, 51 }, // 01010100x
+      { 8, 52 },   { 8, 52 }, // 01010101x
+      { 7, 25 },   { 7, 25 },   { 7, 25 },   { 7, 25 }, // 0101011xx
+      { 8, 55 },   { 8, 55 }, // 01011000x
+      { 8, 56 },   { 8, 56 }, // 01011001x
+      { 8, 57 },   { 8, 57 }, // 01011010x
+      { 8, 58 },   { 8, 58 }, // 01011011x
+      { 6, 192 },  { 6, 192 },  { 6, 192 },  { 6, 192 }, // 010111xxx
+      { 6, 192 },  { 6, 192 },  { 6, 192 },  { 6, 192 },  { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, // 011000xxx
+      { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, { 6, 1664 }, { 8, 448 },  { 8, 448 }, // 01100100x
+      { 8, 512 },  { 8, 512 }, // 01100101x
+      { 9, 704 }, // 011001100
+      { 9, 768 }, // 011001101
+      { 8, 640 },  { 8, 640 }, // 01100111x
+      { 8, 576 },  { 8, 576 }, // 01101000x
+      { 9, 832 }, // 011010010
+      { 9, 896 }, // 011010011
+      { 9, 960 }, // 011010100
+      { 9, 1024 }, // 011010101
+      { 9, 1088 }, // 011010110
+      { 9, 1152 }, // 011010111
+      { 9, 1216 }, // 011011000
+      { 9, 1280 }, // 011011001
+      { 9, 1344 }, // 011011010
+      { 9, 1408 }, // 011011011
+      { 7, 256 },  { 7, 256 },  { 7, 256 },  { 7, 256 }, // 0110111xx
+      { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 }, // 0111xxxxx
+      { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },
+      { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },    { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 2 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 }, // 1000xxxxx
+      { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },
+      { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },    { 4, 3 },   { 4, 3 },   { 4, 3 },   { 4, 3 },   { 5, 128 }, { 5, 128 }, { 5, 128 }, { 5, 128 }, // 10010xxxx
+      { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 },  { 5, 128 }, { 5, 128 }, { 5, 128 }, { 5, 128 }, { 5, 8 },   { 5, 8 },   { 5, 8 },   { 5, 8 }, // 10011xxxx
+      { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },    { 5, 8 },   { 5, 8 },   { 5, 8 },   { 5, 8 },   { 5, 9 },   { 5, 9 },   { 5, 9 },   { 5, 9 }, // 10100xxxx
+      { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },    { 5, 9 },   { 5, 9 },   { 5, 9 },   { 5, 9 },   { 6, 16 },  { 6, 16 },  { 6, 16 },  { 6, 16 }, // 101010xxx
+      { 6, 16 },   { 6, 16 },   { 6, 16 },   { 6, 16 },   { 6, 17 },   { 6, 17 },   { 6, 17 },   { 6, 17 }, // 101011xxx
+      { 6, 17 },   { 6, 17 },   { 6, 17 },   { 6, 17 },   { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 }, // 1011xxxxx
+      { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },
+      { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },    { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 4 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 }, // 1100xxxxx
+      { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },
+      { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },    { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 },   { 6, 14 },  { 6, 14 },  { 6, 14 },  { 6, 14 }, // 110100xxx
+      { 6, 14 },   { 6, 14 },   { 6, 14 },   { 6, 14 },   { 6, 15 },   { 6, 15 },   { 6, 15 },   { 6, 15 }, // 110101xxx
+      { 6, 15 },   { 6, 15 },   { 6, 15 },   { 6, 15 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 }, // 11011xxxx
+      { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },   { 5, 64 },  { 5, 64 },  { 5, 64 },  { 5, 64 },  { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 }, // 1110xxxxx
+      { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },
+      { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },    { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 }, // 1111xxxxx
+      { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 },
+      { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },    { 4, 7 },   { 4, 7 },   { 4, 7 },   { 4, 7 }
+  };
+
+  static const CCITTCode kBlackTab1[128] = { { -1, -1 },       { -1, -1 }, // 000000000000x
+                                          { 12, kCcittEol }, { 12, kCcittEol }, // 000000000001x
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000001xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000010xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000011xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000100xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000101xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000110xx
+                                          { -1, -1 },       { -1, -1 },       { -1, -1 },   { -1, -1 }, // 00000000111xx
+                                          { 11, 1792 },     { 11, 1792 },     { 11, 1792 }, { 11, 1792 }, // 00000001000xx
+                                          { 12, 1984 },     { 12, 1984 }, // 000000010010x
+                                          { 12, 2048 },     { 12, 2048 }, // 000000010011x
+                                          { 12, 2112 },     { 12, 2112 }, // 000000010100x
+                                          { 12, 2176 },     { 12, 2176 }, // 000000010101x
+                                          { 12, 2240 },     { 12, 2240 }, // 000000010110x
+                                          { 12, 2304 },     { 12, 2304 }, // 000000010111x
+                                          { 11, 1856 },     { 11, 1856 },     { 11, 1856 }, { 11, 1856 }, // 00000001100xx
+                                          { 11, 1920 },     { 11, 1920 },     { 11, 1920 }, { 11, 1920 }, // 00000001101xx
+                                          { 12, 2368 },     { 12, 2368 }, // 000000011100x
+                                          { 12, 2432 },     { 12, 2432 }, // 000000011101x
+                                          { 12, 2496 },     { 12, 2496 }, // 000000011110x
+                                          { 12, 2560 },     { 12, 2560 }, // 000000011111x
+                                          { 10, 18 },       { 10, 18 },       { 10, 18 },   { 10, 18 }, // 0000001000xxx
+                                          { 10, 18 },       { 10, 18 },       { 10, 18 },   { 10, 18 },   { 12, 52 }, { 12, 52 }, // 000000100100x
+                                          { 13, 640 }, // 0000001001010
+                                          { 13, 704 }, // 0000001001011
+                                          { 13, 768 }, // 0000001001100
+                                          { 13, 832 }, // 0000001001101
+                                          { 12, 55 },       { 12, 55 }, // 000000100111x
+                                          { 12, 56 },       { 12, 56 }, // 000000101000x
+                                          { 13, 1280 }, // 0000001010010
+                                          { 13, 1344 }, // 0000001010011
+                                          { 13, 1408 }, // 0000001010100
+                                          { 13, 1472 }, // 0000001010101
+                                          { 12, 59 },       { 12, 59 }, // 000000101011x
+                                          { 12, 60 },       { 12, 60 }, // 000000101100x
+                                          { 13, 1536 }, // 0000001011010
+                                          { 13, 1600 }, // 0000001011011
+                                          { 11, 24 },       { 11, 24 },       { 11, 24 },   { 11, 24 }, // 00000010111xx
+                                          { 11, 25 },       { 11, 25 },       { 11, 25 },   { 11, 25 }, // 00000011000xx
+                                          { 13, 1664 }, // 0000001100100
+                                          { 13, 1728 }, // 0000001100101
+                                          { 12, 320 },      { 12, 320 }, // 000000110011x
+                                          { 12, 384 },      { 12, 384 }, // 000000110100x
+                                          { 12, 448 },      { 12, 448 }, // 000000110101x
+                                          { 13, 512 }, // 0000001101100
+                                          { 13, 576 }, // 0000001101101
+                                          { 12, 53 },       { 12, 53 }, // 000000110111x
+                                          { 12, 54 },       { 12, 54 }, // 000000111000x
+                                          { 13, 896 }, // 0000001110010
+                                          { 13, 960 }, // 0000001110011
+                                          { 13, 1024 }, // 0000001110100
+                                          { 13, 1088 }, // 0000001110101
+                                          { 13, 1152 }, // 0000001110110
+                                          { 13, 1216 }, // 0000001110111
+                                          { 10, 64 },       { 10, 64 },       { 10, 64 },   { 10, 64 }, // 0000001111xxx
+                                          { 10, 64 },       { 10, 64 },       { 10, 64 },   { 10, 64 } };
+
+  static const CCITTCode kBlackTab2[192] = {
+    { 8, 13 },   { 8, 13 },  { 8, 13 },  { 8, 13 }, // 00000100xxxx
+    { 8, 13 },   { 8, 13 },  { 8, 13 },  { 8, 13 },  { 8, 13 },   { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 8, 13 }, { 11, 23 }, { 11, 23 }, // 00000101000x
+    { 12, 50 }, // 000001010010
+    { 12, 51 }, // 000001010011
+    { 12, 44 }, // 000001010100
+    { 12, 45 }, // 000001010101
+    { 12, 46 }, // 000001010110
+    { 12, 47 }, // 000001010111
+    { 12, 57 }, // 000001011000
+    { 12, 58 }, // 000001011001
+    { 12, 61 }, // 000001011010
+    { 12, 256 }, // 000001011011
+    { 10, 16 },  { 10, 16 }, { 10, 16 }, { 10, 16 }, // 0000010111xx
+    { 10, 17 },  { 10, 17 }, { 10, 17 }, { 10, 17 }, // 0000011000xx
+    { 12, 48 }, // 000001100100
+    { 12, 49 }, // 000001100101
+    { 12, 62 }, // 000001100110
+    { 12, 63 }, // 000001100111
+    { 12, 30 }, // 000001101000
+    { 12, 31 }, // 000001101001
+    { 12, 32 }, // 000001101010
+    { 12, 33 }, // 000001101011
+    { 12, 40 }, // 000001101100
+    { 12, 41 }, // 000001101101
+    { 11, 22 },  { 11, 22 }, // 00000110111x
+    { 8, 14 },   { 8, 14 },  { 8, 14 },  { 8, 14 }, // 00000111xxxx
+    { 8, 14 },   { 8, 14 },  { 8, 14 },  { 8, 14 },  { 8, 14 },   { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 8, 14 }, { 7, 10 },  { 7, 10 },  { 7, 10 }, { 7, 10 }, // 0000100xxxxx
+    { 7, 10 },   { 7, 10 },  { 7, 10 },  { 7, 10 },  { 7, 10 },   { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 },  { 7, 10 },  { 7, 10 }, { 7, 10 },
+    { 7, 10 },   { 7, 10 },  { 7, 10 },  { 7, 10 },  { 7, 10 },   { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 10 }, { 7, 11 },  { 7, 11 },  { 7, 11 }, { 7, 11 }, // 0000101xxxxx
+    { 7, 11 },   { 7, 11 },  { 7, 11 },  { 7, 11 },  { 7, 11 },   { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 },  { 7, 11 },  { 7, 11 }, { 7, 11 },
+    { 7, 11 },   { 7, 11 },  { 7, 11 },  { 7, 11 },  { 7, 11 },   { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 7, 11 }, { 9, 15 },  { 9, 15 },  { 9, 15 }, { 9, 15 }, // 000011000xxx
+    { 9, 15 },   { 9, 15 },  { 9, 15 },  { 9, 15 },  { 12, 128 }, // 000011001000
+    { 12, 192 }, // 000011001001
+    { 12, 26 }, // 000011001010
+    { 12, 27 }, // 000011001011
+    { 12, 28 }, // 000011001100
+    { 12, 29 }, // 000011001101
+    { 11, 19 },  { 11, 19 }, // 00001100111x
+    { 11, 20 },  { 11, 20 }, // 00001101000x
+    { 12, 34 }, // 000011010010
+    { 12, 35 }, // 000011010011
+    { 12, 36 }, // 000011010100
+    { 12, 37 }, // 000011010101
+    { 12, 38 }, // 000011010110
+    { 12, 39 }, // 000011010111
+    { 11, 21 },  { 11, 21 }, // 00001101100x
+    { 12, 42 }, // 000011011010
+    { 12, 43 }, // 000011011011
+    { 10, 0 },   { 10, 0 },  { 10, 0 },  { 10, 0 }, // 0000110111xx
+    { 7, 12 },   { 7, 12 },  { 7, 12 },  { 7, 12 }, // 0000111xxxxx
+    { 7, 12 },   { 7, 12 },  { 7, 12 },  { 7, 12 },  { 7, 12 },   { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 },  { 7, 12 },  { 7, 12 }, { 7, 12 },
+    { 7, 12 },   { 7, 12 },  { 7, 12 },  { 7, 12 },  { 7, 12 },   { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }, { 7, 12 }
+  };
+
+  static const CCITTCode kBlackTab3[64] = { { -1, -1 }, { -1, -1 }, { -1, -1 }, { -1, -1 }, // 0000xx
+                                         { 6, 9 }, // 000100
+                                         { 6, 8 }, // 000101
+                                         { 5, 7 },   { 5, 7 }, // 00011x
+                                         { 4, 6 },   { 4, 6 },   { 4, 6 },   { 4, 6 }, // 0010xx
+                                         { 4, 5 },   { 4, 5 },   { 4, 5 },   { 4, 5 }, // 0011xx
+                                         { 3, 1 },   { 3, 1 },   { 3, 1 },   { 3, 1 }, // 010xxx
+                                         { 3, 1 },   { 3, 1 },   { 3, 1 },   { 3, 1 },   { 3, 4 }, { 3, 4 }, { 3, 4 }, { 3, 4 }, // 011xxx
+                                         { 3, 4 },   { 3, 4 },   { 3, 4 },   { 3, 4 },   { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, // 10xxxx
+                                         { 2, 3 },   { 2, 3 },   { 2, 3 },   { 2, 3 },   { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 3 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, // 11xxxx
+                                         { 2, 2 },   { 2, 2 },   { 2, 2 },   { 2, 2 },   { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 }, { 2, 2 } };
+
+  int decode_row_num = 0;
+
+  auto get_white_code = [&](BitReader& reader) -> int {
+    int code = 0;
+    if (params.end_of_block) {
+      code = reader.look_bits(12);
+      if (code < 0) {
+        return 1;
+      }
+      const CCITTCode* p = nullptr;
+      if ((code >> 5) == 0) {
+        p = &kWhiteTab1[code];
+      } else {
+        p = &kWhiteTab2[code >> 3];
+      }
+      if (p->bits > 0) {
+        reader.eat_bits(p->bits);
+        return p->run;
+      }
+    } else {
+      for (int n = 1; n <= 9; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 9) {
+          code <<= (9 - n);
+        }
+        const CCITTCode& p = kWhiteTab2[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
+      }
+      for (int n = 11; n <= 12; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 12) {
+          code <<= (12 - n);
+        }
+        const CCITTCode& p = kWhiteTab1[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
+      }
+    }
+
+    NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Bad white code (0x%x)", code);
+    reader.eat_bits(1);
+    return 1;
+  };
+
+  auto get_black_code = [&](BitReader& reader) -> int {
+    int code = 0;
+    if (params.end_of_block) {
+      code = reader.look_bits(13);
+      if (code < 0) {
+        return 1;
+      }
+      const CCITTCode* p = nullptr;
+      if ((code >> 7) == 0) {
+        p = &kBlackTab1[code];
+      } else if ((code >> 9) == 0 && (code >> 7) != 0) {
+        p = &kBlackTab2[(code >> 1) - 64];
+      } else {
+        p = &kBlackTab3[code >> 7];
+      }
+      if (p->bits > 0) {
+        reader.eat_bits(p->bits);
+        return p->run;
+      }
+    } else {
+      for (int n = 2; n <= 6; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 6) {
+          code <<= (6 - n);
+        }
+        const CCITTCode& p = kBlackTab3[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
+      }
+      for (int n = 7; n <= 12; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 12) {
+          code <<= (12 - n);
+        }
+        if (code >= 64) {
+          const CCITTCode& p = kBlackTab2[code - 64];
+          if (p.bits == n) {
+            reader.eat_bits(n);
+            return p.run;
+          }
+        }
+      }
+      for (int n = 10; n <= 13; ++n) {
+        code = reader.look_bits(n);
+        if (code < 0) {
+          return 1;
+        }
+        if (n < 13) {
+          code <<= (13 - n);
+        }
+        const CCITTCode& p = kBlackTab1[code];
+        if (p.bits == n) {
+          reader.eat_bits(n);
+          return p.run;
+        }
+      }
+    }
+
+    NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Bad black code (0x%x)", code);
+    reader.eat_bits(1);
+    return 1;
+  };
+
+  auto decode_run = [&](BitReader& reader, bool white, int* run_length,
+                        std::string* err) -> bool {
+    int total = 0;
+    int code = 0;
+    do {
+      code = white ? get_white_code(reader) : get_black_code(reader);
+      total += code;
+    } while (code >= 64);
+
+    *run_length = total;
+    (void)err;
+    return true;
+  };
+
+  auto decode_row_1d = [&](BitReader& reader, std::vector<bool>& line,
+                           bool allow_indicator_skip, int width,
+                           std::string* err) -> bool {
+    std::fill(line.begin(), line.end(), false);
+    int pos = 0;
+    bool is_white = true;
+    bool skipped_indicator = false;
+
+    while (pos < width) {
+      BitReader::State state_before = reader.save();
+      int run = 0;
+      if (!decode_run(reader, is_white, &run, err)) {
+        if (allow_indicator_skip && !skipped_indicator && pos == 0) {
+          reader.restore(state_before);
+          int indicator = reader.get_bit();
+          if (indicator == 0 || indicator == 1) {
+            skipped_indicator = true;
+            continue;
+          }
+          reader.restore(state_before);
+        }
+        // Check if it's an EOF error - if so, fill rest of row with current color and succeed
+        if (err && err->find("EOF") != std::string::npos) {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF in 1D decode at pos=%d, filling rest of row", pos);
+          // Rest of row remains as initialized (white=false, black=true as needed)
+          break;  // Exit loop, row is complete
+        }
+        return false;
+      }
+
+      // Poppler-style bounds clamping: clamp invalid positions to valid range
+      if (run < 0) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Negative run length %d at pos=%d, clamping to 0", run, pos);
+        run = 0;
+      }
+      if (pos + run > width) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row overrun: pos=%d + run=%d > width=%d, clamping",
+                          pos, run, width);
+        run = width - pos;
+      }
+      if (pos < 0) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Negative position %d, clamping to 0", pos);
+        pos = 0;
+      }
+      if (pos >= width) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Position %d >= width %d, breaking", pos, width);
+        break;
+      }
+      if (!is_white) {
+        for (int i = 0; i < run; ++i) {
+          line[pos + i] = true;
+        }
+      }
+      pos += run;
+      is_white = !is_white;
+    }
+    return true;
+  };
+
+
+  struct TwoDimCodeEntry {
+    int8_t bits;
+    int8_t code;
+  };
+
+  static constexpr int kTwoDimPass = 0;
+  static constexpr int kTwoDimHoriz = 1;
+  static constexpr int kTwoDimVert0 = 2;
+  static constexpr int kTwoDimVertR1 = 3;
+  static constexpr int kTwoDimVertL1 = 4;
+  static constexpr int kTwoDimVertR2 = 5;
+  static constexpr int kTwoDimVertL2 = 6;
+  static constexpr int kTwoDimVertR3 = 7;
+  static constexpr int kTwoDimVertL3 = 8;
+
+  static const TwoDimCodeEntry kTwoDimTab[128] = {
+      { -1, -1 },          { -1, -1 }, // 000000x
+      { 7, kTwoDimVertL3 }, { 7, kTwoDimVertR3 }, // 000001x
+      { 6, kTwoDimVertL2 }, { 6, kTwoDimVertL2 }, // 000010x
+      { 6, kTwoDimVertR2 }, { 6, kTwoDimVertR2 }, // 000011x
+      { 4, kTwoDimPass },   { 4, kTwoDimPass }, // 0001xxx
+      { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 4, kTwoDimPass },   { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz }, // 001xxxx
+      { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },
+      { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimHoriz },  { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, // 010xxxx
+      { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 },
+      { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertL1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, // 011xxxx
+      { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 },
+      { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 3, kTwoDimVertR1 }, { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 }, // 1xxxxxx
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+      { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },  { 1, kTwoDimVert0 },
+  };
+
+  // Return codes: 0=vertical, 1=horizontal, 2=pass, -1=error
+  auto read_2d_code = [&](BitReader& reader, int* delta) -> int {
+    int code = -1;
+    if (params.end_of_block) {
+      int bits = reader.look_bits(7);
+      if (bits < 0) {
+        return -1;
+      }
+      const TwoDimCodeEntry& entry = kTwoDimTab[bits];
+      if (entry.bits > 0) {
+        reader.eat_bits(entry.bits);
+        code = entry.code;
+      }
+    } else {
+      for (int n = 1; n <= 7; ++n) {
+        int bits = reader.look_bits(n);
+        if (bits < 0) {
+          return -1;
+        }
+        if (n < 7) {
+          bits <<= (7 - n);
+        }
+        const TwoDimCodeEntry& entry = kTwoDimTab[bits & 0x7f];
+        if (entry.bits == n) {
+          reader.eat_bits(n);
+          code = entry.code;
+          break;
+        }
+      }
+    }
+
+    if (code < 0) {
+      return -1;
+    }
+
+    switch (code) {
+      case 0:  // pass
+        return 2;
+      case 1:  // horizontal
+        return 1;
+      case 2:  // vert0
+        if (delta) *delta = 0;
+        return 0;
+      case 3:  // vertR1
+        if (delta) *delta = 1;
+        return 0;
+      case 4:  // vertL1
+        if (delta) *delta = -1;
+        return 0;
+      case 5:  // vertR2
+        if (delta) *delta = 2;
+        return 0;
+      case 6:  // vertL2
+        if (delta) *delta = -2;
+        return 0;
+      case 7:  // vertR3
+        if (delta) *delta = 3;
+        return 0;
+      case 8:  // vertL3
+        if (delta) *delta = -3;
+        return 0;
+      default:
+        return -1;
+    }
+  };
+
+  bool hit_eofb = false;  // Flag to signal end of facsimile block
+
+  // Poppler-style helper functions for array-based CCITT decoding.
+  auto addPixels = [](int a1, int blackPixels, int* codingLine, int& a0i,
+                      int columns) -> void {
+    if (a1 > codingLine[a0i]) {
+      if (a1 > columns) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row overrun: a1=%d > columns=%d, clamping", a1, columns);
+        a1 = columns;
+      }
+      // CRITICAL: Conditional increment based on color parity
+      // Even a0i = white position, Odd a0i = black position
+      // If color matches parity, overwrite; otherwise advance to next slot
+      bool will_increment = ((a0i & 1) ^ blackPixels);
+      if (will_increment) {
+        ++a0i;
+      }
+      codingLine[a0i] = a1;
+    }
+  };
+
+  auto addPixelsNeg = [](int a1, int blackPixels, int* codingLine, int& a0i,
+                        int columns) -> void {
+    if (a1 > codingLine[a0i]) {
+      // Forward movement - same as addPixels
+      if (a1 > columns) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Invalid a1=%d > columns=%d", a1, columns);
+        a1 = columns;
+      }
+      if ((a0i & 1) ^ blackPixels) {
+        ++a0i;
+      }
+      codingLine[a0i] = a1;
+    } else if (a1 < codingLine[a0i]) {
+      // Backward movement (negative vertical modes)
+      if (a1 < 0) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Invalid negative a1=%d, setting to columns=%d", a1, columns);
+        a1 = columns;  // CRITICAL: Poppler sets to columns, not 0!
+      }
+      // Scan backwards to find correct insertion point (match poppler)
+      while (a0i > 0 && a1 <= codingLine[a0i - 1]) {
+        --a0i;
+      }
+      codingLine[a0i] = a1;
+    }
+    // else: a1 == codingLine[a0i], no change
+  };
+
+  std::vector<int> prev_coding_line;
+  bool prev_coding_line_valid = false;
+  std::vector<int> coding_line_cache;
+  bool coding_line_cache_valid = false;
+
+  auto build_coding_line_from_bits = [](const std::vector<bool>& bits, int width,
+                                        std::vector<int>& out) {
+    out.resize(width + 2);
+    int idx = 0;
+    if (width > 0 && bits[0]) {
+      out[idx++] = 0;
+    }
+    for (int i = 1; i < width; ++i) {
+      if (bits[i] != bits[i - 1]) {
+        out[idx++] = i;
+      }
+    }
+    for (int i = idx; i < width + 2; ++i) {
+      out[i] = width;
+    }
+  };
+
+  auto decode_row_2d = [&](BitReader& reader, const std::vector<bool>& reference,
+                           std::vector<bool>& line, int width,
+                           std::string* err) -> bool {
+    // Array-based CCITT decoding (poppler style) for 100% accuracy
+    // Use fixed arrays for typical widths, heap for large images
+    static constexpr int MAX_STATIC_WIDTH = 2402;
+    int codingLine_static[MAX_STATIC_WIDTH];
+    int refLine_static[MAX_STATIC_WIDTH];
+    std::vector<int> codingLine_dynamic, refLine_dynamic;
+
+    int* codingLine;
+    int* refLine;
+
+    if (width + 2 <= MAX_STATIC_WIDTH) {
+      codingLine = codingLine_static;
+      refLine = refLine_static;
+    } else {
+      codingLine_dynamic.resize(width + 2);
+      refLine_dynamic.resize(width + 2);
+      codingLine = codingLine_dynamic.data();
+      refLine = refLine_dynamic.data();
+    }
+
+    // Convert reference line to transition array (match poppler codingLine)
+    if (prev_coding_line_valid && static_cast<int>(prev_coding_line.size()) >= width + 2) {
+      for (int i = 0; i < width + 2; ++i) {
+        refLine[i] = prev_coding_line[i];
+      }
+    } else {
+      int refIdx = 0;
+      if (!reference.empty() && reference[0]) {
+        refLine[refIdx++] = 0;
+      }
+      for (int i = 1; i < width; ++i) {
+        if (reference[i] != reference[i - 1]) {
+          refLine[refIdx++] = i;
+        }
+      }
+      // Poppler fills ALL remaining positions with columns (width)
+      for (int i = refIdx; i < width + 2; ++i) {
+        refLine[i] = width;
+      }
+    }
+
+    // Initialize state
+    codingLine[0] = 0;
+    int a0i = 0;
+    int b1i = 0;
+    int blackPixels = 0;
+
+    // Main decode loop using array-based approach
+
+    while (codingLine[a0i] < width) {
+      BitReader::State mode_state = reader.save();
+      int delta = 0;
+      int mode = read_2d_code(reader, &delta);
+      bool row_done = false;
+
+      NANOPDF_LOG_TRACE("CCITTFaxDecode", "2D mode=%d delta=%d at byte=%zu bit=%d a0i=%d pos=%d",
+                        mode, delta, mode_state.byte_pos, mode_state.bit_pos, a0i, codingLine[a0i]);
+      // Error handling
+      if (mode == -1) {
+        if (reader.byte_pos >= reader.size) {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "2D mode: out of data at pos=%d", codingLine[a0i]);
+        } else {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "2D mode: invalid code at pos=%d", codingLine[a0i]);
+        }
+        if (err) *err = "Invalid 2D code";
+        addPixels(width, 0, codingLine, a0i, width);
+        break;
+      }
+
+      if (mode == -2) {
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "Skipping reserved extension at pos=%d", codingLine[a0i]);
+        continue;
+      }
+
+      if (mode == 5) {
+        NANOPDF_LOG_TRACE("CCITTFaxDecode", "Mode 5 (deprecated resync) at pos=%d", codingLine[a0i]);
+        continue;
+      }
+
+      if (mode == 6) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Fill rest of row from pos=%d to width=%d", codingLine[a0i], width);
+        codingLine[a0i] = width;
+        break;
+      }
+
+      if (mode == 3) {
+        // EOFB
+        hit_eofb = true;
+        break;
+      }
+
+      // Pass mode (mode == 2)
+      if (mode == 2) {
+        // Pass mode - match poppler exactly
+        // refLine is filled up to width+2, so we only need to check against that
+        if (b1i + 1 < width + 2) {
+          addPixels(refLine[b1i + 1], blackPixels, codingLine, a0i, width);
+          if (refLine[b1i + 1] < width) {
+            b1i += 2;
+          }
+        } else {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Pass mode: b1i+1=%d out of bounds (width+2=%d)", b1i+1, width+2);
+          break;
+        }
+      }
+      // Horizontal mode (mode == 1)
+      // Horizontal mode (mode == 1) - CRITICAL for accuracy
+      else if (mode == 1) {
+        // Decode two runs: first in current color, then opposite
+        // CRITICAL: Poppler checks codingLine[a0i] < columns before second run!
+        for (int pass = 0; pass < 2; ++pass) {
+          bool decoding_white = (blackPixels == 0);
+          if (pass == 1) decoding_white = !decoding_white;
+          int color = (pass == 0) ? blackPixels : (blackPixels ^ 1);
+
+          int run = 0;
+          if (!decode_run(reader, decoding_white, &run, err)) {
+            addPixels(width, color, codingLine, a0i, width);
+            row_done = true;
+            break;
+          }
+          if (run < 0) run = 0;
+
+          bool do_add = !(pass == 1 && codingLine[a0i] >= width);
+          if (do_add) {
+            // CRITICAL: addPixels uses current codingLine[a0i] which may be updated by first call
+            int target = codingLine[a0i] + run;
+            if (target > width) target = width;
+
+            addPixels(target, color, codingLine, a0i, width);
+          }
+        }
+        if (row_done) {
+          break;
+        }
+
+        // Update b1i to skip past coded region (match poppler exactly)
+        while (refLine[b1i] <= codingLine[a0i] && refLine[b1i] < width) {
+          b1i += 2;
+          if (b1i > width + 1) {
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "H-mode: b1i overflow");
+            break;
+          }
+        }
+        // NOTE: Do NOT toggle blackPixels here! H-mode decodes TWO runs (both colors),
+        // so we end up at the same color state we started with.
+      }
+      // Uncompressed mode (mode == 4) - simplified for now
+      else if (mode == 4) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Uncompressed mode at pos=%d (simplified handling)", codingLine[a0i]);
+
+        int zero_count = 0;
+        while (codingLine[a0i] < width) {
+          int bit = reader.get_bit();
+          if (bit < 0) {
+            // EOF during uncompressed mode - just exit this mode, don't set hit_eofb
+            NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF in uncompressed mode at pos=%d, exiting mode", codingLine[a0i]);
+            break;
+          }
+
+          if (bit == 0) {
+            zero_count++;
+            if (zero_count == 8) {
+              // Could be exit sequence 00000001T - check next bit
+              int exit_bit = reader.get_bit();
+              if (exit_bit < 0) {
+                // EOF while checking exit sequence - just exit this mode
+                NANOPDF_LOG_DEBUG("CCITTFaxDecode", "EOF checking exit sequence at pos=%d, exiting mode", codingLine[a0i]);
+                break;
+              }
+              if (exit_bit == 1) {
+                // Exit sequence found - next bit is tag for following codeword
+                // The tag bit determines if we return to 2D mode (0) or need special handling
+                int tag = reader.get_bit();
+                NANOPDF_LOG_TRACE("CCITTFaxDecode", "Exiting uncompressed mode at pos=%d, tag=%d", codingLine[a0i], tag);
+                // Continue with normal 2D decoding
+                // Note: the tag bit is already consumed, affecting next codeword interpretation
+                break;
+              } else {
+                // Not exit sequence - continue processing
+                zero_count = 0;
+              }
+            }
+          } else {
+            // Non-zero bit - reset counter
+            zero_count = 0;
+          }
+        }
+
+        // Uncompressed mode processing complete
+        // For simplicity, fill rest of row if we didn't find exit
+        if (codingLine[a0i] < width) {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Uncompressed mode: filling rest of row from pos=%d", codingLine[a0i]);
+          addPixels(width, blackPixels, codingLine, a0i, width);
+        }
+      }
+      // Vertical mode (mode == 0) - match poppler exactly
+      else if (mode == 0) {
+        // Bounds check b1i before accessing refLine (filled up to width+2)
+        if (b1i >= width + 2) {
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "V-mode: b1i=%d out of bounds (width+2=%d)", b1i, width+2);
+          break;
+        }
+
+        // Poppler maintains invariant: refLine[b1i-1] <= codingLine[a0i] < refLine[b1i]
+        // (left-edge exception: b1i can be 0), so use refLine[b1i] directly.
+        int target = refLine[b1i] + delta;
+
+        // Use addPixels for positive/zero delta, addPixelsNeg for negative delta
+        if (delta < 0) {
+          addPixelsNeg(target, blackPixels, codingLine, a0i, width);
+        } else {
+          addPixels(target, blackPixels, codingLine, a0i, width);
+        }
+        blackPixels ^= 1;
+
+        // Update b1i to maintain invariant (different logic for negative deltas)
+        if (codingLine[a0i] < width) {
+          if (delta < 0) {
+            // Negative vertical modes: special b1i update
+            if (b1i > 0) {
+              --b1i;
+            } else {
+              ++b1i;
+            }
+          } else {
+            // Positive/zero vertical modes: simple increment
+            ++b1i;
+          }
+          // Skip to next valid b1i (match poppler exactly)
+          while (refLine[b1i] <= codingLine[a0i] && refLine[b1i] < width) {
+            b1i += 2;
+            if (b1i > width + 1) {
+              NANOPDF_LOG_DEBUG("CCITTFaxDecode", "V-mode: b1i overflow");
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Convert codingLine array back to output line vector
+    // Cache codingLine transitions for reuse as next refLine
+    coding_line_cache.resize(width + 2);
+    int cache_limit = std::min(a0i + 1, width + 2);
+    for (int i = 0; i < cache_limit; ++i) {
+      coding_line_cache[i] = codingLine[i];
+    }
+    for (int i = cache_limit; i < width + 2; ++i) {
+      coding_line_cache[i] = width;
+    }
+    coding_line_cache_valid = true;
+
+    std::fill(line.begin(), line.end(), false);
+
+    // CRITICAL: Determine starting color (match poppler's logic at lines 2327-2330)
+    // If codingLine[0] > 0, row starts with white pixels (a0i=0, even)
+    // If codingLine[0] == 0, row starts with black pixels (a0i=1, odd)
+    int start_idx = 0;
+    bool isBlack = false;
+    int prevPos = 0;
+
+    if (codingLine[0] == 0 && a0i > 0) {
+      // First transition is at position 0, meaning we start with black immediately
+      start_idx = 1;
+      isBlack = true;  // codingLine[0]=0 is a black-to-white transition
+      prevPos = 0;
+    } else if (codingLine[0] > 0) {
+      // First transition at position > 0, start with white pixels
+      start_idx = 0;
+      isBlack = false;
+      prevPos = 0;
+    }
+
+    for (int i = start_idx; i <= a0i && codingLine[i] <= width; ++i) {
+      int pos = codingLine[i];
+      if (pos > width) pos = width;
+
+      if (isBlack) {
+        for (int j = prevPos; j < pos; ++j) {
+          line[j] = true;
+        }
+      }
+      prevPos = pos;
+      isBlack = !isBlack;
+    }
+
+    decode_row_num++;
+    return true;
+  };
+
+  int width = params.columns > 0 ? params.columns : 1728;
+  int bytes_per_row = (width + 7) / 8;
+  int max_rows = params.rows;
+  BitReader reader(data, size);
+
+  std::vector<uint8_t> output;
+  output.reserve(static_cast<size_t>(bytes_per_row) * (max_rows > 0 ? max_rows : 1));
+
+  std::vector<bool> prev_line(width, false);
+  std::vector<bool> line(width, false);
+  std::vector<uint8_t> row_bytes(bytes_per_row, 0);
+
+  int decoded_rows = 0;
+  int damaged_rows = 0;
+
+  // Loop until we've decoded the expected rows or hit EOFB
+  // If max_rows is specified, we must decode that many rows even if we run out of data
+  while ((max_rows > 0 && decoded_rows < max_rows) || (max_rows <= 0 && reader.byte_pos < size)) {
+    if (params.end_of_line) {
+      if (!reader.skip_eol()) {
+        result.error = "CCITTFaxDecode: Missing EOL";
+        result.kind = ErrorKind::Malformed;
+        return result;
+      }
+    } else if (params.encoded_byte_align) {
+      reader.align_to_byte();
+    }
+
+    bool allow_indicator_skip = (params.k == 0);
+    bool row_is_1d = false;
+    if (params.k == 0) {
+      row_is_1d = true;
+    } else if (params.k > 0) {
+      int mode = reader.get_bit();
+      if (mode < 0) {
+        result.error = "CCITTFaxDecode: Unexpected EOF while reading row mode";
+        result.kind = ErrorKind::Malformed;
+        return result;
+      }
+      row_is_1d = (mode != 0);
+    } else {
+      row_is_1d = false;
+    }
+
+    std::string row_error;
+    bool ok = false;
+    NANOPDF_LOG_TRACE("CCITTFaxDecode", "Starting row %d at byte=%zu bit=%d",
+                      decoded_rows, reader.byte_pos, reader.bit_pos);
+
+    // If we're out of data but need more rows, repeat previous line
+    if (reader.byte_pos >= size) {
+      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Out of data at row %d, repeating previous line", decoded_rows);
+      line = prev_line;
+      ok = true;
+    } else {
+      if (row_is_1d) {
+        ok = decode_row_1d(reader, line, allow_indicator_skip, width, &row_error);
+      } else {
+        ok = decode_row_2d(reader, prev_line, line, width, &row_error);
+      }
+    }
+
+    // Check if we hit EOFB during 2D decode
+    if (hit_eofb) {
+      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Hit EOFB at row %d, stopping decode", decoded_rows);
+      break;
+    }
+
+    if (!ok) {
+      NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row %d failed: %s (row_is_1d=%d)",
+                        decoded_rows, row_error.c_str(), row_is_1d);
+
+      // Poppler-style EOL recovery: if we have EOL markers, scan for next one
+      if (params.end_of_line) {
+        NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Attempting EOL resync at byte=%zu bit=%d",
+                          reader.byte_pos, reader.bit_pos);
+        bool found_eol = false;
+        size_t scan_start = reader.byte_pos;
+        // Scan bit-by-bit for next EOL marker (11 zeros followed by 1)
+        int zero_count = 0;
+        while (reader.byte_pos < size && reader.byte_pos < scan_start + 100) {
+          int bit = reader.get_bit();
+          if (bit < 0) break;
+          if (bit == 0) {
+            zero_count++;
+          } else {
+            if (zero_count >= 11) {
+              found_eol = true;
+              NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Found EOL after %zu bytes, resuming",
+                                reader.byte_pos - scan_start);
+              break;
+            }
+            zero_count = 0;
+          }
+        }
+        if (found_eol) {
+          // Successfully resynced - use previous line and continue
+          ++damaged_rows;
+          line = prev_line;
+          // Continue to next iteration
+        } else {
+          // EOL scan failed - treat as damaged row or fail
+          if (params.damaged_rows_before_error > 0 &&
+              damaged_rows < params.damaged_rows_before_error) {
+            ++damaged_rows;
+            line = prev_line;
+          } else {
+            result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+            result.kind = ErrorKind::Malformed;
+            NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
+                              decoded_rows, result.error.c_str());
+            return result;
+          }
+        }
+      } else {
+        // No EOL markers - use "just plow on" approach
+        // For EOF errors during row decode, we should have already handled it gracefully
+        // by filling the rest of the row. Don't treat it as a failure.
+        if (row_error.find("EOF") != std::string::npos) {
+          // EOF was encountered but row was completed, just log and continue
+          NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Row %d completed with EOF handling", decoded_rows);
+          damaged_rows = 0;  // Reset since we recovered
+          // Don't break, continue to next row
+        } else if (params.damaged_rows_before_error > 0 &&
+                   damaged_rows < params.damaged_rows_before_error) {
+          ++damaged_rows;
+          line = prev_line;
+        } else {
+          result.error = row_error.empty() ? "CCITTFaxDecode: Failed to decode row" : row_error;
+          result.kind = ErrorKind::Malformed;
+          NANOPDF_LOG_ERROR("CCITTFaxDecode", "Decode failed at row %d: %s",
+                            decoded_rows, result.error.c_str());
+          return result;
+        }
+      }
+    } else {
+      damaged_rows = 0;
+    }
+
+    if (ok) {
+      if (!row_is_1d && coding_line_cache_valid &&
+          static_cast<int>(coding_line_cache.size()) >= width + 2) {
+        prev_coding_line = coding_line_cache;
+      } else {
+        build_coding_line_from_bits(line, width, prev_coding_line);
+      }
+      prev_coding_line_valid = true;
+    }
+
+    // Poppler-style: skip post-row zero padding when no EOL and no byte alignment.
+    if (!params.end_of_line && !params.encoded_byte_align) {
+      int code = reader.look_bits(12);
+      while (code == 0) {
+        if (reader.get_bit() < 0) {
+          break;
+        }
+        code = reader.look_bits(12);
+        if (code < 0) {
+          break;
+        }
+      }
+    }
+
+    std::fill(row_bytes.begin(), row_bytes.end(), 0);
+    for (int i = 0; i < width; ++i) {
+      bool black = line[i];
+      bool bit = params.black_is_1 ? black : !black;
+      if (bit) {
+        row_bytes[i / 8] |= static_cast<uint8_t>(1 << (7 - (i % 8)));
+      }
+    }
+
+    output.insert(output.end(), row_bytes.begin(), row_bytes.end());
+    prev_line = line;
+    ++decoded_rows;
+  }
+
+  result.success = true;
+  return result;
 #else
-  // PDFium-based CCITT decoder (header-only, BSD licensed)
+  // Default: PDFium-based CCITT decoder (header-only, BSD licensed)
   NANOPDF_LOG_DEBUG("CCITTFaxDecode", "Using PDFium decoder");
   int width = params.columns > 0 ? params.columns : 1728;
   int height = params.rows;
@@ -2064,11 +3382,12 @@ DecodedStream decode_ccittfax(const uint8_t* data, size_t size,
                                params.black_is_1 != 0,
                                result.data, &error)) {
     result.error = error.empty() ? "CCITTFaxDecode: Decode failed" : error;
+    result.kind = ErrorKind::Malformed;
     return result;
   }
   result.success = true;
   return result;
-#endif  // NANOPDF_USE_LIBTIFF
+#endif  // NANOPDF_USE_LIBTIFF || NANOPDF_USE_BUILTIN_CCITT
 }
 
 }  // namespace filters
@@ -2107,6 +3426,7 @@ static DecodedStream apply_single_filter(const std::string &filter_name,
   }
 
   result.error = "Unsupported filter type: " + filter_name;
+  result.kind = ErrorKind::Unsupported;
   return result;
 }
 
@@ -2130,6 +3450,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -2137,25 +3458,28 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   uint64_t cache_key = 0;
   if (obj_num > 0) {
     cache_key = make_decoded_stream_cache_key(obj_num, gen_num);
-    auto cache_it = pdf.decoded_stream_cache.find(cache_key);
-    if (cache_it != pdf.decoded_stream_cache.end()) {
-      // Cache hit - return cached result
-      const auto& entry = cache_it->second;
-      result.data = entry.data;
-      result.success = entry.success;
-      result.error = entry.error;
-      result.width = entry.width;
-      result.height = entry.height;
-      result.bits_per_component = entry.bits_per_component;
+    {
+      std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+      auto cache_it = pdf.decoded_stream_cache.find(cache_key);
+      if (cache_it != pdf.decoded_stream_cache.end()) {
+        // Cache hit - return cached result
+        const auto& entry = cache_it->second;
+        result.data = entry.data;
+        result.success = entry.success;
+        result.error = entry.error;
+        result.width = entry.width;
+        result.height = entry.height;
+        result.bits_per_component = entry.bits_per_component;
 
-      // Move to back of LRU order
-      auto& order = pdf.decoded_stream_cache_order;
-      auto it = std::find(order.begin(), order.end(), cache_key);
-      if (it != order.end()) {
-        order.erase(it);
-        order.push_back(cache_key);
+        // Move to back of LRU order
+        auto& order = pdf.decoded_stream_cache_order;
+        auto it = std::find(order.begin(), order.end(), cache_key);
+        if (it != order.end()) {
+          order.erase(it);
+          order.push_back(cache_key);
+        }
+        return result;
       }
-      return result;
     }
   }
 
@@ -2247,12 +3571,14 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
         filter_names.push_back(item.name);
       } else {
         result.error = "decode_stream: Filter array contains non-name element";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
     }
   } else {
     result.error = "decode_stream: Filter must be a name or array, got type " +
                    std::to_string(static_cast<int>(filter_it->second.type));
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -2273,11 +3599,13 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
           params_list.push_back(filters::DecodeParams{});
         } else {
           result.error = "decode_stream: DecodeParms array contains invalid element";
+          result.kind = ErrorKind::Malformed;
           return result;
         }
       }
     } else if (params_it->second.type != Value::NULL_OBJ) {
       result.error = "decode_stream: DecodeParms must be dictionary, array, or null";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
   }
@@ -2341,6 +3669,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
       } else {
         result.error = step_result.error;
       }
+      result.kind = step_result.kind;
       return result;
     }
 
@@ -2352,14 +3681,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   // Store in cache (only if we have a valid object number)
   if (obj_num > 0 && cache_key != 0) {
-    // Evict oldest entries if at capacity
-    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
-      uint64_t evict = pdf.decoded_stream_cache_order.front();
-      pdf.decoded_stream_cache_order.pop_front();
-      pdf.decoded_stream_cache.erase(evict);
-    }
-
-    // Store in cache
+    // Prepare entry outside the lock
     Pdf::DecodedStreamCacheEntry entry;
     entry.data = result.data;  // Copy for cache
     entry.success = result.success;
@@ -2367,6 +3689,15 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     entry.width = result.width;
     entry.height = result.height;
     entry.bits_per_component = result.bits_per_component;
+
+    std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+    // Evict oldest entries if at capacity
+    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
+      uint64_t evict = pdf.decoded_stream_cache_order.front();
+      pdf.decoded_stream_cache_order.pop_front();
+      pdf.decoded_stream_cache.erase(evict);
+    }
+
     pdf.decoded_stream_cache[cache_key] = std::move(entry);
     pdf.decoded_stream_cache_order.push_back(cache_key);
   }
@@ -2382,6 +3713,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   if (stream_obj.type != Value::STREAM) {
     result.error = "decode_stream: not a stream object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -2389,25 +3721,28 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   uint64_t cache_key = 0;
   if (obj_num > 0) {
     cache_key = make_decoded_stream_cache_key(obj_num, gen_num, image_width, image_height);
-    auto cache_it = pdf.decoded_stream_cache.find(cache_key);
-    if (cache_it != pdf.decoded_stream_cache.end()) {
-      // Cache hit - return cached result
-      const auto& entry = cache_it->second;
-      result.data = entry.data;
-      result.success = entry.success;
-      result.error = entry.error;
-      result.width = entry.width;
-      result.height = entry.height;
-      result.bits_per_component = entry.bits_per_component;
+    {
+      std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+      auto cache_it = pdf.decoded_stream_cache.find(cache_key);
+      if (cache_it != pdf.decoded_stream_cache.end()) {
+        // Cache hit - return cached result
+        const auto& entry = cache_it->second;
+        result.data = entry.data;
+        result.success = entry.success;
+        result.error = entry.error;
+        result.width = entry.width;
+        result.height = entry.height;
+        result.bits_per_component = entry.bits_per_component;
 
-      // Move to back of LRU order
-      auto& order = pdf.decoded_stream_cache_order;
-      auto it = std::find(order.begin(), order.end(), cache_key);
-      if (it != order.end()) {
-        order.erase(it);
-        order.push_back(cache_key);
+        // Move to back of LRU order
+        auto& order = pdf.decoded_stream_cache_order;
+        auto it = std::find(order.begin(), order.end(), cache_key);
+        if (it != order.end()) {
+          order.erase(it);
+          order.push_back(cache_key);
+        }
+        return result;
       }
-      return result;
     }
   }
 
@@ -2499,12 +3834,14 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
         filter_names.push_back(item.name);
       } else {
         result.error = "decode_stream: Filter array contains non-name element";
+        result.kind = ErrorKind::Malformed;
         return result;
       }
     }
   } else {
     result.error = "decode_stream: Filter must be a name or array, got type " +
                    std::to_string(static_cast<int>(filter_it->second.type));
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
@@ -2525,11 +3862,13 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
           params_list.push_back(filters::DecodeParams{});
         } else {
           result.error = "decode_stream: DecodeParms array contains invalid element";
+          result.kind = ErrorKind::Malformed;
           return result;
         }
       }
     } else if (params_it->second.type != Value::NULL_OBJ) {
       result.error = "decode_stream: DecodeParms must be dictionary, array, or null";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
   }
@@ -2615,6 +3954,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
       } else {
         result.error = step_result.error;
       }
+      result.kind = step_result.kind;
       return result;
     }
 
@@ -2626,14 +3966,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   // Store in cache (only if we have a valid object number)
   if (obj_num > 0 && cache_key != 0) {
-    // Evict oldest entries if at capacity
-    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
-      uint64_t evict = pdf.decoded_stream_cache_order.front();
-      pdf.decoded_stream_cache_order.pop_front();
-      pdf.decoded_stream_cache.erase(evict);
-    }
-
-    // Store in cache
+    // Prepare entry outside the lock
     Pdf::DecodedStreamCacheEntry entry;
     entry.data = result.data;  // Copy for cache
     entry.success = result.success;
@@ -2641,6 +3974,15 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     entry.width = result.width;
     entry.height = result.height;
     entry.bits_per_component = result.bits_per_component;
+
+    std::lock_guard<std::mutex> lock(pdf.cache_mutex);
+    // Evict oldest entries if at capacity
+    while (pdf.decoded_stream_cache_order.size() >= pdf.decoded_stream_cache_capacity) {
+      uint64_t evict = pdf.decoded_stream_cache_order.front();
+      pdf.decoded_stream_cache_order.pop_front();
+      pdf.decoded_stream_cache.erase(evict);
+    }
+
     pdf.decoded_stream_cache[cache_key] = std::move(entry);
     pdf.decoded_stream_cache_order.push_back(cache_key);
   }
@@ -3543,48 +4885,89 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
 
   uint64_t key = (static_cast<uint64_t>(obj_num) << 32) |
                  static_cast<uint64_t>(gen_num);
-  auto cached = object_cache.find(key);
-  if (cached != object_cache.end()) {
-    result.success = true;
-    result.value = cached->second;
-    return result;
-  }
 
-  if (!object_offsets_built && !object_offsets_failed) {
-    if (build_object_offset_cache()) {
-      object_offsets_built = true;
-    } else {
-      object_offsets_failed = true;
+  // Check object_cache under lock
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto cached = object_cache.find(key);
+    if (cached != object_cache.end()) {
+      result.success = true;
+      result.value = cached->second;
+      return result;
     }
   }
+
+  // Check if we need to build the offset cache.
+  // Set object_offsets_failed optimistically to prevent concurrent builds,
+  // then correct to object_offsets_built on success.
+  {
+    bool need_build = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      if (!object_offsets_built && !object_offsets_failed) {
+        need_build = true;
+        object_offsets_failed = true;  // Prevent other threads from also building
+      }
+    }
+    // build_object_offset_cache accesses caches internally (and may call
+    // decode_stream), so we must not hold the lock across this call.
+    if (need_build) {
+      if (build_object_offset_cache()) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_offsets_built = true;
+        object_offsets_failed = false;
+      }
+      // If build failed, object_offsets_failed remains true (set above)
+    }
+  }
+
   uint64_t body_offset = 0;
   bool have_offset = false;
 
-  if (object_offsets_built) {
-    auto found = object_offsets.find(key);
-    if (found != object_offsets.end()) {
-      body_offset = found->second;
-      have_offset = true;
-    } else if (gen_num != 0) {
-      uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
-      auto zero_found = object_offsets.find(zero_key);
-      if (zero_found != object_offsets.end()) {
-        body_offset = zero_found->second;
+  // Read from offset cache under lock
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    if (object_offsets_built) {
+      auto found = object_offsets.find(key);
+      if (found != object_offsets.end()) {
+        body_offset = found->second;
         have_offset = true;
+      } else if (gen_num != 0) {
+        uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
+        auto zero_found = object_offsets.find(zero_key);
+        if (zero_found != object_offsets.end()) {
+          body_offset = zero_found->second;
+          have_offset = true;
+        }
       }
     }
   }
 
   if (!have_offset) {
-    auto stream_it = object_stream_entries.find(key);
-    if (stream_it == object_stream_entries.end() && gen_num != 0) {
-      uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
-      stream_it = object_stream_entries.find(zero_key);
+    // Check object_stream_entries under lock, copy out the entry info
+    bool found_stream_entry = false;
+    uint32_t stream_obj_num = 0;
+    uint32_t stream_index = 0;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      auto stream_it = object_stream_entries.find(key);
+      if (stream_it == object_stream_entries.end() && gen_num != 0) {
+        uint64_t zero_key = static_cast<uint64_t>(obj_num) << 32;
+        stream_it = object_stream_entries.find(zero_key);
+      }
+      if (stream_it != object_stream_entries.end()) {
+        found_stream_entry = true;
+        stream_obj_num = stream_it->second.first;
+        stream_index = stream_it->second.second;
+      }
     }
-    if (stream_it != object_stream_entries.end()) {
+
+    if (found_stream_entry) {
       Value from_stream;
-      if (load_object_from_stream(obj_num, gen_num, stream_it->second.first,
-                                  stream_it->second.second, &from_stream)) {
+      // load_object_from_stream may recursively call load_object, so no lock held here
+      if (load_object_from_stream(obj_num, gen_num, stream_obj_num,
+                                  stream_index, &from_stream)) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
         object_cache[key] = from_stream;
         result.success = true;
         result.value = std::move(from_stream);
@@ -3592,12 +4975,15 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
       }
       result.success = false;
       result.error = "Failed to load object from object stream";
+      result.kind = ErrorKind::Malformed;
       return result;
     }
 
     if (!find_indirect_object_body_offset(*this, obj_num, gen_num, &body_offset)) {
       result.success = false;
       result.error = "Failed to locate object";
+      result.kind = ErrorKind::Malformed;
+      NANOPDF_LOG_WARN("load_object", "Failed to locate object %u %u", obj_num, gen_num);
       return result;
     }
   }
@@ -3608,17 +4994,20 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
   if (!sr.seek_set(body_offset)) {
     result.success = false;
     result.error = "Invalid object offset";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!parser.skip_whitespace(sr)) {
     result.success = false;
     result.error = "Failed to prepare object stream";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!parse_object(sr, parser, &result.value)) {
     result.success = false;
+    result.kind = ErrorKind::Malformed;
     NANOPDF_LOG_WARN("load_object",
                      "Failed to parse object %u %u at body_offset=%lu have_offset=%d",
                      obj_num, gen_num, (unsigned long)body_offset, have_offset);
@@ -3634,27 +5023,37 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
   if (!parser.skip_whitespace(sr)) {
     result.success = false;
     result.error = "Failed to parse object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   if (!parser.consume_keyword(sr, "endobj")) {
     result.success = false;
     result.error = "Missing endobj for object";
+    result.kind = ErrorKind::Malformed;
     return result;
   }
 
   result.success = true;
-  object_cache[key] = result.value;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    object_cache[key] = result.value;
+  }
   return result;
 }
 
 bool Pdf::build_object_offset_cache() const {
-  object_offsets.clear();
-  object_stream_entries.clear();
-  object_stream_cache.clear();
-  object_stream_cache_order.clear();
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    object_offsets.clear();
+    object_stream_entries.clear();
+    object_stream_cache.clear();
+    object_stream_cache_order.clear();
+  }
 
   if (!data || data_size == 0) {
+    NANOPDF_LOG_WARN("xref", "No data for xref offset cache");
+    set_error(ErrorKind::Malformed, "no data for xref offset cache");
     return false;
   }
 
@@ -3664,6 +5063,8 @@ bool Pdf::build_object_offset_cache() const {
   const size_t keyword_len = sizeof(keyword) - 1;
 
   if (data_size < keyword_len) {
+    NANOPDF_LOG_WARN("xref", "PDF data too small for xref (%zu bytes)", data_size);
+    set_error(ErrorKind::Malformed, "PDF data too small for xref");
     return false;
   }
 
@@ -3679,6 +5080,8 @@ bool Pdf::build_object_offset_cache() const {
   }
 
   if (!startxref_pos) {
+    NANOPDF_LOG_WARN("xref", "startxref keyword not found");
+    set_error(ErrorKind::Malformed, "startxref keyword not found");
     return false;
   }
 
@@ -3687,6 +5090,8 @@ bool Pdf::build_object_offset_cache() const {
     cursor++;
   }
   if (cursor >= end) {
+    NANOPDF_LOG_WARN("xref", "Unexpected end of data after startxref");
+    set_error(ErrorKind::Malformed, "unexpected end of data after startxref");
     return false;
   }
 
@@ -3698,6 +5103,9 @@ bool Pdf::build_object_offset_cache() const {
     cursor++;
   }
   if (!has_digit || initial_xref >= data_size) {
+    NANOPDF_LOG_WARN("xref", "startxref offset beyond file size (offset=%llu, size=%zu)",
+                     (unsigned long long)initial_xref, data_size);
+    set_error(ErrorKind::Malformed, "startxref offset beyond file size");
     return false;
   }
 
@@ -3789,6 +5197,7 @@ bool Pdf::build_object_offset_cache() const {
                                    generation, &body_offset)) {
       uint64_t key = (static_cast<uint64_t>(object_number) << 32) |
                      static_cast<uint64_t>(generation);
+      std::lock_guard<std::mutex> lock(cache_mutex);
       object_offsets[key] = body_offset;
     }
   };
@@ -3936,7 +5345,10 @@ bool Pdf::build_object_offset_cache() const {
         }
 
         handle_trailer_offsets(trailer_val.dict, worklist);
-        any_entries = any_entries || !object_offsets.empty();
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex);
+          any_entries = any_entries || !object_offsets.empty();
+        }
           return true;
         }
 
@@ -4130,7 +5542,10 @@ bool Pdf::build_object_offset_cache() const {
             uint32_t stream_object = static_cast<uint32_t>(field2);
             uint32_t index = static_cast<uint32_t>(field3);
             uint64_t key = (static_cast<uint64_t>(obj) << 32);
-            object_stream_entries[key] = {stream_object, index};
+            {
+              std::lock_guard<std::mutex> lock(cache_mutex);
+              object_stream_entries[key] = {stream_object, index};
+            }
             any_entries = true;
           }
         }
@@ -4148,7 +5563,12 @@ bool Pdf::build_object_offset_cache() const {
     }
   }
 
-  if (!any_entries && object_offsets.empty() && object_stream_entries.empty()) {
+  bool need_fallback = false;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    need_fallback = !any_entries && object_offsets.empty() && object_stream_entries.empty();
+  }
+  if (need_fallback) {
     // Fallback scanning for traditional PDFs without xref tables.
     auto update_trailer_fallback = [&]() {
       const char trailer_kw[] = "trailer";
@@ -4243,12 +5663,16 @@ bool Pdf::build_object_offset_cache() const {
 
       uint64_t key = (static_cast<uint64_t>(obj) << 32) |
                      static_cast<uint64_t>(gen);
-      object_offsets[key] = static_cast<uint64_t>(body_ptr - begin);
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_offsets[key] = static_cast<uint64_t>(body_ptr - begin);
+      }
       any_entries = true;
       ptr = body_ptr;
     }
 
     if (root == 0) {
+      std::lock_guard<std::mutex> lock(cache_mutex);
       uint32_t catalog_obj = 0;
       for (const auto& entry : object_offsets) {
         uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
@@ -4273,20 +5697,26 @@ bool Pdf::build_object_offset_cache() const {
       }
     }
 
-    if (size == 0 && !object_offsets.empty()) {
-      uint32_t max_obj = 0;
-      for (const auto& entry : object_offsets) {
-        uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
-        if (obj_num > max_obj) {
-          max_obj = obj_num;
+    if (size == 0) {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      if (!object_offsets.empty()) {
+        uint32_t max_obj = 0;
+        for (const auto& entry : object_offsets) {
+          uint32_t obj_num = static_cast<uint32_t>(entry.first >> 32);
+          if (obj_num > max_obj) {
+            max_obj = obj_num;
+          }
         }
+        Pdf* self = const_cast<Pdf*>(this);
+        self->size = max_obj + 1;
       }
-      Pdf* self = const_cast<Pdf*>(this);
-      self->size = max_obj + 1;
     }
   }
 
-  return any_entries && (!object_offsets.empty() || !object_stream_entries.empty());
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    return any_entries && (!object_offsets.empty() || !object_stream_entries.empty());
+  }
 }
 
 bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
@@ -4304,6 +5734,8 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
 
   ResolvedObject stream_obj = load_object(stream_object_number, 0);
   if (!stream_obj.success || stream_obj.value.type != Value::STREAM) {
+    NANOPDF_LOG_WARN("obj_stream", "Stream object %u not found or not a stream",
+                     stream_object_number);
     return false;
   }
 
@@ -4322,7 +5754,7 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
     return false;
   }
 
-  const std::vector<uint8_t>* data_ptr = nullptr;
+  // Lambda to touch LRU order for object_stream_cache (must be called with cache_mutex held)
   auto touch_cache_entry = [&](uint32_t key, bool inserted) {
     if (!inserted) {
       for (auto it = object_stream_cache_order.begin();
@@ -4341,23 +5773,39 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
     }
   };
 
-  auto cache_it = object_stream_cache.find(stream_object_number);
-  if (cache_it == object_stream_cache.end()) {
-    // Use overload with object number for proper decryption
-    DecodedStream decoded = decode_stream(*this, stream_obj.value,
-                                          stream_object_number, 0);
-    if (!decoded.success) {
-      return false;
+  // Check object_stream_cache; if miss, decode outside the lock, then insert.
+  // Copy the data locally so we don't hold references into the cache across
+  // unlocked regions.
+  std::vector<uint8_t> local_stream_data;
+  {
+    bool cache_hit = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      auto cache_it = object_stream_cache.find(stream_object_number);
+      if (cache_it != object_stream_cache.end()) {
+        cache_hit = true;
+        local_stream_data = cache_it->second;  // copy
+        touch_cache_entry(stream_object_number, false);
+      }
     }
-    cache_it = object_stream_cache
-                   .emplace(stream_object_number, std::move(decoded.data))
-                   .first;
-    touch_cache_entry(stream_object_number, true);
-  } else {
-    touch_cache_entry(stream_object_number, false);
+    if (!cache_hit) {
+      // decode_stream accesses decoded_stream_cache, so no lock held here
+      DecodedStream decoded = decode_stream(*this, stream_obj.value,
+                                            stream_object_number, 0);
+      if (!decoded.success) {
+        NANOPDF_LOG_WARN("obj_stream", "Failed to decode object stream %u: %s",
+                         stream_object_number, decoded.error.c_str());
+        return false;
+      }
+      local_stream_data = decoded.data;  // keep a local copy
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_stream_cache.emplace(stream_object_number, std::move(decoded.data));
+        touch_cache_entry(stream_object_number, true);
+      }
+    }
   }
-  data_ptr = &cache_it->second;
-  const std::vector<uint8_t>& data = *data_ptr;
+  const std::vector<uint8_t>& data = local_stream_data;
   if (first_offset > data.size()) {
     return false;
   }
@@ -4416,6 +5864,9 @@ bool Pdf::load_object_from_stream(uint32_t object_number, uint16_t generation,
   uint32_t object_id_from_stream = entries[index].first;
   if (object_id_from_stream != object_number) {
     // mismatch, treat as failure
+    NANOPDF_LOG_WARN("obj_stream",
+                     "Object ID mismatch in stream %u: expected %u, got %u at index %u",
+                     stream_object_number, object_number, object_id_from_stream, index);
     return false;
   }
 
@@ -4453,6 +5904,7 @@ void Pdf::set_object_stream_cache_capacity(size_t capacity) const {
   if (capacity == 0) {
     capacity = 1;
   }
+  std::lock_guard<std::mutex> lock(cache_mutex);
   object_stream_cache_capacity = capacity;
 
   while (object_stream_cache_order.size() > object_stream_cache_capacity) {
@@ -4466,6 +5918,7 @@ void Pdf::set_decoded_stream_cache_capacity(size_t capacity) const {
   if (capacity == 0) {
     capacity = 1;
   }
+  std::lock_guard<std::mutex> lock(cache_mutex);
   decoded_stream_cache_capacity = capacity;
 
   while (decoded_stream_cache_order.size() > decoded_stream_cache_capacity) {
@@ -4476,19 +5929,33 @@ void Pdf::set_decoded_stream_cache_capacity(size_t capacity) const {
 }
 
 void Pdf::clear_decoded_stream_cache() const {
+  std::lock_guard<std::mutex> lock(cache_mutex);
   decoded_stream_cache.clear();
   decoded_stream_cache_order.clear();
 }
 
 bool Pdf::load_document_structure() {
+  clear_error();
+
   // Detect linearization (must be done before other parsing)
   parse_linearization_dict(data, data_size, &linearization);
 
-  if (!object_offsets_built && !object_offsets_failed) {
-    if (build_object_offset_cache()) {
-      object_offsets_built = true;
-    } else {
-      object_offsets_failed = true;
+  {
+    bool need_build = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      if (!object_offsets_built && !object_offsets_failed) {
+        need_build = true;
+        object_offsets_failed = true;  // Prevent concurrent builds
+      }
+    }
+    if (need_build) {
+      if (build_object_offset_cache()) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        object_offsets_built = true;
+        object_offsets_failed = false;
+      }
+      // If build failed, object_offsets_failed remains true
     }
   }
 
@@ -4523,11 +5990,15 @@ bool Pdf::load_document_structure() {
   catalog.pages_count = 0;
 
   if (root == 0) {
+    NANOPDF_LOG_ERROR("load", "No /Root entry in trailer");
+    set_error(ErrorKind::Malformed, "no /Root entry in trailer");
     return false;
   }
 
   ResolvedObject root_obj = load_object(root, 0);
   if (!root_obj.success || root_obj.value.type != Value::DICTIONARY) {
+    NANOPDF_LOG_ERROR("load", "Root catalog object %u is not a dictionary", root);
+    set_error(ErrorKind::Malformed, "root catalog object is not a dictionary");
     return false;
   }
 
@@ -10968,6 +12439,225 @@ SignatureValidationResult validate_signature(const Pdf& pdf,
   // over the authenticated attributes.
   result.signature_valid = result.integrity_valid;
   result.success = result.integrity_valid;
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// PDF/A Conformance Validation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The standard 14 PDF fonts that may be unembedded in some profiles.
+// PDF/A-1 technically requires all fonts to be embedded, but we still
+// identify them so the violation detail is informative.
+static const char* kStandard14Fonts[] = {
+    "Courier",
+    "Courier-Bold",
+    "Courier-Oblique",
+    "Courier-BoldOblique",
+    "Helvetica",
+    "Helvetica-Bold",
+    "Helvetica-Oblique",
+    "Helvetica-BoldOblique",
+    "Times-Roman",
+    "Times-Bold",
+    "Times-Italic",
+    "Times-BoldItalic",
+    "Symbol",
+    "ZapfDingbats",
+};
+
+static bool is_standard_14_font(const std::string& name) {
+  for (const auto* std_name : kStandard14Fonts) {
+    if (name == std_name) return true;
+  }
+  return false;
+}
+
+}  // anonymous namespace
+
+PdfAValidationResult validate_pdfa(const Pdf& pdf) {
+  PdfAValidationResult result;
+
+  // 1. Check XMP metadata with PDF/A identification
+  const XMPMetadata& xmp = pdf.catalog.xmp_metadata;
+  if (!xmp.is_pdfa()) {
+    PdfAViolation v;
+    v.rule = PdfAViolation::Rule::MissingXMPMetadata;
+    v.message = "XMP metadata does not contain PDF/A identification";
+    v.detail = "pdfaid:part is missing or zero";
+    result.violations.push_back(std::move(v));
+    // Without a claimed level we cannot validate further, but we still
+    // run the remaining checks so callers get a full report.
+  }
+
+  result.claimed_level = xmp.pdfa_level();
+
+  // 2. Check OutputIntent with GTS_PDFA1 subtype (required for PDF/A-1;
+  //    PDF/A-2/3 accept GTS_PDFA1 as well).
+  {
+    bool has_pdfa_output_intent = false;
+    for (const auto& oi : pdf.catalog.output_intents) {
+      if (oi.subtype == "GTS_PDFA1") {
+        has_pdfa_output_intent = true;
+        break;
+      }
+    }
+    if (!has_pdfa_output_intent) {
+      PdfAViolation v;
+      v.rule = PdfAViolation::Rule::MissingOutputIntent;
+      v.message = "No OutputIntent with subtype GTS_PDFA1 found";
+      v.detail = "output_intents count: " +
+                 std::to_string(pdf.catalog.output_intents.size());
+      result.violations.push_back(std::move(v));
+    }
+  }
+
+  // 3. Check that all fonts are embedded
+  for (size_t pi = 0; pi < pdf.catalog.pages.size(); ++pi) {
+    const Page& page = pdf.catalog.pages[pi];
+    for (const auto& kv : page.fonts) {
+      const std::string& font_name = kv.first;
+      const BaseFont* font = kv.second.get();
+      if (!font) continue;
+
+      bool embedded = false;
+      if (font->descriptor) {
+        // A font is considered embedded when the descriptor carries a
+        // non-None font file type (FontFile, FontFile2, or FontFile3).
+        if (font->descriptor->font_file_type != FontFileType::None) {
+          embedded = true;
+        }
+      }
+
+      if (!embedded) {
+        const std::string& base = font->base_font.empty() ? font_name
+                                                           : font->base_font;
+        PdfAViolation v;
+        v.rule = PdfAViolation::Rule::FontNotEmbedded;
+        if (is_standard_14_font(base)) {
+          v.message =
+              "Standard 14 font is not embedded (required by PDF/A)";
+        } else {
+          v.message = "Font is not embedded";
+        }
+        v.detail = "font=" + base + " page=" + std::to_string(pi + 1);
+        result.violations.push_back(std::move(v));
+      }
+    }
+  }
+
+  // 4. No encryption allowed
+  if (pdf.encrypt != 0) {
+    PdfAViolation v;
+    v.rule = PdfAViolation::Rule::EncryptionPresent;
+    v.message = "PDF/A documents must not be encrypted";
+    v.detail = "encrypt object number: " + std::to_string(pdf.encrypt);
+    result.violations.push_back(std::move(v));
+  }
+
+  // 5. Document info present (title required for conformance level A)
+  {
+    const DocumentInfo& info = pdf.catalog.document_info;
+    if (info.title.empty()) {
+      PdfAViolation v;
+      v.rule = PdfAViolation::Rule::MissingDocumentInfo;
+      v.message = "Document title is empty (required for PDF/A level A)";
+      result.violations.push_back(std::move(v));
+    }
+  }
+
+  // 6. Transparency check for PDF/A-1 (parts 2/3 allow transparency)
+  if (xmp.pdfa_part == 1 || xmp.pdfa_part == 0) {
+    for (size_t pi = 0; pi < pdf.catalog.pages.size(); ++pi) {
+      const Page& page = pdf.catalog.pages[pi];
+      const Dictionary& res = page.resources;
+      auto ext_it = res.find("ExtGState");
+      if (ext_it == res.end()) continue;
+
+      // Resolve the ExtGState dictionary
+      Dictionary ext_dict;
+      if (ext_it->second.type == Value::DICTIONARY) {
+        ext_dict = ext_it->second.dict;
+      } else if (ext_it->second.type == Value::REFERENCE) {
+        ResolvedObject resolved =
+            resolve_reference(pdf, ext_it->second.ref_object_number,
+                              ext_it->second.ref_generation_number);
+        if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+          ext_dict = resolved.value.dict;
+        }
+      }
+
+      for (const auto& gs_entry : ext_dict) {
+        Dictionary gs_dict;
+        if (gs_entry.second.type == Value::DICTIONARY) {
+          gs_dict = gs_entry.second.dict;
+        } else if (gs_entry.second.type == Value::REFERENCE) {
+          ResolvedObject resolved =
+              resolve_reference(pdf, gs_entry.second.ref_object_number,
+                                gs_entry.second.ref_generation_number);
+          if (resolved.success &&
+              resolved.value.type == Value::DICTIONARY) {
+            gs_dict = resolved.value.dict;
+          }
+        }
+        if (gs_dict.empty()) continue;
+
+        // Check for stroking alpha (CA) < 1.0
+        auto ca_it = gs_dict.find("CA");
+        if (ca_it != gs_dict.end() && ca_it->second.type == Value::NUMBER) {
+          if (ca_it->second.number < 1.0) {
+            PdfAViolation v;
+            v.rule = PdfAViolation::Rule::TransparencyUsed;
+            v.message =
+                "Transparency (non-stroking alpha CA) used on page";
+            v.detail = "page=" + std::to_string(pi + 1) +
+                       " CA=" + std::to_string(ca_it->second.number);
+            result.violations.push_back(std::move(v));
+          }
+        }
+
+        // Check for non-stroking alpha (ca) < 1.0
+        auto ca_lower_it = gs_dict.find("ca");
+        if (ca_lower_it != gs_dict.end() &&
+            ca_lower_it->second.type == Value::NUMBER) {
+          if (ca_lower_it->second.number < 1.0) {
+            PdfAViolation v;
+            v.rule = PdfAViolation::Rule::TransparencyUsed;
+            v.message =
+                "Transparency (stroking alpha ca) used on page";
+            v.detail = "page=" + std::to_string(pi + 1) +
+                       " ca=" + std::to_string(ca_lower_it->second.number);
+            result.violations.push_back(std::move(v));
+          }
+        }
+
+        // Check for SMask
+        auto smask_it = gs_dict.find("SMask");
+        if (smask_it != gs_dict.end()) {
+          // SMask can be /None (a name) which is acceptable
+          bool has_smask = true;
+          if (smask_it->second.type == Value::NAME &&
+              smask_it->second.name == "None") {
+            has_smask = false;
+          }
+          if (has_smask) {
+            PdfAViolation v;
+            v.rule = PdfAViolation::Rule::TransparencyUsed;
+            v.message = "Soft mask (SMask) used on page";
+            v.detail = "page=" + std::to_string(pi + 1);
+            result.violations.push_back(std::move(v));
+          }
+        }
+      }
+    }
+  }
+
+  // Determine overall validity: valid only if no violations and the PDF
+  // actually claims to be PDF/A.
+  result.valid = result.violations.empty() && xmp.is_pdfa();
 
   return result;
 }

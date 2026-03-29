@@ -142,6 +142,51 @@ TEST_SUITE("FilterChains") {
     }
 }
 
+TEST_SUITE("ErrorKind") {
+
+    TEST_CASE("FlateDecode corrupted data returns Malformed ErrorKind") {
+        uint8_t corrupted[] = {0xFF, 0xFE, 0xFD, 0xFC, 0xFB};
+        filters::DecodeParams params;
+        DecodedStream result = filters::decode_flate(corrupted, sizeof(corrupted), params);
+
+        CHECK_FALSE(result.success);
+        CHECK(result.kind == ErrorKind::Malformed);
+        CHECK_FALSE(result.error.empty());
+    }
+
+    TEST_CASE("ASCII85Decode invalid data returns Malformed ErrorKind") {
+        // Invalid ASCII85 - contains characters outside the valid range
+        uint8_t invalid[] = {0x01, 0x02, 0x03};
+        filters::DecodeParams params;
+        DecodedStream result = filters::decode_ascii85(invalid, sizeof(invalid), params);
+
+        if (!result.success) {
+            CHECK(result.kind == ErrorKind::Malformed);
+        }
+    }
+
+    TEST_CASE("FlateDecode null input returns Malformed ErrorKind") {
+        filters::DecodeParams params;
+        DecodedStream result = filters::decode_flate(nullptr, 0, params);
+
+        CHECK_FALSE(result.success);
+        CHECK(result.kind == ErrorKind::Malformed);
+    }
+
+    TEST_CASE("DCTDecode invalid data returns Malformed ErrorKind") {
+        uint8_t invalid[] = {0x00, 0x01, 0x02, 0x03};
+        filters::DecodeParams params;
+        DecodedStream result = filters::decode_dct(invalid, sizeof(invalid), params);
+
+        CHECK_FALSE(result.success);
+        CHECK(result.kind == ErrorKind::Malformed);
+    }
+
+}
+
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
     return nanotest::run_all_tests();
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN

@@ -45,10 +45,10 @@ struct Stats {
     int assertions_failed = 0;
 };
 
-static Stats global_stats;
-static bool current_test_failed = false;
-static std::string current_suite_name;
-static std::string current_test_name;
+inline Stats global_stats;
+inline bool current_test_failed = false;
+inline std::string current_suite_name;
+inline std::string current_test_name;
 
 // ============================================================================
 // Test Registry
@@ -64,10 +64,9 @@ struct TestInfo {
     int line;
 };
 
-static std::vector<TestInfo>& get_test_registry() {
-    static std::vector<TestInfo> registry;
-    return registry;
-}
+inline std::vector<TestInfo> global_test_registry;
+
+inline std::vector<TestInfo>& get_test_registry() { return global_test_registry; }
 
 inline void register_test(const char* suite, const char* name,
                          TestFunction func, const char* file, int line) {

@@ -4,55 +4,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-nanopdf is a lightweight, minimal PDF parsing library written in C++14. It focuses on parsing PDF document structure, extracting text content, and decoding various stream filters. The library is designed to be embedded in other applications with minimal dependencies.
+nanopdf is a lightweight PDF parsing and writing library written in C++17. It handles document structure parsing, text extraction, stream decoding, form manipulation, annotations, encryption, and optional rasterization. The library is designed to be embedded in other applications with minimal dependencies (only bundled miniz for zlib).
 
 ## Build System
 
-This project uses CMake as its build system with C++14 standard requirement.
+This project uses CMake (3.16+) with C++17 standard requirement.
 
 ### Build Commands
 
 ```bash
-# Standard CMake build
-mkdir build
-cd build
-cmake ..
-make
+# Standard build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 
 # Using the bootstrap script with Clang
-./scripts/bootstrap-clang.sh
-cd build
-make
+./scripts/bootstrap-clang.sh && cd build && make
 
 # Build for WebAssembly/Emscripten
-./scripts/bootstrap-emscripten.sh
-cd build
-make
+./scripts/bootstrap-emscripten.sh && cd build && make
 
-# Build specific targets
-make nanopdf          # Build library
-make test_nanopdf     # Build test executable
+# Key targets
+make nanopdf          # Library
+make nanopdf-mcp      # MCP server executable
+make benchmark        # Benchmark tool
+make nanopdf_unit_suite  # Unit test suite
 ```
 
 ### CMake Options
 
-- `NANOPDF_USE_CCACHE`: Use ccache for faster recompilation (default: ON)
-- `NANOPDF_USE_NANOSTL`: Use nanostl instead of standard library (default: OFF)
-- `NANOPDF_USE_STB_TRUETYPE`: Use stb_truetype for font loading (default: ON)
-- `NANOPDF_BUILD_TESTS`: Build test executables (default: ON)
-- `NANOPDF_BUILD_WASM`: Build for WebAssembly with Emscripten (default: OFF)
-- `NANOPDF_USE_THORVG`: Use ThorVG for rendering backend (default: OFF)
-- `NANOPDF_USE_LIBTIFF`: Use libtiff for CCITT/Fax decoding (default: OFF, experimental)
-- `SANITIZE_ADDRESS`: Enable address sanitizer for debugging
+| Flag | Default | Description |
+| --- | --- | --- |
+| `NANOPDF_USE_CCACHE` | ON | Use ccache for faster recompilation |
+| `NANOPDF_USE_NANOSTL` | OFF | Use nanostl instead of standard library |
+| `NANOPDF_USE_STB_TRUETYPE` | ON | Use stb_truetype for font loading |
+| `NANOPDF_BUILD_TESTS` | ON | Build test executables |
+| `NANOPDF_BUILD_VALIDATION_TESTS` | ON | Build PDF spec validation tests |
+| `NANOPDF_BUILD_WASM` | OFF | Build for WebAssembly with Emscripten |
+| `NANOPDF_USE_THORVG` | OFF | ThorVG rendering backend |
+| `NANOPDF_USE_BLEND2D` | OFF | Blend2D rendering backend |
+| `NANOPDF_USE_LIBTIFF` | OFF | Use libtiff for CCITT/Fax decoding |
+| `NANOPDF_EMBED_FONTS` | OFF | Embed Standard 14 font replacements |
+| `NANOPDF_EMBED_CJK_FONTS` | OFF | Embed CJK fonts (~61 MB) |
+| `SANITIZE_ADDRESS` | OFF | Enable AddressSanitizer |
 
 ### Testing
 
-Run the test executable with a PDF file:
 ```bash
-./test_nanopdf path/to/file.pdf
-
-# Test with provided sample
-./test_nanopdf ../data/blank.pdf
+cd build
+ctest --output-on-failure              # Run all tests (unit + integration + validation)
+ctest -L unit --output-on-failure      # Unit tests only
+ctest -L integration --output-on-failure  # Integration tests only
+ctest -L validation --output-on-failure   # Validation tests only
 ```
 
 ### Code Formatting
@@ -62,102 +64,155 @@ Uses Google C++ style with 2-space indentation. Format code with:
 clang-format -i src/*.cc src/*.hh
 ```
 
+## Source Directory Layout
+
+```
+src/                    Core library source (flat layout)
+  nanopdf.hh/cc         Main parsing engine, Value class, Pdf struct
+  pdf-writer.hh/cc      PDF creation and incremental writing
+  pdf-security.cc       Encryption/decryption, password auth
+  crypto.hh/cc          Pure C++ crypto (RC4, AES, MD5, SHA-256)
+  document-structure.cc Document outline, page labels, destinations
+  text-layout.hh/cc     Text layout analysis (lines, words, columns)
+  table-extraction.hh/cc Table detection and export (CSV/HTML/JSON)
+  canvas-exporter.hh/cc HTML5 Canvas and SVG export
+  thorvg-backend.hh/cc  ThorVG rendering backend (optional)
+  blend2d-backend.hh/cc Blend2D rendering backend (optional)
+  color-transform.hh/cc Color space conversions
+  font-provider.hh/cc   Font discovery and substitution
+  cff-parser.hh/cc      Compact Font Format parser
+  type1-parser.hh/cc    PostScript Type 1 font parser
+  jpx-decoder.hh/cc     JPEG2000 decoder (single-tile)
+  pdf-attachments.hh/cc File attachment extraction
+  form-manipulation.cc  Form field value manipulation, FDF import/export
+  stream-reader.hh      Byte stream reader with endianness handling
+  nanopdf-log.hh        Logging utilities
+  jbig2/                JBIG2 monochrome bitmap decoder (ported from PDFium)
+  mcp/                  MCP (Model Context Protocol) server
+  third_party/          Embedded libraries (miniz, stb_image, stb_truetype, etc.)
+  nanostl/              Optional minimal STL replacement
+
+tests/
+  nanotest.hh           Custom lightweight test framework
+  fixtures/             Shared test helpers (test_helpers.hh/cc)
+  unit/                 Feature-organized unit tests
+    core/               Value, XRef, PDF parsing tests
+    filters/            Stream decoder tests (flate, ascii85, lzw, dct, ccitt, etc.)
+    fonts/              CMap, Type0, Type3, font substitution tests
+    text/               Text extraction, layout, table extraction tests
+    document/           Catalog, outline, page labels, PDF/A validation tests
+    annotations/        Annotation type tests
+    forms/              Form field manipulation tests
+    security/           AES, RC4, hash tests
+    graphics/           Color transform tests
+    backends/           (conditional on ThorVG/Blend2D)
+  integration/          End-to-end tests with real PDF files
+  validation/           PDF spec compliance (Arlington model, SafeDocs, corpus)
+
+tools/                  Standalone utilities (ccitt_compare, visual_compare)
+examples/               Example apps (pdfdump, rasterize, pdfsign, img2pdf, wasm, mcp)
+fonts/                  Open-source font files (Arimo, Tinos, Cousine, Noto, STIX)
+cmake/                  CMake modules (sanitizers, toolchains, font embedding)
+scripts/                Build and utility scripts
+data/                   Test PDF files and resources
+docs/                   Active documentation (THIRD_PARTY, MCP_USAGE, FONTS_EMBEDDING, WASM)
+docs/archive/           Historical development notes
+```
+
 ## Code Architecture
 
 ### Core Components
 
-**nanopdf.hh/nanopdf.cc**: Main parsing engine containing:
-- `Pdf` struct: Main document container with xref tables, trailer, and document catalog
-- `Value` class: Polymorphic type system for PDF objects (boolean, number, string, name, array, dictionary, stream, reference)
+**nanopdf.hh/cc**: Main parsing engine containing:
+- `Pdf` struct: Document container with thread-safe caches, xref tables, trailer, catalog
+- `Value` class: Polymorphic PDF object type system (9 types)
 - `Parser` class: Low-level PDF syntax parser
-- `DocumentCatalog`: High-level document structure with pages
-- `Page` struct: Individual page with resources, content streams, and font information
+- `DocumentCatalog`: Pages, fonts, annotations, forms, outlines, metadata
+- `Page` struct: Per-page resources, content streams, font management
+- `ErrorKind` enum: Categorized error types (Malformed, Unsupported, Encrypted, IOError, Internal)
+- `ParseResult` struct: Rich parse results with error classification
+- `PdfAValidationResult` / `validate_pdfa()`: PDF/A conformance validation
 
-**stream-reader.hh**: Low-level byte stream reader with endianness handling for binary data parsing.
-
-**jbig2-decoder.hh/cc**: JBIG2 monochrome bitmap decoder for compressed image streams.
-
-**ttf-loader.cc**: TrueType font file loader and parser.
-
-**canvas-exporter.hh/cc**: Canvas and SVG export functionality for rendering PDF content to HTML5 Canvas commands or SVG elements.
-
-**thorvg-backend.hh/cc**: ThorVG rendering backend for vector graphics rendering (optional, enabled with NANOPDF_USE_THORVG).
-
-**crypto.hh/cc**: Pure C++ cryptographic implementations for PDF security (RC4, AES-128/256, MD5, SHA-256).
-
-**pdf-security.cc**: PDF encryption handling including standard security handler, password authentication, and permission flags.
+**pdf-writer.hh/cc**: PDF creation and modification:
+- `PdfWriter` class: Create PDFs from scratch or load existing for incremental updates
+- `PageBuilder`: Fluent API for drawing on pages
+- `SignaturePlaceholder` / `SigningCallback` / `apply_signature()`: Digital signature workflow
+- Form filling, annotation CRUD, watermarks, bookmarks
 
 ### Key Data Structures
 
-- `XRef`/`XRefSection`: Cross-reference table entries for object location tracking
-- `BaseFont`/`FontDescriptor`: Font resource management with metrics and embedded font data
-- `Type0Font`: CID font support with CMap and ToUnicode mappings
-- `Type3Font`: User-defined font support with glyph procedures
-- `DecodedStream`: Result container for stream filter decoding operations
-- `ResolvedObject`: Container for dereferenced PDF objects with error handling
-- `ColorSpace`: Color space representation (DeviceGray, DeviceRGB, DeviceCMYK, CalRGB, CalGray, ICCBased, Indexed)
-- `ImageXObject`: Image resource with dimensions, color space, and decoded data
-- `TextState`: Complete text state tracking for content stream processing
-- `CMap`: Character to Unicode mapping for font encoding
-- `FontSubstitution`: Font fallback system for missing fonts
-- `Annotation`: Base class for all annotation types with appearance streams
-- `TextAnnotation`, `LinkAnnotation`, `MarkupAnnotation`, `FreeTextAnnotation`: Specific annotation types
-- `FormField`: Base class for interactive form fields
-- `TextField`, `ButtonField`, `ChoiceField`: Specific form field types
-- `WidgetAnnotation`: Form field widget annotations
+- `XRef`/`XRefSection`: Cross-reference table entries
+- `BaseFont`/`FontDescriptor`: Font resources with metrics and embedded data
+- `Type0Font`/`Type3Font`: CID and user-defined font support
+- `DecodedStream`: Stream decode result with error classification
+- `ResolvedObject`: Dereferenced PDF object container
+- `ParseResult`: Parse result with `ErrorKind` classification
+- `ColorSpace`: Full color space representation (12 types)
+- `ImageXObject`: Image resource with decode arrays and masks
+- `TextState`: Complete text state machine
+- `CMap`: Character-to-Unicode mapping
+- `Annotation` hierarchy: 27 annotation types
+- `FormField` hierarchy: Text, Button, Choice, Signature fields
+- `OutlineItem`: Bookmark tree with nested hierarchy
+- `XMPMetadata`: XMP metadata with PDF/A identification
+- `OutputIntentInfo`: PDF/A and PDF/X color intent profiles
 
 ### Stream Filters
 
 The `filters` namespace provides decoders for:
-- FlateDecode (zlib/deflate compression)
-- ASCII85Decode (Base85 encoding)
-- ASCIIHexDecode (Hexadecimal encoding)
-- LZWDecode (Lempel-Ziv-Welch compression)
-- RunLengthDecode (Run-length encoding compression)
-- DCTDecode (JPEG compression via stb_image)
-- CCITTFaxDecode (Group 3/4 fax, 1D and 2D modes)
-- JBIG2Decode (monochrome bitmap compression - partial)
+- FlateDecode (zlib/deflate, with PNG predictor support)
+- ASCII85Decode, ASCIIHexDecode
+- LZWDecode, RunLengthDecode
+- DCTDecode (JPEG via stb_image)
+- CCITTFaxDecode (Group 3/4 fax)
+- JBIG2Decode (monochrome bitmap)
+- JPXDecode (JPEG2000, single-tile)
+- Filter chains (multiple filters in sequence)
 
 ### Dependencies
 
-- **Required**: zlib for FlateDecode stream decompression
-- **Embedded**: miniz.c/h, stb_truetype.h, stb_image.h, stb_image_write.h, tiny_dng_loader.h, fpng for various format support
-- **Optional**: nanostl for reduced standard library footprint, ThorVG for rasterization
+- **Embedded** (in `src/third_party/`): miniz (zlib replacement), stb_image, stb_image_write, stb_truetype, tiny_dng_loader
+- **Optional**: nanostl, ThorVG, Blend2D, libtiff
 
 ## Development Patterns
 
 ### Error Handling
-Functions return boolean success/failure or use result structs with `success` flag and `error` message fields.
+Public API uses `ParseResult`/`DecodedStream`/`ResolvedObject` result structs with `success`, `error`, and `ErrorKind` fields. The `ErrorKind` enum classifies errors as `Malformed`, `Unsupported`, `Encrypted`, `IOError`, or `Internal`. Legacy functions return `bool` for backward compatibility (delegating to `ParseResult` internally).
 
-### Memory Management  
-Uses RAII with smart pointers (`std::unique_ptr`) for font resources and manual resource cleanup in destructors.
+### Thread Safety
+The `Pdf` struct contains a `cache_mutex` protecting all mutable caches (object cache, decoded stream cache, object stream cache, offset cache). Individual `Pdf` instances can be used from multiple threads. Create separate `Pdf` instances for parallel document processing.
+
+### Memory Management
+Uses RAII with `std::unique_ptr` for font resources, outline trees, and structure elements.
 
 ### PDF Object Resolution
-Objects are resolved through the `resolve_reference()` function using object number and generation number from xref tables.
+Objects are resolved through `resolve_reference()` using object number and generation number from xref tables. Results are cached in the thread-safe object cache.
 
 ### Stream Processing
-Stream data is decoded through a pipeline: raw bytes → filter decoding → final decoded content using the `decode_stream()` function. Filter chains (multiple filters) are supported and applied in sequence.
+Stream data is decoded through: raw bytes -> filter chain -> decoded content using `decode_stream()`. Results are cached in an LRU decoded stream cache.
 
 ### Lazy Loading
-Fonts are loaded lazily per page - only when text extraction is performed. Use `Page::ensure_fonts_loaded()` or `Page::get_font()` for explicit control. Metadata (forms, outlines, labels) can be loaded lazily by compiling with `NANOPDF_LAZY_METADATA=1`.
+Fonts are loaded lazily per page. Document metadata (forms, outlines, labels) can be loaded on demand via `ensure_*_loaded()` methods.
 
-## Compilation Defines
+## Testing
 
-- `NANOPDF_DEBUG_PRINT`: Enable debug output (set to 1 in CMakeLists.txt by default)
-- `NANOPDF_USE_NANOSTL`: Use nanostl library instead of standard library
-- `NANOPDF_USE_STB_TRUETYPE`: Enable TrueType font support via stb_truetype
-- `NANOPDF_LAZY_METADATA`: Enable lazy loading of metadata (forms, outlines, labels)
+### Test Framework
+Uses `nanotest` - a custom header-only C++17 test framework (~300 LOC) with:
+- `TEST_SUITE()` / `TEST_CASE()` macros for organization
+- `CHECK()` / `REQUIRE()` / `CHECK_EQ()` / `CHECK_APPROX()` assertions
+- Auto-registration and CTest integration
 
-## Testing Files
+### Test Executables
+- `nanopdf_unit_suite`: All unit tests (~500 cases across core, filters, fonts, text, document, annotations, forms, security, graphics)
+- `test_parse_real_pdfs`: Integration tests parsing real PDF files from `data/`
+- `test_text_extraction`: Integration tests for text extraction on real PDFs
+- `test_arlington_*`, `test_safedocs`, `test_corpus_parsing`, `test_pdf_differences`: Validation tests
+- `test_visual_thorvg`, `test_visual_blend2d`: Visual regression (when backend enabled)
 
-The repository includes `data/blank.pdf` as a sample PDF file for testing. The main test executable is `test_nanopdf` which accepts a PDF file path as command-line argument and demonstrates library usage for parsing and extracting content.
+### Compilation Defines
 
-Test executables:
-- `test_nanopdf`: Main PDF parsing test
-- `test_phase1`, `test_phase1_simple`: Phase 1 features (filters, images, color spaces)
-- `test_phase2_features`, `test_phase2_text_extraction`, `test_phase2_standardencoding`, `test_phase2_rendering`, `test_phase2_real_pdfs`: Phase 2 features (text extraction, fonts, encoding)
-- `test_phase3`: Phase 3 features (annotations, forms, interactivity)
-- `test_phase4`: Phase 4 features (document navigation, metadata, outlines)
-- `test_phase5`: Phase 5 features (security, encryption, cryptographic algorithms)
-- `test_phase6`: Phase 6 features (CCITTFaxDecode, advanced filters)
-- `test_thorvg`: ThorVG backend test (when NANOPDF_USE_THORVG is enabled)
+- `NANOPDF_LOG_LEVEL`: Log verbosity 0-5 (None, Error, Warn, Info, Debug, Trace)
+- `NANOPDF_USE_NANOSTL`: Use nanostl library
+- `NANOPDF_USE_STB_TRUETYPE`: Enable TrueType font support
+- `NANOPDF_LAZY_METADATA`: Lazy load metadata
+- `NANOPDF_USE_MINIZ`: Use embedded miniz (set automatically for non-WASM builds)

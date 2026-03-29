@@ -12,10 +12,16 @@
 
 namespace nanopdf {
 
+// Forward-declare ErrorKind if nanopdf.hh was not included first
+#ifndef NANOPDF_HH_INCLUDED
+enum class ErrorKind { None, Malformed, Unsupported, Encrypted, IOError, Internal };
+#endif
+
 /// Result of a write operation
 struct WriteResult {
   bool success = false;
   std::string error;
+  ErrorKind kind{ErrorKind::None};
   size_t bytes_written = 0;
 };
 
@@ -154,6 +160,31 @@ struct SignaturePlaceholder {
   std::vector<size_t> byte_range;      // ByteRange array [offset1, len1, offset2, len2]
   size_t byte_range_offset = 0;        // Offset of ByteRange array in PDF (for updating)
 };
+
+/// Callback type for digital signing.
+/// Receives the data to be signed (the ByteRange portions of the PDF),
+/// must return a DER-encoded PKCS#7/CMS signature.
+/// Return an empty vector to indicate signing failure.
+using SigningCallback = std::function<std::vector<uint8_t>(
+    const std::vector<uint8_t>& data_to_sign)>;
+
+/// Apply a digital signature to a PDF prepared with write_for_signing().
+///
+/// Usage:
+///   PdfWriter writer;
+///   writer.add_signature_field(config);
+///   std::vector<uint8_t> pdf_bytes;
+///   writer.write_for_signing(pdf_bytes);
+///   auto placeholders = writer.get_signature_placeholders();
+///   bool ok = apply_signature(pdf_bytes, placeholders[0], my_signing_callback);
+///
+/// @param pdf_data      The PDF bytes from write_for_signing() (modified in-place)
+/// @param placeholder   The signature placeholder to fill
+/// @param sign_fn       Callback that produces a PKCS#7 signature from input data
+/// @return WriteResult  success/error
+WriteResult apply_signature(std::vector<uint8_t>& pdf_data,
+                            const SignaturePlaceholder& placeholder,
+                            const SigningCallback& sign_fn);
 
 /// Page size in PDF points (1/72 inch)
 struct PageSize {

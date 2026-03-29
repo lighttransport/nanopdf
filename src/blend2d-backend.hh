@@ -230,6 +230,10 @@ private:
     bool initialized{false};
   };
 
+  // Draw an outlined "tofu" box placeholder for a missing glyph
+  bool draw_missing_glyph_placeholder(float x, float y, float size,
+                                      uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+
   // Draw a single glyph using stb_truetype outlines (by Unicode codepoint)
   bool draw_glyph(int codepoint, float x, float y, float size,
                   uint8_t r, uint8_t g, uint8_t b, uint8_t a);

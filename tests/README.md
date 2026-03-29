@@ -71,7 +71,7 @@ We use **nanotest** - a custom, lightweight, header-only C++ testing framework b
 - ✅ **Header-only** - No compilation overhead, just include nanotest.hh
 - ✅ **No external dependencies** - Fully owned by the project
 - ✅ **Fast** - Minimal overhead, lightning-fast compile times
-- ✅ **C++14 compatible** - Matches nanopdf's requirement
+- ✅ **C++17 compatible** - Matches nanopdf's requirement
 - ✅ **Simple assertions** - `CHECK`, `REQUIRE`, `CHECK_EQ`, etc.
 - ✅ **CTest integration** - Returns proper exit codes for test reporting
 - ✅ **Minimal** - ~300 LOC vs doctest's 6,000 LOC or Google Test's 30,000+ LOC

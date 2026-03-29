@@ -195,7 +195,7 @@ cmake .. && make
 ### Testing
 ```bash
 # Build test program
-g++ -std=c++14 -I../build -lz -DNANOPDF_EMBED_FONTS=1 \
+g++ -std=c++17 -I../build -lz -DNANOPDF_EMBED_FONTS=1 \
   examples/test_embedded_fonts.cc -o test_fonts
 
 # Run tests

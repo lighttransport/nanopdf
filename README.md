@@ -1,9 +1,9 @@
 # NanoPDF
 
-NanoPDF is a lightweight C++14 library for parsing and inspecting PDF files. It focuses on
-read-only workflows such as structure inspection, text extraction, annotations, and form
-metadata. The codebase is self-contained and ships with optional miniature STL replacements
-for constrained environments.
+NanoPDF is a lightweight C++17 library for parsing, inspecting, and writing PDF files. It handles
+document structure, text extraction, form manipulation, annotations, encryption, and optional
+rasterization. The codebase is self-contained with no external dependencies (zlib is provided by
+the bundled miniz library).
 
 ## Features
 
@@ -12,15 +12,17 @@ for constrained environments.
 - Cross-reference tables (traditional and compressed object streams)
 - Linearized PDF support (including truncated partial downloads)
 - Robust xref repair for malformed/corrupted PDFs
-- Trailer chain merging for incremental updates
+- Thread-safe object and stream caches
+- Structured error handling with `ParseResult` and `ErrorKind` classification
 
 ### Stream Filters
-- FlateDecode (zlib/deflate)
+- FlateDecode (zlib/deflate with PNG predictor support)
 - ASCII85Decode, ASCIIHexDecode
 - LZWDecode, RunLengthDecode
 - DCTDecode (JPEG via stb_image)
 - CCITTFaxDecode (Group 3/4 fax, 1D and 2D modes)
 - JBIG2Decode (monochrome bitmap compression)
+- JPXDecode (JPEG2000, single-tile)
 - Filter chains (multiple filters applied in sequence)
 
 ### Fonts
@@ -35,45 +37,69 @@ for constrained environments.
 
 ### Text Extraction
 - Text positioning operators (Td, TD, Tm, T*)
-- Text matrix transformations and rendering modes
+- Text layout analysis with line, word, and column detection
 - Character/word spacing support
-- Automatic line break injection
-- Table structure detection
+- Reading order detection (including RTL)
+- Table structure detection with CSV/HTML/JSON/Markdown export
+- Spatial queries (text in rectangle)
 
 ### Graphics
-- Color spaces: DeviceGray, DeviceRGB, DeviceCMYK, CalRGB, CalGray, Lab, ICCBased, Indexed, Separation, DeviceN
+- Color spaces: DeviceGray, DeviceRGB, DeviceCMYK, CalRGB, CalGray, Lab, ICCBased, Indexed, Separation, DeviceN, Pattern
 - Image XObjects with decode arrays and masks
 - Extended graphics state (transparency, blend modes)
 - Pattern and shading parsing
-- Color space transformations
+- Color space transformations (CMYK/Lab/CalRGB to RGB)
+- ICC profile parsing
 
 ### Interactive Features
-- Annotations: Text, Link, Markup, FreeText, Stamp, Ink, Line, Shape, Widget
+- 27 annotation types (Text, Link, Markup, FreeText, Stamp, Ink, Line, Shape, Widget, Redaction, etc.)
 - Form fields: Text, Button, Choice, Signature (AcroForm)
-- Form manipulation (fill, flatten)
+- Form manipulation (fill, validate, FDF import/export)
 - Appearance streams (Normal, Rollover, Down states)
-- Bookmarks/outlines with destinations
+- Bookmarks/outlines with nested hierarchy
 - Page labels and named destinations
-- File attachments
+- File attachments with metadata
 
 ### Security
 - Standard security handler (RC4/AES-128/AES-256)
 - User/owner password authentication
 - Permission flags
+- Digital signature validation (PKCS#7 structure)
+- Signature creation with callback-based signing API
 - Pure C++ crypto implementation (no external libraries)
+
+### Document Metadata
+- Document info dictionary (title, author, subject, keywords, dates)
+- XMP metadata parsing (PDF/A identification, Dublin Core, XMP-MM)
+- PDF/A conformance validation (font embedding, output intents, transparency, encryption)
+- Output intents (PDF/A, PDF/X) with ICC profiles
+- Optional content groups (layers) with visibility control
+- Tagged PDF structure trees (40+ element types)
+
+### PDF Writing
+- Create PDFs from scratch with pages, text, images, shapes
+- Incremental updates for existing PDFs (form filling, annotations, signatures)
+- Digital signature placeholders with `apply_signature()` callback API
+- Font embedding (TrueType/OpenType subsetting)
+- Encryption support (AES-128/256)
+- Watermarks, bookmarks, layer creation
 
 ### Rendering Backends
 - Canvas export (HTML5 Canvas commands)
-- SVG export
+- SVG export (paths, text, gradients, patterns)
 - ThorVG vector graphics backend (optional)
 - Blend2D rasterization backend (optional)
 
 ### Other
-- PDF writing/generation
 - MCP (Model Context Protocol) server for AI integration
-- WebAssembly/Emscripten support
+- WebAssembly/Emscripten support with font embedding
+- Benchmark tool for performance profiling
 
 ## Building
+
+Requirements:
+- CMake 3.16+
+- C++17 compiler
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -91,22 +117,21 @@ cmake --build build
 | `NANOPDF_USE_BLEND2D` | `OFF` | Build the Blend2D raster backend |
 | `NANOPDF_BUILD_TESTS` | `ON` | Build test executables |
 | `NANOPDF_BUILD_VALIDATION_TESTS` | `ON` | Build PDF spec validation tests |
-| `NANOPDF_BUILD_LEGACY_TESTS` | `ON` | Build legacy phase test executables |
 | `NANOPDF_BUILD_WASM` | `OFF` | Target WebAssembly (requires Emscripten) |
 | `NANOPDF_EMBED_FONTS` | `OFF` | Embed Standard 14 font replacements |
 | `NANOPDF_EMBED_CJK_FONTS` | `OFF` | Embed CJK fonts (~61 MB) |
-| `NANOPDF_LAZY_METADATA` | `OFF` | Lazy loading of metadata (forms, outlines, labels) |
 | `SANITIZE_ADDRESS` | `OFF` | Enable AddressSanitizer |
 
 ## Tests
 
-### Unit and validation tests
+### Unit, integration, and validation tests
 
 ```bash
 cmake --build build
-ctest --test-dir build                     # Run all tests
-ctest --test-dir build -L unit             # Unit tests only
-ctest --test-dir build -L validation       # Validation tests only
+ctest --test-dir build                        # Run all tests
+ctest --test-dir build -L unit                # Unit tests only (~500 test cases)
+ctest --test-dir build -L integration         # Integration tests (real PDF parsing)
+ctest --test-dir build -L validation          # Validation tests
 ```
 
 ### Corpus testing
@@ -124,10 +149,10 @@ NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/test_corpus_parsing
 ```
 
 Supported corpora:
-- **CC-MAIN-2021** — 100k+ real-world PDFs from Common Crawl (99.66% parse rate, 0 crashes)
-- **UNSAFE-DOCS** — 14k+ synthetically malformed PDFs from DARPA SafeDocs (98.18% parse rate, 0 crashes)
-- **SafeDocs** — hand-crafted edge-case PDFs (100% parse rate)
-- **GovDocs1**, **veraPDF**, **pdf.js**, **pdfium**, **Tika** — additional corpora
+- **CC-MAIN-2021** -- 100k+ real-world PDFs from Common Crawl (99.66% parse rate, 0 crashes)
+- **UNSAFE-DOCS** -- 14k+ synthetically malformed PDFs from DARPA SafeDocs (98.18% parse rate, 0 crashes)
+- **SafeDocs** -- hand-crafted edge-case PDFs (100% parse rate)
+- **GovDocs1**, **veraPDF**, **pdf.js**, **pdfium**, **Tika** -- additional corpora
 
 ### Arlington PDF model validation
 
@@ -143,25 +168,39 @@ NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/test_arlington_validat
 cmake -P scripts/run-ci.cmake
 ```
 
-### Maintaining the glyph list
+## Project Layout
 
-`src/adobe_glyph_list.inc` is auto-generated from Adobe's canonical glyph list:
-
-```bash
-scripts/update-glyph-list-inc.py
+```
+src/                    Core library source
+  nanopdf.hh/cc         Main parsing engine
+  pdf-writer.hh/cc      PDF creation and incremental writing
+  crypto.hh/cc          Cryptographic implementations
+  mcp/                  MCP server (JSON-RPC protocol)
+  jbig2/                JBIG2 decoder (ported from PDFium)
+  third_party/          Embedded libraries (miniz, stb_image, stb_truetype)
+tests/
+  unit/                 Feature-organized unit tests (nanotest framework)
+  integration/          End-to-end tests with real PDF files
+  validation/           PDF spec compliance tests (Arlington, SafeDocs)
+examples/               Example apps (pdfdump, rasterize, pdfsign, wasm, mcp)
+fonts/                  Open-source font files for embedding
+tools/                  Standalone comparison utilities
+data/                   Test PDF files
+docs/                   Documentation
 ```
 
 ## Limitations
 
-- JPXDecode (JPEG2000) filter not implemented
-- Advanced transparency, blending, and pattern rendering are parsed but not fully rendered
-- Tagged PDF / accessibility structure trees not yet supported
-- PDF writing support is experimental
+- JPXDecode (JPEG2000) supports single-tile images only
+- Advanced transparency and pattern rendering are parsed but not fully rendered
+- PDF writing is functional but does not support content stream editing of existing pages
+- Digital signing requires a user-provided PKCS#7 callback (no built-in crypto signing)
+- XFA forms are not supported
 
 ## Contributing
 
-1. Keep headers self-contained (`#pragma once`) and prefer STL over custom containers unless building with `NANOSTL`
-2. Add unit tests under `tests/` for new features
+1. Keep headers self-contained and prefer STL over custom containers unless building with `NANOSTL`
+2. Add unit tests under `tests/unit/` for new features using the nanotest framework
 3. Run `ctest` and corpus tests before submitting changes
 4. Format code with `clang-format -i` (Google style, 2-space indent)
 
@@ -196,4 +235,4 @@ When building with `NANOPDF_EMBED_FONTS` or `NANOPDF_EMBED_CJK_FONTS`:
 
 ## License
 
-Apache 2.0 © 2024-present Light Transport Entertainment Inc.
+Apache 2.0 (c) 2024-present Light Transport Entertainment Inc.

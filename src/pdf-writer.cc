@@ -3805,6 +3805,81 @@ void PdfWriter::set_permissions(MdpPermissions permissions) {
 }
 
 // ============================================================
+// Digital Signature Application (free function)
+// ============================================================
+
+WriteResult apply_signature(std::vector<uint8_t>& pdf_data,
+                            const SignaturePlaceholder& placeholder,
+                            const SigningCallback& sign_fn) {
+  WriteResult result;
+
+  // Validate placeholder
+  if (placeholder.byte_range.size() != 4) {
+    result.error = "invalid placeholder: ByteRange must have 4 elements";
+    return result;
+  }
+  if (placeholder.contents_length == 0) {
+    result.error = "invalid placeholder: contents_length is 0";
+    return result;
+  }
+  if (!sign_fn) {
+    result.error = "signing callback is null";
+    return result;
+  }
+
+  size_t part1_offset = placeholder.byte_range[0];
+  size_t part1_length = placeholder.byte_range[1];
+  size_t part2_offset = placeholder.byte_range[2];
+  size_t part2_length = placeholder.byte_range[3];
+
+  // Bounds check
+  if (part1_offset + part1_length > pdf_data.size() ||
+      part2_offset + part2_length > pdf_data.size()) {
+    result.error = "ByteRange exceeds PDF data size";
+    return result;
+  }
+
+  // Collect the data covered by ByteRange (everything except the signature hex)
+  std::vector<uint8_t> data_to_sign;
+  data_to_sign.reserve(part1_length + part2_length);
+  data_to_sign.insert(data_to_sign.end(),
+                       pdf_data.begin() + part1_offset,
+                       pdf_data.begin() + part1_offset + part1_length);
+  data_to_sign.insert(data_to_sign.end(),
+                       pdf_data.begin() + part2_offset,
+                       pdf_data.begin() + part2_offset + part2_length);
+
+  // Call the user's signing callback
+  std::vector<uint8_t> signature = sign_fn(data_to_sign);
+  if (signature.empty()) {
+    result.error = "signing callback returned empty signature";
+    return result;
+  }
+  if (signature.size() > placeholder.contents_length) {
+    result.error = "signature (" + std::to_string(signature.size()) +
+                   " bytes) exceeds reserved space (" +
+                   std::to_string(placeholder.contents_length) + " bytes)";
+    return result;
+  }
+
+  // Encode signature as hex string and write into the /Contents placeholder.
+  // The placeholder in the PDF is: <0000...0000> where the hex digits are at
+  // contents_offset. Each byte becomes 2 hex chars.
+  static const char hex_chars[] = "0123456789abcdef";
+  size_t hex_offset = placeholder.contents_offset;
+
+  for (size_t i = 0; i < signature.size(); ++i) {
+    pdf_data[hex_offset + i * 2] = hex_chars[(signature[i] >> 4) & 0xF];
+    pdf_data[hex_offset + i * 2 + 1] = hex_chars[signature[i] & 0xF];
+  }
+  // Remaining hex positions stay as '0' (already filled by write_for_signing)
+
+  result.success = true;
+  result.bytes_written = signature.size();
+  return result;
+}
+
+// ============================================================
 // Encryption Implementation
 // ============================================================
 

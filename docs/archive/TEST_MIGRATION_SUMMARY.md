@@ -12,7 +12,7 @@ Successfully reorganized nanopdf's test infrastructure from phase-based developm
 
 ### Key Achievements
 
-- **Custom Testing Framework:** Created lightweight `nanotest` framework (281 LOC, zero dependencies, C++14 compatible)
+- **Custom Testing Framework:** Created lightweight `nanotest` framework (281 LOC, zero dependencies, C++17 compatible)
 - **Organized Structure:** Tests organized by feature area in `tests/unit/` rather than development phase
 - **Comprehensive Coverage:** 32 unit test files across 8 feature categories
 - **100% Success Rate:** All tests passing throughout migration
@@ -448,7 +448,7 @@ nanopdf/
 
 **Key Design Decisions:**
 1. **Header-only** - Zero compilation overhead, just `#include "nanotest.hh"`
-2. **C++14 compatible** - Matches nanopdf's language requirement
+2. **C++17 compatible** - Matches nanopdf's language requirement
 3. **Zero dependencies** - No external libraries required
 4. **Macro-based API** - Familiar syntax similar to Catch2/doctest
 5. **Rich assertions** - Informative failure messages with actual/expected values
@@ -556,7 +556,7 @@ ctest -j8  # Run 8 tests in parallel
 
 1. **Incremental Migration:** Phase-by-phase approach allowed continuous validation
 2. **100% Test Success:** Maintained passing tests throughout entire migration
-3. **Custom Framework:** nanotest perfectly suited to project needs (lightweight, C++14)
+3. **Custom Framework:** nanotest perfectly suited to project needs (lightweight, C++17)
 4. **Self-Contained Tests:** Helper functions in test files reduced dependencies
 5. **CMake Integration:** add_nanopdf_unit_test helper simplified test creation
 6. **Parallel Execution:** CTest integration enabled fast test runs

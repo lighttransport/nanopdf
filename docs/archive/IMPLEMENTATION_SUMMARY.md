@@ -163,7 +163,7 @@ static const FontMapping pdf_standard_14_mapping[14];
 - No platform-specific code
 - No external dependencies beyond Python 3
 - Pure CMake + Python solution
-- Works with any C++14 compiler
+- Works with any C++17 compiler
 
 ### ✓ Performance
 
@@ -293,7 +293,7 @@ cmake -DNANOPDF_EMBED_FONTS=ON ..
 make
 
 # Compile and run test
-g++ -std=c++14 -I. -DNANOPDF_EMBED_FONTS=1 \
+g++ -std=c++17 -I. -DNANOPDF_EMBED_FONTS=1 \
   ../examples/test_embedded_fonts.cc -o test_embedded_fonts
 ./test_embedded_fonts
 ```

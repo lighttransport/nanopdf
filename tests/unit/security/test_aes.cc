@@ -261,6 +261,9 @@ TEST_SUITE("AES-128 CBC") {
     }
 }
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
     return nanotest::run_all_tests();
 }
+
+#endif  // NANOPDF_TEST_SUITE_NO_MAIN
