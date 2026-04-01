@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -127,6 +128,28 @@ inline bool dict_find_int(const uint8_t* dict_data, size_t dict_size,
 
 } // namespace detail
 
+inline bool append_gid_cid_pair(std::vector<std::pair<uint16_t, uint16_t>>* pairs,
+                                uint16_t gid,
+                                uint16_t cid,
+                                uint16_t* max_cid) {
+  pairs->push_back({gid, cid});
+  if (cid > *max_cid) *max_cid = cid;
+  return true;
+}
+
+inline bool append_gid_cid_pair_checked(
+    std::vector<std::pair<uint16_t, uint16_t>>* pairs,
+    uint16_t gid,
+    uint16_t first,
+    uint32_t delta,
+    uint16_t* max_cid) {
+  if (delta > static_cast<uint32_t>((std::numeric_limits<uint16_t>::max)() - first)) {
+    return false;
+  }
+  return append_gid_cid_pair(
+      pairs, gid, static_cast<uint16_t>(first + delta), max_cid);
+}
+
 // Build CID to GID mapping from CFF data.
 // For CID-keyed fonts, parses the charset to map CIDs to glyph indices.
 // Returns a vector where result[cid] = gid.
@@ -226,9 +249,10 @@ inline std::vector<uint16_t> build_cid_to_gid_map(
       uint8_t n_left = data[cpos + 2];
       cpos += 3;
       for (int j = 0; j <= n_left && gid < num_glyphs; ++j, ++gid) {
-        uint16_t cid = first + j;
-        gid_cid_pairs.push_back({gid, cid});
-        if (cid > max_cid) max_cid = cid;
+        if (!append_gid_cid_pair_checked(&gid_cid_pairs, gid, first,
+                                         static_cast<uint32_t>(j), &max_cid)) {
+          break;
+        }
       }
     }
   } else if (format == 2) {
@@ -239,9 +263,10 @@ inline std::vector<uint16_t> build_cid_to_gid_map(
       uint16_t n_left = detail::read_u16(data + cpos + 2);
       cpos += 4;
       for (int j = 0; j <= n_left && gid < num_glyphs; ++j, ++gid) {
-        uint16_t cid = first + j;
-        gid_cid_pairs.push_back({gid, cid});
-        if (cid > max_cid) max_cid = cid;
+        if (!append_gid_cid_pair_checked(&gid_cid_pairs, gid, first,
+                                         static_cast<uint32_t>(j), &max_cid)) {
+          break;
+        }
       }
     }
   } else {

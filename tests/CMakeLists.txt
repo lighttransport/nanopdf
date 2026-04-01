@@ -50,6 +50,7 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/core/test_value.cc
     unit/core/test_xref.cc
     unit/core/test_pdf_parsing.cc
+    unit/core/test_pdf_function.cc
     unit/annotations/test_annotation_types.cc
     unit/annotations/test_freetext_annotation.cc
     unit/annotations/test_link_annotation.cc

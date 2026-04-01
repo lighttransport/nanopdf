@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include <limits>
+#include <type_traits>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -24,6 +26,19 @@ namespace pdfunc {
 template<typename T>
 inline T clamp_val(const T& v, const T& lo, const T& hi) {
   return (v < lo) ? lo : (hi < v) ? hi : v;
+}
+
+inline double safe_pow(double base, double exponent, double fallback = 0.0) {
+  double integral_part = 0.0;
+  if (base < 0.0 && std::modf(exponent, &integral_part) != 0.0) {
+    return fallback;
+  }
+  if (base == 0.0 && exponent < 0.0) {
+    return fallback;
+  }
+
+  const double value = std::pow(base, exponent);
+  return std::isfinite(value) ? value : fallback;
 }
 
 // PostScript calculator stack
@@ -159,7 +174,7 @@ inline bool execute_postscript(const std::vector<std::string>& tokens,
     else if (tok == "sin") { stack.push(std::sin(stack.pop() * M_PI / 180.0)); }
     else if (tok == "cos") { stack.push(std::cos(stack.pop() * M_PI / 180.0)); }
     else if (tok == "atan") { double x = stack.pop(), y = stack.pop(); stack.push(std::atan2(y, x) * 180.0 / M_PI); }
-    else if (tok == "exp") { double e = stack.pop(), b = stack.pop(); stack.push(std::pow(b, e)); }
+    else if (tok == "exp") { double e = stack.pop(), b = stack.pop(); stack.push(safe_pow(b, e)); }
     else if (tok == "ln") { double v = stack.pop(); stack.push(v > 0 ? std::log(v) : 0.0); }
     else if (tok == "log") { double v = stack.pop(); stack.push(v > 0 ? std::log10(v) : 0.0); }
     // Relational
@@ -174,7 +189,20 @@ inline bool execute_postscript(const std::vector<std::string>& tokens,
     else if (tok == "or") { int b = (int)stack.pop(), a = (int)stack.pop(); stack.push((double)(a | b)); }
     else if (tok == "xor") { int b = (int)stack.pop(), a = (int)stack.pop(); stack.push((double)(a ^ b)); }
     else if (tok == "not") { stack.push(((int)stack.pop()) == 0 ? 1.0 : 0.0); }
-    else if (tok == "bitshift") { int s = (int)stack.pop(), v = (int)stack.pop(); stack.push((double)(s >= 0 ? (v << s) : (v >> (-s)))); }
+    else if (tok == "bitshift") {
+      int s = static_cast<int>(stack.pop());
+      int v = static_cast<int>(stack.pop());
+      using UnsignedInt = typename std::make_unsigned<int>::type;
+      constexpr int kBitWidth = std::numeric_limits<UnsignedInt>::digits;
+      if (s <= -kBitWidth || s >= kBitWidth) {
+        stack.push(0.0);
+      } else if (s >= 0) {
+        const auto shifted = static_cast<UnsignedInt>(v) << s;
+        stack.push(static_cast<double>(static_cast<int>(shifted)));
+      } else {
+        stack.push(static_cast<double>(v >> (-s)));
+      }
+    }
     // Stack ops
     else if (tok == "dup") { stack.dup(); }
     else if (tok == "exch") { stack.exch(); }
@@ -297,18 +325,31 @@ inline bool evaluate(const Pdf& pdf, const Value& function,
 
     if (function.type == Value::STREAM && !sizes.empty() && !inputs.empty()) {
       auto decoded = decode_stream(pdf, function);
-      if (decoded.success && !decoded.data.empty() && sizes.size() == 1 && domain.size() >= 2) {
-        double t = (inputs[0] - domain[0]) / (domain[1] - domain[0]);
+      if (decoded.success && !decoded.data.empty() && sizes.size() == 1 &&
+          sizes[0] > 0 && domain.size() >= 2) {
+        const double domain_width = domain[1] - domain[0];
+        if (domain_width == 0.0) {
+          outputs.resize(n_out, 0.5);
+          return true;
+        }
+        double t = (inputs[0] - domain[0]) / domain_width;
         t = clamp_val(t, 0.0, 1.0);
         int idx = static_cast<int>(t * (sizes[0] - 1));
         idx = clamp_val(idx, 0, sizes[0] - 1);
         outputs.resize(n_out);
-        int bps_bytes = (bps + 7) / 8;
-        int off = idx * n_out * bps_bytes;
-        for (int i = 0; i < n_out && off + i * bps_bytes < (int)decoded.data.size(); ++i) {
+        const size_t bps_bytes = static_cast<size_t>((bps + 7) / 8);
+        const size_t off =
+            static_cast<size_t>(idx) * static_cast<size_t>(n_out) * bps_bytes;
+        for (int i = 0; i < n_out; ++i) {
+          const size_t sample_off = off + static_cast<size_t>(i) * bps_bytes;
+          if (sample_off + bps_bytes > decoded.data.size()) break;
           double val = 0;
-          if (bps == 8) val = decoded.data[off + i] / 255.0;
-          else if (bps == 16) val = ((decoded.data[off + i * 2] << 8) | decoded.data[off + i * 2 + 1]) / 65535.0;
+          if (bps == 8) {
+            val = decoded.data[sample_off] / 255.0;
+          } else if (bps == 16) {
+            val = ((decoded.data[sample_off] << 8) |
+                   decoded.data[sample_off + 1]) / 65535.0;
+          }
           if (decode.size() >= (size_t)((i + 1) * 2))
             val = decode[i * 2] + val * (decode[i * 2 + 1] - decode[i * 2]);
           outputs[i] = val;
@@ -340,7 +381,7 @@ inline bool evaluate(const Pdf& pdf, const Value& function,
       double dr = domain[1] - domain[0];
       if (dr > 0) x = (x - domain[0]) / dr;
     }
-    double xp = std::pow(x, n_exp);
+    double xp = safe_pow(x, n_exp);
     outputs.resize(c0.size());
     for (size_t i = 0; i < c0.size(); ++i)
       outputs[i] = c0[i] + xp * ((i < c1.size() ? c1[i] : 1.0) - c0[i]);

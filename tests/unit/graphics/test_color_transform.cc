@@ -118,4 +118,34 @@ TEST_CASE("ICC profile header parsing") {
   CHECK_EQ(info.num_components, 3);
 }
 
+TEST_CASE("ICC parametric curve avoids NaN for negative pow base") {
+  IccParametricCurve curve;
+  curve.type = 3;
+  curve.g = 2.2f;
+  curve.a = -2.0f;
+  curve.b = 0.1f;
+  curve.c = 0.5f;
+  curve.d = 0.0f;
+
+  float value = curve.apply(1.0f);
+  CHECK(std::isfinite(value));
+  CHECK_EQ(value, 0.0f);
+}
+
+TEST_CASE("ICC parametric type 4 falls back when pow base is negative") {
+  IccParametricCurve curve;
+  curve.type = 4;
+  curve.g = 2.4f;
+  curve.a = -1.5f;
+  curve.b = 0.1f;
+  curve.c = 0.25f;
+  curve.d = 0.0f;
+  curve.e = 0.2f;
+  curve.f = 0.1f;
+
+  float value = curve.apply(1.0f);
+  CHECK(std::isfinite(value));
+  CHECK_EQ(value, 0.2f);
+}
+
 } // TEST_SUITE

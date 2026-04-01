@@ -93,6 +93,29 @@ TEST_CASE_IN_SUITE("backends", "ThorVG progress callback respects threshold") {
 }
 
 TEST_CASE_IN_SUITE("backends",
+                   "ThorVG progress callback skips empty pages even with zero threshold") {
+#if !defined(NANOPDF_USE_THORVG)
+  SKIP_IF(true, "ThorVG backend is not enabled");
+#else
+  nanopdf::Pdf pdf;
+  auto page = make_rect_page(0);
+
+  nanopdf::ThorVGBackend backend;
+  REQUIRE(backend.initialize(64, 64));
+
+  size_t callback_count = 0;
+  backend.set_progress_callback(
+      [&](const nanopdf::RenderProgressInfo&) { callback_count++; }, 0, 1);
+
+  auto result = backend.render_page(pdf, page);
+  REQUIRE(result.success);
+  CHECK_EQ(callback_count, size_t(0));
+
+  backend.clear_progress_callback();
+#endif
+}
+
+TEST_CASE_IN_SUITE("backends",
                    "ThorVG per-render progress options override backend callback") {
 #if !defined(NANOPDF_USE_THORVG)
   SKIP_IF(true, "ThorVG backend is not enabled");

@@ -16,6 +16,27 @@ namespace color {
 
 namespace {
 
+bool checked_mul_size(size_t lhs, size_t rhs, size_t* out) {
+  if (rhs != 0 && lhs > (std::numeric_limits<size_t>::max)() / rhs) {
+    return false;
+  }
+  *out = lhs * rhs;
+  return true;
+}
+
+float safe_powf(float base, float exponent, float fallback = 0.0f) {
+  float integral_part = 0.0f;
+  if (base < 0.0f && std::modf(exponent, &integral_part) != 0.0f) {
+    return fallback;
+  }
+  if (base == 0.0f && exponent < 0.0f) {
+    return fallback;
+  }
+
+  const float value = std::pow(base, exponent);
+  return std::isfinite(value) ? value : fallback;
+}
+
 // Clamp value to [0, 1] range
 inline float clamp01(float v) {
   return std::max(0.0f, std::min(1.0f, v));
@@ -389,29 +410,37 @@ float IccParametricCurve::apply(float x) const {
   switch (type) {
     case 0:
       // Y = X^g
-      return std::pow(x, g);
+      return safe_powf(x, g);
     case 1:
       // Y = (aX+b)^g  if X >= -b/a, else Y = 0
-      if (a != 0.0f && x >= -b / a)
-        return std::pow(a * x + b, g);
+      if (a != 0.0f) {
+        const float base = a * x + b;
+        if (base >= 0.0f) return safe_powf(base, g);
+      }
       return 0.0f;
     case 2:
       // Y = (aX+b)^g + c  if X >= -b/a, else Y = c
-      if (a != 0.0f && x >= -b / a)
-        return std::pow(a * x + b, g) + c;
+      if (a != 0.0f) {
+        const float base = a * x + b;
+        if (base >= 0.0f) return safe_powf(base, g) + c;
+      }
       return c;
     case 3:
       // Y = (aX+b)^g  if X >= d, else Y = cX
-      if (x >= d)
-        return std::pow(a * x + b, g);
+      if (x >= d) {
+        const float base = a * x + b;
+        return (base >= 0.0f) ? safe_powf(base, g) : 0.0f;
+      }
       return c * x;
     case 4:
       // Y = (aX+b)^g + e  if X >= d, else Y = cX + f
-      if (x >= d)
-        return std::pow(a * x + b, g) + e;
+      if (x >= d) {
+        const float base = a * x + b;
+        return (base >= 0.0f) ? safe_powf(base, g) + e : e;
+      }
       return c * x + f;
     default:
-      return std::pow(x, g);
+      return safe_powf(x, g);
   }
 }
 
@@ -696,8 +725,21 @@ bool parse_clut_tag(const uint8_t* data, size_t data_size,
 
     // CLUT data: grid_points^input_channels * output_channels * 2 bytes
     size_t clut_entries = 1;
-    for (int i = 0; i < input_channels; ++i) clut_entries *= grid_points;
-    clut_entries *= output_channels;
+    for (int i = 0; i < input_channels; ++i) {
+      if (!checked_mul_size(clut_entries, static_cast<size_t>(grid_points),
+                            &clut_entries)) {
+        return false;
+      }
+    }
+    if (!checked_mul_size(clut_entries, static_cast<size_t>(output_channels),
+                          &clut_entries)) {
+      return false;
+    }
+    size_t clut_bytes = 0;
+    if (!checked_mul_size(clut_entries, size_t(2), &clut_bytes) ||
+        clut_bytes > (tag_size - pos)) {
+      return false;
+    }
 
     info->clut_data.resize(clut_entries);
     for (size_t i = 0; i < clut_entries; ++i) {
@@ -737,8 +779,17 @@ bool parse_clut_tag(const uint8_t* data, size_t data_size,
     }
 
     size_t clut_entries = 1;
-    for (int i = 0; i < input_channels; ++i) clut_entries *= grid_points;
-    clut_entries *= output_channels;
+    for (int i = 0; i < input_channels; ++i) {
+      if (!checked_mul_size(clut_entries, static_cast<size_t>(grid_points),
+                            &clut_entries)) {
+        return false;
+      }
+    }
+    if (!checked_mul_size(clut_entries, static_cast<size_t>(output_channels),
+                          &clut_entries) ||
+        clut_entries > (tag_size - pos)) {
+      return false;
+    }
 
     info->clut_data.resize(clut_entries);
     for (size_t i = 0; i < clut_entries; ++i) {
