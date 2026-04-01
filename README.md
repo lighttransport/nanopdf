@@ -91,6 +91,9 @@ the bundled miniz library).
 - Blend2D rasterization backend (optional)
 - Render progress callbacks for dense pages (1% steps once the object threshold is reached)
 
+### Example tools
+- `examples/pdfdump/pdfdump.cc` can dump PDF structure as YAML/JSON and export a page as SVG with `-f svg -p 1 -o page1.svg`
+
 ### Other
 - MCP (Model Context Protocol) server for AI integration
 - WebAssembly/Emscripten support with font embedding

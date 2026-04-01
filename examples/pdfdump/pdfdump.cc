@@ -4,12 +4,12 @@
 // PDF structure dump tool using nanopdf
 //
 // Outputs document information including layout, fonts, and images
-// in YAML (default) or JSON format.
+// in YAML (default), JSON, or page-scoped SVG format.
 //
 // Usage: pdfdump <input.pdf> [options]
 //
 // Options:
-//   -f, --format <yaml|json>  Output format (default: yaml)
+//   -f, --format <yaml|json|svg>  Output format (default: yaml)
 //   -o, --output <file>       Output to file instead of stdout
 //   -p, --page <n>            Dump specific page only (1-based)
 //   --no-fonts                Skip font information
@@ -30,6 +30,7 @@
 #include <cmath>
 
 #include "../../src/nanopdf.hh"
+#include "../../src/canvas-exporter.hh"
 #include "../../src/crypto.hh"
 #include "../../src/third_party/stb_image_write.h"
 
@@ -40,7 +41,8 @@ namespace {
 // Output format enum
 enum class OutputFormat {
   YAML,
-  JSON
+  JSON,
+  SVG
 };
 
 struct DumpOptions {
@@ -1919,7 +1921,7 @@ void print_usage(const char* program_name) {
   std::cout << "Usage: " << program_name << " <input.pdf> [options]\n";
   std::cout << "\n";
   std::cout << "Options:\n";
-  std::cout << "  -f, --format <yaml|json>  Output format (default: yaml)\n";
+  std::cout << "  -f, --format <yaml|json|svg>  Output format (default: yaml)\n";
   std::cout << "  -o, --output <file>       Output to file instead of stdout\n";
   std::cout << "  -p, --page <n>            Dump specific page only (1-based)\n";
   std::cout << "  --no-fonts                Skip font information\n";
@@ -1931,6 +1933,7 @@ void print_usage(const char* program_name) {
   std::cout << "Examples:\n";
   std::cout << "  " << program_name << " document.pdf\n";
   std::cout << "  " << program_name << " document.pdf -f json\n";
+  std::cout << "  " << program_name << " document.pdf -f svg -p 1 -o page1.svg\n";
   std::cout << "  " << program_name << " document.pdf -o info.yaml --verbose\n";
   std::cout << "  " << program_name << " document.pdf -p 1 --no-images\n";
 }
@@ -1951,8 +1954,11 @@ bool parse_arguments(int argc, char* argv[], DumpOptions& options) {
         options.format = OutputFormat::YAML;
       } else if (fmt == "json" || fmt == "JSON") {
         options.format = OutputFormat::JSON;
+      } else if (fmt == "svg" || fmt == "SVG") {
+        options.format = OutputFormat::SVG;
       } else {
-        std::cerr << "Error: Unknown format: " << fmt << " (use yaml or json)\n";
+        std::cerr << "Error: Unknown format: " << fmt
+                  << " (use yaml, json, or svg)\n";
         return false;
       }
     } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
@@ -2055,6 +2061,14 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  if (options.format == OutputFormat::SVG &&
+      options.specific_page == 0 &&
+      pdf.catalog.pages.size() != 1) {
+    std::cerr << "Error: SVG output requires --page for multi-page PDFs.\n";
+    std::cerr << "       This keeps the output as a single valid SVG document.\n";
+    return 1;
+  }
+
   // Setup output stream
   std::ofstream output_file;
   std::ostream* out = &std::cout;
@@ -2066,6 +2080,29 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     out = &output_file;
+  }
+
+  if (options.format == OutputFormat::SVG) {
+    size_t page_index = 0;
+    if (options.specific_page > 0) {
+      page_index = static_cast<size_t>(options.specific_page - 1);
+    }
+
+    nanopdf::CanvasExporter exporter;
+    const nanopdf::Page& page = pdf.catalog.pages[page_index];
+    nanopdf::SvgExportResult result = exporter.export_page_to_svg(pdf, page);
+    if (!result.success) {
+      std::cerr << "Error: Failed to export page "
+                << (page_index + 1) << " to SVG: " << result.error << "\n";
+      return 1;
+    }
+
+    *out << exporter.svg_to_markup(result.elements);
+
+    if (output_file.is_open()) {
+      output_file.close();
+    }
+    return 0;
   }
 
   // Create writer and dump information
