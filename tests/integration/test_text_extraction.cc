@@ -5,6 +5,7 @@
 
 #include "nanotest.hh"
 #include "nanopdf.hh"
+#include "pdf-writer.hh"
 #include "text-layout.hh"
 
 #include <fstream>
@@ -35,6 +36,42 @@ bool open_pdf(const std::string& rel_path, std::vector<uint8_t>& data,
               Pdf& pdf) {
   data = load_file(kDataDir + rel_path);
   if (data.empty()) return false;
+  if (!parse_from_memory(data.data(), data.size(), &pdf)) return false;
+  if (!pdf.load_document_structure()) return false;
+  return true;
+}
+
+std::string project_root() {
+#ifdef NANOPDF_PROJECT_DIR
+  return std::string(NANOPDF_PROJECT_DIR);
+#else
+  return std::string("..");
+#endif
+}
+
+std::string noto_sans_jp_regular_path() {
+  return project_root() + "/fonts/noto-sans-jp/NotoSansJP-Regular.otf";
+}
+
+bool build_utf8_pdf(const std::string& text, std::vector<uint8_t>& out_pdf) {
+  nanopdf::PdfWriter writer;
+  const std::string font_path = noto_sans_jp_regular_path();
+  const std::string font_name = writer.add_truetype_font(font_path);
+  if (font_name.empty()) return false;
+
+  writer.add_page(PageSize::A4(), [&](PageBuilder& builder) {
+    builder.begin_text();
+    builder.set_font(font_name, 18.0);
+    builder.show_text_at(72.0, 720.0, text);
+    builder.end_text();
+  });
+
+  WriteResult result = writer.write_to_memory(out_pdf);
+  return result.success;
+}
+
+bool open_generated_pdf(const std::string& text, std::vector<uint8_t>& data, Pdf& pdf) {
+  if (!build_utf8_pdf(text, data)) return false;
   if (!parse_from_memory(data.data(), data.size(), &pdf)) return false;
   if (!pdf.load_document_structure()) return false;
   return true;
@@ -331,6 +368,43 @@ TEST_CASE("search_text_on_page supports fuzzy token matches") {
     CHECK(matches[0].fuzzy);
     CHECK(matches[0].score < 1.0);
     CHECK(matches[0].score > 0.5);
+  }
+}
+
+TEST_CASE("UTF-8 exact search finds Japanese text") {
+  std::vector<uint8_t> data;
+  Pdf pdf;
+  SKIP_IF(!open_generated_pdf("こんにちは世界", data, pdf),
+          "UTF-8 writer fixture not available");
+
+  const Page* page = pdf.get_page(0);
+  REQUIRE(page != nullptr);
+
+  std::vector<TextSearchResult> matches =
+      search_text_on_page(pdf, *page, "こんにちは", false);
+
+  CHECK(!matches.empty());
+  if (!matches.empty()) {
+    CHECK_FALSE(matches[0].fuzzy);
+    CHECK(matches[0].score == 1.0);
+    CHECK(matches[0].length >= std::string("こんにちは").size());
+  }
+}
+
+TEST_CASE("UTF-8 fuzzy search does not mask byte-based limitation") {
+  std::vector<uint8_t> data;
+  Pdf pdf;
+  SKIP_IF(!open_generated_pdf("こんにちは世界", data, pdf),
+          "UTF-8 writer fixture not available");
+
+  const Page* page = pdf.get_page(0);
+  REQUIRE(page != nullptr);
+
+  std::vector<TextSearchResult> matches =
+      search_text_on_page(pdf, *page, "こんにちわ", false);
+
+  if (!matches.empty()) {
+    CHECK(matches[0].fuzzy);
   }
 }
 
