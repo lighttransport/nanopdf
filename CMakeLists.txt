@@ -236,7 +236,7 @@ if(NANOPDF_BUILD_WASM)
 else()
   add_library(${BUILD_TARGET} ${NANOPDF_SOURCES})
 endif()
-target_include_directories(${BUILD_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party)
+target_include_directories(${BUILD_TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party)
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_LOG_LEVEL=${NANOPDF_LOG_LEVEL}")
 
 # Add embedded fonts support
