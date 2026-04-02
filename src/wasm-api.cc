@@ -490,19 +490,12 @@ const char* nanopdf_find_text(int page_index, const char* search_term) {
   }
 
   const auto& page = g_pdf->catalog.pages[page_index];
-  auto text_page = nanopdf::extract_text_layout(*g_pdf, page);
-
-  if (!text_page) {
-    g_text_buffer = "[]";
-    return g_text_buffer.c_str();
-  }
-
-  auto results = text_page->find_text(search_term);
+  auto results = nanopdf::search_text_on_page(*g_pdf, page, search_term, false);
 
   std::string json = "[";
   for (size_t i = 0; i < results.size(); ++i) {
     if (i > 0) json += ",";
-    json += std::to_string(results[i]);
+    json += std::to_string(results[i].char_index);
   }
   json += "]";
 
@@ -1555,14 +1548,8 @@ const char* nanopdf_batch_find_text(const char* search_term, const char* page_in
 
   for (int page_idx : pages) {
     const auto& page = g_pdf->catalog.pages[page_idx];
-    std::string text = nanopdf::extract_text_from_page(*g_pdf, page);
-
-    std::vector<std::pair<size_t, size_t>> matches;
-    size_t pos = 0;
-    while ((pos = text.find(search, pos)) != std::string::npos) {
-      matches.push_back({pos, pos + search.length()});
-      pos += search.length();
-    }
+    std::vector<nanopdf::TextSearchResult> matches =
+        nanopdf::search_text_on_page(*g_pdf, page, search, false);
 
     if (!matches.empty()) {
       if (!first_page) json += ",";
@@ -1577,14 +1564,15 @@ const char* nanopdf_batch_find_text(const char* search_term, const char* page_in
         if (!first_match) json += ",";
         first_match = false;
 
-        // Get context (30 chars before and after)
-        size_t ctx_start = match.first > 30 ? match.first - 30 : 0;
-        size_t ctx_end = std::min(match.second + 30, text.size());
-        std::string context = text.substr(ctx_start, ctx_end - ctx_start);
-
-        json += "{\"start\":" + std::to_string(match.first);
-        json += ",\"end\":" + std::to_string(match.second);
-        json += ",\"context\":\"" + json_escape(context) + "\"}";
+        json += "{\"start\":" + std::to_string(match.char_index);
+        json += ",\"end\":" + std::to_string(match.char_index + match.length);
+        json += ",\"x\":" + std::to_string(match.x);
+        json += ",\"y\":" + std::to_string(match.y);
+        json += ",\"width\":" + std::to_string(match.width);
+        json += ",\"height\":" + std::to_string(match.height);
+        json += ",\"score\":" + std::to_string(match.score);
+        json += ",\"fuzzy\":" + std::string(match.fuzzy ? "true" : "false");
+        json += ",\"context\":\"" + json_escape(match.context) + "\"}";
       }
       json += "]}";
       total_matches += static_cast<int>(matches.size());

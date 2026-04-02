@@ -464,25 +464,22 @@ ToolResult find_text_tool(const JsonValue& args) {
     return ToolResult::error("Page index out of range: " + std::to_string(page_num));
   }
 
-  // Extract text
   const auto& page = g_pdf_state.pdf->catalog.pages[page_num];
-  std::string text = extract_text_from_page(*g_pdf_state.pdf, page);
+  std::vector<TextSearchResult> found =
+      search_text_on_page(*g_pdf_state.pdf, page, query, false);
 
-  // Find all occurrences
   JsonValue matches = JsonValue::array();
-  size_t pos = 0;
-  while ((pos = text.find(query, pos)) != std::string::npos) {
+  for (const auto& hit : found) {
     JsonValue match = JsonValue::object();
-    match["position"] = JsonValue(static_cast<int>(pos));
-
-    // Extract context (20 chars before and after)
-    size_t context_start = (pos >= 20) ? pos - 20 : 0;
-    size_t context_end = std::min(pos + query.length() + 20, text.length());
-    std::string context = text.substr(context_start, context_end - context_start);
-    match["context"] = JsonValue(context);
-
+    match["position"] = JsonValue(static_cast<int>(hit.char_index));
+    match["context"] = JsonValue(hit.context);
+    match["x"] = JsonValue(hit.x);
+    match["y"] = JsonValue(hit.y);
+    match["width"] = JsonValue(hit.width);
+    match["height"] = JsonValue(hit.height);
+    match["score"] = JsonValue(hit.score);
+    match["fuzzy"] = JsonValue(hit.fuzzy);
     matches.push_back(match);
-    pos += query.length();
   }
 
   JsonValue result = JsonValue::object();

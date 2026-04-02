@@ -1434,6 +1434,8 @@ struct TextSearchResult {
   double x{0.0}, y{0.0};    // Position of first character
   double width{0.0}, height{0.0};  // Bounding box of match
   std::string context;       // Surrounding text context
+  double score{1.0};         // 1.0 for exact match, lower for fuzzy
+  bool fuzzy{false};         // Whether this result came from approximate match
 };
 
 // Search text across all pages

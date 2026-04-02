@@ -8,6 +8,7 @@
 #include "text-layout.hh"
 
 #include <fstream>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,44 @@ bool open_pdf(const std::string& rel_path, std::vector<uint8_t>& data,
   if (!parse_from_memory(data.data(), data.size(), &pdf)) return false;
   if (!pdf.load_document_structure()) return false;
   return true;
+}
+
+std::string to_lower_ascii(std::string s) {
+  for (char& ch : s) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return s;
+}
+
+std::string pick_search_token(const std::string& text) {
+  std::string current;
+  for (char ch : text) {
+    if (std::isalnum(static_cast<unsigned char>(ch))) {
+      current.push_back(ch);
+    } else {
+      if (current.size() >= 4) {
+        return current;
+      }
+      current.clear();
+    }
+  }
+
+  if (current.size() >= 4) {
+    return current;
+  }
+
+  return std::string();
+}
+
+std::string mutate_search_token(std::string token) {
+  if (token.size() >= 5) {
+    token.erase(1, 1);
+    return token;
+  }
+  if (!token.empty()) {
+    token[0] = (token[0] == 'x') ? 'y' : 'x';
+  }
+  return token;
 }
 
 }  // namespace
@@ -242,6 +281,79 @@ TEST_CASE("extract_text_from_page and extract_text_layout agree on presence") {
   bool simple_has_text = !simple_text.empty();
   bool layout_has_text = !text_page->chars.empty();
   CHECK_EQ(simple_has_text, layout_has_text);
+}
+
+TEST_CASE("search_text_on_page finds a real token with geometry") {
+  std::vector<uint8_t> data;
+  Pdf pdf;
+  SKIP_IF(!open_pdf("standardencoding/sample_standardencoding.pdf", data, pdf),
+          "sample_standardencoding.pdf not available");
+
+  const Page* page = pdf.get_page(0);
+  REQUIRE(page != nullptr);
+
+  std::string text = extract_text_from_page(pdf, *page);
+  std::string token = pick_search_token(text);
+  REQUIRE(!token.empty());
+
+  std::vector<TextSearchResult> matches =
+      search_text_on_page(pdf, *page, to_lower_ascii(token), false);
+
+  CHECK(!matches.empty());
+  if (!matches.empty()) {
+    CHECK(!matches[0].context.empty());
+    CHECK(matches[0].height >= 0.0);
+    CHECK(matches[0].width >= 0.0);
+  }
+}
+
+TEST_CASE("search_text_on_page supports fuzzy token matches") {
+  std::vector<uint8_t> data;
+  Pdf pdf;
+  SKIP_IF(!open_pdf("standardencoding/sample_standardencoding.pdf", data, pdf),
+          "sample_standardencoding.pdf not available");
+
+  const Page* page = pdf.get_page(0);
+  REQUIRE(page != nullptr);
+
+  std::string text = extract_text_from_page(pdf, *page);
+  std::string token = pick_search_token(text);
+  REQUIRE(!token.empty());
+
+  std::string mutated = mutate_search_token(to_lower_ascii(token));
+  REQUIRE(mutated != to_lower_ascii(token));
+
+  std::vector<TextSearchResult> matches =
+      search_text_on_page(pdf, *page, mutated, false);
+
+  CHECK(!matches.empty());
+  if (!matches.empty()) {
+    CHECK(matches[0].fuzzy);
+    CHECK(matches[0].score < 1.0);
+    CHECK(matches[0].score > 0.5);
+  }
+}
+
+TEST_CASE("search_text respects max_results") {
+  std::vector<uint8_t> data;
+  Pdf pdf;
+  SKIP_IF(!open_pdf("standardencoding/sample_standardencoding.pdf", data, pdf),
+          "sample_standardencoding.pdf not available");
+
+  const Page* page = pdf.get_page(0);
+  REQUIRE(page != nullptr);
+
+  std::string text = extract_text_from_page(pdf, *page);
+  std::string token = pick_search_token(text);
+  REQUIRE(!token.empty());
+
+  std::vector<TextSearchResult> matches =
+      search_text(pdf, to_lower_ascii(token), false, 1);
+
+  CHECK_EQ(matches.size(), size_t(1));
+  if (!matches.empty()) {
+    CHECK(matches[0].page_number < pdf.catalog.pages.size());
+  }
 }
 
 }  // TEST_SUITE("TextExtraction")

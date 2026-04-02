@@ -11609,6 +11609,387 @@ std::string get_context(const std::string& text, size_t match_start,
   return text.substr(ctx_start, ctx_end - ctx_start);
 }
 
+struct SearchCharRef {
+  size_t line_idx{0};
+  size_t char_in_line{0};
+  bool is_text_char{false};
+};
+
+struct SearchablePageText {
+  std::string text;
+  std::vector<SearchCharRef> char_refs;
+};
+
+struct TrigramIndex {
+  std::string text;
+  std::unordered_map<uint32_t, std::vector<size_t>> postings;
+};
+
+struct SearchCandidate {
+  size_t start{0};
+  size_t length{0};
+  double score{0.0};
+  bool fuzzy{false};
+};
+
+void append_utf8(uint32_t unicode, std::string* out,
+                 std::vector<SearchCharRef>* char_refs,
+                 const SearchCharRef& ref) {
+  if (unicode < 0x80) {
+    out->push_back(static_cast<char>(unicode));
+    char_refs->push_back(ref);
+  } else if (unicode < 0x800) {
+    out->push_back(static_cast<char>(0xC0 | (unicode >> 6)));
+    char_refs->push_back(ref);
+    out->push_back(static_cast<char>(0x80 | (unicode & 0x3F)));
+    char_refs->push_back(ref);
+  } else if (unicode < 0x10000) {
+    out->push_back(static_cast<char>(0xE0 | (unicode >> 12)));
+    char_refs->push_back(ref);
+    out->push_back(static_cast<char>(0x80 | ((unicode >> 6) & 0x3F)));
+    char_refs->push_back(ref);
+    out->push_back(static_cast<char>(0x80 | (unicode & 0x3F)));
+    char_refs->push_back(ref);
+  } else {
+    out->push_back(static_cast<char>(0xF0 | (unicode >> 18)));
+    char_refs->push_back(ref);
+    out->push_back(static_cast<char>(0x80 | ((unicode >> 12) & 0x3F)));
+    char_refs->push_back(ref);
+    out->push_back(static_cast<char>(0x80 | ((unicode >> 6) & 0x3F)));
+    char_refs->push_back(ref);
+    out->push_back(static_cast<char>(0x80 | (unicode & 0x3F)));
+    char_refs->push_back(ref);
+  }
+}
+
+SearchablePageText build_searchable_page_text(const TextPage& text_page) {
+  SearchablePageText result;
+
+  std::vector<size_t> line_order(text_page.lines.size());
+  for (size_t i = 0; i < line_order.size(); ++i) {
+    line_order[i] = i;
+  }
+
+  std::sort(line_order.begin(), line_order.end(),
+            [&](size_t a, size_t b) {
+              return text_page.lines[a].reading_order <
+                     text_page.lines[b].reading_order;
+            });
+
+  for (size_t li : line_order) {
+    const TextLine& line = text_page.lines[li];
+    for (size_t ci = 0; ci < line.chars.size(); ++ci) {
+      append_utf8(line.chars[ci].unicode, &result.text, &result.char_refs,
+                  SearchCharRef{li, ci, true});
+    }
+
+    result.text.push_back('\n');
+    result.char_refs.push_back(SearchCharRef{li, line.chars.size(), false});
+  }
+
+  return result;
+}
+
+uint32_t make_trigram_key(unsigned char c0, unsigned char c1, unsigned char c2) {
+  return (static_cast<uint32_t>(c0) << 16) |
+         (static_cast<uint32_t>(c1) << 8) |
+         static_cast<uint32_t>(c2);
+}
+
+std::vector<uint32_t> collect_trigrams(const std::string& text) {
+  std::vector<uint32_t> trigrams;
+  if (text.size() < 3) {
+    return trigrams;
+  }
+
+  trigrams.reserve(text.size() - 2);
+  for (size_t i = 0; i + 2 < text.size(); ++i) {
+    trigrams.push_back(make_trigram_key(
+        static_cast<unsigned char>(text[i]),
+        static_cast<unsigned char>(text[i + 1]),
+        static_cast<unsigned char>(text[i + 2])));
+  }
+  return trigrams;
+}
+
+TrigramIndex build_trigram_index(const std::string& text) {
+  TrigramIndex index;
+  index.text = text;
+
+  if (text.size() < 3) {
+    return index;
+  }
+
+  index.postings.reserve(text.size());
+  for (size_t i = 0; i + 2 < text.size(); ++i) {
+    const uint32_t key = make_trigram_key(
+        static_cast<unsigned char>(text[i]),
+        static_cast<unsigned char>(text[i + 1]),
+        static_cast<unsigned char>(text[i + 2]));
+    index.postings[key].push_back(i);
+  }
+
+  return index;
+}
+
+std::vector<size_t> find_query_positions(const TrigramIndex& index,
+                                         const std::string& query) {
+  std::vector<size_t> matches;
+
+  if (query.empty() || index.text.size() < query.size()) {
+    return matches;
+  }
+
+  if (query.size() < 3) {
+    size_t pos = 0;
+    while ((pos = index.text.find(query, pos)) != std::string::npos) {
+      matches.push_back(pos);
+      pos += 1;
+    }
+    return matches;
+  }
+
+  const uint32_t key = make_trigram_key(
+      static_cast<unsigned char>(query[0]),
+      static_cast<unsigned char>(query[1]),
+      static_cast<unsigned char>(query[2]));
+  auto it = index.postings.find(key);
+  if (it == index.postings.end()) {
+    return matches;
+  }
+
+  for (size_t pos : it->second) {
+    if (pos + query.size() > index.text.size()) {
+      continue;
+    }
+    if (index.text.compare(pos, query.size(), query) == 0) {
+      matches.push_back(pos);
+    }
+  }
+
+  return matches;
+}
+
+size_t levenshtein_distance_bounded(const std::string& a, const std::string& b,
+                                    size_t max_distance) {
+  if (a == b) {
+    return 0;
+  }
+
+  const size_t a_size = a.size();
+  const size_t b_size = b.size();
+  const size_t len_gap = (a_size > b_size) ? (a_size - b_size) : (b_size - a_size);
+  if (len_gap > max_distance) {
+    return max_distance + 1;
+  }
+
+  std::vector<size_t> prev(b_size + 1);
+  std::vector<size_t> curr(b_size + 1);
+  for (size_t j = 0; j <= b_size; ++j) {
+    prev[j] = j;
+  }
+
+  for (size_t i = 0; i < a_size; ++i) {
+    curr[0] = i + 1;
+    size_t row_best = curr[0];
+    for (size_t j = 0; j < b_size; ++j) {
+      const size_t cost = (a[i] == b[j]) ? 0 : 1;
+      curr[j + 1] = std::min(std::min(curr[j] + 1, prev[j + 1] + 1), prev[j] + cost);
+      row_best = std::min(row_best, curr[j + 1]);
+    }
+
+    if (row_best > max_distance) {
+      return max_distance + 1;
+    }
+
+    prev.swap(curr);
+  }
+
+  return prev[b_size];
+}
+
+double trigram_similarity(const std::vector<uint32_t>& query_trigrams,
+                          const std::string& candidate) {
+  if (query_trigrams.empty()) {
+    return candidate.empty() ? 1.0 : 0.0;
+  }
+
+  std::unordered_set<uint32_t> query_set(query_trigrams.begin(), query_trigrams.end());
+  std::vector<uint32_t> candidate_trigrams = collect_trigrams(candidate);
+  if (candidate_trigrams.empty()) {
+    return 0.0;
+  }
+
+  std::unordered_set<uint32_t> candidate_set(candidate_trigrams.begin(), candidate_trigrams.end());
+  size_t intersection = 0;
+  for (uint32_t tri : query_set) {
+    if (candidate_set.count(tri)) {
+      intersection++;
+    }
+  }
+
+  const size_t union_count = query_set.size() + candidate_set.size() - intersection;
+  if (union_count == 0) {
+    return 0.0;
+  }
+
+  return static_cast<double>(intersection) / static_cast<double>(union_count);
+}
+
+std::vector<SearchCandidate> find_fuzzy_positions(const TrigramIndex& index,
+                                                  const std::string& query) {
+  std::vector<SearchCandidate> matches;
+  if (query.size() < 4 || index.text.empty()) {
+    return matches;
+  }
+
+  const std::vector<uint32_t> query_trigrams = collect_trigrams(query);
+  if (query_trigrams.empty()) {
+    return matches;
+  }
+
+  std::unordered_map<size_t, int> vote_map;
+  for (size_t qoff = 0; qoff + 2 < query.size(); ++qoff) {
+    const uint32_t key = query_trigrams[qoff];
+    auto it = index.postings.find(key);
+    if (it == index.postings.end()) {
+      continue;
+    }
+
+    for (size_t pos : it->second) {
+      if (pos < qoff) {
+        continue;
+      }
+      vote_map[pos - qoff] += 1;
+    }
+  }
+
+  if (vote_map.empty()) {
+    return matches;
+  }
+
+  std::vector<std::pair<size_t, int>> ranked(vote_map.begin(), vote_map.end());
+  std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+    if (a.second != b.second) {
+      return a.second > b.second;
+    }
+    return a.first < b.first;
+  });
+
+  const size_t max_edits = std::max<size_t>(1, query.size() / 4);
+  const int min_votes = std::max<int>(1, static_cast<int>(query_trigrams.size() / 3));
+  std::unordered_set<size_t> seen;
+
+  for (size_t i = 0; i < ranked.size() && i < 64; ++i) {
+    const size_t start = ranked[i].first;
+    const int votes = ranked[i].second;
+    if (votes < min_votes || start >= index.text.size()) {
+      continue;
+    }
+
+    const size_t min_len = (query.size() > max_edits) ? (query.size() - max_edits) : 1;
+    const size_t max_len = std::min(index.text.size() - start, query.size() + max_edits);
+    for (size_t cand_len = min_len; cand_len <= max_len; ++cand_len) {
+      const std::string candidate = index.text.substr(start, cand_len);
+      const double tri_score = trigram_similarity(query_trigrams, candidate);
+      if (tri_score < 0.25) {
+        continue;
+      }
+
+      const size_t distance = levenshtein_distance_bounded(query, candidate, max_edits);
+      if (distance > max_edits) {
+        continue;
+      }
+
+      const double norm = static_cast<double>(std::max(query.size(), cand_len));
+      const double edit_score = 1.0 - (static_cast<double>(distance) / norm);
+      const double score = 0.55 * edit_score + 0.45 * tri_score;
+      if (score < 0.55) {
+        continue;
+      }
+
+      if (seen.insert(start).second) {
+        matches.push_back(SearchCandidate{start, cand_len, score, true});
+      }
+      break;
+    }
+  }
+
+  std::sort(matches.begin(), matches.end(), [](const SearchCandidate& a, const SearchCandidate& b) {
+    if (a.score != b.score) {
+      return a.score > b.score;
+    }
+    return a.start < b.start;
+  });
+
+  return matches;
+}
+
+void populate_search_result_geometry(const SearchablePageText& searchable_page,
+                                     const TextPage& text_page,
+                                     size_t start, size_t match_length,
+                                     TextSearchResult* result) {
+  if (!result || start >= searchable_page.char_refs.size() || match_length == 0) {
+    return;
+  }
+
+  const SearchCharRef& first_ref = searchable_page.char_refs[start];
+  if (!first_ref.is_text_char ||
+      first_ref.line_idx >= text_page.lines.size() ||
+      first_ref.char_in_line >= text_page.lines[first_ref.line_idx].chars.size()) {
+    return;
+  }
+
+  const TextChar& first_ch =
+      text_page.lines[first_ref.line_idx].chars[first_ref.char_in_line];
+  result->x = first_ch.x;
+  result->y = first_ch.y;
+  result->height = first_ch.height;
+
+  const size_t end_pos = start + match_length - 1;
+  if (end_pos >= searchable_page.char_refs.size()) {
+    return;
+  }
+
+  const SearchCharRef& last_ref = searchable_page.char_refs[end_pos];
+  if (!last_ref.is_text_char ||
+      last_ref.line_idx >= text_page.lines.size() ||
+      last_ref.char_in_line >= text_page.lines[last_ref.line_idx].chars.size()) {
+    return;
+  }
+
+  const TextChar& last_ch =
+      text_page.lines[last_ref.line_idx].chars[last_ref.char_in_line];
+  result->width = (last_ch.x + last_ch.width) - result->x;
+  result->height = std::max(result->height, last_ch.height);
+}
+
+std::vector<TextSearchResult> build_results_from_candidates(
+    const std::vector<SearchCandidate>& candidates,
+    const std::string& original_text,
+    const SearchablePageText* searchable_page,
+    const TextPage* text_page,
+    const std::string& query) {
+  std::vector<TextSearchResult> results;
+  for (const auto& candidate : candidates) {
+    TextSearchResult result;
+    result.page_number = 0;
+    result.char_index = candidate.start;
+    result.length = candidate.length;
+    result.context = get_context(original_text, candidate.start, candidate.length);
+    result.score = candidate.score;
+    result.fuzzy = candidate.fuzzy;
+
+    if (searchable_page && text_page) {
+      populate_search_result_geometry(*searchable_page, *text_page,
+                                      candidate.start, candidate.length, &result);
+    }
+
+    results.push_back(std::move(result));
+  }
+  return results;
+}
+
 }  // anonymous namespace
 
 std::vector<TextSearchResult> search_text_on_page(const Pdf& pdf,
@@ -11621,156 +12002,63 @@ std::vector<TextSearchResult> search_text_on_page(const Pdf& pdf,
     return results;
   }
 
-  // Extract the plain text from the page
   std::string page_text = extract_text_from_page(pdf, page);
   if (page_text.empty()) {
     return results;
   }
 
-  // Prepare text and query for searching
   std::string search_text_str = case_sensitive ? page_text : to_lower_str(page_text);
   std::string search_query = case_sensitive ? query : to_lower_str(query);
 
-  // Try to get layout information for position data
   std::unique_ptr<TextPage> text_page = extract_text_layout(pdf, page);
 
-  // Build a mapping from text character index to TextChar index in the layout.
-  // The plain text from extract_text_from_page may differ from TextPage chars
-  // (line breaks, spaces, etc.), so we use the layout chars to build a
-  // parallel text string and map positions through it.
-  std::string layout_text;
-  bool have_layout = false;
-
   if (text_page && !text_page->chars.empty()) {
-    // Build text from layout chars in reading order (same order as lines)
-    // Sort lines by reading order
-    std::vector<size_t> line_order(text_page->lines.size());
-    for (size_t i = 0; i < line_order.size(); ++i) {
-      line_order[i] = i;
-    }
-    std::sort(line_order.begin(), line_order.end(),
-              [&](size_t a, size_t b) {
-                return text_page->lines[a].reading_order <
-                       text_page->lines[b].reading_order;
-              });
+    SearchablePageText searchable_page = build_searchable_page_text(*text_page);
+    if (!searchable_page.char_refs.empty()) {
+      std::string search_layout = case_sensitive
+                                      ? searchable_page.text
+                                      : to_lower_str(searchable_page.text);
+      TrigramIndex index = build_trigram_index(search_layout);
 
-    // We'll track which TextChar (by global index in text_page->chars) maps
-    // to each byte position. But since chars inside lines are copies, we need
-    // to match by position. Instead, we iterate lines in reading order and
-    // for each character, record a reference back to the line's char.
-    struct CharRef {
-      size_t line_idx;
-      size_t char_in_line;
-    };
-    std::vector<CharRef> char_refs;
-
-    for (size_t li : line_order) {
-      const TextLine& line = text_page->lines[li];
-      for (size_t ci = 0; ci < line.chars.size(); ++ci) {
-        const TextChar& ch = line.chars[ci];
-        // Encode as UTF-8
-        if (ch.unicode < 0x80) {
-          size_t byte_pos = layout_text.size();
-          layout_text += static_cast<char>(ch.unicode);
-          char_refs.push_back({li, ci});
-          (void)byte_pos;
-        } else if (ch.unicode < 0x800) {
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0xC0 | (ch.unicode >> 6));
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0x80 | (ch.unicode & 0x3F));
-        } else if (ch.unicode < 0x10000) {
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0xE0 | (ch.unicode >> 12));
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0x80 | ((ch.unicode >> 6) & 0x3F));
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0x80 | (ch.unicode & 0x3F));
-        } else {
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0xF0 | (ch.unicode >> 18));
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0x80 | ((ch.unicode >> 12) & 0x3F));
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0x80 | ((ch.unicode >> 6) & 0x3F));
-          char_refs.push_back({li, ci});
-          layout_text += static_cast<char>(0x80 | (ch.unicode & 0x3F));
-        }
-      }
-      // Add newline between lines
-      char_refs.push_back({li, line.chars.size()});  // sentinel
-      layout_text += '\n';
-    }
-
-    have_layout = !char_refs.empty();
-
-    // Now search the layout_text for matches and compute bounding boxes
-    if (have_layout) {
-      std::string search_layout =
-          case_sensitive ? layout_text : to_lower_str(layout_text);
-
-      size_t pos = 0;
-      while ((pos = search_layout.find(search_query, pos)) != std::string::npos) {
-        TextSearchResult result;
-        result.page_number = 0;  // caller sets this for multi-page search
-        result.char_index = pos;
-        result.length = query.size();
-        result.context = get_context(layout_text, pos, search_query.size());
-
-        // Compute bounding box from layout chars
-        if (pos < char_refs.size()) {
-          const CharRef& first_ref = char_refs[pos];
-          if (first_ref.line_idx < text_page->lines.size() &&
-              first_ref.char_in_line <
-                  text_page->lines[first_ref.line_idx].chars.size()) {
-            const TextChar& first_ch =
-                text_page->lines[first_ref.line_idx]
-                    .chars[first_ref.char_in_line];
-            result.x = first_ch.x;
-            result.y = first_ch.y;
-            result.height = first_ch.height;
-
-            // Find the last character of the match
-            size_t end_pos = pos + search_query.size() - 1;
-            if (end_pos < char_refs.size()) {
-              const CharRef& last_ref = char_refs[end_pos];
-              if (last_ref.line_idx < text_page->lines.size() &&
-                  last_ref.char_in_line <
-                      text_page->lines[last_ref.line_idx].chars.size()) {
-                const TextChar& last_ch =
-                    text_page->lines[last_ref.line_idx]
-                        .chars[last_ref.char_in_line];
-                result.width = (last_ch.x + last_ch.width) - result.x;
-                result.height =
-                    std::max(result.height, last_ch.height);
-              }
-            }
-          }
-        }
-
-        results.push_back(result);
-        pos += search_query.size();
+      std::vector<SearchCandidate> exact_candidates;
+      for (size_t pos : find_query_positions(index, search_query)) {
+        exact_candidates.push_back(SearchCandidate{pos, search_query.size(), 1.0, false});
       }
 
-      return results;
+      results = build_results_from_candidates(exact_candidates, searchable_page.text,
+                                              &searchable_page, text_page.get(),
+                                              query);
+      if (!results.empty()) {
+        return results;
+      }
+
+      std::vector<SearchCandidate> fuzzy_candidates =
+          find_fuzzy_positions(index, search_query);
+      results = build_results_from_candidates(fuzzy_candidates, searchable_page.text,
+                                              &searchable_page, text_page.get(),
+                                              query);
+      if (!results.empty()) {
+        return results;
+      }
     }
   }
 
-  // Fallback: search plain text without layout position information
+  std::vector<SearchCandidate> plain_exact_candidates;
   size_t pos = 0;
   while ((pos = search_text_str.find(search_query, pos)) != std::string::npos) {
-    TextSearchResult result;
-    result.page_number = 0;
-    result.char_index = pos;
-    result.length = query.size();
-    result.context = get_context(page_text, pos, search_query.size());
-    // x, y, width, height remain 0 since we have no layout data
-
-    results.push_back(result);
+    plain_exact_candidates.push_back(SearchCandidate{pos, search_query.size(), 1.0, false});
     pos += search_query.size();
   }
 
-  return results;
+  results = build_results_from_candidates(plain_exact_candidates, page_text, nullptr, nullptr, query);
+  if (!results.empty()) {
+    return results;
+  }
+
+  TrigramIndex plain_index = build_trigram_index(search_text_str);
+  std::vector<SearchCandidate> plain_fuzzy_candidates =
+      find_fuzzy_positions(plain_index, search_query);
+  return build_results_from_candidates(plain_fuzzy_candidates, page_text, nullptr, nullptr, query);
 }
 
 std::vector<TextSearchResult> search_text(const Pdf& pdf,
