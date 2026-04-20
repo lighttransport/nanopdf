@@ -115,6 +115,8 @@ set(NANOPDF_SOURCES
   src/third_party/stb_image_write_impl.cc
   src/third_party/stb_truetype_impl.cc
   src/third_party/tiny_dng_impl.cc
+  # ttf_parse for GPOS/kerning support
+  src/third_party/ttf_parse.c
   # JBIG2 decoder infrastructure (Phase 1.4)
   src/jbig2/JBig2_BitStream.cc
   src/jbig2/JBig2_Image.cc

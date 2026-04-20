@@ -15,6 +15,9 @@
 // stb_truetype for glyph outline extraction
 #include "stb_truetype.h"
 
+// ttf_parse for kerning lookup (GPOS and kern table support)
+#include "ttf_parse.h"
+
 #if defined(NANOPDF_USE_NANOSTL)
 #include "nanocstring.h"
 #include "nanostring.h"
@@ -238,6 +241,10 @@ private:
     bool initialized{false};
     bool is_embedded{false};  // true when loaded from PDF-embedded font stream
     std::vector<uint16_t> cid_to_gid;  // CFF charset CID→GID map (empty = identity)
+
+    // ttf_parse context for kerning lookup (supports GPOS kerning)
+    bool has_ttf_parse{false};
+    ttf_font_t ttf;
   };
 
   // Glyph bitmap cache key: font_name + glyph_id + quantized_size

@@ -1686,6 +1686,53 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
           float adv = w / 1000.0f * size + tc_canvas;
           cursor_x += adv * cos_tm;
           cursor_y -= adv * sin_tm;  // canvas y = -(PDF y), so subtract sin
+
+          // Apply kerning if next glyph exists and ttf_parse is available
+          if (font->has_ttf_parse && i + bytes_consumed < text.length()) {
+            // Determine next character code
+            uint32_t next_char_code;
+            if (is_two_byte_cid && i + bytes_consumed + 1 < text.length()) {
+              uint8_t high = static_cast<unsigned char>(text[i + bytes_consumed]);
+              uint8_t low = static_cast<unsigned char>(text[i + bytes_consumed + 1]);
+              next_char_code = (static_cast<uint32_t>(high) << 8) | low;
+            } else {
+              next_char_code = static_cast<unsigned char>(text[i + bytes_consumed]);
+            }
+
+            // Get current glyph index for kern lookup
+            uint16_t current_gid = 0;
+            if (!type0_font->cid_to_gid_map.empty() &&
+                char_code < type0_font->cid_to_gid_map.size()) {
+              current_gid = type0_font->cid_to_gid_map[char_code];
+            } else if (!font->cid_to_gid.empty() &&
+                       char_code < font->cid_to_gid.size()) {
+              current_gid = font->cid_to_gid[char_code];
+            } else {
+              current_gid = static_cast<uint16_t>(char_code);
+            }
+
+            // Get next glyph index
+            uint16_t next_gid = 0;
+            if (!type0_font->cid_to_gid_map.empty() &&
+                next_char_code < type0_font->cid_to_gid_map.size()) {
+              next_gid = type0_font->cid_to_gid_map[next_char_code];
+            } else if (!font->cid_to_gid.empty() &&
+                       next_char_code < font->cid_to_gid.size()) {
+              next_gid = font->cid_to_gid[next_char_code];
+            } else {
+              next_gid = static_cast<uint16_t>(next_char_code);
+            }
+
+            // Lookup kern value in font units
+            int kern = ttf_kern_lookup(&font->ttf, current_gid, next_gid);
+            if (kern != 0) {
+              // Convert kern from font units to text space units
+              // kern is in font units, scale by font_size / units_per_em
+              float kern_text = kern * size / static_cast<float>(font->ttf.units_per_em);
+              cursor_x += kern_text * cos_tm;
+              cursor_y -= kern_text * sin_tm;
+            }
+          }
         }
         i += bytes_consumed;
         continue;
@@ -2120,6 +2167,9 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
       if (embedded_fonts::decompress_font(entry, cache.font_data)) {
         int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+          if (ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
+            cache.has_ttf_parse = true;
+          }
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
           NANOPDF_LOG_DEBUG("ThorVG", "Using embedded font: %s for '%s'",
@@ -2258,6 +2308,15 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
   int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
   if (!stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
     return load_fallback_font_with_hint(font_name, font);
+  }
+
+  // Initialize ttf_parse for kerning lookup (GPOS and kern table support)
+  if (ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
+    cache.has_ttf_parse = true;
+    NANOPDF_LOG_DEBUG("ThorVG", "ttf_parse: kerning available for '%s' (kern=%d, GPOS_count=%d)",
+                      font_name.c_str(),
+                      cache.ttf.tab_kern.len > 0 ? 1 : 0,
+                      cache.ttf.gpos_kern_count);
   }
 
   cache.initialized = true;
@@ -2861,6 +2920,11 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   m.e32 = 0.0f;
   m.e33 = 1.0f;
   picture->transform(m);
+
+  // Apply blend mode
+  if (state_.blend_mode != 0) {
+    picture->blend(static_cast<tvg::BlendMethod>(state_.blend_mode));
+  }
 
   // Push to scene
   apply_soft_mask_opacity(picture);
