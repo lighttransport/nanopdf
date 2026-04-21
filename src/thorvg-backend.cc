@@ -39,10 +39,171 @@ struct ThorVGRect {
   float h{0.0f};
 };
 
+// Emit ThorVG path commands for a ttf_outline_t (TrueType quadratic or CFF cubic).
+// `emit_move`/`emit_line`/`emit_cubic` are called with canvas-space coordinates.
+// Each glyph point (gx, gy) in font units is mapped to canvas by:
+//   dx = gx*scale*cos_theta - gy*scale*sin_theta;
+//   dy = gx*scale*sin_theta + gy*scale*cos_theta;  (in PDF y-up)
+//   cx = x0 + dx;  cy = y0 - dy;                   (canvas is y-down)
+// Contour-traversal mirrors lightui rasterize.c's decompose_outline so that
+// quadratic-only and cubic-only glyphs both round-trip losslessly (quads are
+// converted to cubics via the standard 2/3 control-point rule so ThorVG's
+// cubicTo path is sufficient).
+template <typename MoveFn, typename LineFn, typename CubicFn>
+static void decompose_ttf_outline_to_path(const ttf_outline_t& outline,
+                                          float scale, float x0, float y0,
+                                          float cos_theta, float sin_theta,
+                                          MoveFn emit_move, LineFn emit_line,
+                                          CubicFn emit_cubic) {
+  auto map = [&](float gx, float gy, float& cx, float& cy) {
+    float fx = gx * scale;
+    float fy = gy * scale;
+    cx = x0 + fx * cos_theta - fy * sin_theta;
+    cy = y0 - (fx * sin_theta + fy * cos_theta);
+  };
+
+  int pt_idx = 0;
+  for (int c = 0; c < outline.num_contours; ++c) {
+    int end = outline.contour_ends[c];
+    int start = pt_idx;
+    int npts = end - start + 1;
+    if (npts < 2) { pt_idx = end + 1; continue; }
+
+    auto on_curve = [&](int i) { return outline.points[i].on_curve; };
+    auto raw_x = [&](int i) { return outline.points[i].x; };
+    auto raw_y = [&](int i) { return outline.points[i].y; };
+
+    float first_cx, first_cy;
+    float cur_gx, cur_gy;  // current on-curve point in font units
+    bool has_first = false;
+
+    if (on_curve(start) == 1 || on_curve(start) == 2) {
+      cur_gx = raw_x(start);
+      cur_gy = raw_y(start);
+      map(cur_gx, cur_gy, first_cx, first_cy);
+      emit_move(first_cx, first_cy);
+      has_first = true;
+      pt_idx = start + 1;
+    } else {
+      // TrueType: first point off-curve. If last is on-curve, start there;
+      // otherwise start from midpoint of first and last off-curve points.
+      if (on_curve(end) == 1) {
+        cur_gx = raw_x(end);
+        cur_gy = raw_y(end);
+      } else {
+        cur_gx = 0.5f * (raw_x(start) + raw_x(end));
+        cur_gy = 0.5f * (raw_y(start) + raw_y(end));
+      }
+      map(cur_gx, cur_gy, first_cx, first_cy);
+      emit_move(first_cx, first_cy);
+      has_first = true;
+      pt_idx = start;  // keep the leading off-curve point for the next iteration
+    }
+
+    if (!has_first) { pt_idx = end + 1; continue; }
+
+    while (pt_idx <= end) {
+      int on = on_curve(pt_idx);
+      if (on == 1) {
+        float gx = raw_x(pt_idx), gy = raw_y(pt_idx);
+        float cx, cy; map(gx, gy, cx, cy);
+        emit_line(cx, cy);
+        cur_gx = gx; cur_gy = gy;
+        ++pt_idx;
+      } else if (on == 0) {
+        // Quadratic control point in TrueType; emit as cubic via 2/3 rule.
+        float ctrl_gx = raw_x(pt_idx), ctrl_gy = raw_y(pt_idx);
+        int next = pt_idx + 1;
+        bool wrapped = next > end;
+        if (wrapped) next = start;
+        float end_gx, end_gy;
+        if (on_curve(next) == 1) {
+          end_gx = raw_x(next); end_gy = raw_y(next);
+          pt_idx = wrapped ? end + 1 : next + 1;
+        } else {
+          // Implied on-curve midpoint between two off-curve points.
+          end_gx = 0.5f * (ctrl_gx + raw_x(next));
+          end_gy = 0.5f * (ctrl_gy + raw_y(next));
+          pt_idx = wrapped ? end + 1 : pt_idx + 1;
+        }
+        float p0x, p0y, cpx, cpy, p1x, p1y;
+        map(cur_gx, cur_gy, p0x, p0y);
+        map(ctrl_gx, ctrl_gy, cpx, cpy);
+        map(end_gx, end_gy, p1x, p1y);
+        float cp1x = p0x + (2.0f / 3.0f) * (cpx - p0x);
+        float cp1y = p0y + (2.0f / 3.0f) * (cpy - p0y);
+        float cp2x = p1x + (2.0f / 3.0f) * (cpx - p1x);
+        float cp2y = p1y + (2.0f / 3.0f) * (cpy - p1y);
+        emit_cubic(cp1x, cp1y, cp2x, cp2y, p1x, p1y);
+        cur_gx = end_gx; cur_gy = end_gy;
+      } else if (on == 2) {
+        // CFF cubic: two cubic control points followed by an on-curve endpoint.
+        int n1 = pt_idx + 1, n2 = pt_idx + 2;
+        if (n1 > end) n1 = start + (n1 - end - 1);
+        if (n2 > end) n2 = start + (n2 - end - 1);
+        float c1x, c1y, c2x, c2y, ex, ey;
+        map(raw_x(pt_idx), raw_y(pt_idx), c1x, c1y);
+        map(raw_x(n1), raw_y(n1), c2x, c2y);
+        map(raw_x(n2), raw_y(n2), ex, ey);
+        emit_cubic(c1x, c1y, c2x, c2y, ex, ey);
+        cur_gx = raw_x(n2); cur_gy = raw_y(n2);
+        pt_idx += 3;
+        if (pt_idx > end + 1) pt_idx = end + 1;
+      } else {
+        ++pt_idx;
+      }
+    }
+    pt_idx = end + 1;
+  }
+}
+
 static bool is_pdf_content_delimiter(char c) {
   return std::isspace(static_cast<unsigned char>(c)) || c == '/' || c == '[' ||
          c == ']' || c == '(' || c == ')' || c == '<' || c == '>' ||
          c == '{' || c == '}';
+}
+
+// Decode PDF literal string body (content inside the outer parentheses).
+// Handles backslash escapes (\n, \r, \t, \b, \f, \(, \), \\) and octal
+// escapes (\ddd up to 3 digits). Unknown escapes reduce to the next char.
+// Line continuations (\ followed by newline) are removed.
+static std::string decode_pdf_literal_string(const std::string& raw) {
+  std::string out;
+  out.reserve(raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) {
+    char c = raw[i];
+    if (c != '\\') { out += c; continue; }
+    if (i + 1 >= raw.size()) break;
+    char n = raw[++i];
+    switch (n) {
+      case 'n': out += '\n'; break;
+      case 'r': out += '\r'; break;
+      case 't': out += '\t'; break;
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
+      case '(': out += '('; break;
+      case ')': out += ')'; break;
+      case '\\': out += '\\'; break;
+      case '\n': break;  // line continuation
+      case '\r':
+        if (i + 1 < raw.size() && raw[i + 1] == '\n') ++i;
+        break;
+      default:
+        if (n >= '0' && n <= '7') {
+          int val = n - '0';
+          for (int d = 0; d < 2 && i + 1 < raw.size() && raw[i + 1] >= '0' &&
+                          raw[i + 1] <= '7';
+               ++d) {
+            val = val * 8 + (raw[++i] - '0');
+          }
+          out += static_cast<char>(val & 0xFF);
+        } else {
+          out += n;  // unknown escape: emit literal character
+        }
+        break;
+    }
+  }
+  return out;
 }
 
 static bool is_render_progress_operator(std::string_view token) {
@@ -1650,9 +1811,27 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         } else {
           // Fallback font: need Unicode codepoints for the font's real Unicode cmap
           uint32_t unicode = char_code;
+          bool mapped = false;
           if (!type0_font->to_unicode_cmap.code_to_unicode.empty()) {
-            unicode = type0_font->to_unicode_cmap.map_code_to_unicode(char_code);
-          } else {
+            auto it = type0_font->to_unicode_cmap.code_to_unicode.find(char_code);
+            if (it != type0_font->to_unicode_cmap.code_to_unicode.end()) {
+              unicode = it->second;
+              mapped = true;
+            }
+          }
+          if (!mapped) {
+            // Subsetted Symbol-family CID fonts often carry a bullet glyph at
+            // CID 0x50 without a ToUnicode entry; translate to U+2022 so the
+            // Unicode-based substitute (STIXTwoMath) hits the right glyph.
+            const std::string& bn = type0_font->base_font;
+            bool is_symbol = bn.find("Symbol") != std::string::npos ||
+                             bn.find("symbol") != std::string::npos;
+            if (is_symbol && char_code == 0x50) {
+              unicode = 0x2022;  // bullet
+              mapped = true;
+            }
+          }
+          if (!mapped) {
             unicode = map_char_to_unicode(char_code, current_font_);
           }
           draw_glyph(static_cast<int>(unicode), draw_x, draw_y, size, r, g, b, a);
@@ -1681,9 +1860,26 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         } else {
           // Horizontal mode: advance cursor in text direction using horizontal widths
           auto width_it = type0_font->cid_widths.find(char_code);
-          int w = (width_it != type0_font->cid_widths.end())
-              ? width_it->second : type0_font->default_width;
-          float adv = w / 1000.0f * size + tc_canvas;
+          float adv;
+          if (width_it != type0_font->cid_widths.end()) {
+            adv = width_it->second / 1000.0f * size + tc_canvas;
+          } else if (!using_embedded && font && font->has_ttf_parse) {
+            // Substitute font: look up advance from the fallback font's hmtx
+            // rather than trusting DW=1000 which gives 1-em spacing per glyph.
+            uint32_t lookup = char_code;
+            if (!type0_font->to_unicode_cmap.code_to_unicode.empty()) {
+              lookup = type0_font->to_unicode_cmap.map_code_to_unicode(char_code);
+            }
+            uint16_t fgid = ttf_cmap_lookup(&font->ttf, lookup);
+            if (fgid == 0 && lookup != char_code) {
+              fgid = ttf_cmap_lookup(&font->ttf, char_code);
+            }
+            uint16_t fadv_units = ttf_hmtx_advance(&font->ttf, fgid);
+            uint16_t upem = font->ttf.units_per_em ? font->ttf.units_per_em : 1000;
+            adv = (static_cast<float>(fadv_units) / upem) * size + tc_canvas;
+          } else {
+            adv = type0_font->default_width / 1000.0f * size + tc_canvas;
+          }
           cursor_x += adv * cos_tm;
           cursor_y -= adv * sin_tm;  // canvas y = -(PDF y), so subtract sin
 
@@ -1738,12 +1934,23 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         continue;
       }
 
-      // Non-Type0 fonts: use encoding tables and stbtt metrics
+      // Non-Type0 fonts: use encoding tables and ttf_parse metrics.
+      // ttf_parse (from lightui) covers both the legacy `kern` table and GPOS
+      // PairPos (kern feature), matching what HarfBuzz does for Latin kerning.
       uint32_t codepoint = map_char_to_unicode(char_code, current_font_);
 
-      // Get glyph metrics for advance width
-      int advance_width, left_bearing;
-      stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(codepoint), &advance_width, &left_bearing);
+      // Resolve glyph ID via ttf_parse cmap when available; fall back to stbtt.
+      uint16_t gid = 0;
+      int advance_width = 0;
+      if (font->has_ttf_parse) {
+        gid = ttf_cmap_lookup(&font->ttf, codepoint);
+        advance_width = ttf_hmtx_advance(&font->ttf, gid);
+      } else {
+        int lsb;
+        stbtt_GetCodepointHMetrics(&font->font_info,
+                                   static_cast<int>(codepoint),
+                                   &advance_width, &lsb);
+      }
 
       // Draw the glyph
       draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
@@ -1759,18 +1966,31 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
       if (char_code == 32 && std::abs(state_.font_size) > 0.001f) {
         tw_canvas = state_.word_spacing * size / state_.font_size;
       }
-      float adv = advance_width * scale + tc_canvas2 + tw_canvas;
+      // PDF text space uses em units: advance_text = advance_font_units / units_per_em * Tfs.
+      // Keep draw_text advance in canvas pixels but derived from the em box so it matches
+      // TJ/Tj tracking in calculate_text_width (which is also em-based).
+      float em_scale = (font->ttf.units_per_em > 0)
+          ? (size / static_cast<float>(font->ttf.units_per_em))
+          : scale;
+      float adv = advance_width * em_scale + tc_canvas2 + tw_canvas;
       cursor_x += adv * cos_tm;
       cursor_y -= adv * sin_tm;
 
-      // Add kerning if there's a next character
+      // Add kerning if there's a next character. Prefer ttf_parse (kern + GPOS)
+      // over stbtt which only reads the legacy kern table.
       if (i + bytes_consumed < text.length()) {
         uint32_t next_char_code = static_cast<unsigned char>(text[i + bytes_consumed]);
         uint32_t next_codepoint = map_char_to_unicode(next_char_code, current_font_);
-        int kern = stbtt_GetCodepointKernAdvance(&font->font_info,
-                                                  static_cast<int>(codepoint),
-                                                  static_cast<int>(next_codepoint));
-        float kern_adv = kern * scale;
+        int kern = 0;
+        if (font->has_ttf_parse) {
+          uint16_t next_gid = ttf_cmap_lookup(&font->ttf, next_codepoint);
+          kern = ttf_kern_lookup(&font->ttf, gid, next_gid);
+        } else {
+          kern = stbtt_GetCodepointKernAdvance(&font->font_info,
+                                               static_cast<int>(codepoint),
+                                               static_cast<int>(next_codepoint));
+        }
+        float kern_adv = kern * em_scale;
         cursor_x += kern_adv * cos_tm;
         cursor_y -= kern_adv * sin_tm;
       }
@@ -2082,11 +2302,13 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
 
   static const char** font_lists[] = { sans_fonts, mono_fonts, serif_fonts, symbol_fonts, cjk_sans_fonts };
 
-  // For CJK, select serif (Mincho) or sans (Gothic) list based on font name
+  // For CJK, select serif (Mincho) or sans (Gothic) list based on font name.
+  // Use hint_name (PDF BaseFont like "YuMincho-Regular") rather than the short
+  // PDF resource name ("C2_0"), which carries no type info.
   const char** font_list = font_lists[category];
   if (category == 4) {
     std::string lower;
-    for (char c : font_name)
+    for (char c : hint_name)
       lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (lower.find("mincho") != std::string::npos ||
         lower.find("ming") != std::string::npos ||
@@ -2193,6 +2415,9 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
         int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
           cache.initialized = true;
+          if (ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
+            cache.has_ttf_parse = true;
+          }
           font_cache_[font_name] = std::move(cache);
           NANOPDF_LOG_DEBUG("ThorVG", "Using embedded CJK font: %s for '%s'", target, font_name.c_str());
           return true;
@@ -2262,8 +2487,12 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
     return load_fallback_font_with_hint(font_name, font);
   }
 
-  // Resolve and decode font file stream
+  // Resolve and decode font file stream. The obj/gen numbers must be passed through
+  // to decode_stream so encrypted font streams can be decrypted (the per-object key
+  // is derived from obj/gen).
   Value font_file_val = desc->font_file;
+  uint32_t font_obj_num = desc->font_file.ref_object_number;
+  uint16_t font_gen_num = desc->font_file.ref_generation_number;
   if (font_file_val.type == Value::REFERENCE) {
     auto resolved = resolve_reference(pdf, font_file_val.ref_object_number,
                                       font_file_val.ref_generation_number);
@@ -2277,8 +2506,7 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
     return load_fallback_font_with_hint(font_name, font);
   }
 
-  // Decode the font stream
-  auto decoded = decode_stream(pdf, font_file_val);
+  auto decoded = decode_stream(pdf, font_file_val, font_obj_num, font_gen_num);
   if (!decoded.success || decoded.data.empty()) {
     return load_fallback_font_with_hint(font_name, font);
   }
@@ -2378,8 +2606,29 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
         // PDF widths are in 1/1000 of text space unit
         width += width_it->second / 1000.0f * font_size;
       } else {
-        // Use default width
-        width += type0_font->default_width / 1000.0f * font_size;
+        // Fallback: if using a substitute (non-embedded) font with ttf_parse,
+        // use the substitute's actual hmtx advance instead of the 1-em DW.
+        FontCache* fc = get_font(current_font_name_);
+        bool used_ttf = false;
+        if (fc && !fc->is_embedded && fc->has_ttf_parse) {
+          uint32_t lookup = char_code;
+          if (!type0_font->to_unicode_cmap.code_to_unicode.empty()) {
+            lookup = type0_font->to_unicode_cmap.map_code_to_unicode(char_code);
+          }
+          uint16_t fgid = ttf_cmap_lookup(&fc->ttf, lookup);
+          if (fgid == 0 && lookup != char_code) {
+            fgid = ttf_cmap_lookup(&fc->ttf, char_code);
+          }
+          if (fgid != 0) {
+            uint16_t fadv_units = ttf_hmtx_advance(&fc->ttf, fgid);
+            uint16_t upem = fc->ttf.units_per_em ? fc->ttf.units_per_em : 1000;
+            width += (static_cast<float>(fadv_units) / upem) * font_size;
+            used_ttf = true;
+          }
+        }
+        if (!used_ttf) {
+          width += type0_font->default_width / 1000.0f * font_size;
+        }
       }
       num_chars++;
       i += bytes_consumed;
@@ -2389,7 +2638,6 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
     return width;
   }
 
-  // Check if BaseFont has width information
   if (current_font_ && !current_font_->widths.empty()) {
     float width = 0.0f;
     int num_chars = 0;
@@ -2402,20 +2650,16 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
           static_cast<int>(char_code) <= last_char) {
         size_t idx = char_code - first_char;
         if (idx < current_font_->widths.size()) {
-          // PDF widths are in 1/1000 of text space unit
           width += current_font_->widths[idx] / 1000.0f * font_size;
-          // Add word spacing (Tw) for single-byte space (code 32)
           if (char_code == 32) width += state_.word_spacing;
           num_chars++;
           continue;
         }
       }
-      // Default width for missing glyphs
       width += font_size * 0.5f;
       if (char_code == 32) width += state_.word_spacing;
       num_chars++;
     }
-    // Add character spacing (Tc) for each character
     width += num_chars * state_.char_spacing;
     return width;
   }
@@ -2433,41 +2677,50 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
   for (size_t i = 0; i < text.length(); i++) {
     uint32_t char_code = static_cast<unsigned char>(text[i]);
 
-    // For Type0/CID fonts with CIDToGIDMap, use glyph index
+    // For Type0/CID fonts with CIDToGIDMap, use glyph index directly.
     if (type0_font && !type0_font->cid_to_gid_map.empty()) {
       if (char_code < type0_font->cid_to_gid_map.size()) {
         int gid = type0_font->cid_to_gid_map[char_code];
-        int advance_width, left_bearing;
-        stbtt_GetGlyphHMetrics(&font->font_info, gid, &advance_width, &left_bearing);
+        int advance_width = 0;
+        if (font->has_ttf_parse) {
+          advance_width = ttf_hmtx_advance(&font->ttf, static_cast<uint16_t>(gid));
+        } else {
+          int lsb;
+          stbtt_GetGlyphHMetrics(&font->font_info, gid, &advance_width, &lsb);
+        }
         width += advance_width * scale;
         continue;
       }
     }
 
-    // Map to Unicode and get metrics
+    // Map to Unicode and get metrics. Prefer ttf_parse (cmap + hmtx) over
+    // stbtt; the two agree on advance widths but ttf_parse keeps the code
+    // path consistent with draw_text. Kerning is intentionally NOT applied
+    // here because Tm advance in PDF tracks unkerned widths — kerning is a
+    // visual offset applied per-glyph inside draw_text only.
     uint32_t codepoint = map_char_to_unicode(char_code, current_font_);
-    int advance_width, left_bearing;
-    stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(codepoint), &advance_width, &left_bearing);
+    int advance_width = 0;
+    if (font->has_ttf_parse) {
+      uint16_t g = ttf_cmap_lookup(&font->ttf, codepoint);
+      advance_width = ttf_hmtx_advance(&font->ttf, g);
+    } else {
+      int lsb;
+      stbtt_GetCodepointHMetrics(&font->font_info,
+                                 static_cast<int>(codepoint),
+                                 &advance_width, &lsb);
+    }
     width += advance_width * scale;
 
-    // Add kerning
-    if (i + 1 < text.length()) {
-      uint32_t next_char_code = static_cast<unsigned char>(text[i + 1]);
-      uint32_t next_codepoint = map_char_to_unicode(next_char_code, current_font_);
-      int kern = stbtt_GetCodepointKernAdvance(&font->font_info,
-                                                static_cast<int>(codepoint),
-                                                static_cast<int>(next_codepoint));
-      width += kern * scale;
-    }
     // Add word spacing (Tw) for single-byte space (code 32)
     if (char_code == 32) width += state_.word_spacing * scale;
   }
 
-  // Convert from pixel width back to text space units
   if (scale > 0) {
-    width = width / scale;
+    float em_scale = (font->ttf.units_per_em > 0)
+        ? (font_size / static_cast<float>(font->ttf.units_per_em))
+        : scale;
+    width = (width / scale) * em_scale;
   }
-  // Add character spacing (Tc) for each character
   width += static_cast<float>(text.length()) * state_.char_spacing;
   return width;
 }
@@ -2677,19 +2930,28 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
       }
     }
 
-    for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
-      uint8_t idx = image.data[i];
-      int lookup_idx = idx * base_components;
-
-      uint8_t r = 0, g = 0, b = 0;
-      if (base_components == 1 && lookup_idx < static_cast<int>(lookup.size())) {
-        r = g = b = lookup[lookup_idx];
-      } else if (base_components >= 3 && lookup_idx + 2 < static_cast<int>(lookup.size())) {
-        r = lookup[lookup_idx];
-        g = lookup[lookup_idx + 1];
-        b = lookup[lookup_idx + 2];
+    // If the lookup table couldn't be resolved, fall back to treating pixel bytes
+    // as direct grayscale — visually degraded but avoids a solid block.
+    if (lookup.empty()) {
+      for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
+        uint8_t gray = image.data[i];
+        argb_data[i] = (0xFF << 24) | (gray << 16) | (gray << 8) | gray;
       }
-      argb_data[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+    } else {
+      for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
+        uint8_t idx = image.data[i];
+        int lookup_idx = idx * base_components;
+
+        uint8_t r = 0, g = 0, b = 0;
+        if (base_components == 1 && lookup_idx < static_cast<int>(lookup.size())) {
+          r = g = b = lookup[lookup_idx];
+        } else if (base_components >= 3 && lookup_idx + 2 < static_cast<int>(lookup.size())) {
+          r = lookup[lookup_idx];
+          g = lookup[lookup_idx + 1];
+          b = lookup[lookup_idx + 2];
+        }
+        argb_data[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+      }
     }
   }
   // Handle ICCBased color space with profile conversion
@@ -2873,6 +3135,68 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
                     image.data[src_idx + 2] / 255.0f, image.data[src_idx + 3] / 255.0f,
                     r, g, b_val);
         argb_data[i] = (0xFF << 24) | (r << 16) | (g << 8) | b_val;
+      }
+    }
+  }
+
+  // Apply image's own Soft Mask (SMask) as per-pixel alpha.
+  // SMask is a grayscale image; each sample becomes alpha for the corresponding
+  // base-image pixel. When dimensions differ, nearest-neighbor sample.
+  if (current_pdf_ && image.soft_mask.type != Value::UNDEFINED &&
+      image.soft_mask.type != Value::NULL_OBJ) {
+    Value smask_val = image.soft_mask;
+    uint32_t sm_obj = smask_val.ref_object_number;
+    uint16_t sm_gen = smask_val.ref_generation_number;
+    if (smask_val.type == Value::REFERENCE) {
+      auto resolved = resolve_reference(*current_pdf_, sm_obj, sm_gen);
+      if (resolved.success) smask_val = resolved.value;
+    }
+    if (smask_val.type == Value::STREAM) {
+      ImageXObject smask_img = parse_image_xobject(*current_pdf_, smask_val, sm_obj, sm_gen);
+      if (!smask_img.data.empty() && smask_img.width > 0 && smask_img.height > 0) {
+        int sw = smask_img.width;
+        int sh = smask_img.height;
+        // We load the Picture with tvg::ColorSpace::ARGB8888 (premultiplied),
+        // so we must premultiply each RGB channel by the alpha we're applying.
+        // If we wrote straight alpha here, ThorVG's downscaling filter would
+        // blend the interior RGB with the palette's "outside" color (typically
+        // black for PDF masked images), producing a dark halo at letter edges.
+        auto premult_pixel = [](uint32_t& argb, uint32_t alpha) {
+          uint32_t r = (argb >> 16) & 0xFF;
+          uint32_t g = (argb >> 8) & 0xFF;
+          uint32_t b = argb & 0xFF;
+          // Round-to-nearest to avoid a one-bit bias that darkens fringe pixels.
+          r = (r * alpha + 127) / 255;
+          g = (g * alpha + 127) / 255;
+          b = (b * alpha + 127) / 255;
+          argb = (alpha << 24) | (r << 16) | (g << 8) | b;
+        };
+        // Only 8-bit grayscale masks handled here; other bit depths fall through.
+        if (smask_img.bits_per_component == 8) {
+          for (int py = 0; py < img_height; ++py) {
+            int sy = (py * sh) / img_height;
+            for (int px = 0; px < img_width; ++px) {
+              int sx = (px * sw) / img_width;
+              size_t si = static_cast<size_t>(sy) * sw + sx;
+              if (si < smask_img.data.size()) {
+                premult_pixel(argb_data[py * img_width + px], smask_img.data[si]);
+              }
+            }
+          }
+        } else if (smask_img.bits_per_component == 1) {
+          int stride = (sw + 7) / 8;
+          for (int py = 0; py < img_height; ++py) {
+            int sy = (py * sh) / img_height;
+            for (int px = 0; px < img_width; ++px) {
+              int sx = (px * sw) / img_width;
+              size_t bi = static_cast<size_t>(sy) * stride + (sx / 8);
+              if (bi < smask_img.data.size()) {
+                uint8_t bit = (smask_img.data[bi] >> (7 - (sx % 8))) & 1u;
+                premult_pixel(argb_data[py * img_width + px], bit ? 0xFFu : 0x00u);
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -4539,18 +4863,45 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     }
   }
 
-  // Get glyph outline from stb_truetype
-  stbtt_vertex* vertices = nullptr;
-  int num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
-
-  if (num_verts == 0 || !vertices) {
-    // Glyph not found - draw tofu box placeholder
-    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
-    return true;
+  // Resolve glyph via ttf_parse when available; keep stbtt as a last-ditch
+  // fallback for fonts that ttf_parse rejects at init time.
+  uint16_t gid = 0;
+  ttf_outline_t outline{};
+  bool have_ttf_outline = false;
+  if (font->has_ttf_parse) {
+    gid = ttf_cmap_lookup(&font->ttf, static_cast<uint32_t>(codepoint));
+    if (gid != 0 && ttf_glyph_outline(&font->ttf, gid, &outline) == 0) {
+      have_ttf_outline = true;
+    }
   }
 
-  // Calculate scale factor
-  float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+  stbtt_vertex* vertices = nullptr;
+  int num_verts = 0;
+  if (!have_ttf_outline) {
+    // stbtt_GetCodepointShape returns the font's .notdef glyph when the
+    // codepoint is not in the cmap — many fonts draw .notdef as a visible
+    // tofu-box-with-X, which is misleading here. Check the glyph index
+    // explicitly and render our own placeholder when missing.
+    int stbtt_gid = stbtt_FindGlyphIndex(&font->font_info, codepoint);
+    if (stbtt_gid == 0) {
+      draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
+      return true;
+    }
+    num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
+    if (num_verts == 0 || !vertices) {
+      draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
+      return true;
+    }
+  }
+
+  // Both code paths use the same em-based scale: size (canvas px) per em unit.
+  // ttf_parse stores units_per_em; fall back to stbtt's ScaleForPixelHeight.
+  float scale = 0.0f;
+  if (have_ttf_outline && font->ttf.units_per_em > 0) {
+    scale = size / static_cast<float>(font->ttf.units_per_em);
+  } else {
+    scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+  }
 
   // Compute rotation from text matrix for rotated text (e.g., [0 -8 8 0])
   float font_scale_tm = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
@@ -4561,142 +4912,98 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     sin_theta = state_.text_matrix.b / font_scale_tm;
   }
 
-  // Build ThorVG path from stb_truetype vertices
   auto shape = tvg::Shape::gen();
   if (!shape) {
-    stbtt_FreeShape(&font->font_info, vertices);
+    if (have_ttf_outline) ttf_outline_free(&outline);
+    else stbtt_FreeShape(&font->font_info, vertices);
     return false;
   }
 
-  // Helper lambda to transform glyph-local coordinates with rotation
-  // In PDF coords (y-up), glyph point (gx, gy) rotates to:
-  //   dx = gx*cos - gy*sin, dy = gx*sin + gy*cos
-  // In canvas coords (y-down): vx = x + dx, vy = y - dy
-  auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
-    float gx = gx_raw * scale;
-    float gy = gy_raw * scale;
-    out_x = x + gx * cos_theta - gy * sin_theta;
-    out_y = y - (gx * sin_theta + gy * cos_theta);
-  };
-
-  // Track current position for quadratic-to-cubic conversion
-  float curr_x = x, curr_y = y;
-
-  for (int i = 0; i < num_verts; i++) {
-    stbtt_vertex* v = &vertices[i];
-    float vx, vy;
-    transform_vertex(v->x, v->y, vx, vy);
-
-    switch (v->type) {
-      case STBTT_vmove:
-        shape->moveTo(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      case STBTT_vline:
-        shape->lineTo(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      case STBTT_vcurve: {
-        // Quadratic bezier - convert to cubic for ThorVG
-        float cx, cy;
-        transform_vertex(v->cx, v->cy, cx, cy);
-
-        // Convert quadratic to cubic bezier:
-        // CP1 = P0 + 2/3 * (P1 - P0)
-        // CP2 = P2 + 2/3 * (P1 - P2)
-        float cp1x = curr_x + (2.0f / 3.0f) * (cx - curr_x);
-        float cp1y = curr_y + (2.0f / 3.0f) * (cy - curr_y);
-        float cp2x = vx + (2.0f / 3.0f) * (cx - vx);
-        float cp2y = vy + (2.0f / 3.0f) * (cy - vy);
-
-        shape->cubicTo(cp1x, cp1y, cp2x, cp2y, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      }
-      case STBTT_vcubic: {
-        float cx1, cy1, cx2, cy2;
-        transform_vertex(v->cx, v->cy, cx1, cy1);
-        transform_vertex(v->cx1, v->cy1, cx2, cy2);
-        shape->cubicTo(cx1, cy1, cx2, cy2, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      }
-    }
-  }
-
-  shape->close();
-
-  // Apply rendering based on text rendering mode
-  // 0 = Fill, 1 = Stroke, 2 = Fill+Stroke, 3 = Invisible
-  // 4 = Fill+Clip, 5 = Stroke+Clip, 6 = Fill+Stroke+Clip, 7 = Clip only
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
-  bool invisible = (render_mode == 3);  // Only mode 3 is truly invisible
+  bool invisible = (render_mode == 3);
   bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
 
-  // If adding to clip, accumulate glyph path in text_clip arrays
-  if (add_to_clip) {
-    state_.text_clip_active = true;
-    // Re-trace the glyph path to accumulate clip commands
-    float curr_x_clip = x, curr_y_clip = y;
+  // Emit path commands into both the shape and (when needed) the clip accumulator
+  // in a single outline walk.
+  auto emit_move = [&](float cx, float cy) {
+    shape->moveTo(cx, cy);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::MoveTo);
+      state_.text_clip_points.push_back({cx, cy});
+    }
+  };
+  auto emit_line = [&](float cx, float cy) {
+    shape->lineTo(cx, cy);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::LineTo);
+      state_.text_clip_points.push_back({cx, cy});
+    }
+  };
+  auto emit_cubic = [&](float c1x, float c1y, float c2x, float c2y, float ex, float ey) {
+    shape->cubicTo(c1x, c1y, c2x, c2y, ex, ey);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
+      state_.text_clip_points.push_back({c1x, c1y});
+      state_.text_clip_points.push_back({c2x, c2y});
+      state_.text_clip_points.push_back({ex, ey});
+    }
+  };
+
+  if (add_to_clip) state_.text_clip_active = true;
+
+  if (have_ttf_outline) {
+    decompose_ttf_outline_to_path(outline, scale, x, y, cos_theta, sin_theta,
+                                  emit_move, emit_line, emit_cubic);
+  } else {
+    // Legacy stbtt path — only reached when ttf_parse couldn't load the font.
+    auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
+      float gx = gx_raw * scale;
+      float gy = gy_raw * scale;
+      out_x = x + gx * cos_theta - gy * sin_theta;
+      out_y = y - (gx * sin_theta + gy * cos_theta);
+    };
+    float curr_x = x, curr_y = y;
     for (int i = 0; i < num_verts; i++) {
       stbtt_vertex* v = &vertices[i];
       float vx, vy;
       transform_vertex(v->x, v->y, vx, vy);
-
       switch (v->type) {
         case STBTT_vmove:
-          state_.text_clip_commands.push_back(tvg::PathCommand::MoveTo);
-          state_.text_clip_points.push_back({vx, vy});
-          curr_x_clip = vx;
-          curr_y_clip = vy;
-          break;
+          emit_move(vx, vy);
+          curr_x = vx; curr_y = vy; break;
         case STBTT_vline:
-          state_.text_clip_commands.push_back(tvg::PathCommand::LineTo);
-          state_.text_clip_points.push_back({vx, vy});
-          curr_x_clip = vx;
-          curr_y_clip = vy;
-          break;
+          emit_line(vx, vy);
+          curr_x = vx; curr_y = vy; break;
         case STBTT_vcurve: {
-          float cx, cy;
-          transform_vertex(v->cx, v->cy, cx, cy);
-          float cp1x = curr_x_clip + (2.0f / 3.0f) * (cx - curr_x_clip);
-          float cp1y = curr_y_clip + (2.0f / 3.0f) * (cy - curr_y_clip);
+          float cx, cy; transform_vertex(v->cx, v->cy, cx, cy);
+          float cp1x = curr_x + (2.0f / 3.0f) * (cx - curr_x);
+          float cp1y = curr_y + (2.0f / 3.0f) * (cy - curr_y);
           float cp2x = vx + (2.0f / 3.0f) * (cx - vx);
           float cp2y = vy + (2.0f / 3.0f) * (cy - vy);
-          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
-          state_.text_clip_points.push_back({cp1x, cp1y});
-          state_.text_clip_points.push_back({cp2x, cp2y});
-          state_.text_clip_points.push_back({vx, vy});
-          curr_x_clip = vx;
-          curr_y_clip = vy;
-          break;
+          emit_cubic(cp1x, cp1y, cp2x, cp2y, vx, vy);
+          curr_x = vx; curr_y = vy; break;
         }
         case STBTT_vcubic: {
           float cx1, cy1, cx2, cy2;
           transform_vertex(v->cx, v->cy, cx1, cy1);
           transform_vertex(v->cx1, v->cy1, cx2, cy2);
-          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
-          state_.text_clip_points.push_back({cx1, cy1});
-          state_.text_clip_points.push_back({cx2, cy2});
-          state_.text_clip_points.push_back({vx, vy});
-          curr_x_clip = vx;
-          curr_y_clip = vy;
-          break;
+          emit_cubic(cx1, cy1, cx2, cy2, vx, vy);
+          curr_x = vx; curr_y = vy; break;
         }
       }
     }
-    state_.text_clip_commands.push_back(tvg::PathCommand::Close);
   }
+
+  shape->close();
+  if (add_to_clip) state_.text_clip_commands.push_back(tvg::PathCommand::Close);
+
+  if (have_ttf_outline) ttf_outline_free(&outline);
+  else stbtt_FreeShape(&font->font_info, vertices);
 
   // Mode 7: clip only - don't render visible shape
   if (render_mode == 7 || invisible) {
-    stbtt_FreeShape(&font->font_info, vertices);
     return true;
   }
 
@@ -4705,14 +5012,12 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   }
 
   if (do_stroke) {
-    // Apply stroke with current stroke style
     float stroke_width = state_.stroke_width * state_.scale;
-    if (stroke_width < 0.5f) stroke_width = 0.5f;  // Minimum stroke width for visibility
+    if (stroke_width < 0.5f) stroke_width = 0.5f;
     shape->strokeWidth(stroke_width);
     uint8_t stroke_alpha = static_cast<uint8_t>(state_.stroke_a * state_.stroke_opacity);
     shape->strokeFill(state_.stroke_r, state_.stroke_g, state_.stroke_b, stroke_alpha);
 
-    // Set line cap and join
     tvg::StrokeCap cap = tvg::StrokeCap::Butt;
     if (state_.line_cap == 1) cap = tvg::StrokeCap::Round;
     else if (state_.line_cap == 2) cap = tvg::StrokeCap::Square;
@@ -4723,8 +5028,6 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     else if (state_.line_join == 2) join = tvg::StrokeJoin::Bevel;
     shape->strokeJoin(join);
   }
-
-  stbtt_FreeShape(&font->font_info, vertices);
 
   return push_with_clip(shape);
 }
@@ -4762,20 +5065,31 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
     }
   }
 
-  // Get glyph outline from stb_truetype using glyph index directly
-  stbtt_vertex* vertices = nullptr;
-  int num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
-
-  if (num_verts == 0 || !vertices) {
-    // Glyph not found - draw tofu box placeholder
-    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
-    return true;
+  // Primary path: ttf_parse outline. Fall back to stbtt only when ttf rejected the font.
+  ttf_outline_t outline{};
+  bool have_ttf_outline = false;
+  if (font->has_ttf_parse &&
+      ttf_glyph_outline(&font->ttf, static_cast<uint16_t>(glyph_index), &outline) == 0) {
+    have_ttf_outline = true;
   }
 
-  // Calculate scale factor
-  float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+  stbtt_vertex* vertices = nullptr;
+  int num_verts = 0;
+  if (!have_ttf_outline) {
+    num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
+    if (num_verts == 0 || !vertices) {
+      draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
+      return true;
+    }
+  }
 
-  // Compute rotation from text matrix for rotated text (e.g., [0 -8 8 0])
+  float scale = 0.0f;
+  if (have_ttf_outline && font->ttf.units_per_em > 0) {
+    scale = size / static_cast<float>(font->ttf.units_per_em);
+  } else {
+    scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+  }
+
   float font_scale_tm = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
                                   state_.text_matrix.b * state_.text_matrix.b);
   float cos_theta = 1.0f, sin_theta = 0.0f;
@@ -4784,135 +5098,90 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
     sin_theta = state_.text_matrix.b / font_scale_tm;
   }
 
-  // Helper lambda to transform glyph-local coordinates with rotation
-  auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
-    float gx = gx_raw * scale;
-    float gy = gy_raw * scale;
-    out_x = x + gx * cos_theta - gy * sin_theta;
-    out_y = y - (gx * sin_theta + gy * cos_theta);
-  };
-
-  // Build ThorVG path from stb_truetype vertices
   auto shape = tvg::Shape::gen();
   if (!shape) {
-    stbtt_FreeShape(&font->font_info, vertices);
+    if (have_ttf_outline) ttf_outline_free(&outline);
+    else stbtt_FreeShape(&font->font_info, vertices);
     return false;
   }
 
-  // Track current position for quadratic-to-cubic conversion
-  float curr_x = x, curr_y = y;
-
-  for (int i = 0; i < num_verts; i++) {
-    stbtt_vertex* v = &vertices[i];
-    float vx, vy;
-    transform_vertex(v->x, v->y, vx, vy);
-
-    switch (v->type) {
-      case STBTT_vmove:
-        shape->moveTo(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      case STBTT_vline:
-        shape->lineTo(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      case STBTT_vcurve: {
-        float cx, cy;
-        transform_vertex(v->cx, v->cy, cx, cy);
-
-        float cp1x = curr_x + (2.0f / 3.0f) * (cx - curr_x);
-        float cp1y = curr_y + (2.0f / 3.0f) * (cy - curr_y);
-        float cp2x = vx + (2.0f / 3.0f) * (cx - vx);
-        float cp2y = vy + (2.0f / 3.0f) * (cy - vy);
-
-        shape->cubicTo(cp1x, cp1y, cp2x, cp2y, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      }
-      case STBTT_vcubic: {
-        float cx1, cy1, cx2, cy2;
-        transform_vertex(v->cx, v->cy, cx1, cy1);
-        transform_vertex(v->cx1, v->cy1, cx2, cy2);
-        shape->cubicTo(cx1, cy1, cx2, cy2, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
-        break;
-      }
-    }
-  }
-
-  shape->close();
-
-  // Apply rendering based on text rendering mode
-  // 0 = Fill, 1 = Stroke, 2 = Fill+Stroke, 3 = Invisible
-  // 4 = Fill+Clip, 5 = Stroke+Clip, 6 = Fill+Stroke+Clip, 7 = Clip only
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
-  bool invisible = (render_mode == 3);  // Only mode 3 is truly invisible
+  bool invisible = (render_mode == 3);
   bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
 
-  // If adding to clip, accumulate glyph path in text_clip arrays
-  if (add_to_clip) {
-    state_.text_clip_active = true;
-    // Re-trace the glyph path to accumulate clip commands
-    float curr_x_clip = x, curr_y_clip = y;
+  auto emit_move = [&](float cx, float cy) {
+    shape->moveTo(cx, cy);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::MoveTo);
+      state_.text_clip_points.push_back({cx, cy});
+    }
+  };
+  auto emit_line = [&](float cx, float cy) {
+    shape->lineTo(cx, cy);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::LineTo);
+      state_.text_clip_points.push_back({cx, cy});
+    }
+  };
+  auto emit_cubic = [&](float c1x, float c1y, float c2x, float c2y, float ex, float ey) {
+    shape->cubicTo(c1x, c1y, c2x, c2y, ex, ey);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
+      state_.text_clip_points.push_back({c1x, c1y});
+      state_.text_clip_points.push_back({c2x, c2y});
+      state_.text_clip_points.push_back({ex, ey});
+    }
+  };
+
+  if (add_to_clip) state_.text_clip_active = true;
+
+  if (have_ttf_outline) {
+    decompose_ttf_outline_to_path(outline, scale, x, y, cos_theta, sin_theta,
+                                  emit_move, emit_line, emit_cubic);
+  } else {
+    auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
+      float gx = gx_raw * scale;
+      float gy = gy_raw * scale;
+      out_x = x + gx * cos_theta - gy * sin_theta;
+      out_y = y - (gx * sin_theta + gy * cos_theta);
+    };
+    float curr_x = x, curr_y = y;
     for (int i = 0; i < num_verts; i++) {
       stbtt_vertex* v = &vertices[i];
-      float vx_c, vy_c;
-      transform_vertex(v->x, v->y, vx_c, vy_c);
-
+      float vx, vy;
+      transform_vertex(v->x, v->y, vx, vy);
       switch (v->type) {
-        case STBTT_vmove:
-          state_.text_clip_commands.push_back(tvg::PathCommand::MoveTo);
-          state_.text_clip_points.push_back({vx_c, vy_c});
-          curr_x_clip = vx_c;
-          curr_y_clip = vy_c;
-          break;
-        case STBTT_vline:
-          state_.text_clip_commands.push_back(tvg::PathCommand::LineTo);
-          state_.text_clip_points.push_back({vx_c, vy_c});
-          curr_x_clip = vx_c;
-          curr_y_clip = vy_c;
-          break;
+        case STBTT_vmove: emit_move(vx, vy); curr_x = vx; curr_y = vy; break;
+        case STBTT_vline: emit_line(vx, vy); curr_x = vx; curr_y = vy; break;
         case STBTT_vcurve: {
-          float cx_c, cy_c;
-          transform_vertex(v->cx, v->cy, cx_c, cy_c);
-          float cp1x = curr_x_clip + (2.0f / 3.0f) * (cx_c - curr_x_clip);
-          float cp1y = curr_y_clip + (2.0f / 3.0f) * (cy_c - curr_y_clip);
-          float cp2x = vx_c + (2.0f / 3.0f) * (cx_c - vx_c);
-          float cp2y = vy_c + (2.0f / 3.0f) * (cy_c - vy_c);
-          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
-          state_.text_clip_points.push_back({cp1x, cp1y});
-          state_.text_clip_points.push_back({cp2x, cp2y});
-          state_.text_clip_points.push_back({vx_c, vy_c});
-          curr_x_clip = vx_c;
-          curr_y_clip = vy_c;
-          break;
+          float cx, cy; transform_vertex(v->cx, v->cy, cx, cy);
+          float cp1x = curr_x + (2.0f / 3.0f) * (cx - curr_x);
+          float cp1y = curr_y + (2.0f / 3.0f) * (cy - curr_y);
+          float cp2x = vx + (2.0f / 3.0f) * (cx - vx);
+          float cp2y = vy + (2.0f / 3.0f) * (cy - vy);
+          emit_cubic(cp1x, cp1y, cp2x, cp2y, vx, vy);
+          curr_x = vx; curr_y = vy; break;
         }
         case STBTT_vcubic: {
           float cx1, cy1, cx2, cy2;
           transform_vertex(v->cx, v->cy, cx1, cy1);
           transform_vertex(v->cx1, v->cy1, cx2, cy2);
-          state_.text_clip_commands.push_back(tvg::PathCommand::CubicTo);
-          state_.text_clip_points.push_back({cx1, cy1});
-          state_.text_clip_points.push_back({cx2, cy2});
-          state_.text_clip_points.push_back({vx_c, vy_c});
-          curr_x_clip = vx_c;
-          curr_y_clip = vy_c;
-          break;
+          emit_cubic(cx1, cy1, cx2, cy2, vx, vy);
+          curr_x = vx; curr_y = vy; break;
         }
       }
     }
-    state_.text_clip_commands.push_back(tvg::PathCommand::Close);
   }
 
-  // Mode 7: clip only - don't render visible shape
+  shape->close();
+  if (add_to_clip) state_.text_clip_commands.push_back(tvg::PathCommand::Close);
+
+  if (have_ttf_outline) ttf_outline_free(&outline);
+  else stbtt_FreeShape(&font->font_info, vertices);
+
   if (render_mode == 7 || invisible) {
-    stbtt_FreeShape(&font->font_info, vertices);
     return true;
   }
 
@@ -4921,14 +5190,12 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
   }
 
   if (do_stroke) {
-    // Apply stroke with current stroke style
     float stroke_width = state_.stroke_width * state_.scale;
-    if (stroke_width < 0.5f) stroke_width = 0.5f;  // Minimum stroke width for visibility
+    if (stroke_width < 0.5f) stroke_width = 0.5f;
     shape->strokeWidth(stroke_width);
     uint8_t stroke_alpha = static_cast<uint8_t>(state_.stroke_a * state_.stroke_opacity);
     shape->strokeFill(state_.stroke_r, state_.stroke_g, state_.stroke_b, stroke_alpha);
 
-    // Set line cap and join
     tvg::StrokeCap cap = tvg::StrokeCap::Butt;
     if (state_.line_cap == 1) cap = tvg::StrokeCap::Round;
     else if (state_.line_cap == 2) cap = tvg::StrokeCap::Square;
@@ -4940,8 +5207,6 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
     shape->strokeJoin(join);
   }
 
-  stbtt_FreeShape(&font->font_info, vertices);
-
   return push_with_clip(shape);
 }
 
@@ -4950,7 +5215,13 @@ bool ThorVGBackend::draw_glyph_bitmap(int codepoint, float x, float y,
                                       uint8_t b, uint8_t a) {
   FontCache* font = get_font(current_font_name_);
   if (!font) return false;
-  int glyph_index = stbtt_FindGlyphIndex(&font->font_info, codepoint);
+  int glyph_index = 0;
+  if (font->has_ttf_parse) {
+    glyph_index = ttf_cmap_lookup(&font->ttf, static_cast<uint32_t>(codepoint));
+  }
+  if (glyph_index == 0) {
+    glyph_index = stbtt_FindGlyphIndex(&font->font_info, codepoint);
+  }
   if (glyph_index == 0) return false;
   return draw_glyph_bitmap_by_index(glyph_index, x, y, size, r, g, b, a);
 }
@@ -4977,51 +5248,100 @@ bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
       glyph_bitmap_cache_.clear();
     }
 
-    // Render glyph bitmap with 2x oversampling for better edge quality
+    // Render glyph bitmap with 2x oversampling for better edge quality.
+    // Primary path uses ttf_parse + rasterize; stbtt is a fallback.
     static const float kOversample = 2.0f;
-    float scale_2x =
-        stbtt_ScaleForPixelHeight(&font->font_info, size * kOversample);
-    int w2x, h2x, xoff2x, yoff2x;
-    unsigned char* bmp2x = stbtt_GetGlyphBitmapSubpixel(
-        &font->font_info, scale_2x, scale_2x, 0, 0, glyph_index, &w2x, &h2x,
-        &xoff2x, &yoff2x);
-
     auto& e = glyph_bitmap_cache_[key];
-    if (!bmp2x || w2x <= 0 || h2x <= 0) {
-      // Empty glyph (space etc.)
-      e.width = 0;
-      e.height = 0;
-      e.xoff = 0;
-      e.yoff = 0;
-      if (bmp2x) stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
-      entry = &e;
-    } else {
-      // Downsample 2x -> 1x with box filter
-      int w1x = (w2x + 1) / 2;
-      int h1x = (h2x + 1) / 2;
-      e.bitmap.resize(w1x * h1x);
-      for (int iy = 0; iy < h1x; iy++) {
-        for (int ix = 0; ix < w1x; ix++) {
-          int sum = 0, count = 0;
-          for (int dy = 0; dy < 2; dy++) {
-            for (int dx = 0; dx < 2; dx++) {
-              int sy = iy * 2 + dy, sx = ix * 2 + dx;
-              if (sy < h2x && sx < w2x) {
-                sum += bmp2x[sy * w2x + sx];
-                count++;
+    bool produced = false;
+
+    if (font->has_ttf_parse) {
+      ttf_outline_t outline{};
+      if (ttf_glyph_outline(&font->ttf, static_cast<uint16_t>(glyph_index),
+                            &outline) == 0) {
+        float em_scale_2x = (font->ttf.units_per_em > 0)
+            ? ((size * kOversample) / static_cast<float>(font->ttf.units_per_em))
+            : stbtt_ScaleForPixelHeight(&font->font_info, size * kOversample);
+        rast_bitmap_t bm{};
+        if (rast_glyph(&outline, em_scale_2x, &bm) == 0 && bm.pixels &&
+            bm.width > 0 && bm.height > 0) {
+          int w2x = bm.width;
+          int h2x = bm.height;
+          // rasterize.c reports bearing_x = left side bearing in pixels and
+          // bearing_y = distance from baseline up to the top of the bitmap.
+          // Canvas is y-down, so the bitmap's top-left Y offset from the
+          // baseline is -bearing_y.
+          float xoff2x = static_cast<float>(bm.bearing_x);
+          float yoff2x = -static_cast<float>(bm.bearing_y);
+
+          int w1x = (w2x + 1) / 2;
+          int h1x = (h2x + 1) / 2;
+          e.bitmap.assign(static_cast<size_t>(w1x) * h1x, 0);
+          for (int iy = 0; iy < h1x; ++iy) {
+            for (int ix = 0; ix < w1x; ++ix) {
+              int sum = 0, count = 0;
+              for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                  int sy = iy * 2 + dy, sx = ix * 2 + dx;
+                  if (sy < h2x && sx < w2x) {
+                    sum += bm.pixels[sy * w2x + sx];
+                    ++count;
+                  }
+                }
               }
+              e.bitmap[iy * w1x + ix] = static_cast<uint8_t>(sum / count);
             }
           }
-          e.bitmap[iy * w1x + ix] = static_cast<uint8_t>(sum / count);
+          e.width = w1x;
+          e.height = h1x;
+          e.xoff = xoff2x / kOversample;
+          e.yoff = yoff2x / kOversample;
+          free(bm.pixels);
+          produced = true;
+        } else if (bm.pixels) {
+          free(bm.pixels);
         }
+        ttf_outline_free(&outline);
       }
-      e.width = w1x;
-      e.height = h1x;
-      e.xoff = xoff2x / kOversample;
-      e.yoff = yoff2x / kOversample;
-      stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
-      entry = &e;
     }
+
+    if (!produced) {
+      float scale_2x =
+          stbtt_ScaleForPixelHeight(&font->font_info, size * kOversample);
+      int w2x, h2x, xoff2x, yoff2x;
+      unsigned char* bmp2x = stbtt_GetGlyphBitmapSubpixel(
+          &font->font_info, scale_2x, scale_2x, 0, 0, glyph_index, &w2x, &h2x,
+          &xoff2x, &yoff2x);
+
+      if (!bmp2x || w2x <= 0 || h2x <= 0) {
+        e.width = 0; e.height = 0; e.xoff = 0; e.yoff = 0;
+        if (bmp2x) stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
+      } else {
+        int w1x = (w2x + 1) / 2;
+        int h1x = (h2x + 1) / 2;
+        e.bitmap.resize(w1x * h1x);
+        for (int iy = 0; iy < h1x; iy++) {
+          for (int ix = 0; ix < w1x; ix++) {
+            int sum = 0, count = 0;
+            for (int dy = 0; dy < 2; dy++) {
+              for (int dx = 0; dx < 2; dx++) {
+                int sy = iy * 2 + dy, sx = ix * 2 + dx;
+                if (sy < h2x && sx < w2x) {
+                  sum += bmp2x[sy * w2x + sx];
+                  count++;
+                }
+              }
+            }
+            e.bitmap[iy * w1x + ix] = static_cast<uint8_t>(sum / count);
+          }
+        }
+        e.width = w1x;
+        e.height = h1x;
+        e.xoff = xoff2x / kOversample;
+        e.yoff = yoff2x / kOversample;
+        stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
+      }
+    }
+    entry = &e;
   }
 
   if (!entry || entry->width <= 0 || entry->height <= 0) {
@@ -6640,16 +6960,54 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         if (operands.size() >= 1 && state_.in_text_block) {
           // Remove parentheses or angle brackets from text string
           std::string text = operands[0];
-          if (!text.empty() && text[0] == '(' && text.back() == ')') {
-            text = text.substr(1, text.length() - 2);
+          bool was_literal = !text.empty() && text[0] == '(' && text.back() == ')';
+          bool was_hex_odd = false;
+          if (was_literal) {
+            text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
           } else if (!text.empty() && text[0] == '<' && text.back() == '>') {
             // Hex string - decode hex pairs to bytes
             std::string hex_str = text.substr(1, text.length() - 2);
             text.clear();
+            if (hex_str.size() % 2 == 1) hex_str.push_back('0');
+            size_t decoded = 0;
             for (size_t i = 0; i + 1 < hex_str.length(); i += 2) {
               char hex_byte[3] = {hex_str[i], hex_str[i+1], '\0'};
               int byte_val = static_cast<int>(strtol(hex_byte, nullptr, 16));
               text += static_cast<char>(byte_val);
+              decoded++;
+            }
+            was_hex_odd = (decoded % 2 == 1);
+          }
+          if (!text.empty()) {
+            auto* t0 = dynamic_cast<const Type0Font*>(current_font_);
+            if (t0) {
+              const auto& cn = t0->encoding_cmap.name;
+              bool two_byte =
+                  cn.find("Identity") != std::string::npos ||
+                  cn.find("UTF16") != std::string::npos ||
+                  cn.find("UCS2") != std::string::npos ||
+                  cn.find("UniJIS") != std::string::npos ||
+                  cn.find("UniGB") != std::string::npos ||
+                  cn.find("UniKS") != std::string::npos ||
+                  cn.find("UniCNS") != std::string::npos ||
+                  t0->ordering == "Japan1" || t0->ordering == "GB1" ||
+                  t0->ordering == "CNS1" || t0->ordering == "Korea1";
+              auto looks_single_byte = [&]() {
+                bool has_null = false, has_high = false;
+                for (unsigned char c : text) {
+                  if (c == 0x00) has_null = true;
+                  else if (c >= 0x80) has_high = true;
+                }
+                return !has_null && !has_high;
+              };
+              bool widen = two_byte &&
+                           (was_literal || was_hex_odd || looks_single_byte());
+              if (widen) {
+                std::string widened;
+                widened.reserve(text.size() * 2);
+                for (char c : text) { widened.push_back(0); widened.push_back(c); }
+                text = std::move(widened);
+              }
             }
           }
 
@@ -6709,21 +7067,77 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             is_vertical_tj = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
           }
 
+          // Identity-H / CID two-byte encoding hint. Some PDFs mix literal
+          // strings like (L) inside TJ arrays for CID fonts — these are
+          // single-byte content that must be widened to \x00\xBB so the
+          // two-byte CID decoder in draw_text reads them correctly.
+          bool type0_two_byte_tj = false;
+          if (type0_font_tj) {
+            const auto& cn = type0_font_tj->encoding_cmap.name;
+            type0_two_byte_tj =
+                cn.find("Identity") != std::string::npos ||
+                cn.find("UTF16") != std::string::npos ||
+                cn.find("UCS2") != std::string::npos ||
+                cn.find("UniJIS") != std::string::npos ||
+                cn.find("UniGB") != std::string::npos ||
+                cn.find("UniKS") != std::string::npos ||
+                cn.find("UniCNS") != std::string::npos ||
+                type0_font_tj->ordering == "Japan1" ||
+                type0_font_tj->ordering == "GB1" ||
+                type0_font_tj->ordering == "CNS1" ||
+                type0_font_tj->ordering == "Korea1";
+          }
+
           for (const auto& item : operands) {
             if (!item.empty() && (item[0] == '(' || item[0] == '<')) {
               // Text string element
               std::string text = item;
-              if (text[0] == '(' && text.back() == ')') {
-                text = text.substr(1, text.length() - 2);
+              bool was_literal = (text[0] == '(' && text.back() == ')');
+              bool was_hex_odd = false;
+              if (was_literal) {
+                text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
               } else if (text[0] == '<' && text.back() == '>') {
                 // Hex string - decode hex pairs to bytes
                 std::string hex_str = text.substr(1, text.length() - 2);
                 text.clear();
+                // PDF spec: odd-length hex pads a trailing 0; we'll detect odd
+                // length to widen the decoded bytes as 1-byte-per-CID later.
+                if (hex_str.size() % 2 == 1) hex_str.push_back('0');
+                size_t decoded = 0;
                 for (size_t i = 0; i + 1 < hex_str.length(); i += 2) {
                   char hex_byte[3] = {hex_str[i], hex_str[i+1], '\0'};
                   int byte_val = static_cast<int>(strtol(hex_byte, nullptr, 16));
                   text += static_cast<char>(byte_val);
+                  decoded++;
                 }
+                was_hex_odd = (decoded % 2 == 1);
+              }
+              // For Type0/Identity-H fonts, literal strings (L) and hex strings
+              // that look like 1-byte-per-code content (ASCII-only, no 0x00 high
+              // bytes, odd length, or no byte >= 0x80) are non-standard 1-byte
+              // content that must be widened to \x00\xBB before the two-byte CID
+              // decoder sees them. Proper 2-byte hex like <004C> has a 0x00 high
+              // byte, and genuine CJK CIDs like <0280> have a byte >= 0x80, so
+              // we leave those alone.
+              auto looks_single_byte = [&]() {
+                if (text.empty()) return false;
+                bool has_null = false, has_high = false;
+                for (unsigned char c : text) {
+                  if (c == 0x00) has_null = true;
+                  else if (c >= 0x80) has_high = true;
+                }
+                return !has_null && !has_high;
+              };
+              bool widen = type0_two_byte_tj && !text.empty() &&
+                           (was_literal || was_hex_odd || looks_single_byte());
+              if (widen) {
+                std::string widened;
+                widened.reserve(text.size() * 2);
+                for (char c : text) {
+                  widened.push_back(0);
+                  widened.push_back(c);
+                }
+                text = std::move(widened);
               }
               if (!text.empty()) {
                 float text_x = state_.text_matrix.e;
@@ -6794,7 +7208,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
 
           std::string text = operands[text_idx];
           if (!text.empty() && text[0] == '(' && text.back() == ')') {
-            text = text.substr(1, text.length() - 2);
+            text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
           } else if (!text.empty() && text[0] == '<' && text.back() == '>') {
             std::string hex_str = text.substr(1, text.length() - 2);
             text.clear();

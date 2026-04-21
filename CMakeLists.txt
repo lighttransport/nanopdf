@@ -115,8 +115,10 @@ set(NANOPDF_SOURCES
   src/third_party/stb_image_write_impl.cc
   src/third_party/stb_truetype_impl.cc
   src/third_party/tiny_dng_impl.cc
-  # ttf_parse for GPOS/kerning support
+  # TrueType/CFF font parser + kerning (kern + GPOS PairPos); ported from lightui/src/fonts.
   src/third_party/ttf_parse.c
+  # Analytic-area glyph outline rasterizer; pairs with ttf_parse. Ported from lightui/src/fonts.
+  src/third_party/rasterize.c
   # JBIG2 decoder infrastructure (Phase 1.4)
   src/jbig2/JBig2_BitStream.cc
   src/jbig2/JBig2_Image.cc
@@ -164,6 +166,8 @@ endif()
 if(NANOPDF_EMBED_FONTS)
   set(FONTS_DIR ${CMAKE_SOURCE_DIR}/fonts)
   set(EMBEDDED_FONTS_HEADER ${CMAKE_BINARY_DIR}/embedded-fonts.hh)
+  set(EMBEDDED_FONTS_ASM ${CMAKE_BINARY_DIR}/embedded-fonts.S)
+  set(EMBEDDED_FONTS_CC ${CMAKE_BINARY_DIR}/embedded-fonts.cc)
 
   # Find all font files to establish dependencies
   file(GLOB_RECURSE FONT_FILES
@@ -172,27 +176,30 @@ if(NANOPDF_EMBED_FONTS)
   )
 
   if(FONT_FILES)
-    # Generate the embedded fonts header at configure time and when fonts change
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+    # Generate compressed .bin files + .hh/.S/.cc (ELF .incbin approach) —
+    # dramatically faster to compile than a single multi-megabyte hex array.
     add_custom_command(
-      OUTPUT ${EMBEDDED_FONTS_HEADER}
-      COMMAND ${CMAKE_COMMAND}
-        -DFONTS_DIR=${FONTS_DIR}
-        -DOUTPUT_FILE=${EMBEDDED_FONTS_HEADER}
-        -P ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.cmake
-      DEPENDS ${FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.cmake
-      COMMENT "Generating embedded fonts header"
+      OUTPUT ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+        ${FONTS_DIR} ${CMAKE_BINARY_DIR} embedded-fonts
+        --exclude-dirs=noto-sans-jp,noto-serif-jp
+      DEPENDS ${FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+      COMMENT "Generating embedded fonts (incbin)"
       VERBATIM
     )
 
-    # Add a custom target to ensure the header is generated
     add_custom_target(generate_embedded_fonts
-      DEPENDS ${EMBEDDED_FONTS_HEADER}
+      DEPENDS ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
     )
 
-    # Add the generated header to sources (as a dependency)
-    set_source_files_properties(${EMBEDDED_FONTS_HEADER} PROPERTIES GENERATED TRUE)
+    set_source_files_properties(${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM}
+                                ${EMBEDDED_FONTS_CC} PROPERTIES GENERATED TRUE)
+    enable_language(ASM)
+    list(APPEND NANOPDF_SOURCES ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC})
 
-    message(STATUS "Font embedding enabled (${FONTS_DIR})")
+    message(STATUS "Font embedding enabled (${FONTS_DIR}, incbin)")
   else()
     message(WARNING "Font embedding enabled but no fonts found in ${FONTS_DIR}")
     set(NANOPDF_EMBED_FONTS OFF)
@@ -209,24 +216,34 @@ if(NANOPDF_EMBED_CJK_FONTS)
   endif()
 
   set(EMBEDDED_CJK_FONTS_HEADER ${CMAKE_BINARY_DIR}/embedded-cjk-fonts.hh)
+  set(EMBEDDED_CJK_FONTS_ASM ${CMAKE_BINARY_DIR}/embedded-cjk-fonts.S)
+  set(EMBEDDED_CJK_FONTS_CC ${CMAKE_BINARY_DIR}/embedded-cjk-fonts.cc)
   file(GLOB_RECURSE CJK_FONT_FILES
     "${FONTS_DIR}/noto-sans-jp/*.otf"
     "${FONTS_DIR}/noto-serif-jp/*.otf"
   )
 
   if(CJK_FONT_FILES)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_custom_command(
-      OUTPUT ${EMBEDDED_CJK_FONTS_HEADER}
-      COMMAND ${CMAKE_COMMAND}
-        -DFONTS_DIR=${FONTS_DIR}
-        -DOUTPUT_FILE=${EMBEDDED_CJK_FONTS_HEADER}
-        -P ${CMAKE_SOURCE_DIR}/cmake/embed_cjk_fonts.cmake
-      DEPENDS ${CJK_FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_cjk_fonts.cmake
-      COMMENT "Generating embedded CJK fonts header"
+      OUTPUT ${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+        ${FONTS_DIR} ${CMAKE_BINARY_DIR} embedded-cjk-fonts
+        --include-only-dirs=noto-sans-jp,noto-serif-jp
+        --header-guard=NANOPDF_EMBEDDED_CJK_FONTS_HH
+        --namespace=embedded_cjk_fonts
+        --symbol-prefix=nanopdf_cjkfont_
+        --skip-pdf-mapping
+      DEPENDS ${CJK_FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+      COMMENT "Generating embedded CJK fonts (incbin)"
     )
-    add_custom_target(generate_embedded_cjk_fonts DEPENDS ${EMBEDDED_CJK_FONTS_HEADER})
-    set_source_files_properties(${EMBEDDED_CJK_FONTS_HEADER} PROPERTIES GENERATED TRUE)
-    message(STATUS "CJK font embedding enabled (${FONTS_DIR}/noto-sans-jp, ${FONTS_DIR}/noto-serif-jp)")
+    add_custom_target(generate_embedded_cjk_fonts
+      DEPENDS ${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC})
+    set_source_files_properties(${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM}
+                                ${EMBEDDED_CJK_FONTS_CC} PROPERTIES GENERATED TRUE)
+    enable_language(ASM)
+    list(APPEND NANOPDF_SOURCES ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC})
+    message(STATUS "CJK font embedding enabled (incbin)")
   else()
     message(WARNING "CJK font embedding enabled but no CJK fonts found in ${FONTS_DIR}/noto-sans-jp or ${FONTS_DIR}/noto-serif-jp")
     set(NANOPDF_EMBED_CJK_FONTS OFF)

@@ -10,7 +10,7 @@
 //   -w, --width <n>    Output width in pixels (default: 800)
 //   -h, --height <n>   Output height in pixels (default: 600)
 //   -s, --scale <f>    Scale factor (overrides width/height)
-//   --dpi <n>          DPI for rendering (default: 72)
+//   --dpi <n>          DPI for rendering (default: 150, same as pdftoppm)
 //   -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)
 //   -g, --grayscale    Convert output to grayscale
 //   --all              Render all pages (creates multiple PNG files)
@@ -46,7 +46,11 @@ struct RasterizeOptions {
   int width = 800;
   int height = 600;
   float scale = 0.0f;  // 0 means auto-calculate
-  float dpi = 72.0f;
+  // Default DPI matches pdftoppm's default so that output dimensions line up
+  // with the common "poppler at 150 dpi" baseline used by visual-diff tooling.
+  float dpi = 150.0f;
+  bool width_set = false;
+  bool height_set = false;
   int rotation = 0;    // 0, 90, 180, 270 degrees
   bool grayscale = false;
   bool render_all_pages = false;
@@ -64,7 +68,7 @@ void print_usage(const char* program_name) {
   std::cout << "  -w, --width <n>    Output width in pixels (default: 800)\n";
   std::cout << "  -h, --height <n>   Output height in pixels (default: 600)\n";
   std::cout << "  -s, --scale <f>    Scale factor (overrides width/height)\n";
-  std::cout << "  --dpi <n>          DPI for rendering (default: 72)\n";
+  std::cout << "  --dpi <n>          DPI for rendering (default: 150, same as pdftoppm)\n";
   std::cout << "  -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)\n";
   std::cout << "  -g, --grayscale    Convert output to grayscale\n";
   std::cout << "  --all              Render all pages (creates multiple PNG files)\n";
@@ -104,12 +108,14 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
         std::cerr << "Error: Width must be > 0\n";
         return false;
       }
+      options.width_set = true;
     } else if ((arg == "-h" || arg == "--height") && i + 1 < argc) {
       options.height = std::atoi(argv[++i]);
       if (options.height <= 0) {
         std::cerr << "Error: Height must be > 0\n";
         return false;
       }
+      options.height_set = true;
     } else if ((arg == "-s" || arg == "--scale") && i + 1 < argc) {
       options.scale = std::atof(argv[++i]);
       if (options.scale <= 0) {
@@ -260,23 +266,23 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
   int output_width = options.width;
   int output_height = options.height;
 
+  // Priority: --scale > explicit --width/--height > --dpi (defaults to 150).
+  // PDF user space is 72 pt per inch; output px = page_pt * dpi / 72.
   if (options.scale > 0) {
-    // Use scale factor
     output_width = static_cast<int>(page_width * options.scale);
     output_height = static_cast<int>(page_height * options.scale);
-  } else if (options.dpi != 72.0f) {
-    // Calculate based on DPI (PDF uses 72 DPI by default)
+  } else if (options.width_set || options.height_set) {
+    float aspect_ratio = page_width / page_height;
+    if (options.width_set && !options.height_set) {
+      output_height = static_cast<int>(output_width / aspect_ratio);
+    } else if (options.height_set && !options.width_set) {
+      output_width = static_cast<int>(output_height * aspect_ratio);
+    }
+    // If both are set, honor them verbatim (may distort aspect).
+  } else {
     float dpi_scale = options.dpi / 72.0f;
     output_width = static_cast<int>(page_width * dpi_scale);
     output_height = static_cast<int>(page_height * dpi_scale);
-  } else {
-    // Maintain aspect ratio if only one dimension is different from default
-    float aspect_ratio = page_width / page_height;
-    if (output_width == 800 && output_height != 600) {
-      output_width = static_cast<int>(output_height * aspect_ratio);
-    } else if (output_height == 600 && output_width != 800) {
-      output_height = static_cast<int>(output_width / aspect_ratio);
-    }
   }
 
   if (options.verbose) {

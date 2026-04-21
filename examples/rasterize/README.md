@@ -50,7 +50,7 @@ Convert the first page of a PDF to PNG:
 - `-w, --width <n>` : Output width in pixels (default: 800)
 - `-h, --height <n>` : Output height in pixels (default: 600)
 - `-s, --scale <f>` : Scale factor (overrides width/height)
-- `--dpi <n>` : DPI for rendering (default: 72)
+- `--dpi <n>` : DPI for rendering (default: 150, matching pdftoppm)
 - `--all` : Render all pages (creates multiple PNG files)
 - `--verbose` : Verbose output
 - `--help` : Show help message

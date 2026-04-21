@@ -7,10 +7,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find nanopdf library (assumes it's built in the parent build directory)
 set(NANOPDF_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
-set(NANOPDF_BUILD_DIR ${NANOPDF_ROOT}/build)
+if(NOT DEFINED NANOPDF_BUILD_DIR OR "${NANOPDF_BUILD_DIR}" STREQUAL "")
+  set(NANOPDF_BUILD_DIR ${NANOPDF_ROOT}/build CACHE PATH "Path to nanopdf build directory")
+endif()
 
 # Include nanopdf headers
 include_directories(${NANOPDF_ROOT}/src)
+include_directories(${NANOPDF_ROOT}/src/third_party)
 
 # Find ThorVG if enabled
 option(USE_THORVG "Enable ThorVG backend" ON)
@@ -82,6 +85,8 @@ option(EMBED_FONTS "Embed PDF Standard 14 alternative fonts as binary data" ON)
 if(EMBED_FONTS)
   set(FONTS_DIR ${NANOPDF_ROOT}/fonts)
   set(EMBEDDED_FONTS_HEADER ${CMAKE_CURRENT_BINARY_DIR}/embedded-fonts.hh)
+  set(EMBEDDED_FONTS_ASM ${CMAKE_CURRENT_BINARY_DIR}/embedded-fonts.S)
+  set(EMBEDDED_FONTS_CC ${CMAKE_CURRENT_BINARY_DIR}/embedded-fonts.cc)
 
   # Find all font files to establish dependencies
   file(GLOB_RECURSE FONT_FILES
@@ -90,24 +95,25 @@ if(EMBED_FONTS)
   )
 
   if(FONT_FILES)
-    # Generate the embedded fonts header
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_custom_command(
-      OUTPUT ${EMBEDDED_FONTS_HEADER}
-      COMMAND ${CMAKE_COMMAND}
-        -DFONTS_DIR=${FONTS_DIR}
-        -DOUTPUT_FILE=${EMBEDDED_FONTS_HEADER}
-        -P ${NANOPDF_ROOT}/cmake/embed_fonts.cmake
-      DEPENDS ${FONT_FILES} ${NANOPDF_ROOT}/cmake/embed_fonts.cmake
-      COMMENT "Generating embedded fonts header for rasterize"
+      OUTPUT ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
+      COMMAND ${Python3_EXECUTABLE} ${NANOPDF_ROOT}/cmake/embed_fonts_binary.py
+        ${FONTS_DIR} ${CMAKE_CURRENT_BINARY_DIR} embedded-fonts
+        --exclude-dirs=noto-sans-jp,noto-serif-jp
+      DEPENDS ${FONT_FILES} ${NANOPDF_ROOT}/cmake/embed_fonts_binary.py
+      COMMENT "Generating embedded fonts for rasterize (incbin)"
       VERBATIM
     )
 
-    # Add a custom target
     add_custom_target(generate_embedded_fonts_rasterize
-      DEPENDS ${EMBEDDED_FONTS_HEADER}
+      DEPENDS ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
     )
+    set_source_files_properties(${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM}
+                                ${EMBEDDED_FONTS_CC} PROPERTIES GENERATED TRUE)
+    enable_language(ASM)
 
-    message(STATUS "Font embedding enabled for rasterize (${FONTS_DIR})")
+    message(STATUS "Font embedding enabled for rasterize (${FONTS_DIR}, incbin)")
   else()
     message(WARNING "Font embedding enabled but no fonts found in ${FONTS_DIR}")
     set(EMBED_FONTS OFF)
@@ -115,13 +121,13 @@ if(EMBED_FONTS)
 endif()
 
 # Create the rasterize executable
-add_executable(rasterize rasterize.cc)
-
-# Add embedded fonts support
 if(EMBED_FONTS)
+  add_executable(rasterize rasterize.cc ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC})
   add_dependencies(rasterize generate_embedded_fonts_rasterize)
-  target_include_directories(rasterize PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-  target_compile_definitions(rasterize PRIVATE "NANOPDF_EMBED_FONTS=1")
+  target_include_directories(rasterize PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${NANOPDF_ROOT}/src)
+  target_compile_definitions(rasterize PRIVATE "NANOPDF_EMBED_FONTS=1" "NANOPDF_USE_MINIZ")
+else()
+  add_executable(rasterize rasterize.cc)
 endif()
 
 # Link with nanopdf library
@@ -193,6 +199,12 @@ endif()
 # Platform-specific libraries
 if(UNIX AND NOT APPLE)
   target_link_libraries(rasterize pthread)
+endif()
+
+# OpenMP for ThorVG parallel processing
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(rasterize OpenMP::OpenMP_CXX)
 endif()
 
 # Installation

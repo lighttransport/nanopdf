@@ -12,11 +12,14 @@
 #include <map>
 #include <unordered_map>
 
-// stb_truetype for glyph outline extraction
+// stb_truetype is kept only as a fallback for the rare font that
+// ttf_parse rejects (malformed/unusual sfnt tables). All glyph metric,
+// cmap, outline, and raster lookups go through ttf_parse + rasterize by default.
 #include "stb_truetype.h"
 
-// ttf_parse for kerning lookup (GPOS and kern table support)
+// ttf_parse + rasterize — the primary TrueType/CFF stack (ported from lightui).
 #include "ttf_parse.h"
+#include "rasterize.h"
 
 #if defined(NANOPDF_USE_NANOSTL)
 #include "nanocstring.h"

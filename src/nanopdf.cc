@@ -6619,12 +6619,29 @@ ColorSpace parse_color_space(const Pdf& pdf, const Value& cs_value) {
             color_space.hival = static_cast<int>(cs_value.array[2].number);
           }
 
-          // Parse lookup table
-          if (cs_value.array[3].type == Value::STRING) {
-            color_space.lookup_table.assign(cs_value.array[3].str.begin(),
-                                           cs_value.array[3].str.end());
-          } else if (cs_value.array[3].type == Value::STREAM) {
-            color_space.lookup_table = cs_value.array[3].stream.data;
+          // Parse lookup table. The entry can be a string literal, a stream,
+          // or an indirect reference to either. Resolve references first.
+          Value lookup_val = cs_value.array[3];
+          if (lookup_val.type == Value::REFERENCE) {
+            ResolvedObject resolved = resolve_reference(
+                pdf, lookup_val.ref_object_number, lookup_val.ref_generation_number);
+            if (resolved.success) {
+              lookup_val = resolved.value;
+            }
+          }
+          if (lookup_val.type == Value::STRING) {
+            color_space.lookup_table.assign(lookup_val.str.begin(),
+                                           lookup_val.str.end());
+          } else if (lookup_val.type == Value::STREAM) {
+            // Lookup table stream may be compressed; decode it.
+            DecodedStream dec = decode_stream(
+                pdf, lookup_val, cs_value.array[3].ref_object_number,
+                cs_value.array[3].ref_generation_number);
+            if (dec.success) {
+              color_space.lookup_table = std::move(dec.data);
+            } else {
+              color_space.lookup_table = lookup_val.stream.data;
+            }
           }
         }
       } else if (type_name == "Separation") {
@@ -6755,7 +6772,6 @@ ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
                     static_cast<uint32_t>(image.width), static_cast<uint32_t>(image.height),
                     image.bits_per_component, static_cast<int>(image.color_space.type),
                     image.filter.c_str(), image.data.size());
-
   return image;
 }
 
@@ -8631,10 +8647,20 @@ std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& fon
   }
 
   auto desc_it = font_dict.find("DescendantFonts");
-  if (desc_it != font_dict.end() && desc_it->second.type == Value::ARRAY &&
-      !desc_it->second.array.empty()) {
+  Value desc_array_val;
+  bool has_desc = false;
+  if (desc_it != font_dict.end()) {
+    desc_array_val = desc_it->second;
+    if (desc_array_val.type == Value::REFERENCE) {
+      ResolvedObject r = resolve_reference(pdf, desc_array_val.ref_object_number,
+                                           desc_array_val.ref_generation_number);
+      if (r.success) desc_array_val = r.value;
+    }
+    has_desc = desc_array_val.type == Value::ARRAY && !desc_array_val.array.empty();
+  }
+  if (has_desc) {
     Value descendant_value;
-    if (resolve_indirect_value(pdf, desc_it->second.array[0], &descendant_value) &&
+    if (resolve_indirect_value(pdf, desc_array_val.array[0], &descendant_value) &&
         descendant_value.type == Value::DICTIONARY) {
       const Dictionary& cid_font_dict = descendant_value.dict;
 
@@ -8674,30 +8700,52 @@ std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& fon
         descendant->last_char = static_cast<int>(last_it->second.number);
       }
 
+      // Several descendant CID-font entries can be indirect references.
+      auto resolve = [&](Value v) -> Value {
+        if (v.type == Value::REFERENCE) {
+          ResolvedObject r = resolve_reference(pdf, v.ref_object_number,
+                                               v.ref_generation_number);
+          if (r.success) return r.value;
+        }
+        return v;
+      };
+
       auto widths_it = cid_font_dict.find("Widths");
-      if (widths_it != cid_font_dict.end() && widths_it->second.type == Value::ARRAY) {
-        descendant->widths.clear();
-        for (const auto& width_val : widths_it->second.array) {
-          if (width_val.type == Value::NUMBER) {
-            descendant->widths.push_back(static_cast<int>(width_val.number));
+      if (widths_it != cid_font_dict.end()) {
+        Value v = resolve(widths_it->second);
+        if (v.type == Value::ARRAY) {
+          descendant->widths.clear();
+          for (const auto& width_val : v.array) {
+            if (width_val.type == Value::NUMBER) {
+              descendant->widths.push_back(static_cast<int>(width_val.number));
+            }
           }
         }
       }
 
       auto cid_info_it = cid_font_dict.find("CIDSystemInfo");
-      if (cid_info_it != cid_font_dict.end() && cid_info_it->second.type == Value::DICTIONARY) {
-        parse_cid_system_info(cid_info_it->second.dict, font.get());
+      if (cid_info_it != cid_font_dict.end()) {
+        Value v = resolve(cid_info_it->second);
+        if (v.type == Value::DICTIONARY) {
+          parse_cid_system_info(v.dict, font.get());
+        }
       }
 
       auto dw_it = cid_font_dict.find("DW");
-      if (dw_it != cid_font_dict.end() && dw_it->second.type == Value::NUMBER) {
-        font->default_width = static_cast<int>(dw_it->second.number);
+      if (dw_it != cid_font_dict.end()) {
+        Value v = resolve(dw_it->second);
+        if (v.type == Value::NUMBER) {
+          font->default_width = static_cast<int>(v.number);
+        }
       }
 
       auto w_it = cid_font_dict.find("W");
-      if (w_it != cid_font_dict.end() && w_it->second.type == Value::ARRAY) {
-        font->cid_widths.clear();
-        parse_cid_width_array(w_it->second.array, font.get());
+      if (w_it != cid_font_dict.end()) {
+        Value v = resolve(w_it->second);
+        if (v.type == Value::ARRAY) {
+          font->cid_widths.clear();
+          parse_cid_width_array(v.array, font.get());
+        }
       }
 
       // Parse DW2 (default vertical metrics): [v_y w1_y]
@@ -8785,26 +8833,37 @@ std::unique_ptr<BaseFont> parse_type3_font(const Pdf& pdf, const Dictionary& fon
     font->resources = res_it->second.dict;
   }
 
-  // Parse Widths
+  // Parse Widths — may be an indirect reference, resolve before use.
   auto widths_it = font_dict.find("Widths");
-  if (widths_it != font_dict.end() && widths_it->second.type == Value::ARRAY) {
-    for (const auto& val : widths_it->second.array) {
-      if (val.type == Value::NUMBER) {
-        font->widths.push_back(static_cast<int>(val.number));
+  if (widths_it != font_dict.end()) {
+    Value widths_val = widths_it->second;
+    if (widths_val.type == Value::REFERENCE) {
+      ResolvedObject resolved = resolve_reference(pdf,
+          widths_val.ref_object_number, widths_val.ref_generation_number);
+      if (resolved.success) widths_val = resolved.value;
+    }
+    if (widths_val.type == Value::ARRAY) {
+      for (const auto& val : widths_val.array) {
+        if (val.type == Value::NUMBER) {
+          font->widths.push_back(static_cast<int>(val.number));
+        }
       }
     }
   }
 
-  // Parse FirstChar and LastChar
-  auto first_it = font_dict.find("FirstChar");
-  if (first_it != font_dict.end() && first_it->second.type == Value::NUMBER) {
-    font->first_char = static_cast<int>(first_it->second.number);
-  }
-
-  auto last_it = font_dict.find("LastChar");
-  if (last_it != font_dict.end() && last_it->second.type == Value::NUMBER) {
-    font->last_char = static_cast<int>(last_it->second.number);
-  }
+  // Parse FirstChar and LastChar — also may be indirect references.
+  auto resolve_int = [&](const std::string& key, int& out) {
+    auto it = font_dict.find(key);
+    if (it == font_dict.end()) return;
+    Value v = it->second;
+    if (v.type == Value::REFERENCE) {
+      ResolvedObject r = resolve_reference(pdf, v.ref_object_number, v.ref_generation_number);
+      if (r.success) v = r.value;
+    }
+    if (v.type == Value::NUMBER) out = static_cast<int>(v.number);
+  };
+  resolve_int("FirstChar", font->first_char);
+  resolve_int("LastChar",  font->last_char);
 
   // Parse Encoding (critical for text extraction from Type3 fonts)
   auto enc_it = font_dict.find("Encoding");
@@ -9015,6 +9074,38 @@ std::unique_ptr<BaseFont> Pdf::parse_font(const Pdf& pdf, const Value& font_val)
     if (desc_it != font_dict.end()) {
       font->descriptor = parse_font_descriptor(pdf, desc_it->second).release();
     }
+
+    // Parse Widths / FirstChar / LastChar. Each entry may be an indirect
+    // reference that needs resolving (common in encrypted/compressed PDFs).
+    auto widths_it = font_dict.find("Widths");
+    if (widths_it != font_dict.end()) {
+      Value widths_val = widths_it->second;
+      if (widths_val.type == Value::REFERENCE) {
+        ResolvedObject r = resolve_reference(pdf,
+            widths_val.ref_object_number, widths_val.ref_generation_number);
+        if (r.success) widths_val = r.value;
+      }
+      if (widths_val.type == Value::ARRAY) {
+        for (const auto& val : widths_val.array) {
+          if (val.type == Value::NUMBER) {
+            font->widths.push_back(static_cast<int>(val.number));
+          }
+        }
+      }
+    }
+    auto resolve_int = [&](const std::string& key, int& out) {
+      auto it = font_dict.find(key);
+      if (it == font_dict.end()) return;
+      Value v = it->second;
+      if (v.type == Value::REFERENCE) {
+        ResolvedObject r = resolve_reference(pdf,
+            v.ref_object_number, v.ref_generation_number);
+        if (r.success) v = r.value;
+      }
+      if (v.type == Value::NUMBER) out = static_cast<int>(v.number);
+    };
+    resolve_int("FirstChar", font->first_char);
+    resolve_int("LastChar",  font->last_char);
 
     // For Type1 fonts with embedded font program, try to extract encoding
     // if no explicit encoding was provided in the PDF
