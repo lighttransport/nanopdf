@@ -4,6 +4,7 @@
 //
 
 #include "mcp-json.hh"
+#include "../string-parse.hh"
 
 #include <cmath>
 #include <cstdint>
@@ -279,7 +280,7 @@ ParseResult JsonParser::parse_number() {
   }
 
   std::string num_str = json_.substr(start, pos_ - start);
-  double value = std::stod(num_str);
+  double value = stod_or(num_str);
   return ParseResult::ok(JsonValue(value));
 }
 
@@ -312,7 +313,10 @@ ParseResult JsonParser::parse_string() {
           }
           std::string hex = json_.substr(pos_, 4);
           pos_ += 4;
-          uint32_t codepoint = static_cast<uint32_t>(std::stoul(hex, nullptr, 16));
+          uint32_t codepoint = 0;
+          if (!parse_hex_uint(hex, &codepoint)) {
+            return ParseResult::fail("Invalid unicode escape hex", pos_);
+          }
           result += unicode_to_utf8(codepoint);
           break;
         }

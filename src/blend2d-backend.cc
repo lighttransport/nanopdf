@@ -4,7 +4,9 @@
 #ifdef NANOPDF_USE_BLEND2D
 
 #include "blend2d-backend.hh"
+#include "font-unicode-map.hh"
 #include "nanopdf-log.hh"
+#include "string-parse.hh"
 
 #include <algorithm>
 #include <cmath>
@@ -206,11 +208,9 @@ static uint32_t glyph_name_to_unicode(const std::string& name) {
 
   // Try uniXXXX format
   if (name.length() == 7 && name.substr(0, 3) == "uni") {
-    try {
-      return static_cast<uint32_t>(std::stoul(name.substr(3), nullptr, 16));
-    } catch (...) {
-      return 0;
-    }
+    uint32_t cp = 0;
+    if (parse_hex_uint(name.substr(3), &cp)) return cp;
+    return 0;
   }
 
   // Single character name
@@ -293,28 +293,12 @@ static const uint16_t kMacRomanEncoding[256] = {
     0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7
 };
 
-// Adobe-Japan1 CID to Unicode mapping
-// Based on Adobe-Japan1-7 standard mapping (subset for common characters)
+// Adobe-Japan1 CID to Unicode mapping. Best-effort fallback when the PDF
+// omits a ToUnicode CMap. Regular closed-form ranges come from the shared
+// helper; this function adds a hand-maintained kanji / punctuation table
+// that covers the characters observed in sample corpora.
 static uint32_t adobe_japan1_cid_to_unicode(uint32_t cid) {
-  // CID 1 = space
-  if (cid == 1) return 0x0020;
-
-  // CIDs 2-94: Fullwidth ASCII punctuation and letters
-  static const uint32_t cid_2_94[] = {
-    0xFF01, 0xFF02, 0xFF03, 0xFF04, 0xFF05, 0xFF06, 0xFF07, 0xFF08, 0xFF09, 0xFF0A,
-    0xFF0B, 0xFF0C, 0xFF0D, 0xFF0E, 0xFF0F, 0xFF10, 0xFF11, 0xFF12, 0xFF13, 0xFF14,
-    0xFF15, 0xFF16, 0xFF17, 0xFF18, 0xFF19, 0xFF1A, 0xFF1B, 0xFF1C, 0xFF1D, 0xFF1E,
-    0xFF1F, 0xFF20, 0xFF21, 0xFF22, 0xFF23, 0xFF24, 0xFF25, 0xFF26, 0xFF27, 0xFF28,
-    0xFF29, 0xFF2A, 0xFF2B, 0xFF2C, 0xFF2D, 0xFF2E, 0xFF2F, 0xFF30, 0xFF31, 0xFF32,
-    0xFF33, 0xFF34, 0xFF35, 0xFF36, 0xFF37, 0xFF38, 0xFF39, 0xFF3A, 0xFF3B, 0xFF3C,
-    0xFF3D, 0xFF3E, 0xFF3F, 0xFF40, 0xFF41, 0xFF42, 0xFF43, 0xFF44, 0xFF45, 0xFF46,
-    0xFF47, 0xFF48, 0xFF49, 0xFF4A, 0xFF4B, 0xFF4C, 0xFF4D, 0xFF4E, 0xFF4F, 0xFF50,
-    0xFF51, 0xFF52, 0xFF53, 0xFF54, 0xFF55, 0xFF56, 0xFF57, 0xFF58, 0xFF59, 0xFF5A,
-    0xFF5B, 0xFF5C, 0xFF5D
-  };
-  if (cid >= 2 && cid <= 94) {
-    return cid_2_94[cid - 2];
-  }
+  if (uint32_t u = adobe_japan1_cid_to_unicode_regular(cid)) return u;
 
   // CID 95-96: Fullwidth tilde and overline
   if (cid == 95) return 0xFF5E;  // ～
@@ -328,31 +312,6 @@ static uint32_t adobe_japan1_cid_to_unicode(uint32_t cid) {
   };
   if (cid >= 97 && cid <= 117) {
     return cid_97_117[cid - 97];
-  }
-
-  // Hiragana (CID 842-924 -> U+3041-U+3093)
-  if (cid >= 842 && cid <= 924) {
-    return 0x3041 + (cid - 842);
-  }
-
-  // Katakana (CID 925-1010 -> U+30A1-U+30F6)
-  if (cid >= 925 && cid <= 1010) {
-    return 0x30A1 + (cid - 925);
-  }
-
-  // Fullwidth digits (CID 231-240 -> U+FF10-U+FF19)
-  if (cid >= 231 && cid <= 240) {
-    return 0xFF10 + (cid - 231);
-  }
-
-  // Fullwidth uppercase (CID 241-266 -> U+FF21-U+FF3A)
-  if (cid >= 241 && cid <= 266) {
-    return 0xFF21 + (cid - 241);
-  }
-
-  // Fullwidth lowercase (CID 267-292 -> U+FF41-U+FF5A)
-  if (cid >= 267 && cid <= 292) {
-    return 0xFF41 + (cid - 267);
   }
 
   // Common Japanese punctuation
@@ -639,14 +598,8 @@ static uint32_t adobe_japan1_cid_to_unicode(uint32_t cid) {
     return it->second;
   }
 
-  // Log unmapped CIDs for debugging (limited to avoid spam)
-  static std::set<uint32_t> unmapped_cids;
-  if (unmapped_cids.size() < 200 && unmapped_cids.find(cid) == unmapped_cids.end()) {
-    unmapped_cids.insert(cid);
-    printf("UNMAPPED_CID: %u\n", cid);
-  }
-
-  // Not found - return 0 to indicate no mapping
+  // Not found - return 0 to indicate no mapping. Rely on ToUnicode CMap
+  // at the caller side for authoritative coverage.
   return 0;
 }
 
@@ -668,7 +621,7 @@ static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
   }
 
   // For Type0 fonts with Adobe-Japan1, try CID-to-Unicode mapping
-  auto* type0_font = dynamic_cast<const Type0Font*>(font);
+  auto* type0_font = as_type0_font(font);
   if (type0_font && type0_font->ordering == "Japan1") {
     uint32_t japan1_unicode = adobe_japan1_cid_to_unicode(char_code);
     if (japan1_unicode != 0) {
@@ -700,29 +653,10 @@ static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
   return char_code;
 }
 
-// Check if font uses two-byte CID encoding
+// Check if font uses two-byte CID encoding. Thin wrapper over the shared
+// helper so existing call sites keep the familiar name.
 static bool is_two_byte_cid_font(const Type0Font* type0_font) {
-  if (!type0_font) {
-    return false;
-  }
-  // Determine if the CMap uses two-byte encoding based on CMap name
-  // Common two-byte CMaps: Identity-H, Identity-V, UniJIS-*, UniGB-*, UniKS-*, UniCNS-*
-  const std::string& cmap_name = type0_font->encoding_cmap.name;
-  if (cmap_name.find("Identity") != std::string::npos ||
-      cmap_name.find("UTF16") != std::string::npos ||
-      cmap_name.find("UCS2") != std::string::npos ||
-      cmap_name.find("UniJIS") != std::string::npos ||
-      cmap_name.find("UniGB") != std::string::npos ||
-      cmap_name.find("UniKS") != std::string::npos ||
-      cmap_name.find("UniCNS") != std::string::npos ||
-      // Also check registry/ordering for CJK fonts
-      type0_font->ordering == "Japan1" ||
-      type0_font->ordering == "GB1" ||
-      type0_font->ordering == "CNS1" ||
-      type0_font->ordering == "Korea1") {
-    return true;
-  }
-  return false;
+  return is_type0_two_byte_cid(type0_font);
 }
 
 // ICC Profile parsing helpers
@@ -1365,7 +1299,7 @@ static int get_font_category(const std::string& font_name) {
 // Check if font is CJK based on Type0Font ordering
 static bool is_cjk_font(const BaseFont* font) {
   if (!font) return false;
-  auto* type0_font = dynamic_cast<const Type0Font*>(font);
+  auto* type0_font = as_type0_font(font);
   if (type0_font) {
     // Check ordering for CJK collections
     const std::string& ordering = type0_font->ordering;
@@ -1632,7 +1566,7 @@ bool Blend2DBackend::load_font(const Pdf& pdf, const std::string& font_name, con
 
   // For Type0 fonts, check descendant font's descriptor for embedded font
   const FontDescriptor* desc = nullptr;
-  auto* type0_font = dynamic_cast<const Type0Font*>(font);
+  auto* type0_font = as_type0_font(font);
   if (font) {
     if (type0_font && type0_font->descendant_font) {
       BaseFont* descendant = type0_font->descendant_font.get();
@@ -2010,7 +1944,7 @@ bool Blend2DBackend::render_type3_glyph(const Type3Font* type3_font, const std::
 
 float Blend2DBackend::calculate_text_width(const std::string& text, float font_size) {
   // First try to use PDF font width information for Type0/CID fonts
-  auto* type0_font = dynamic_cast<const Type0Font*>(current_font_);
+  auto* type0_font = as_type0_font(current_font_);
   if (type0_font) {
     bool is_two_byte_cid = is_two_byte_cid_font(type0_font);
 
@@ -2091,11 +2025,20 @@ float Blend2DBackend::calculate_text_width(const std::string& text, float font_s
   return width;
 }
 
-float Blend2DBackend::render_text_string(const std::string& text,
+float Blend2DBackend::render_text_string(const std::string& raw_text,
     float x, float y, float font_size,
     uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  std::string text = raw_text;
+  // Literal strings like "(Hi)" in a Type0/Identity-H content stream are
+  // single-byte-shaped but expected to map to two-byte CIDs <00 48><00 69>.
+  // Widen before the two-byte decoder below reads them as CID 0x4869.
+  // (The tokenizer already pads odd-length hex strings, so was_hex_odd is
+  // not observable here; this only handles the literal-string case.)
+  maybe_widen_for_type0_cid(as_type0_font(current_font_),
+                            /*was_hex_odd=*/false, text);
+
   // Check for Type 3 font (user-defined glyphs) first
-  auto* type3_font = dynamic_cast<const Type3Font*>(current_font_);
+  auto* type3_font = as_type3_font(current_font_);
   if (type3_font) {
     float cursor_x = x;
 
@@ -2146,7 +2089,7 @@ float Blend2DBackend::render_text_string(const std::string& text,
   float scale = stbtt_ScaleForPixelHeight(&font->font_info, font_size);
 
   // Check if this is a Type0/CID font that uses two-byte encoding
-  auto* type0_font = dynamic_cast<const Type0Font*>(current_font_);
+  auto* type0_font = as_type0_font(current_font_);
   bool is_two_byte_cid = is_two_byte_cid_font(type0_font);
 
 
@@ -4042,8 +3985,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       // Path construction
       else if (token == "m") {  // moveto
         if (operands.size() >= 2) {
-          float x = std::stof(operands[operands.size() - 2]) * state_.scale;
-          float y = (state_.page_height - std::stof(operands[operands.size() - 1])) * state_.scale;
+          float x = nanopdf::stof_or(operands[operands.size() - 2]) * state_.scale;
+          float y = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 1])) * state_.scale;
           state_.current_path.move_to(x, y);
           state_.current_x = x;
           state_.current_y = y;
@@ -4051,40 +3994,40 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       } else if (token == "l") {  // lineto
         if (operands.size() >= 2) {
-          float x = std::stof(operands[operands.size() - 2]) * state_.scale;
-          float y = (state_.page_height - std::stof(operands[operands.size() - 1])) * state_.scale;
+          float x = nanopdf::stof_or(operands[operands.size() - 2]) * state_.scale;
+          float y = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 1])) * state_.scale;
           state_.current_path.line_to(x, y);
           state_.current_x = x;
           state_.current_y = y;
         }
       } else if (token == "c") {  // curveto
         if (operands.size() >= 6) {
-          float x1 = std::stof(operands[operands.size() - 6]) * state_.scale;
-          float y1 = (state_.page_height - std::stof(operands[operands.size() - 5])) * state_.scale;
-          float x2 = std::stof(operands[operands.size() - 4]) * state_.scale;
-          float y2 = (state_.page_height - std::stof(operands[operands.size() - 3])) * state_.scale;
-          float x3 = std::stof(operands[operands.size() - 2]) * state_.scale;
-          float y3 = (state_.page_height - std::stof(operands[operands.size() - 1])) * state_.scale;
+          float x1 = nanopdf::stof_or(operands[operands.size() - 6]) * state_.scale;
+          float y1 = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 5])) * state_.scale;
+          float x2 = nanopdf::stof_or(operands[operands.size() - 4]) * state_.scale;
+          float y2 = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 3])) * state_.scale;
+          float x3 = nanopdf::stof_or(operands[operands.size() - 2]) * state_.scale;
+          float y3 = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 1])) * state_.scale;
           state_.current_path.cubic_to(x1, y1, x2, y2, x3, y3);
           state_.current_x = x3;
           state_.current_y = y3;
         }
       } else if (token == "v") {  // curveto (first control point = current point)
         if (operands.size() >= 4) {
-          float x2 = std::stof(operands[operands.size() - 4]) * state_.scale;
-          float y2 = (state_.page_height - std::stof(operands[operands.size() - 3])) * state_.scale;
-          float x3 = std::stof(operands[operands.size() - 2]) * state_.scale;
-          float y3 = (state_.page_height - std::stof(operands[operands.size() - 1])) * state_.scale;
+          float x2 = nanopdf::stof_or(operands[operands.size() - 4]) * state_.scale;
+          float y2 = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 3])) * state_.scale;
+          float x3 = nanopdf::stof_or(operands[operands.size() - 2]) * state_.scale;
+          float y3 = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 1])) * state_.scale;
           state_.current_path.cubic_to(state_.current_x, state_.current_y, x2, y2, x3, y3);
           state_.current_x = x3;
           state_.current_y = y3;
         }
       } else if (token == "y") {  // curveto (last control point = end point)
         if (operands.size() >= 4) {
-          float x1 = std::stof(operands[operands.size() - 4]) * state_.scale;
-          float y1 = (state_.page_height - std::stof(operands[operands.size() - 3])) * state_.scale;
-          float x3 = std::stof(operands[operands.size() - 2]) * state_.scale;
-          float y3 = (state_.page_height - std::stof(operands[operands.size() - 1])) * state_.scale;
+          float x1 = nanopdf::stof_or(operands[operands.size() - 4]) * state_.scale;
+          float y1 = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 3])) * state_.scale;
+          float x3 = nanopdf::stof_or(operands[operands.size() - 2]) * state_.scale;
+          float y3 = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 1])) * state_.scale;
           state_.current_path.cubic_to(x1, y1, x3, y3, x3, y3);
           state_.current_x = x3;
           state_.current_y = y3;
@@ -4093,10 +4036,10 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         state_.current_path.close();
       } else if (token == "re") {  // rectangle
         if (operands.size() >= 4) {
-          float x = std::stof(operands[operands.size() - 4]) * state_.scale;
-          float y = (state_.page_height - std::stof(operands[operands.size() - 3])) * state_.scale;
-          float w = std::stof(operands[operands.size() - 2]) * state_.scale;
-          float h = std::stof(operands[operands.size() - 1]) * state_.scale;
+          float x = nanopdf::stof_or(operands[operands.size() - 4]) * state_.scale;
+          float y = (state_.page_height - nanopdf::stof_or(operands[operands.size() - 3])) * state_.scale;
+          float w = nanopdf::stof_or(operands[operands.size() - 2]) * state_.scale;
+          float h = nanopdf::stof_or(operands[operands.size() - 1]) * state_.scale;
           // PDF y is bottom-up, adjust for top-down
           y -= h;
           state_.current_path.add_rect(x, y, w, h);
@@ -4162,42 +4105,42 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       // Color operators
       else if (token == "g") {  // gray fill
         if (operands.size() >= 1) {
-          uint8_t gray = static_cast<uint8_t>(std::stof(operands[0]) * 255);
+          uint8_t gray = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
           state_.fill_r = state_.fill_g = state_.fill_b = gray;
         }
       } else if (token == "G") {  // gray stroke
         if (operands.size() >= 1) {
-          uint8_t gray = static_cast<uint8_t>(std::stof(operands[0]) * 255);
+          uint8_t gray = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
           state_.stroke_r = state_.stroke_g = state_.stroke_b = gray;
         }
       } else if (token == "rg") {  // RGB fill
         if (operands.size() >= 3) {
-          state_.fill_r = static_cast<uint8_t>(std::stof(operands[0]) * 255);
-          state_.fill_g = static_cast<uint8_t>(std::stof(operands[1]) * 255);
-          state_.fill_b = static_cast<uint8_t>(std::stof(operands[2]) * 255);
+          state_.fill_r = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
+          state_.fill_g = static_cast<uint8_t>(nanopdf::stof_or(operands[1]) * 255);
+          state_.fill_b = static_cast<uint8_t>(nanopdf::stof_or(operands[2]) * 255);
         }
       } else if (token == "RG") {  // RGB stroke
         if (operands.size() >= 3) {
-          state_.stroke_r = static_cast<uint8_t>(std::stof(operands[0]) * 255);
-          state_.stroke_g = static_cast<uint8_t>(std::stof(operands[1]) * 255);
-          state_.stroke_b = static_cast<uint8_t>(std::stof(operands[2]) * 255);
+          state_.stroke_r = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
+          state_.stroke_g = static_cast<uint8_t>(nanopdf::stof_or(operands[1]) * 255);
+          state_.stroke_b = static_cast<uint8_t>(nanopdf::stof_or(operands[2]) * 255);
         }
       } else if (token == "k") {  // CMYK fill
         if (operands.size() >= 4) {
-          float c = std::stof(operands[0]);
-          float m = std::stof(operands[1]);
-          float y = std::stof(operands[2]);
-          float k = std::stof(operands[3]);
+          float c = nanopdf::stof_or(operands[0]);
+          float m = nanopdf::stof_or(operands[1]);
+          float y = nanopdf::stof_or(operands[2]);
+          float k = nanopdf::stof_or(operands[3]);
           state_.fill_r = static_cast<uint8_t>((1.0f - c) * (1.0f - k) * 255);
           state_.fill_g = static_cast<uint8_t>((1.0f - m) * (1.0f - k) * 255);
           state_.fill_b = static_cast<uint8_t>((1.0f - y) * (1.0f - k) * 255);
         }
       } else if (token == "K") {  // CMYK stroke
         if (operands.size() >= 4) {
-          float c = std::stof(operands[0]);
-          float m = std::stof(operands[1]);
-          float y = std::stof(operands[2]);
-          float k = std::stof(operands[3]);
+          float c = nanopdf::stof_or(operands[0]);
+          float m = nanopdf::stof_or(operands[1]);
+          float y = nanopdf::stof_or(operands[2]);
+          float k = nanopdf::stof_or(operands[3]);
           state_.stroke_r = static_cast<uint8_t>((1.0f - c) * (1.0f - k) * 255);
           state_.stroke_g = static_cast<uint8_t>((1.0f - m) * (1.0f - k) * 255);
           state_.stroke_b = static_cast<uint8_t>((1.0f - y) * (1.0f - k) * 255);
@@ -4235,9 +4178,9 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         if (!is_pattern) {
           state_.fill_pattern.clear();
           if (operands.size() >= 3) {
-            state_.fill_r = static_cast<uint8_t>(std::stof(operands[0]) * 255);
-            state_.fill_g = static_cast<uint8_t>(std::stof(operands[1]) * 255);
-            state_.fill_b = static_cast<uint8_t>(std::stof(operands[2]) * 255);
+            state_.fill_r = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
+            state_.fill_g = static_cast<uint8_t>(nanopdf::stof_or(operands[1]) * 255);
+            state_.fill_b = static_cast<uint8_t>(nanopdf::stof_or(operands[2]) * 255);
           } else if (operands.size() >= 1) {
             // Check if current color space is Separation
             bool handled = false;
@@ -4254,7 +4197,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                 }
                 ColorSpace cs = parse_color_space(*current_pdf_, resolved_cs);
                 if (cs.type == ColorSpaceType::Separation) {
-                  double tint = std::stof(operands[0]);
+                  double tint = nanopdf::stof_or(operands[0]);
                   if (evaluate_separation_color(*current_pdf_, cs, tint,
                                                 state_.fill_r, state_.fill_g, state_.fill_b)) {
                     handled = true;
@@ -4264,7 +4207,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             }
             if (!handled) {
               // Fallback: treat as grayscale
-              uint8_t gray = static_cast<uint8_t>(std::stof(operands[0]) * 255);
+              uint8_t gray = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
               state_.fill_r = state_.fill_g = state_.fill_b = gray;
             }
           }
@@ -4281,9 +4224,9 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         if (!is_pattern) {
           state_.stroke_pattern.clear();
           if (operands.size() >= 3) {
-            state_.stroke_r = static_cast<uint8_t>(std::stof(operands[0]) * 255);
-            state_.stroke_g = static_cast<uint8_t>(std::stof(operands[1]) * 255);
-            state_.stroke_b = static_cast<uint8_t>(std::stof(operands[2]) * 255);
+            state_.stroke_r = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
+            state_.stroke_g = static_cast<uint8_t>(nanopdf::stof_or(operands[1]) * 255);
+            state_.stroke_b = static_cast<uint8_t>(nanopdf::stof_or(operands[2]) * 255);
           } else if (operands.size() >= 1) {
             // Check if current stroke color space is Separation
             bool handled = false;
@@ -4300,7 +4243,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                 }
                 ColorSpace cs = parse_color_space(*current_pdf_, resolved_cs);
                 if (cs.type == ColorSpaceType::Separation) {
-                  double tint = std::stof(operands[0]);
+                  double tint = nanopdf::stof_or(operands[0]);
                   if (evaluate_separation_color(*current_pdf_, cs, tint,
                                                 state_.stroke_r, state_.stroke_g, state_.stroke_b)) {
                     handled = true;
@@ -4310,7 +4253,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             }
             if (!handled) {
               // Fallback: treat as grayscale
-              uint8_t gray = static_cast<uint8_t>(std::stof(operands[0]) * 255);
+              uint8_t gray = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
               state_.stroke_r = state_.stroke_g = state_.stroke_b = gray;
             }
           }
@@ -4319,19 +4262,19 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       // Line style
       else if (token == "w") {
         if (operands.size() >= 1) {
-          state_.stroke_width = std::stof(operands[0]);
+          state_.stroke_width = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "J") {
         if (operands.size() >= 1) {
-          state_.line_cap = std::stoi(operands[0]);
+          state_.line_cap = nanopdf::stoi_or(operands[0]);
         }
       } else if (token == "j") {
         if (operands.size() >= 1) {
-          state_.line_join = std::stoi(operands[0]);
+          state_.line_join = nanopdf::stoi_or(operands[0]);
         }
       } else if (token == "M") {
         if (operands.size() >= 1) {
-          state_.miter_limit = std::stof(operands[0]);
+          state_.miter_limit = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "d") {
         state_.dash_pattern.clear();
@@ -4343,9 +4286,9 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           } else if (operands[i] == "]") {
             in_array = false;
           } else if (in_array) {
-            state_.dash_pattern.push_back(std::stof(operands[i]));
+            state_.dash_pattern.push_back(nanopdf::stof_or(operands[i]));
           } else if (!in_array && i == operands.size() - 1) {
-            state_.dash_phase = std::stof(operands[i]);
+            state_.dash_phase = nanopdf::stof_or(operands[i]);
           }
         }
       }
@@ -4554,7 +4497,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           if (!font_name.empty() && font_name[0] == '/') {
             font_name = font_name.substr(1);
           }
-          state_.font_size = std::stof(operands[operands.size() - 1]);
+          state_.font_size = nanopdf::stof_or(operands[operands.size() - 1]);
           current_font_name_ = font_name;
           current_font_ = nullptr;
           if (current_pdf_ && current_page_) {
@@ -4571,16 +4514,16 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       } else if (token == "Td") {
         if (operands.size() >= 2) {
-          float tx = std::stof(operands[0]);
-          float ty = std::stof(operands[1]);
+          float tx = nanopdf::stof_or(operands[0]);
+          float ty = nanopdf::stof_or(operands[1]);
           state_.text_matrix.e += tx * state_.text_matrix.a + ty * state_.text_matrix.c;
           state_.text_matrix.f += tx * state_.text_matrix.b + ty * state_.text_matrix.d;
           state_.text_line_matrix = state_.text_matrix;
         }
       } else if (token == "TD") {
         if (operands.size() >= 2) {
-          float tx = std::stof(operands[0]);
-          float ty = std::stof(operands[1]);
+          float tx = nanopdf::stof_or(operands[0]);
+          float ty = nanopdf::stof_or(operands[1]);
           state_.text_leading = -ty;
           state_.text_matrix.e += tx * state_.text_matrix.a + ty * state_.text_matrix.c;
           state_.text_matrix.f += tx * state_.text_matrix.b + ty * state_.text_matrix.d;
@@ -4588,12 +4531,12 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       } else if (token == "Tm") {
         if (operands.size() >= 6) {
-          state_.text_matrix.a = std::stof(operands[0]);
-          state_.text_matrix.b = std::stof(operands[1]);
-          state_.text_matrix.c = std::stof(operands[2]);
-          state_.text_matrix.d = std::stof(operands[3]);
-          state_.text_matrix.e = std::stof(operands[4]);
-          state_.text_matrix.f = std::stof(operands[5]);
+          state_.text_matrix.a = nanopdf::stof_or(operands[0]);
+          state_.text_matrix.b = nanopdf::stof_or(operands[1]);
+          state_.text_matrix.c = nanopdf::stof_or(operands[2]);
+          state_.text_matrix.d = nanopdf::stof_or(operands[3]);
+          state_.text_matrix.e = nanopdf::stof_or(operands[4]);
+          state_.text_matrix.f = nanopdf::stof_or(operands[5]);
           state_.text_line_matrix = state_.text_matrix;
         }
       } else if (token == "T*") {
@@ -4605,27 +4548,27 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         state_.text_line_matrix = state_.text_matrix;
       } else if (token == "TL") {
         if (operands.size() >= 1) {
-          state_.text_leading = std::stof(operands[0]);
+          state_.text_leading = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "Tc") {
         if (operands.size() >= 1) {
-          state_.char_spacing = std::stof(operands[0]);
+          state_.char_spacing = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "Tw") {
         if (operands.size() >= 1) {
-          state_.word_spacing = std::stof(operands[0]);
+          state_.word_spacing = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "Tz") {
         if (operands.size() >= 1) {
-          state_.horiz_scaling = std::stof(operands[0]);
+          state_.horiz_scaling = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "Ts") {
         if (operands.size() >= 1) {
-          state_.text_rise = static_cast<int>(std::stof(operands[0]));
+          state_.text_rise = static_cast<int>(nanopdf::stof_or(operands[0]));
         }
       } else if (token == "Tr") {
         if (operands.size() >= 1) {
-          state_.text_render_mode = std::stoi(operands[0]);
+          state_.text_render_mode = nanopdf::stoi_or(operands[0]);
         }
       } else if (token == "Tj") {
         // Show text with CMap-aware rendering
@@ -4660,19 +4603,11 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           for (const auto& op : operands) {
             if (op == "[" || op == "]") continue;
 
-            try {
-              float adjust = std::stof(op);
-              // Negative values move right, positive values move left
+            float adjust = nanopdf::stof_or(op);
+            // Negative values move right, positive values move left
               float pixel_adjust = (adjust / 1000.0f) * font_size;
-              x -= pixel_adjust;
-              total_advance -= pixel_adjust / state_.scale;
-            } catch (...) {
-              // This is a text string
-              float text_width = render_text_string(op, x, y, font_size,
-                  state_.fill_r, state_.fill_g, state_.fill_b, fill_alpha);
-              x += text_width;
-              total_advance += text_width / state_.scale;
-            }
+            x -= pixel_adjust;
+            total_advance -= pixel_adjust / state_.scale;
           }
           state_.text_matrix.e += total_advance;
           advance_progress();
@@ -4683,8 +4618,8 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         if (state_.in_text_block) {
           size_t text_idx = operands.size() - 1;
           if (token == "\"" && operands.size() >= 3) {
-            state_.word_spacing = std::stof(operands[0]);
-            state_.char_spacing = std::stof(operands[1]);
+            state_.word_spacing = nanopdf::stof_or(operands[0]);
+            state_.char_spacing = nanopdf::stof_or(operands[1]);
           }
 
           // T* - move to next line
@@ -4883,12 +4818,12 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       else if (token == "cm") {
         if (operands.size() >= 6) {
           GraphicsState::Matrix m;
-          m.a = std::stof(operands[0]);
-          m.b = std::stof(operands[1]);
-          m.c = std::stof(operands[2]);
-          m.d = std::stof(operands[3]);
-          m.e = std::stof(operands[4]);
-          m.f = std::stof(operands[5]);
+          m.a = nanopdf::stof_or(operands[0]);
+          m.b = nanopdf::stof_or(operands[1]);
+          m.c = nanopdf::stof_or(operands[2]);
+          m.d = nanopdf::stof_or(operands[3]);
+          m.e = nanopdf::stof_or(operands[4]);
+          m.f = nanopdf::stof_or(operands[5]);
           state_.transform = state_.transform * m;
         }
       } else if (token == "ri") {
@@ -4899,7 +4834,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       } else if (token == "i") {
         // Flatness tolerance from content stream
         if (!operands.empty()) {
-          state_.flatness = std::stof(operands[0]);
+          state_.flatness = nanopdf::stof_or(operands[0]);
         }
       }
 
@@ -5017,17 +4952,17 @@ bool Blend2DBackend::parse_inline_image(const std::string& content, size_t& pos)
   // W or Width
   auto it = dict.find("W");
   if (it == dict.end()) it = dict.find("Width");
-  if (it != dict.end()) width = std::stoi(it->second);
+  if (it != dict.end()) width = nanopdf::stoi_or(it->second);
 
   // H or Height
   it = dict.find("H");
   if (it == dict.end()) it = dict.find("Height");
-  if (it != dict.end()) height = std::stoi(it->second);
+  if (it != dict.end()) height = nanopdf::stoi_or(it->second);
 
   // BPC or BitsPerComponent
   it = dict.find("BPC");
   if (it == dict.end()) it = dict.find("BitsPerComponent");
-  if (it != dict.end()) bpc = std::stoi(it->second);
+  if (it != dict.end()) bpc = nanopdf::stoi_or(it->second);
 
   // CS or ColorSpace
   it = dict.find("CS");

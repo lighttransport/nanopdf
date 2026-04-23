@@ -37,6 +37,7 @@
 #include "stream-reader.hh"
 #include "text-layout.hh"
 #include "type1-parser.hh"
+#include "string-parse.hh"
 
 namespace nanopdf {
 
@@ -747,11 +748,7 @@ static bool parse_linearization_dict(const uint8_t* data, size_t data_size,
            dict_text[kpos] == '+' || dict_text[kpos] == '.' ||
            (dict_text[kpos] >= '0' && dict_text[kpos] <= '9'))) ++kpos;
     if (kpos == num_start) return 0.0;
-    try {
-      return std::stod(dict_text.substr(num_start, kpos - num_start));
-    } catch (...) {
-      return 0.0;
-    }
+    return nanopdf::stod_or(dict_text.substr(num_start, kpos - num_start));
   };
 
   // Parse /H array: [offset length] or [offset1 length1 offset2 length2]
@@ -773,9 +770,10 @@ static bool parse_linearization_dict(const uint8_t* data, size_t data_size,
       while (hpos < dict_text.size() && dict_text[hpos] >= '0' &&
              dict_text[hpos] <= '9') ++hpos;
       if (hpos > nstart) {
-        try {
-          values.push_back(std::stoull(dict_text.substr(nstart, hpos - nstart)));
-        } catch (...) {}
+        uint64_t v = 0;
+        if (parse_uint64(dict_text.substr(nstart, hpos - nstart), &v)) {
+          values.push_back(v);
+        }
       }
     }
     if (values.size() >= 2) {
@@ -4725,11 +4723,7 @@ bool parse_number(StreamReader& sr, Parser& parser, double* out_number) {
     return false;
   }
 
-  try {
-    *out_number = std::stod(token);
-  } catch (const std::exception&) {
-    return false;
-  }
+  *out_number = nanopdf::stod_or(token);
 
   return true;
 }
@@ -7263,11 +7257,7 @@ private:
   }
 
   double parse_number(const std::string& str) {
-    try {
-      return std::stod(str);
-    } catch (...) {
-      return 0.0;
-    }
+    return nanopdf::stod_or(str);
   }
 
   std::string decode_text_string(const std::string& str) {
@@ -7302,7 +7292,7 @@ private:
                    result[i] >= '0' && result[i] <= '7') {
               octal += result[i++];
             }
-            int value = std::stoi(octal, nullptr, 8);
+            int value = nanopdf::stou_base_or(octal, 8);
             result.replace(pos, i - pos, 1, static_cast<char>(value));
           } else {
             pos++;
@@ -7319,7 +7309,7 @@ private:
       for (size_t i = 0; i < hex.size(); i += 2) {
         std::string byte = hex.substr(i, 2);
         if (byte.size() == 1) byte += "0";
-        result += static_cast<char>(std::stoi(byte, nullptr, 16));
+        result += static_cast<char>(nanopdf::stou_base_or(byte, 16));
       }
       return result;
     }
@@ -7343,7 +7333,7 @@ private:
     }
 
     if (base_font->subtype == "Type0") {
-      const Type0Font* type0 = dynamic_cast<const Type0Font*>(base_font);
+      const Type0Font* type0 = as_type0_font(base_font);
       if (type0) {
         if (!type0->encoding_cmap.code_to_unicode.empty()) {
           return map_with_cmap(type0->encoding_cmap, raw);
@@ -7853,37 +7843,23 @@ std::vector<std::string> tokenize_cmap_line(const std::string& line) {
 }
 
 bool parse_integer_token(const std::string& token, int* out) {
-  if (!out) {
-    return false;
-  }
-  try {
-    size_t consumed = 0;
-    int value = std::stoi(token, &consumed, 10);
-    if (consumed != token.size()) {
-      return false;
-    }
-    *out = value;
-    return true;
-  } catch (...) {
-    return false;
-  }
+  if (!out) return false;
+  int32_t value = 0;
+  if (!parse_int(token, &value)) return false;
+  *out = value;
+  return true;
 }
 
 bool parse_literal_number(const std::string& token, uint32_t* out) {
   if (!out) {
     return false;
   }
-  try {
-    size_t consumed = 0;
-    uint32_t value = static_cast<uint32_t>(std::stoul(token, &consumed, 10));
-    if (consumed != token.size()) {
-      return false;
-    }
-    *out = value;
-    return true;
-  } catch (...) {
-    return false;
-  }
+  size_t consumed = 0;
+  uint32_t value = 0;
+  if (!parse_uint_consumed(token, &value, &consumed)) return false;
+  if (consumed != token.size()) return false;
+  *out = value;
+  return true;
 }
 
 bool parse_hex_string_token(const std::string& token, uint32_t* out) {
@@ -7905,12 +7881,7 @@ bool parse_hex_string_token(const std::string& token, uint32_t* out) {
     *out = 0;
     return true;
   }
-  try {
-    *out = static_cast<uint32_t>(std::stoul(hex, nullptr, 16));
-    return true;
-  } catch (...) {
-    return false;
-  }
+  return parse_hex_uint(hex, out);
 }
 
 std::vector<uint32_t> parse_hex_array_token(const std::string& token) {
@@ -11046,6 +11017,46 @@ std::unique_ptr<Pattern> parse_pattern(const Pdf& pdf, const Dictionary& pattern
     }
   }
 
+  return pattern;
+}
+
+std::unique_ptr<Pattern> parse_pattern(const Pdf& pdf, const Value& value,
+                                       uint32_t obj_num, uint16_t gen_num) {
+  const Value* pv = &value;
+  Value resolved_holder;
+  if (pv->type == Value::REFERENCE) {
+    auto resolved = resolve_reference(pdf, pv->ref_object_number,
+                                      pv->ref_generation_number);
+    if (!resolved.success) return nullptr;
+    if (obj_num == 0) {
+      obj_num = pv->ref_object_number;
+      gen_num = pv->ref_generation_number;
+    }
+    resolved_holder = std::move(resolved.value);
+    pv = &resolved_holder;
+  }
+
+  const Dictionary* dict = nullptr;
+  if (pv->type == Value::DICTIONARY) {
+    dict = &pv->dict;
+  } else if (pv->type == Value::STREAM) {
+    dict = &pv->stream.dict;
+  } else {
+    return nullptr;
+  }
+
+  auto pattern = parse_pattern(pdf, *dict);
+  if (!pattern) return nullptr;
+
+  // Tiling patterns carry their drawing operators in the stream body; the
+  // dictionary-only path can't see it, so decode and attach here.
+  if (pattern->type == PatternType::Tiling && pattern->tiling &&
+      pv->type == Value::STREAM) {
+    auto decoded = decode_stream(pdf, *pv, obj_num, gen_num);
+    if (decoded.success) {
+      pattern->tiling->content_stream = std::move(decoded.data);
+    }
+  }
   return pattern;
 }
 

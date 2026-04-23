@@ -16,6 +16,7 @@
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
+#include "string-parse.hh"
 #include "text-layout.hh"
 #include "table-extraction.hh"
 
@@ -1398,14 +1399,14 @@ const char* nanopdf_batch_extract_text(const char* page_indices) {
     std::string token;
     while ((pos = indices_str.find(',')) != std::string::npos) {
       token = indices_str.substr(0, pos);
-      int idx = std::atoi(token.c_str());
+      int idx = nanopdf::stoi_or(token.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }
       indices_str.erase(0, pos + 1);
     }
     if (!indices_str.empty()) {
-      int idx = std::atoi(indices_str.c_str());
+      int idx = nanopdf::stoi_or(indices_str.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }
@@ -1451,14 +1452,14 @@ const char* nanopdf_batch_get_page_info(const char* page_indices) {
     std::string token;
     while ((pos = indices_str.find(',')) != std::string::npos) {
       token = indices_str.substr(0, pos);
-      int idx = std::atoi(token.c_str());
+      int idx = nanopdf::stoi_or(token.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }
       indices_str.erase(0, pos + 1);
     }
     if (!indices_str.empty()) {
-      int idx = std::atoi(indices_str.c_str());
+      int idx = nanopdf::stoi_or(indices_str.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }
@@ -1527,14 +1528,14 @@ const char* nanopdf_batch_find_text(const char* search_term, const char* page_in
     std::string token;
     while ((pos = indices_str.find(',')) != std::string::npos) {
       token = indices_str.substr(0, pos);
-      int idx = std::atoi(token.c_str());
+      int idx = nanopdf::stoi_or(token.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }
       indices_str.erase(0, pos + 1);
     }
     if (!indices_str.empty()) {
-      int idx = std::atoi(indices_str.c_str());
+      int idx = nanopdf::stoi_or(indices_str.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }
@@ -1604,14 +1605,14 @@ const char* nanopdf_batch_extract_text_layout(const char* page_indices) {
     std::string token;
     while ((pos = indices_str.find(',')) != std::string::npos) {
       token = indices_str.substr(0, pos);
-      int idx = std::atoi(token.c_str());
+      int idx = nanopdf::stoi_or(token.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }
       indices_str.erase(0, pos + 1);
     }
     if (!indices_str.empty()) {
-      int idx = std::atoi(indices_str.c_str());
+      int idx = nanopdf::stoi_or(indices_str.c_str());
       if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) {
         pages.push_back(idx);
       }

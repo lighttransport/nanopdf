@@ -3,6 +3,7 @@
 
 #include "text-layout.hh"
 #include "nanopdf.hh"
+#include "string-parse.hh"
 
 #include <algorithm>
 #include <cmath>
@@ -938,7 +939,7 @@ private:
 
     // For Type0 fonts, check CID widths
     if (font->subtype == "Type0") {
-      const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+      const Type0Font* type0 = as_type0_font(font);
       if (type0) {
         auto it = type0->cid_widths.find(char_code);
         if (it != type0->cid_widths.end()) {
@@ -982,7 +983,7 @@ private:
             while (i < result.size() && i < pos + 4 && result[i] >= '0' && result[i] <= '7') {
               octal += result[i++];
             }
-            int value = std::stoi(octal, nullptr, 8);
+            int value = nanopdf::stou_base_or(octal, 8);
             result.replace(pos, i - pos, 1, static_cast<char>(value));
           } else {
             pos++;
@@ -998,7 +999,7 @@ private:
       for (size_t i = 0; i < hex.size(); i += 2) {
         std::string byte = hex.substr(i, 2);
         if (byte.size() == 1) byte += "0";
-        result += static_cast<char>(std::stoi(byte, nullptr, 16));
+        result += static_cast<char>(nanopdf::stou_base_or(byte, 16));
       }
       return result;
     }
@@ -1006,11 +1007,7 @@ private:
   }
 
   double parse_number(const std::string& str) {
-    try {
-      return std::stod(str);
-    } catch (...) {
-      return 0.0;
-    }
+    return nanopdf::stod_or(str);
   }
 };
 

@@ -311,6 +311,9 @@ private:
 
   // Calculate text width using font metrics (returns width in text space units)
   float calculate_text_width(const std::string& text, float font_size);
+  // Calculate text advance using the same glyph-advance model as draw_text.
+  float calculate_text_advance_draw_model(const std::string& text,
+                                          float font_size);
 
   // Calculate vertical advance using W2/DW2 metrics (for vertical writing mode)
   float calculate_vertical_advance(const std::string& text, float font_size);
@@ -402,6 +405,10 @@ private:
   // Form XObject resource stack for nested Form XObjects
   // Each entry contains resources from a Form XObject
   std::vector<Dictionary> form_resources_stack_;
+
+  // True while rendering text chunks originating from a TJ array.
+  // Used to disable bitmap glyph snapping for high-precision spacing.
+  bool in_tj_text_draw_{false};
 
   // Helper to lookup a resource, checking Form resources first, then page resources
   const Value* lookup_resource(const std::string& resource_type, const std::string& name) const;

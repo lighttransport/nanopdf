@@ -46,11 +46,7 @@ void StdioTransport::run() {
 
     // Call message callback
     if (callback_) {
-      try {
-        callback_(line);
-      } catch (const std::exception& e) {
-        log(LogLevel::Error, std::string("Exception in message callback: ") + e.what());
-      }
+      callback_(line);
     }
   }
 

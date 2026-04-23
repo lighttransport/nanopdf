@@ -150,11 +150,7 @@ ToolResult ToolRegistry::call_tool(const std::string& name, const JsonValue& arg
     return ToolResult::error("Tool not found: " + name);
   }
 
-  try {
-    return it->second(arguments);
-  } catch (const std::exception& e) {
-    return ToolResult::error(std::string("Tool execution error: ") + e.what());
-  }
+  return it->second(arguments);
 }
 
 bool ToolRegistry::has_tool(const std::string& name) const {
@@ -746,7 +742,7 @@ ToolResult query_region_tool(const JsonValue& args) {
       const BaseFont* bf = mutable_page.get_font(font_name, *g_pdf_state.pdf);
       std::string writing_mode = "horizontal";
       if (bf) {
-        const Type0Font* t0 = dynamic_cast<const Type0Font*>(bf);
+        const Type0Font* t0 = as_type0_font(bf);
         if (t0 && t0->has_vertical_metrics) {
           writing_mode = "vertical";
         }

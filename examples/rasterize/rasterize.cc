@@ -7,6 +7,7 @@
 //
 // Options:
 //   -p, --page <n>     Page number to render (default: 1)
+//   --pages <spec>     Page selection (e.g. 1-3,7,10-12)
 //   -w, --width <n>    Output width in pixels (default: 800)
 //   -h, --height <n>   Output height in pixels (default: 600)
 //   -s, --scale <f>    Scale factor (overrides width/height)
@@ -23,8 +24,10 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <iomanip>
 #include <sstream>
+#include <set>
 
 #ifdef NANOPDF_USE_THORVG
 #include "../../src/thorvg-backend.hh"
@@ -43,6 +46,9 @@ struct RasterizeOptions {
   std::string input_file;
   std::string output_file;
   int page_number = 1;  // 1-based page numbering
+  bool page_option_set = false;
+  std::string pages_spec;
+  bool pages_spec_set = false;
   int width = 800;
   int height = 600;
   float scale = 0.0f;  // 0 means auto-calculate
@@ -65,6 +71,7 @@ void print_usage(const char* program_name) {
   std::cout << "\n";
   std::cout << "Options:\n";
   std::cout << "  -p, --page <n>     Page number to render (default: 1)\n";
+  std::cout << "  --pages <spec>     Page selection (e.g. 1-3,7,10-12)\n";
   std::cout << "  -w, --width <n>    Output width in pixels (default: 800)\n";
   std::cout << "  -h, --height <n>   Output height in pixels (default: 600)\n";
   std::cout << "  -s, --scale <f>    Scale factor (overrides width/height)\n";
@@ -79,6 +86,7 @@ void print_usage(const char* program_name) {
   std::cout << "Examples:\n";
   std::cout << "  " << program_name << " document.pdf output.png\n";
   std::cout << "  " << program_name << " document.pdf output.png -p 2 -w 1024 -h 768\n";
+  std::cout << "  " << program_name << " document.pdf output.png --pages 1-3,7,10\n";
   std::cout << "  " << program_name << " document.pdf output.png --all --dpi 150\n";
   std::cout << "  " << program_name << " document.pdf output.png -s 2.0\n";
   std::cout << "  " << program_name << " document.pdf output.png -r 90 --grayscale\n";
@@ -102,6 +110,14 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
         std::cerr << "Error: Page number must be >= 1\n";
         return false;
       }
+      options.page_option_set = true;
+    } else if (arg == "--pages" && i + 1 < argc) {
+      options.pages_spec = argv[++i];
+      if (options.pages_spec.empty()) {
+        std::cerr << "Error: --pages must not be empty\n";
+        return false;
+      }
+      options.pages_spec_set = true;
     } else if ((arg == "-w" || arg == "--width") && i + 1 < argc) {
       options.width = std::atoi(argv[++i]);
       if (options.width <= 0) {
@@ -155,26 +171,127 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
     }
   }
 
+  int selection_mode_count = 0;
+  if (options.render_all_pages) selection_mode_count++;
+  if (options.page_option_set) selection_mode_count++;
+  if (options.pages_spec_set) selection_mode_count++;
+  if (selection_mode_count > 1) {
+    std::cerr << "Error: --all, --page, and --pages are mutually exclusive\n";
+    return false;
+  }
+
   return true;
 }
 
-std::string generate_output_filename(const std::string& base_output, int page_num, int total_pages) {
-  // If rendering all pages, append page number before extension
-  if (total_pages > 1) {
-    size_t dot_pos = base_output.rfind('.');
-    if (dot_pos != std::string::npos) {
-      std::stringstream ss;
-      ss << base_output.substr(0, dot_pos);
-      ss << "_page" << std::setfill('0') << std::setw(3) << page_num;
-      ss << base_output.substr(dot_pos);
-      return ss.str();
-    } else {
-      std::stringstream ss;
-      ss << base_output << "_page" << std::setfill('0') << std::setw(3) << page_num;
-      return ss.str();
-    }
+static std::string trim_copy(const std::string& s) {
+  size_t start = 0;
+  while (start < s.size() &&
+         std::isspace(static_cast<unsigned char>(s[start]))) {
+    start++;
   }
-  return base_output;
+  size_t end = s.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+    end--;
+  }
+  return s.substr(start, end - start);
+}
+
+static bool parse_positive_int(const std::string& s, int& out) {
+  if (s.empty()) return false;
+  for (char c : s) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+  }
+  out = std::atoi(s.c_str());
+  return out > 0;
+}
+
+static bool parse_pages_spec(const std::string& spec, std::vector<int>& pages,
+                             std::string& error_message) {
+  pages.clear();
+  std::set<int> seen;
+
+  size_t pos = 0;
+  while (pos <= spec.size()) {
+    size_t comma = spec.find(',', pos);
+    std::string token = (comma == std::string::npos)
+                            ? spec.substr(pos)
+                            : spec.substr(pos, comma - pos);
+    token = trim_copy(token);
+    if (token.empty()) {
+      error_message = "empty token in --pages spec";
+      return false;
+    }
+
+    size_t dash = token.find('-');
+    if (dash == std::string::npos) {
+      int page = 0;
+      if (!parse_positive_int(token, page)) {
+        error_message = "invalid page number: " + token;
+        return false;
+      }
+      if (!seen.count(page)) {
+        pages.push_back(page);
+        seen.insert(page);
+      }
+    } else {
+      if (token.find('-', dash + 1) != std::string::npos) {
+        error_message = "invalid range token: " + token;
+        return false;
+      }
+      std::string left = trim_copy(token.substr(0, dash));
+      std::string right = trim_copy(token.substr(dash + 1));
+      int start = 0;
+      int end = 0;
+      if (!parse_positive_int(left, start) || !parse_positive_int(right, end)) {
+        error_message = "invalid range token: " + token;
+        return false;
+      }
+      if (start > end) {
+        error_message = "range start > end: " + token;
+        return false;
+      }
+      for (int p = start; p <= end; p++) {
+        if (!seen.count(p)) {
+          pages.push_back(p);
+          seen.insert(p);
+        }
+      }
+    }
+
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+
+  if (pages.empty()) {
+    error_message = "no pages selected";
+    return false;
+  }
+  return true;
+}
+
+std::string generate_output_filename(const std::string& base_output, int page_num,
+                                     bool multi_page_output) {
+  if (!multi_page_output) return base_output;
+
+  size_t dot_pos = base_output.rfind('.');
+  std::string stem = (dot_pos == std::string::npos) ? base_output
+                                                     : base_output.substr(0, dot_pos);
+  std::string ext = (dot_pos == std::string::npos) ? "" : base_output.substr(dot_pos);
+
+  std::stringstream page_ss;
+  page_ss << std::setfill('0') << std::setw(4) << page_num;
+  std::string page_str = page_ss.str();
+
+  // If user provided placeholder "0000" in filename, replace it.
+  size_t placeholder_pos = stem.rfind("0000");
+  if (placeholder_pos != std::string::npos) {
+    stem.replace(placeholder_pos, 4, page_str);
+    return stem + ext;
+  }
+
+  // Otherwise append "-0000"-style suffix.
+  return stem + "-" + page_str + ext;
 }
 
 // Convert RGBA pixels to grayscale (in-place, keeps alpha)
@@ -447,6 +564,19 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i <= total_pages; i++) {
       pages_to_render.push_back(i);
     }
+  } else if (options.pages_spec_set) {
+    std::string parse_error;
+    if (!parse_pages_spec(options.pages_spec, pages_to_render, parse_error)) {
+      std::cerr << "Error: invalid --pages spec: " << parse_error << "\n";
+      return 1;
+    }
+    for (int page_num : pages_to_render) {
+      if (page_num > total_pages) {
+        std::cerr << "Error: Page " << page_num << " does not exist. ";
+        std::cerr << "PDF has " << total_pages << " page(s).\n";
+        return 1;
+      }
+    }
   } else {
     if (options.page_number > total_pages) {
       std::cerr << "Error: Page " << options.page_number << " does not exist. ";
@@ -458,12 +588,12 @@ int main(int argc, char* argv[]) {
 
   // Render pages
   int success_count = 0;
+  bool multi_page_output = (pages_to_render.size() > 1);
   for (int page_num : pages_to_render) {
     const auto& page = pdf.catalog.pages[page_num - 1];  // Convert to 0-based index
 
     std::string output_file = generate_output_filename(
-      options.output_file, page_num,
-      options.render_all_pages ? total_pages : 1
+      options.output_file, page_num, multi_page_output
     );
 
     if (options.verbose) {

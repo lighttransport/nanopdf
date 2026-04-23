@@ -17,6 +17,7 @@
 #include "canvas-exporter.hh"
 #include "color-transform.hh"
 #include "pdf-function.hh"
+#include "string-parse.hh"
 #include "common-macros.inc"
 #include "stb_image_write.h"
 
@@ -94,13 +95,9 @@ bool parse_pdf_bool(const std::string& token, bool* value) {
     *value = false;
     return true;
   }
-  try {
-    double numeric = std::stod(token);
-    *value = (numeric != 0.0);
-    return true;
-  } catch (...) {
-    return false;
-  }
+  double numeric = nanopdf::stod_or(token);
+  *value = (numeric != 0.0);
+  return true;
 }
 
 bool parse_inline_decode_parms(const std::vector<std::string>& tokens,
@@ -153,11 +150,7 @@ bool parse_inline_decode_parms(const std::vector<std::string>& tokens,
     }
 
     auto parse_int = [&](const std::string& str, int fallback) -> int {
-      try {
-        return static_cast<int>(std::stod(str));
-      } catch (...) {
-        return fallback;
-      }
+      return static_cast<int>(nanopdf::stod_or(str));
     };
 
     auto parse_bool_token = [&](const std::string& str, bool fallback) -> bool {
@@ -284,7 +277,7 @@ std::string extract_raw_bytes(const std::string& str) {
           std::string oct(1, next);
           while (i + 1 < inner.size() && oct.size() < 3 &&
                  inner[i + 1] >= '0' && inner[i + 1] <= '7') oct += inner[++i];
-          raw += static_cast<char>(std::stoi(oct, nullptr, 8));
+          raw += static_cast<char>(nanopdf::stou_base_or(oct, 8));
         } else raw += next;
       } else raw += inner[i];
     }
@@ -293,7 +286,7 @@ std::string extract_raw_bytes(const std::string& str) {
     for (size_t i = 0; i < hex.size(); i += 2) {
       std::string bs = hex.substr(i, std::min<size_t>(2, hex.size() - i));
       if (bs.size() == 1) bs += "0";
-      raw += static_cast<char>(std::stoi(bs, nullptr, 16));
+      raw += static_cast<char>(nanopdf::stou_base_or(bs, 16));
     }
   }
   return raw;
@@ -455,11 +448,7 @@ void CanvasExporter::handle_text_command(const std::string& op,
     state_.in_text_block = false;
   } else if (op == "Tf" && operands.size() >= 2) {
     state_.current_font = operands[0];
-    try {
-      state_.font_size = std::stod(operands[1]);
-    } catch (...) {
-      state_.font_size = 12.0;
-    }
+    state_.font_size = nanopdf::stod_or(operands[1]);
     // Build CSS font string: "<style> <weight> <size>px <family>"
     std::string family = resolve_font_family(state_.current_font);
     if (family.empty()) family = "sans-serif";
@@ -512,54 +501,48 @@ void CanvasExporter::handle_text_command(const std::string& op,
     font_str += double_to_string(state_.font_size) + "px " + clean_family;
     add_canvas_command("font", {font_str});
   } else if (op == "Tc" && operands.size() >= 1) {
-    try { state_.char_spacing = std::stod(operands[0]); } catch (...) {}
+    state_.char_spacing = nanopdf::stod_or(operands[0]);
   } else if (op == "Tw" && operands.size() >= 1) {
-    try { state_.word_spacing = std::stod(operands[0]); } catch (...) {}
+    state_.word_spacing = nanopdf::stod_or(operands[0]);
   } else if (op == "Tz" && operands.size() >= 1) {
-    try { state_.horizontal_scaling = std::stod(operands[0]); } catch (...) {}
+    state_.horizontal_scaling = nanopdf::stod_or(operands[0]);
   } else if (op == "Ts" && operands.size() >= 1) {
-    try { state_.text_rise = std::stod(operands[0]); } catch (...) {}
+    state_.text_rise = nanopdf::stod_or(operands[0]);
   } else if (op == "Tr" && operands.size() >= 1) {
-    try { state_.text_render_mode = static_cast<int>(std::stod(operands[0])); } catch (...) {}
+    state_.text_render_mode = static_cast<int>(nanopdf::stod_or(operands[0]));
   } else if (op == "TL" && operands.size() >= 1) {
-    try { state_.leading = std::stod(operands[0]); } catch (...) {}
+    state_.leading = nanopdf::stod_or(operands[0]);
   } else if (op == "Td" && operands.size() >= 2) {
-    try {
-      double dx = std::stod(operands[0]);
-      double dy = std::stod(operands[1]);
-      Matrix2D translation;
-      translation.e = dx;
-      translation.f = dy;
-      state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
-      state_.text_matrix = state_.text_line_matrix;
-      state_.text_x = state_.text_matrix.e;
-      state_.text_y = state_.text_matrix.f;
-    } catch (...) {}
+    double dx = nanopdf::stod_or(operands[0]);
+    double dy = nanopdf::stod_or(operands[1]);
+    Matrix2D translation;
+    translation.e = dx;
+    translation.f = dy;
+    state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
+    state_.text_matrix = state_.text_line_matrix;
+    state_.text_x = state_.text_matrix.e;
+    state_.text_y = state_.text_matrix.f;
   } else if (op == "TD" && operands.size() >= 2) {
-    try {
-      double dx = std::stod(operands[0]);
-      double dy = std::stod(operands[1]);
-      state_.leading = -dy;
-      Matrix2D translation;
-      translation.e = dx;
-      translation.f = dy;
-      state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
-      state_.text_matrix = state_.text_line_matrix;
-      state_.text_x = state_.text_matrix.e;
-      state_.text_y = state_.text_matrix.f;
-    } catch (...) {}
+    double dx = nanopdf::stod_or(operands[0]);
+    double dy = nanopdf::stod_or(operands[1]);
+    state_.leading = -dy;
+    Matrix2D translation;
+    translation.e = dx;
+    translation.f = dy;
+    state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
+    state_.text_matrix = state_.text_line_matrix;
+    state_.text_x = state_.text_matrix.e;
+    state_.text_y = state_.text_matrix.f;
   } else if (op == "Tm" && operands.size() >= 6) {
-    try {
-      state_.text_matrix.a = std::stod(operands[0]);
-      state_.text_matrix.b = std::stod(operands[1]);
-      state_.text_matrix.c = std::stod(operands[2]);
-      state_.text_matrix.d = std::stod(operands[3]);
-      state_.text_matrix.e = std::stod(operands[4]);
-      state_.text_matrix.f = std::stod(operands[5]);
-      state_.text_line_matrix = state_.text_matrix;
-      state_.text_x = state_.text_matrix.e;
-      state_.text_y = state_.text_matrix.f;
-    } catch (...) {}
+    state_.text_matrix.a = nanopdf::stod_or(operands[0]);
+    state_.text_matrix.b = nanopdf::stod_or(operands[1]);
+    state_.text_matrix.c = nanopdf::stod_or(operands[2]);
+    state_.text_matrix.d = nanopdf::stod_or(operands[3]);
+    state_.text_matrix.e = nanopdf::stod_or(operands[4]);
+    state_.text_matrix.f = nanopdf::stod_or(operands[5]);
+    state_.text_line_matrix = state_.text_matrix;
+    state_.text_x = state_.text_matrix.e;
+    state_.text_y = state_.text_matrix.f;
   } else if (op == "T*") {
     Matrix2D translation;
     translation.e = 0.0;
@@ -645,14 +628,12 @@ void CanvasExporter::handle_text_command(const std::string& op,
         }
       } else {
         // Numeric spacing: negative = move right (kerning)
-        try {
-          double val = std::stod(token);
-          Matrix2D advance;
-          advance.e = (-val / 1000.0) * std::abs(state_.font_size) * h_scale;
-          state_.text_matrix = multiply_matrices(state_.text_matrix, advance);
-          state_.text_x = state_.text_matrix.e;
-          state_.text_y = state_.text_matrix.f;
-        } catch (...) {}
+        double val = nanopdf::stod_or(token);
+        Matrix2D advance;
+        advance.e = (-val / 1000.0) * std::abs(state_.font_size) * h_scale;
+        state_.text_matrix = multiply_matrices(state_.text_matrix, advance);
+        state_.text_x = state_.text_matrix.e;
+        state_.text_y = state_.text_matrix.f;
       }
     }
   } else if (op == "'" && operands.size() >= 1) {
@@ -671,9 +652,8 @@ void CanvasExporter::handle_text_command(const std::string& op,
 void CanvasExporter::handle_path_command(const std::string& op, 
                                        const std::vector<std::string>& operands) {
   if (op == "m" && operands.size() >= 2) {
-    try {
-      double x = std::stod(operands[0]);
-      double y = std::stod(operands[1]);
+      double x = nanopdf::stod_or(operands[0]);
+      double y = nanopdf::stod_or(operands[1]);
       transform_coordinates(x, y);
       add_canvas_command("moveTo", {double_to_string(x), double_to_string(y)});
       state_.current_x = x;
@@ -682,24 +662,22 @@ void CanvasExporter::handle_path_command(const std::string& op,
         add_canvas_command("beginPath");
         state_.in_path = true;
       }
-    } catch (...) {}
+    
   } else if (op == "l" && operands.size() >= 2) {
-    try {
-      double x = std::stod(operands[0]);
-      double y = std::stod(operands[1]);
+      double x = nanopdf::stod_or(operands[0]);
+      double y = nanopdf::stod_or(operands[1]);
       transform_coordinates(x, y);
       add_canvas_command("lineTo", {double_to_string(x), double_to_string(y)});
       state_.current_x = x;
       state_.current_y = y;
-    } catch (...) {}
+    
   } else if (op == "c" && operands.size() >= 6) {
-    try {
-      double x1 = std::stod(operands[0]);
-      double y1 = std::stod(operands[1]);
-      double x2 = std::stod(operands[2]);
-      double y2 = std::stod(operands[3]);
-      double x3 = std::stod(operands[4]);
-      double y3 = std::stod(operands[5]);
+      double x1 = nanopdf::stod_or(operands[0]);
+      double y1 = nanopdf::stod_or(operands[1]);
+      double x2 = nanopdf::stod_or(operands[2]);
+      double y2 = nanopdf::stod_or(operands[3]);
+      double x3 = nanopdf::stod_or(operands[4]);
+      double y3 = nanopdf::stod_or(operands[5]);
       transform_coordinates(x1, y1);
       transform_coordinates(x2, y2);
       transform_coordinates(x3, y3);
@@ -710,14 +688,13 @@ void CanvasExporter::handle_path_command(const std::string& op,
       });
       state_.current_x = x3;
       state_.current_y = y3;
-    } catch (...) {}
+    
   } else if (op == "v" && operands.size() >= 4) {
     // Curve with first control point = current point
-    try {
-      double x2 = std::stod(operands[0]);
-      double y2 = std::stod(operands[1]);
-      double x3 = std::stod(operands[2]);
-      double y3 = std::stod(operands[3]);
+      double x2 = nanopdf::stod_or(operands[0]);
+      double y2 = nanopdf::stod_or(operands[1]);
+      double x3 = nanopdf::stod_or(operands[2]);
+      double y3 = nanopdf::stod_or(operands[3]);
       transform_coordinates(x2, y2);
       transform_coordinates(x3, y3);
       add_canvas_command("bezierCurveTo", {
@@ -727,14 +704,13 @@ void CanvasExporter::handle_path_command(const std::string& op,
       });
       state_.current_x = x3;
       state_.current_y = y3;
-    } catch (...) {}
+    
   } else if (op == "y" && operands.size() >= 4) {
     // Curve with last control point = end point
-    try {
-      double x1 = std::stod(operands[0]);
-      double y1 = std::stod(operands[1]);
-      double x3 = std::stod(operands[2]);
-      double y3 = std::stod(operands[3]);
+      double x1 = nanopdf::stod_or(operands[0]);
+      double y1 = nanopdf::stod_or(operands[1]);
+      double x3 = nanopdf::stod_or(operands[2]);
+      double y3 = nanopdf::stod_or(operands[3]);
       transform_coordinates(x1, y1);
       transform_coordinates(x3, y3);
       add_canvas_command("bezierCurveTo", {
@@ -744,13 +720,12 @@ void CanvasExporter::handle_path_command(const std::string& op,
       });
       state_.current_x = x3;
       state_.current_y = y3;
-    } catch (...) {}
+    
   } else if (op == "re" && operands.size() >= 4) {
-    try {
-      double x = std::stod(operands[0]);
-      double y = std::stod(operands[1]);
-      double w = std::stod(operands[2]);
-      double h = std::stod(operands[3]);
+      double x = nanopdf::stod_or(operands[0]);
+      double y = nanopdf::stod_or(operands[1]);
+      double w = nanopdf::stod_or(operands[2]);
+      double h = nanopdf::stod_or(operands[3]);
       transform_coordinates(x, y);
       if (!state_.in_path) {
         add_canvas_command("beginPath");
@@ -760,7 +735,7 @@ void CanvasExporter::handle_path_command(const std::string& op,
         double_to_string(x), double_to_string(y),
         double_to_string(w), double_to_string(h)
       });
-    } catch (...) {}
+    
   } else if (op == "h") {
     add_canvas_command("closePath");
   } else if (op == "W") {
@@ -826,10 +801,8 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
       graphics_state_stack_.pop_back();
     }
   } else if (op == "w" && operands.size() >= 1) {
-    try {
-      state_.stroke_width = std::stod(operands[0]);
-      update_canvas_line_width();
-    } catch (...) {}
+    state_.stroke_width = nanopdf::stod_or(operands[0]);
+    update_canvas_line_width();
   } else if (op == "gs" && !operands.empty()) {
     std::string name;
     for (auto it = operands.rbegin(); it != operands.rend(); ++it) {
@@ -846,23 +819,20 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
       apply_extended_graphics_state(name);
     }
   } else if (op == "cm" && operands.size() >= 6) {
-    try {
-      Matrix2D m;
-      m.a = std::stod(operands[0]);
-      m.b = std::stod(operands[1]);
-      m.c = std::stod(operands[2]);
-      m.d = std::stod(operands[3]);
-      m.e = std::stod(operands[4]);
-      m.f = std::stod(operands[5]);
-      state_.ctm = multiply_matrices(state_.ctm, m);
-    } catch (...) {}
+    Matrix2D m;
+    m.a = nanopdf::stod_or(operands[0]);
+    m.b = nanopdf::stod_or(operands[1]);
+    m.c = nanopdf::stod_or(operands[2]);
+    m.d = nanopdf::stod_or(operands[3]);
+    m.e = nanopdf::stod_or(operands[4]);
+    m.f = nanopdf::stod_or(operands[5]);
+    state_.ctm = multiply_matrices(state_.ctm, m);
     add_canvas_command("transform", {
       operands[0], operands[1], operands[2],
       operands[3], operands[4], operands[5]
     });
   } else if (op == "J" && operands.size() >= 1) {
-    try {
-      int cap = static_cast<int>(std::stod(operands[0]));
+      int cap = static_cast<int>(nanopdf::stod_or(operands[0]));
       switch (cap) {
         case 0:
           state_.line_cap = "butt";
@@ -877,10 +847,9 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
           return;
       }
       update_canvas_line_cap();
-    } catch (...) {}
+    
   } else if (op == "j" && operands.size() >= 1) {
-    try {
-      int join = static_cast<int>(std::stod(operands[0]));
+      int join = static_cast<int>(nanopdf::stod_or(operands[0]));
       switch (join) {
         case 0:
           state_.line_join = "miter";
@@ -895,12 +864,10 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
           return;
       }
       update_canvas_line_join();
-    } catch (...) {}
+    
   } else if (op == "M" && operands.size() >= 1) {
-    try {
-      state_.miter_limit = std::stod(operands[0]);
-      update_canvas_miter_limit();
-    } catch (...) {}
+    state_.miter_limit = nanopdf::stod_or(operands[0]);
+    update_canvas_miter_limit();
   } else if (op == "d" && operands.size() >= 2) {
     std::vector<double> pattern;
     double phase = 0.0;
@@ -914,45 +881,33 @@ void CanvasExporter::handle_graphics_state_command(const std::string& op,
 void CanvasExporter::handle_color_command(const std::string& op,
                                         const std::vector<std::string>& operands) {
   if (op == "rg" && operands.size() >= 3) {
-    try {
-      state_.fill_color_space = "DeviceRGB";
-      state_.fill_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
-      update_canvas_fill_style();
-    } catch (...) {}
+    state_.fill_color_space = "DeviceRGB";
+    state_.fill_color = rgb_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]), nanopdf::stod_or(operands[2]));
+    update_canvas_fill_style();
   } else if (op == "RG" && operands.size() >= 3) {
-    try {
-      state_.stroke_color_space = "DeviceRGB";
-      state_.stroke_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
-      update_canvas_stroke_style();
-    } catch (...) {}
+    state_.stroke_color_space = "DeviceRGB";
+    state_.stroke_color = rgb_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]), nanopdf::stod_or(operands[2]));
+    update_canvas_stroke_style();
   } else if (op == "g" && operands.size() >= 1) {
-    try {
-      state_.fill_color_space = "DeviceGray";
-      double gray = std::stod(operands[0]);
-      state_.fill_color = rgb_to_hex(gray, gray, gray);
-      update_canvas_fill_style();
-    } catch (...) {}
+    state_.fill_color_space = "DeviceGray";
+    double gray = nanopdf::stod_or(operands[0]);
+    state_.fill_color = rgb_to_hex(gray, gray, gray);
+    update_canvas_fill_style();
   } else if (op == "G" && operands.size() >= 1) {
-    try {
-      state_.stroke_color_space = "DeviceGray";
-      double gray = std::stod(operands[0]);
-      state_.stroke_color = rgb_to_hex(gray, gray, gray);
-      update_canvas_stroke_style();
-    } catch (...) {}
+    state_.stroke_color_space = "DeviceGray";
+    double gray = nanopdf::stod_or(operands[0]);
+    state_.stroke_color = rgb_to_hex(gray, gray, gray);
+    update_canvas_stroke_style();
   } else if (op == "k" && operands.size() >= 4) {
-    try {
-      state_.fill_color_space = "DeviceCMYK";
-      state_.fill_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                                       std::stod(operands[2]), std::stod(operands[3]));
-      update_canvas_fill_style();
-    } catch (...) {}
+    state_.fill_color_space = "DeviceCMYK";
+    state_.fill_color = cmyk_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]),
+                                       nanopdf::stod_or(operands[2]), nanopdf::stod_or(operands[3]));
+    update_canvas_fill_style();
   } else if (op == "K" && operands.size() >= 4) {
-    try {
-      state_.stroke_color_space = "DeviceCMYK";
-      state_.stroke_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                                         std::stod(operands[2]), std::stod(operands[3]));
-      update_canvas_stroke_style();
-    } catch (...) {}
+    state_.stroke_color_space = "DeviceCMYK";
+    state_.stroke_color = cmyk_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]),
+                                         nanopdf::stod_or(operands[2]), nanopdf::stod_or(operands[3]));
+    update_canvas_stroke_style();
   } else if (op == "cs" && !operands.empty()) {
     std::string cs = operands.back();
     if (!cs.empty() && cs.front() == '/') cs.erase(0, 1);
@@ -1026,13 +981,9 @@ std::string CanvasExporter::canvas_color_string(const std::string& hex, double a
   double a = clamp_unit(alpha);
   int r = 0, g = 0, b = 0;
   if (hex.size() == 7 && hex[0] == '#') {
-    try {
-      r = std::stoi(hex.substr(1, 2), nullptr, 16);
-      g = std::stoi(hex.substr(3, 2), nullptr, 16);
-      b = std::stoi(hex.substr(5, 2), nullptr, 16);
-    } catch (...) {
-      r = g = b = 0;
-    }
+    r = nanopdf::stou_base_or(hex.substr(1, 2), 16);
+    g = nanopdf::stou_base_or(hex.substr(3, 2), 16);
+    b = nanopdf::stou_base_or(hex.substr(5, 2), 16);
   }
 
   std::ostringstream ss;
@@ -1224,15 +1175,14 @@ void CanvasExporter::parse_dash_pattern(const std::vector<std::string>& operands
       continue;
     }
 
-    try {
-      double value = std::stod(token);
+      double value = nanopdf::stod_or(token);
       if (in_array) {
         pattern->push_back(value);
       } else {
         *phase = value;
         break;
       }
-    } catch (...) {}
+    
   }
 }
 
@@ -2167,11 +2117,7 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
     if (it == dict.end() || it->second.empty()) {
       return fallback;
     }
-    try {
-      return static_cast<int>(std::stod(it->second.front()));
-    } catch (...) {
-      return fallback;
-    }
+    return static_cast<int>(nanopdf::stod_or(it->second.front()));
   };
 
   ImageXObject image;
@@ -2205,7 +2151,7 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
       std::string base = tokens[1];
       if (!base.empty() && base.front() == '/') base = base.substr(1);
       int hival = 0;
-      try { hival = static_cast<int>(std::stod(tokens[2])); } catch (...) {}
+      hival = static_cast<int>(nanopdf::stod_or(tokens[2]));
 
       // Parse lookup table (hex string or raw bytes)
       std::vector<uint8_t> lookup;
@@ -2215,7 +2161,7 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
         for (size_t i = 0; i < hex.size(); i += 2) {
           std::string bs = hex.substr(i, std::min<size_t>(2, hex.size() - i));
           if (bs.size() == 1) bs += "0";
-          try { lookup.push_back(static_cast<uint8_t>(std::stoi(bs, nullptr, 16))); } catch (...) {}
+          lookup.push_back(static_cast<uint8_t>(nanopdf::stou_base_or(bs, 16)));
         }
       } else if (!lookup_str.empty() && lookup_str.front() == '(' && lookup_str.back() == ')') {
         std::string raw = extract_raw_bytes(lookup_str);
@@ -2273,9 +2219,7 @@ bool CanvasExporter::build_inline_image(const std::map<std::string, std::vector<
   }
   if (decode_it != dict.end()) {
     for (const std::string& token : decode_it->second) {
-      try {
-        image.decode.push_back(std::stod(token));
-      } catch (...) {}
+      image.decode.push_back(nanopdf::stod_or(token));
     }
   }
 
@@ -2591,60 +2535,50 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
     state_.in_text_block = false;
   } else if (op == "Tf" && operands.size() >= 2) {
     state_.current_font = operands[0];
-    try {
-      state_.font_size = std::stod(operands[1]);
-    } catch (...) {
-      state_.font_size = 12.0;
-    }
+    state_.font_size = nanopdf::stod_or(operands[1]);
   } else if (op == "TL" && operands.size() >= 1) {
-    try { state_.leading = std::stod(operands[0]); } catch (...) {}
+    state_.leading = nanopdf::stod_or(operands[0]);
   } else if (op == "Tc" && operands.size() >= 1) {
-    try { state_.char_spacing = std::stod(operands[0]); } catch (...) {}
+    state_.char_spacing = nanopdf::stod_or(operands[0]);
   } else if (op == "Tw" && operands.size() >= 1) {
-    try { state_.word_spacing = std::stod(operands[0]); } catch (...) {}
+    state_.word_spacing = nanopdf::stod_or(operands[0]);
   } else if (op == "Tz" && operands.size() >= 1) {
-    try { state_.horizontal_scaling = std::stod(operands[0]); } catch (...) {}
+    state_.horizontal_scaling = nanopdf::stod_or(operands[0]);
   } else if (op == "Ts" && operands.size() >= 1) {
-    try { state_.text_rise = std::stod(operands[0]); } catch (...) {}
+    state_.text_rise = nanopdf::stod_or(operands[0]);
   } else if (op == "Tr" && operands.size() >= 1) {
-    try { state_.text_render_mode = static_cast<int>(std::stod(operands[0])); } catch (...) {}
+    state_.text_render_mode = static_cast<int>(nanopdf::stod_or(operands[0]));
   } else if (op == "Td" && operands.size() >= 2) {
-    try {
-      double dx = std::stod(operands[0]);
-      double dy = std::stod(operands[1]);
-      Matrix2D translation;
-      translation.e = dx;
-      translation.f = dy;
-      state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
-      state_.text_matrix = state_.text_line_matrix;
-    } catch (...) {}
+    double dx = nanopdf::stod_or(operands[0]);
+    double dy = nanopdf::stod_or(operands[1]);
+    Matrix2D translation;
+    translation.e = dx;
+    translation.f = dy;
+    state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
+    state_.text_matrix = state_.text_line_matrix;
     state_.text_x = state_.text_matrix.e;
     state_.text_y = state_.text_matrix.f;
   } else if (op == "TD" && operands.size() >= 2) {
-    try {
-      double dx = std::stod(operands[0]);
-      double dy = std::stod(operands[1]);
-      state_.leading = -dy;
-      Matrix2D translation;
-      translation.e = dx;
-      translation.f = dy;
-      state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
-      state_.text_matrix = state_.text_line_matrix;
-    } catch (...) {}
+    double dx = nanopdf::stod_or(operands[0]);
+    double dy = nanopdf::stod_or(operands[1]);
+    state_.leading = -dy;
+    Matrix2D translation;
+    translation.e = dx;
+    translation.f = dy;
+    state_.text_line_matrix = multiply_matrices(state_.text_line_matrix, translation);
+    state_.text_matrix = state_.text_line_matrix;
     state_.text_x = state_.text_matrix.e;
     state_.text_y = state_.text_matrix.f;
   } else if (op == "Tm" && operands.size() >= 6) {
-    try {
-      state_.text_matrix.a = std::stod(operands[0]);
-      state_.text_matrix.b = std::stod(operands[1]);
-      state_.text_matrix.c = std::stod(operands[2]);
-      state_.text_matrix.d = std::stod(operands[3]);
-      state_.text_matrix.e = std::stod(operands[4]);
-      state_.text_matrix.f = std::stod(operands[5]);
-      state_.text_line_matrix = state_.text_matrix;
-      state_.text_x = state_.text_matrix.e;
-      state_.text_y = state_.text_matrix.f;
-    } catch (...) {}
+    state_.text_matrix.a = nanopdf::stod_or(operands[0]);
+    state_.text_matrix.b = nanopdf::stod_or(operands[1]);
+    state_.text_matrix.c = nanopdf::stod_or(operands[2]);
+    state_.text_matrix.d = nanopdf::stod_or(operands[3]);
+    state_.text_matrix.e = nanopdf::stod_or(operands[4]);
+    state_.text_matrix.f = nanopdf::stod_or(operands[5]);
+    state_.text_line_matrix = state_.text_matrix;
+    state_.text_x = state_.text_matrix.e;
+    state_.text_y = state_.text_matrix.f;
   } else if (op == "T*") {
     double move_y = state_.leading;
     if (std::abs(move_y) < 1e-6) {
@@ -2742,11 +2676,9 @@ void CanvasExporter::handle_text_command_svg(const std::string& op,
         }
       } else {
         // Numeric spacing value: negative = move right (kerning), positive = move left
-        try {
-          double val = std::stod(token);
-          // Convert from thousandths of text space to SVG units
+        double val = nanopdf::stod_or(token);
+        // Convert from thousandths of text space to SVG units
           cumulative_offset += (-val / 1000.0) * std::abs(state_.font_size) * text_scale * ctm_scale * h_scale;
-        } catch (...) {}
       }
     }
 
@@ -2818,9 +2750,8 @@ void CanvasExporter::handle_path_command_svg(const std::string& op,
   if (ocg_skip_depth_ > 0) return;
 
   if (op == "m" && operands.size() >= 2) {
-    try {
-      double x = std::stod(operands[0]);
-      double y = std::stod(operands[1]);
+      double x = nanopdf::stod_or(operands[0]);
+      double y = nanopdf::stod_or(operands[1]);
       transform_coordinates_svg(x, y);
       if (!state_.in_path) {
         state_.path_data.clear();
@@ -2829,69 +2760,60 @@ void CanvasExporter::handle_path_command_svg(const std::string& op,
       state_.path_data += "M " + double_to_string(x) + " " + double_to_string(y) + " ";
       state_.current_x = x;
       state_.current_y = y;
-    } catch (...) {}
+    
   } else if (op == "l" && operands.size() >= 2) {
-    try {
-      double x = std::stod(operands[0]);
-      double y = std::stod(operands[1]);
-      transform_coordinates_svg(x, y);
-      state_.path_data += "L " + double_to_string(x) + " " + double_to_string(y) + " ";
-      state_.current_x = x;
-      state_.current_y = y;
-    } catch (...) {}
+    double x = nanopdf::stod_or(operands[0]);
+    double y = nanopdf::stod_or(operands[1]);
+    transform_coordinates_svg(x, y);
+    state_.path_data += "L " + double_to_string(x) + " " + double_to_string(y) + " ";
+    state_.current_x = x;
+    state_.current_y = y;
   } else if (op == "c" && operands.size() >= 6) {
-    try {
-      double x1 = std::stod(operands[0]);
-      double y1 = std::stod(operands[1]);
-      double x2 = std::stod(operands[2]);
-      double y2 = std::stod(operands[3]);
-      double x3 = std::stod(operands[4]);
-      double y3 = std::stod(operands[5]);
-      transform_coordinates_svg(x1, y1);
-      transform_coordinates_svg(x2, y2);
-      transform_coordinates_svg(x3, y3);
-      state_.path_data += "C " + double_to_string(x1) + " " + double_to_string(y1) + " " +
+    double x1 = nanopdf::stod_or(operands[0]);
+    double y1 = nanopdf::stod_or(operands[1]);
+    double x2 = nanopdf::stod_or(operands[2]);
+    double y2 = nanopdf::stod_or(operands[3]);
+    double x3 = nanopdf::stod_or(operands[4]);
+    double y3 = nanopdf::stod_or(operands[5]);
+    transform_coordinates_svg(x1, y1);
+    transform_coordinates_svg(x2, y2);
+    transform_coordinates_svg(x3, y3);
+    state_.path_data += "C " + double_to_string(x1) + " " + double_to_string(y1) + " " +
                          double_to_string(x2) + " " + double_to_string(y2) + " " +
                          double_to_string(x3) + " " + double_to_string(y3) + " ";
-      state_.current_x = x3;
-      state_.current_y = y3;
-    } catch (...) {}
+    state_.current_x = x3;
+    state_.current_y = y3;
   } else if (op == "v" && operands.size() >= 4) {
-    try {
-      double x2 = std::stod(operands[0]);
-      double y2 = std::stod(operands[1]);
-      double x3 = std::stod(operands[2]);
-      double y3 = std::stod(operands[3]);
-      transform_coordinates_svg(x2, y2);
-      transform_coordinates_svg(x3, y3);
-      double x1 = state_.current_x;
-      double y1 = state_.current_y;
-      state_.path_data += "C " + double_to_string(x1) + " " + double_to_string(y1) + " " +
+    double x2 = nanopdf::stod_or(operands[0]);
+    double y2 = nanopdf::stod_or(operands[1]);
+    double x3 = nanopdf::stod_or(operands[2]);
+    double y3 = nanopdf::stod_or(operands[3]);
+    transform_coordinates_svg(x2, y2);
+    transform_coordinates_svg(x3, y3);
+    double x1 = state_.current_x;
+    double y1 = state_.current_y;
+    state_.path_data += "C " + double_to_string(x1) + " " + double_to_string(y1) + " " +
                          double_to_string(x2) + " " + double_to_string(y2) + " " +
                          double_to_string(x3) + " " + double_to_string(y3) + " ";
-      state_.current_x = x3;
-      state_.current_y = y3;
-    } catch (...) {}
+    state_.current_x = x3;
+    state_.current_y = y3;
   } else if (op == "y" && operands.size() >= 4) {
-    try {
-      double x1 = std::stod(operands[0]);
-      double y1 = std::stod(operands[1]);
-      double x3 = std::stod(operands[2]);
-      double y3 = std::stod(operands[3]);
-      transform_coordinates_svg(x1, y1);
-      transform_coordinates_svg(x3, y3);
-      state_.path_data += "C " + double_to_string(x1) + " " + double_to_string(y1) + " " +
+    double x1 = nanopdf::stod_or(operands[0]);
+    double y1 = nanopdf::stod_or(operands[1]);
+    double x3 = nanopdf::stod_or(operands[2]);
+    double y3 = nanopdf::stod_or(operands[3]);
+    transform_coordinates_svg(x1, y1);
+    transform_coordinates_svg(x3, y3);
+    state_.path_data += "C " + double_to_string(x1) + " " + double_to_string(y1) + " " +
                          double_to_string(x3) + " " + double_to_string(y3) + " " +
                          double_to_string(x3) + " " + double_to_string(y3) + " ";
-      state_.current_x = x3;
-      state_.current_y = y3;
-    } catch (...) {}
+    state_.current_x = x3;
+    state_.current_y = y3;
   } else if (op == "re" && operands.size() >= 4) {
-    try {
-      double x = std::stod(operands[0]);
-      double y = std::stod(operands[1]);
-      double w = std::stod(operands[2]);
-      double h = std::stod(operands[3]);
+      double x = nanopdf::stod_or(operands[0]);
+      double y = nanopdf::stod_or(operands[1]);
+      double w = nanopdf::stod_or(operands[2]);
+      double h = nanopdf::stod_or(operands[3]);
 
       double x0 = x;
       double y0 = y;
@@ -2919,7 +2841,7 @@ void CanvasExporter::handle_path_command_svg(const std::string& op,
 
       state_.current_x = x0;
       state_.current_y = y0;
-    } catch (...) {}
+    
   } else if (op == "h") {
     state_.path_data += "Z ";
   } else if (op == "S") {
@@ -3048,20 +2970,16 @@ void CanvasExporter::handle_graphics_state_command_svg(const std::string& op,
       graphics_state_stack_.pop_back();
     }
   } else if (op == "cm" && operands.size() >= 6) {
-    try {
-      Matrix2D matrix;
-      matrix.a = std::stod(operands[0]);
-      matrix.b = std::stod(operands[1]);
-      matrix.c = std::stod(operands[2]);
-      matrix.d = std::stod(operands[3]);
-      matrix.e = std::stod(operands[4]);
-      matrix.f = std::stod(operands[5]);
-      state_.ctm = multiply_matrices(state_.ctm, matrix);
-    } catch (...) {}
+    Matrix2D matrix;
+    matrix.a = nanopdf::stod_or(operands[0]);
+    matrix.b = nanopdf::stod_or(operands[1]);
+    matrix.c = nanopdf::stod_or(operands[2]);
+    matrix.d = nanopdf::stod_or(operands[3]);
+    matrix.e = nanopdf::stod_or(operands[4]);
+    matrix.f = nanopdf::stod_or(operands[5]);
+    state_.ctm = multiply_matrices(state_.ctm, matrix);
   } else if (op == "w" && operands.size() >= 1) {
-    try {
-      state_.stroke_width = std::stod(operands[0]);
-    } catch (...) {}
+    state_.stroke_width = nanopdf::stod_or(operands[0]);
   } else if (op == "gs" && !operands.empty()) {
     std::string name;
     for (auto it = operands.rbegin(); it != operands.rend(); ++it) {
@@ -3076,8 +2994,7 @@ void CanvasExporter::handle_graphics_state_command_svg(const std::string& op,
       apply_extended_graphics_state(name);
     }
   } else if (op == "J" && operands.size() >= 1) {
-    try {
-      int cap = static_cast<int>(std::stod(operands[0]));
+      int cap = static_cast<int>(nanopdf::stod_or(operands[0]));
       switch (cap) {
         case 0:
           state_.line_cap = "butt";
@@ -3091,10 +3008,9 @@ void CanvasExporter::handle_graphics_state_command_svg(const std::string& op,
         default:
           break;
       }
-    } catch (...) {}
+    
   } else if (op == "j" && operands.size() >= 1) {
-    try {
-      int join = static_cast<int>(std::stod(operands[0]));
+      int join = static_cast<int>(nanopdf::stod_or(operands[0]));
       switch (join) {
         case 0:
           state_.line_join = "miter";
@@ -3108,11 +3024,9 @@ void CanvasExporter::handle_graphics_state_command_svg(const std::string& op,
         default:
           break;
       }
-    } catch (...) {}
+    
   } else if (op == "M" && operands.size() >= 1) {
-    try {
-      state_.miter_limit = std::stod(operands[0]);
-    } catch (...) {}
+    state_.miter_limit = nanopdf::stod_or(operands[0]);
   } else if (op == "d" && operands.size() >= 2) {
     std::vector<double> pattern;
     double phase = 0.0;
@@ -3125,39 +3039,27 @@ void CanvasExporter::handle_graphics_state_command_svg(const std::string& op,
 void CanvasExporter::handle_color_command_svg(const std::string& op,
                                              const std::vector<std::string>& operands) {
   if (op == "rg" && operands.size() >= 3) {
-    try {
-      state_.fill_color_space = "DeviceRGB";
-      state_.fill_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
-    } catch (...) {}
+    state_.fill_color_space = "DeviceRGB";
+    state_.fill_color = rgb_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]), nanopdf::stod_or(operands[2]));
   } else if (op == "RG" && operands.size() >= 3) {
-    try {
-      state_.stroke_color_space = "DeviceRGB";
-      state_.stroke_color = rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
-    } catch (...) {}
+    state_.stroke_color_space = "DeviceRGB";
+    state_.stroke_color = rgb_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]), nanopdf::stod_or(operands[2]));
   } else if (op == "g" && operands.size() >= 1) {
-    try {
-      state_.fill_color_space = "DeviceGray";
-      double gray = std::stod(operands[0]);
-      state_.fill_color = rgb_to_hex(gray, gray, gray);
-    } catch (...) {}
+    state_.fill_color_space = "DeviceGray";
+    double gray = nanopdf::stod_or(operands[0]);
+    state_.fill_color = rgb_to_hex(gray, gray, gray);
   } else if (op == "G" && operands.size() >= 1) {
-    try {
-      state_.stroke_color_space = "DeviceGray";
-      double gray = std::stod(operands[0]);
-      state_.stroke_color = rgb_to_hex(gray, gray, gray);
-    } catch (...) {}
+    state_.stroke_color_space = "DeviceGray";
+    double gray = nanopdf::stod_or(operands[0]);
+    state_.stroke_color = rgb_to_hex(gray, gray, gray);
   } else if (op == "k" && operands.size() >= 4) {
-    try {
-      state_.fill_color_space = "DeviceCMYK";
-      state_.fill_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                                       std::stod(operands[2]), std::stod(operands[3]));
-    } catch (...) {}
+    state_.fill_color_space = "DeviceCMYK";
+    state_.fill_color = cmyk_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]),
+                                       nanopdf::stod_or(operands[2]), nanopdf::stod_or(operands[3]));
   } else if (op == "K" && operands.size() >= 4) {
-    try {
-      state_.stroke_color_space = "DeviceCMYK";
-      state_.stroke_color = cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                                         std::stod(operands[2]), std::stod(operands[3]));
-    } catch (...) {}
+    state_.stroke_color_space = "DeviceCMYK";
+    state_.stroke_color = cmyk_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]),
+                                         nanopdf::stod_or(operands[2]), nanopdf::stod_or(operands[3]));
   } else if (op == "cs" && !operands.empty()) {
     std::string cs = operands.back();
     if (!cs.empty() && cs.front() == '/') cs.erase(0, 1);
@@ -3346,7 +3248,7 @@ std::string CanvasExporter::decode_pdf_text_for_display(const std::string& str) 
                  result[i + 1] >= '0' && result[i + 1] <= '7') {
             octal += result[++i];
           }
-          decoded += static_cast<char>(std::stoi(octal, nullptr, 8));
+          decoded += static_cast<char>(nanopdf::stou_base_or(octal, 8));
         } else {
           decoded += next;
         }
@@ -3364,7 +3266,7 @@ std::string CanvasExporter::decode_pdf_text_for_display(const std::string& str) 
     for (size_t i = 0; i < hex.size(); i += 2) {
       std::string byte_str = hex.substr(i, std::min<size_t>(2, hex.size() - i));
       if (byte_str.size() == 1) byte_str += "0";
-      bytes.push_back(static_cast<uint8_t>(std::stoi(byte_str, nullptr, 16)));
+      bytes.push_back(static_cast<uint8_t>(nanopdf::stou_base_or(byte_str, 16)));
     }
     if (bytes.size() >= 2) {
       // Check for UTF-16BE BOM or assume UTF-16BE for multi-byte
@@ -3436,7 +3338,7 @@ std::string CanvasExporter::decode_pdf_text_with_font(const std::string& str) co
           std::string oct(1, next);
           while (i + 1 < inner.size() && oct.size() < 3 &&
                  inner[i + 1] >= '0' && inner[i + 1] <= '7') oct += inner[++i];
-          raw += static_cast<char>(std::stoi(oct, nullptr, 8));
+          raw += static_cast<char>(nanopdf::stou_base_or(oct, 8));
         } else raw += next;
       } else raw += inner[i];
     }
@@ -3446,7 +3348,7 @@ std::string CanvasExporter::decode_pdf_text_with_font(const std::string& str) co
     for (size_t i = 0; i < hex.size(); i += 2) {
       std::string bs = hex.substr(i, std::min<size_t>(2, hex.size() - i));
       if (bs.size() == 1) bs += "0";
-      raw += static_cast<char>(std::stoi(bs, nullptr, 16));
+      raw += static_cast<char>(nanopdf::stou_base_or(bs, 16));
     }
   } else {
     return decode_pdf_text_for_display(str);
@@ -3507,7 +3409,7 @@ std::string CanvasExporter::decode_pdf_text_with_font(const std::string& str) co
 
   // For Type0 fonts with Identity CMap, treat as UTF-16BE
   if (font->subtype == "Type0") {
-    const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+    const Type0Font* type0 = as_type0_font(font);
     if (type0) {
       const std::string& cmap_name = type0->encoding_cmap.name;
       if (cmap_name == "Identity-H" || cmap_name == "Identity-V" ||
@@ -3548,7 +3450,7 @@ double CanvasExporter::compute_string_width(const std::string& raw_str) const {
   double h_scale = state_.horizontal_scaling / 100.0;
 
   if (font && font->subtype == "Type0") {
-    const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+    const Type0Font* type0 = as_type0_font(font);
     int dw = type0 ? type0->default_width : 1000;
     for (size_t i = 0; i + 1 < raw_str.size(); i += 2) {
       uint32_t cid = (static_cast<uint8_t>(raw_str[i]) << 8) | static_cast<uint8_t>(raw_str[i + 1]);
@@ -3605,10 +3507,8 @@ void CanvasExporter::advance_text_matrix_tj(const std::vector<std::string>& oper
       total_advance += compute_string_width(raw);
     } else {
       // Numeric spacing: negative = move right
-      try {
-        double val = std::stod(token);
-        total_advance += (-val / 1000.0) * std::abs(state_.font_size) * h_scale;
-      } catch (...) {}
+      double val = nanopdf::stod_or(token);
+      total_advance += (-val / 1000.0) * std::abs(state_.font_size) * h_scale;
     }
   }
 
@@ -3646,7 +3546,7 @@ bool CanvasExporter::is_vertical_font(const std::string& resource_name) const {
   if (!name.empty() && name.front() == '/') name.erase(0, 1);
   const BaseFont* font = current_page_->get_font(name, *current_pdf_);
   if (!font || font->subtype != "Type0") return false;
-  const Type0Font* type0 = dynamic_cast<const Type0Font*>(font);
+  const Type0Font* type0 = as_type0_font(font);
   if (!type0) return false;
   // Check CMap name for vertical indicator
   const std::string& cmap_name = type0->encoding_cmap.name;
@@ -3681,16 +3581,15 @@ std::string CanvasExporter::resolve_scn_color(const std::vector<std::string>& op
     return "";
   }
 
-  try {
     if ((cs == "DeviceGray" || cs == "CalGray") && operands.size() >= 1) {
-      double gray = std::stod(operands[0]);
+      double gray = nanopdf::stod_or(operands[0]);
       return rgb_to_hex(gray, gray, gray);
     } else if ((cs == "DeviceRGB" || cs == "CalRGB") && operands.size() >= 3) {
-      return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
+      return rgb_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]), nanopdf::stod_or(operands[2]));
     } else if (cs == "DeviceCMYK") {
       if (operands.size() >= 4) {
-        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                           std::stod(operands[2]), std::stod(operands[3]));
+        return cmyk_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]),
+                           nanopdf::stod_or(operands[2]), nanopdf::stod_or(operands[3]));
       }
     } else {
       // Try resolving via parsed ColorSpace resource
@@ -3702,16 +3601,16 @@ std::string CanvasExporter::resolve_scn_color(const std::vector<std::string>& op
       // Fallback:
       // Unknown color space - guess from operand count
       if (operands.size() >= 4) {
-        return cmyk_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                           std::stod(operands[2]), std::stod(operands[3]));
+        return cmyk_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]),
+                           nanopdf::stod_or(operands[2]), nanopdf::stod_or(operands[3]));
       } else if (operands.size() >= 3) {
-        return rgb_to_hex(std::stod(operands[0]), std::stod(operands[1]), std::stod(operands[2]));
+        return rgb_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]), nanopdf::stod_or(operands[2]));
       } else if (operands.size() >= 1) {
-        double gray = std::stod(operands[0]);
+        double gray = nanopdf::stod_or(operands[0]);
         return rgb_to_hex(gray, gray, gray);
       }
     }
-  } catch (...) {}
+  
   return "";
 }
 
@@ -4312,12 +4211,8 @@ std::string CanvasExporter::commands_to_json(const std::vector<CanvasCommand>& c
         if (arg.front() == '"' && arg.back() == '"') {
           json << "\"" << escape_json_string(arg.substr(1, arg.length() - 2)) << "\"";
         } else {
-          try {
-            std::stod(arg);
-            json << arg;
-          } catch (...) {
-            json << "\"" << escape_json_string(arg) << "\"";
-          }
+          nanopdf::stod_or(arg);
+          json << arg;
         }
         
         if (j < cmd.args.size() - 1) {
@@ -4364,12 +4259,8 @@ std::string CanvasExporter::svg_to_json(const std::vector<SvgElement>& elements)
       for (const auto& attr : elem.attributes) {
         json << "        \"" << escape_json_string(attr.first) << "\": ";
         
-        try {
-          std::stod(attr.second);
-          json << "\"" << escape_json_string(attr.second) << "\"";
-        } catch (...) {
-          json << "\"" << escape_json_string(attr.second) << "\"";
-        }
+        nanopdf::stod_or(attr.second);
+        json << "\"" << escape_json_string(attr.second) << "\"";
         
         if (++attr_count < elem.attributes.size()) {
           json << ",";
@@ -4623,17 +4514,16 @@ std::string CanvasExporter::lab_to_hex(double l_star, double a_star, double b_st
 
 std::string CanvasExporter::resolve_color_with_space(const ColorSpace& cs,
                                                       const std::vector<std::string>& operands) {
-  try {
     if (cs.type == ColorSpaceType::Lab && operands.size() >= 3) {
-      return lab_to_hex(std::stod(operands[0]), std::stod(operands[1]),
-                        std::stod(operands[2]), cs);
+      return lab_to_hex(nanopdf::stod_or(operands[0]), nanopdf::stod_or(operands[1]),
+                        nanopdf::stod_or(operands[2]), cs);
     }
 
     if ((cs.type == ColorSpaceType::Separation || cs.type == ColorSpaceType::DeviceN) &&
         !operands.empty() && current_pdf_) {
       // Evaluate tint function to get alternate color space values
       std::vector<double> inputs;
-      for (const auto& op : operands) inputs.push_back(std::stod(op));
+      for (const auto& op : operands) inputs.push_back(nanopdf::stod_or(op));
 
       std::vector<double> outputs;
       if (pdfunc::evaluate(*current_pdf_, cs.tint_function, inputs, outputs) && !outputs.empty()) {
@@ -4666,7 +4556,7 @@ std::string CanvasExporter::resolve_color_with_space(const ColorSpace& cs,
       if (static_cast<int>(operands.size()) >= nc) {
         float components[4] = {0};
         for (int i = 0; i < nc && i < 4; ++i) {
-          try { components[i] = static_cast<float>(std::stod(operands[i])); } catch (...) {}
+          components[i] = static_cast<float>(nanopdf::stod_or(operands[i]));
         }
 
         if (!cs.icc_profile_data.empty()) {
@@ -4685,14 +4575,14 @@ std::string CanvasExporter::resolve_color_with_space(const ColorSpace& cs,
     }
 
     if (cs.type == ColorSpaceType::CalGray && operands.size() >= 1) {
-      double g = std::stod(operands[0]);
+      double g = nanopdf::stod_or(operands[0]);
       // Apply gamma if present
       if (!cs.gamma.empty()) g = std::pow(g, cs.gamma[0]);
       return rgb_to_hex(g, g, g);
     }
 
     if (cs.type == ColorSpaceType::CalRGB && operands.size() >= 3) {
-      double r = std::stod(operands[0]), gv = std::stod(operands[1]), b = std::stod(operands[2]);
+      double r = nanopdf::stod_or(operands[0]), gv = nanopdf::stod_or(operands[1]), b = nanopdf::stod_or(operands[2]);
       if (cs.gamma.size() >= 3) {
         r = std::pow(r, cs.gamma[0]);
         gv = std::pow(gv, cs.gamma[1]);
@@ -4700,7 +4590,7 @@ std::string CanvasExporter::resolve_color_with_space(const ColorSpace& cs,
       }
       return rgb_to_hex(r, gv, b);
     }
-  } catch (...) {}
+  
   return "";
 }
 

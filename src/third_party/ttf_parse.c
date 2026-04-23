@@ -2041,11 +2041,14 @@ int ttf_font_init(ttf_font_t *font, const uint8_t *data, size_t len)
         sfnt_ver != tag4("true"))   /* Apple TrueType */
         return -1;
 
-    /* Find required tables */
+    /* Find required tables. cmap is marked as optional here: CID-keyed
+     * subsets embedded in PDFs typically omit it because glyph selection
+     * goes through the PDF's CIDToGIDMap. Callers that rely on Unicode
+     * lookup must check tab_cmap.len before using ttf_cmap_lookup. */
     if (find_table(font, tag4("head"), &font->tab_head) != 0) return -1;
     if (find_table(font, tag4("hhea"), &font->tab_hhea) != 0) return -1;
     if (find_table(font, tag4("maxp"), &font->tab_maxp) != 0) return -1;
-    if (find_table(font, tag4("cmap"), &font->tab_cmap) != 0) return -1;
+    find_table(font, tag4("cmap"), &font->tab_cmap);
     if (find_table(font, tag4("hmtx"), &font->tab_hmtx) != 0) return -1;
 
     /* Optional tables */
@@ -2065,7 +2068,11 @@ int ttf_font_init(ttf_font_t *font, const uint8_t *data, size_t len)
     if (parse_head(font) != 0) return -1;
     if (parse_hhea(font) != 0) return -1;
     if (parse_maxp(font) != 0) return -1;
-    if (parse_cmap(font) != 0) return -1;
+    /* cmap is optional for CID-keyed subsets. A missing/unparseable cmap
+     * simply leaves the Unicode-to-GID lookup disabled. */
+    if (font->tab_cmap.len >= 4) {
+        (void)parse_cmap(font);
+    }
 
     /* OS/2 overrides hhea metrics if available */
     parse_os2(font);

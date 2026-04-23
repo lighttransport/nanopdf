@@ -714,6 +714,14 @@ struct FontDescriptor {
 };
 
 // Base font class for all font types
+// Runtime kind tag for BaseFont-derived types. Needed in place of typeid /
+// dynamic_cast so the library can be compiled with -fno-rtti.
+enum class FontKind {
+  Simple,  // Type1 / TrueType / MMType1 — the plain BaseFont
+  Type0,   // composite CID font
+  Type3    // user-defined glyph font
+};
+
 struct BaseFont {
   std::string subtype;                  // Font type (Type1, TrueType, etc.)
   std::string base_font;                // PostScript name of the font
@@ -727,6 +735,10 @@ struct BaseFont {
   int first_char{0};
   int last_char{0};
 
+  // Runtime kind tag. Set by derived-class constructors. Use the as_*_font()
+  // helpers below to downcast safely without dynamic_cast.
+  virtual FontKind kind() const { return FontKind::Simple; }
+
   virtual ~BaseFont() {
     if (descriptor) {
       delete descriptor;
@@ -737,6 +749,8 @@ struct BaseFont {
 
 // Type0 (CID) font structure
 struct Type0Font : public BaseFont {
+  FontKind kind() const override { return FontKind::Type0; }
+
   std::string registry;
   std::string ordering;
   int supplement = 0;
@@ -779,6 +793,8 @@ struct Type0Font : public BaseFont {
 
 // Type3 font structure
 struct Type3Font : public BaseFont {
+  FontKind kind() const override { return FontKind::Type3; }
+
   std::vector<double> font_bbox;
   std::vector<double> font_matrix = {0.001, 0, 0, 0.001, 0, 0};
 
@@ -792,6 +808,28 @@ struct Type3Font : public BaseFont {
     subtype = "Type3";
   }
 };
+
+// Safe downcasts that replace dynamic_cast<...>(base_font). The runtime
+// `kind()` tag lets us static_cast without RTTI. Return nullptr when the
+// input is null or the kind does not match, matching dynamic_cast semantics.
+inline const Type0Font* as_type0_font(const BaseFont* f) {
+  return (f && f->kind() == FontKind::Type0)
+             ? static_cast<const Type0Font*>(f)
+             : nullptr;
+}
+inline Type0Font* as_type0_font(BaseFont* f) {
+  return (f && f->kind() == FontKind::Type0) ? static_cast<Type0Font*>(f)
+                                              : nullptr;
+}
+inline const Type3Font* as_type3_font(const BaseFont* f) {
+  return (f && f->kind() == FontKind::Type3)
+             ? static_cast<const Type3Font*>(f)
+             : nullptr;
+}
+inline Type3Font* as_type3_font(BaseFont* f) {
+  return (f && f->kind() == FontKind::Type3) ? static_cast<Type3Font*>(f)
+                                              : nullptr;
+}
 
 /// Error classification for parse/decode operations
 enum class ErrorKind {
@@ -1662,6 +1700,14 @@ struct Pattern {
 ExtendedGraphicsState parse_ext_gstate(const Pdf& pdf, const Dictionary& gs_dict);
 BlendMode parse_blend_mode(const std::string& mode_name);
 std::unique_ptr<Pattern> parse_pattern(const Pdf& pdf, const Dictionary& pattern_dict);
+
+// Overload that takes a Value directly. Resolves references, pulls the
+// dictionary from STREAM or DICTIONARY values, and for Tiling patterns also
+// decodes the stream body into `pattern->tiling->content_stream`. obj_num/
+// gen_num are the resolved object's number/generation (used for decryption
+// and cache lookup); pass 0/0 for inline dictionaries with no object id.
+std::unique_ptr<Pattern> parse_pattern(const Pdf& pdf, const Value& value,
+                                       uint32_t obj_num, uint16_t gen_num);
 std::unique_ptr<Shading> parse_shading(const Pdf& pdf, const Dictionary& shading_dict);
 TransparencyGroup parse_transparency_group(const Pdf& pdf, const Dictionary& group_dict);
 

@@ -16,6 +16,8 @@ option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
 option(NANOPDF_EXTERNAL_FONTS "Load fonts from external files instead of embedding" OFF)
+option(NANOPDF_NO_EXCEPTIONS "Build without C++ exceptions (-fno-exceptions / /EHs-c-)" ON)
+option(NANOPDF_NO_RTTI "Build without C++ RTTI (-fno-rtti / /GR-)" ON)
 
 # Log level: 0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
 set(NANOPDF_LOG_LEVEL "3" CACHE STRING "Log level (0=None, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace)")
@@ -33,6 +35,40 @@ find_package(Sanitizers) # Address sanitizer (-DSANITIZE_ADDRESS=ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Build nanopdf (and the examples/tests that pick up these flags) without C++
+# exceptions and RTTI. The library replaces every std::stoi / std::stod call
+# with the non-throwing parsers in src/string-parse.hh and uses
+# static_cast<Type0Font*> guards instead of dynamic_cast<Type0Font*> on
+# known-derived pointers, so neither feature is required by library code.
+#
+# Third-party prebuilts (ThorVG, Blend2D) are consumed as already-compiled
+# static libraries from dist/, so these flags do not affect them. If someone
+# builds ThorVG or Blend2D from source alongside nanopdf, both projects
+# support -DTVG_NO_EXCEPTIONS / -DBL_BUILD_NO_CXX_RUNTIME toggles which map
+# to the same intent; wire those up in the respective subproject.
+#
+# Leave the flags opt-out (defaults ON) because an unchecked std::stoi in
+# PDF content-stream parsing is a crash on malformed input.
+set(NANOPDF_CXX_OPTIONS "")
+set(NANOPDF_CXX_DEFINES "")
+if(NANOPDF_NO_EXCEPTIONS)
+  if(MSVC)
+    list(APPEND NANOPDF_CXX_OPTIONS "/EHs-c-")
+  else()
+    list(APPEND NANOPDF_CXX_OPTIONS "-fno-exceptions")
+  endif()
+  # libc++ / libstdc++ use these to avoid throwing from the STL where
+  # possible. Setting them unconditionally is safe.
+  list(APPEND NANOPDF_CXX_DEFINES "_HAS_EXCEPTIONS=0")
+endif()
+if(NANOPDF_NO_RTTI)
+  if(MSVC)
+    list(APPEND NANOPDF_CXX_OPTIONS "/GR-")
+  else()
+    list(APPEND NANOPDF_CXX_OPTIONS "-fno-rtti")
+  endif()
+endif()
 
 # Windows/MinGW: enable M_PI and other POSIX math constants
 if(WIN32 OR MINGW)
@@ -257,6 +293,20 @@ else()
 endif()
 target_include_directories(${BUILD_TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party)
 target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_LOG_LEVEL=${NANOPDF_LOG_LEVEL}")
+
+# Apply the no-exception / no-rtti toggles to C++ sources only. The C
+# third-party code (miniz, stb_image, ttf_parse) doesn't care about -fno-rtti
+# but -fno-exceptions is harmless for C. Using a generator expression so the
+# flags are scoped to the nanopdf target and don't leak into dependents via
+# PUBLIC propagation.
+if(NANOPDF_CXX_OPTIONS)
+  target_compile_options(${BUILD_TARGET} PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${NANOPDF_CXX_OPTIONS}>)
+endif()
+if(NANOPDF_CXX_DEFINES)
+  target_compile_definitions(${BUILD_TARGET} PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:${NANOPDF_CXX_DEFINES}>)
+endif()
 
 # Add embedded fonts support
 if(NANOPDF_EMBED_FONTS)

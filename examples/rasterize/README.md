@@ -47,6 +47,7 @@ Convert the first page of a PDF to PNG:
 ### Options
 
 - `-p, --page <n>` : Page number to render (default: 1)
+- `--pages <spec>` : Page selection spec (e.g. `1-3,7,10-12`)
 - `-w, --width <n>` : Output width in pixels (default: 800)
 - `-h, --height <n>` : Output height in pixels (default: 600)
 - `-s, --scale <f>` : Scale factor (overrides width/height)
@@ -54,6 +55,12 @@ Convert the first page of a PDF to PNG:
 - `--all` : Render all pages (creates multiple PNG files)
 - `--verbose` : Verbose output
 - `--help` : Show help message
+
+Notes:
+- `--all`, `--page`, and `--pages` are mutually exclusive.
+- For multi-page output, page numbers use `-0000` style suffixes.
+  - `output.png` -> `output-0001.png`, `output-0002.png`, ...
+  - If output stem already contains `0000`, that placeholder is replaced.
 
 ### Examples
 
@@ -66,7 +73,12 @@ Convert the first page of a PDF to PNG:
 ```bash
 ./rasterize document.pdf output.png --all --dpi 150
 ```
-This creates: `output_page001.png`, `output_page002.png`, etc.
+This creates: `output-0001.png`, `output-0002.png`, etc.
+
+**Render selected pages (range + list):**
+```bash
+./rasterize document.pdf output.png --pages 1-3,7,10-12 --dpi 300
+```
 
 **Render with 2x scale factor:**
 ```bash
@@ -82,7 +94,7 @@ When the page contains many render objects, verbose mode prints render progress 
 ## Output Format
 
 - Single page: Creates the specified output file
-- Multiple pages (`--all`): Creates numbered files with pattern `basename_pageNNN.png`
+- Multiple pages (`--all` / `--pages`): Creates numbered files with pattern `basename-NNNN.png`
 
 ## Limitations
 

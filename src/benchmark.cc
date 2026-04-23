@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "nanopdf.hh"
+#include "string-parse.hh"
 
 #ifdef NANOPDF_USE_THORVG
 #include "thorvg-backend.hh"
@@ -282,13 +283,13 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "-i" || arg == "--iterations") {
-      if (i + 1 < argc) iterations = std::atoi(argv[++i]);
+      if (i + 1 < argc) iterations = nanopdf::stoi_or(argv[++i]);
     } else if (arg == "-w" || arg == "--width") {
-      if (i + 1 < argc) width = static_cast<uint32_t>(std::atoi(argv[++i]));
+      if (i + 1 < argc) width = static_cast<uint32_t>(nanopdf::stoi_or(argv[++i]));
     } else if (arg == "-h" || arg == "--height") {
-      if (i + 1 < argc) height = static_cast<uint32_t>(std::atoi(argv[++i]));
+      if (i + 1 < argc) height = static_cast<uint32_t>(nanopdf::stoi_or(argv[++i]));
     } else if (arg == "-p" || arg == "--page") {
-      if (i + 1 < argc) page_idx = std::atoi(argv[++i]);
+      if (i + 1 < argc) page_idx = nanopdf::stoi_or(argv[++i]);
     } else if (arg == "--all-pages") {
       all_pages = true;
     } else if (arg == "--help") {

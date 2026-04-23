@@ -5,6 +5,7 @@
 // Reference: Adobe Technical Note #5176 "The Compact Font Format Specification"
 
 #include "cff-parser.hh"
+#include "string-parse.hh"
 
 #include <algorithm>
 #include <cstring>
@@ -1223,7 +1224,7 @@ bool CFFParser::read_dict_operand(const uint8_t* data, size_t size, size_t& pos,
       }
     }
     if (!realStr.empty()) {
-      operands.push_back(std::stod(realStr));
+      operands.push_back(nanopdf::stod_or(realStr));
     }
     return true;
   }
