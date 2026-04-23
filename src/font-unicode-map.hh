@@ -30,8 +30,7 @@ inline bool is_identity_cmap(const Type0Font* type0_font) {
 
 // True when the Type0 font uses a two-byte CID encoding. Identity-H/V and the
 // Adobe-registered CJK CMaps (UniJIS*, UniGB*, UniKS*, UniCNS*) all decode
-// input bytes in pairs. This drives whether single-byte literal strings in a
-// content stream need to be widened before being handed to the CID decoder.
+// input bytes in pairs.
 inline bool is_type0_two_byte_cid(const Type0Font* t0) {
   if (!t0) return false;
   const std::string& cn = t0->encoding_cmap.name;
@@ -46,32 +45,6 @@ inline bool is_type0_two_byte_cid(const Type0Font* t0) {
   }
   const std::string& o = t0->ordering;
   return o == "Japan1" || o == "GB1" || o == "CNS1" || o == "Korea1";
-}
-
-// Some PDFs emit single-byte literal or odd-length hex strings inside content
-// streams for Type0 fonts whose CID encoding is two bytes per code. A string
-// is "single-byte-shaped" when it has no NUL bytes, no high bytes (>= 0x80),
-// and no control bytes (< 0x20) — i.e. it only contains printable ASCII, so
-// it cannot be a genuine two-byte CID sequence (which would have a 0x00 high
-// byte for BMP codepoints or a high byte for CJK CIDs).
-inline bool looks_single_byte_cid_shaped(const std::string& bytes) {
-  if (bytes.empty()) return false;
-  for (unsigned char c : bytes) {
-    if (c == 0x00 || c >= 0x80 || c < 0x20) return false;
-  }
-  return true;
-}
-
-// Widen a string in-place to two-byte-per-code by prepending 0x00 to each
-// byte, so a two-byte CID decoder sees <00 XX> for every input byte XX.
-inline void widen_bytes_to_two_byte_cid(std::string& text) {
-  std::string widened;
-  widened.reserve(text.size() * 2);
-  for (char c : text) {
-    widened.push_back(0);
-    widened.push_back(c);
-  }
-  text = std::move(widened);
 }
 
 // Adobe-Japan1 CID → Unicode for the deterministic, closed-form ranges only.
@@ -111,41 +84,6 @@ inline uint32_t adobe_japan1_cid_to_unicode_regular(uint32_t cid) {
   if (cid >= 842 && cid <= 924) return 0x3041 + (cid - 842);
   if (cid >= 925 && cid <= 1010) return 0x30A1 + (cid - 925);
   return 0;
-}
-
-// Combined helper: widen `text` if the Type0 font is two-byte-CID and the
-// string is either hex-odd-length or single-byte-shaped. Returns true if
-// widening was applied.
-inline bool maybe_widen_for_type0_cid(const Type0Font* t0, bool was_hex_odd,
-                                      std::string& text) {
-  if (!is_type0_two_byte_cid(t0) || text.empty()) return false;
-  if (!(was_hex_odd || looks_single_byte_cid_shaped(text))) return false;
-  widen_bytes_to_two_byte_cid(text);
-  return true;
-}
-
-inline bool is_symbolic_font_name(std::string_view base_font_name) {
-  if (base_font_name.empty()) return false;
-  std::string lower;
-  lower.reserve(base_font_name.size());
-  for (char c : base_font_name) {
-    lower.push_back(
-        static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-  }
-  return lower.find("symbol") != std::string::npos ||
-         lower.find("dingbat") != std::string::npos ||
-         lower.find("wingding") != std::string::npos;
-}
-
-inline bool is_dingbats_font_name(std::string_view base_font_name) {
-  if (base_font_name.empty()) return false;
-  std::string lower;
-  lower.reserve(base_font_name.size());
-  for (char c : base_font_name) {
-    lower.push_back(
-        static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-  }
-  return lower.find("dingbat") != std::string::npos;
 }
 
 // Adobe Symbol encoding (PDF 1.7 Annex D.5) mapped to Unicode.
@@ -302,4 +240,3 @@ inline uint32_t map_char_to_unicode_generic(
 }
 
 }  // namespace nanopdf
-

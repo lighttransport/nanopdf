@@ -18,6 +18,12 @@ nanopdf::Value make_stream_value(const std::string& content) {
   return stream_value;
 }
 
+nanopdf::Value make_number_value(double n) {
+  nanopdf::Value v(nanopdf::Value::NUMBER);
+  v.number = n;
+  return v;
+}
+
 nanopdf::Page make_rect_page(size_t rect_count) {
   nanopdf::Page page;
   page.page_number = 1;
@@ -30,6 +36,60 @@ nanopdf::Page make_rect_page(size_t rect_count) {
   }
 
   page.contents.push_back(make_stream_value(content));
+  return page;
+}
+
+nanopdf::Page make_tiny_scale_pattern_page() {
+  nanopdf::Page page;
+  page.page_number = 1;
+  page.media_box = {0.0, 0.0, 64.0, 64.0};
+
+  // Use a colored tiling pattern with a very small matrix scale.
+  // This exercises the internal tiled bitmap dimension path where
+  // tiles_x * step_ix can truncate to 0 without clamping.
+  nanopdf::Value pattern_stream(nanopdf::Value::STREAM);
+  pattern_stream.stream.data.assign(
+      {'0', ' ', '1', ' ', '0', ' ', 'r', 'g', '\n',
+       '0', ' ', '0', ' ', '1', ' ', '1', ' ', 'r', 'e', ' ', 'f', '\n'});
+
+  auto& dict = pattern_stream.stream.dict;
+  dict["PatternType"] = make_number_value(1.0);
+  dict["PaintType"] = make_number_value(1.0);   // Colored tiles
+  dict["TilingType"] = make_number_value(1.0);
+
+  nanopdf::Value bbox(nanopdf::Value::ARRAY);
+  bbox.array.push_back(make_number_value(0.0));
+  bbox.array.push_back(make_number_value(0.0));
+  bbox.array.push_back(make_number_value(1.0));
+  bbox.array.push_back(make_number_value(1.0));
+  dict["BBox"] = bbox;
+
+  dict["XStep"] = make_number_value(1.0);
+  dict["YStep"] = make_number_value(1.0);
+
+  nanopdf::Value matrix(nanopdf::Value::ARRAY);
+  matrix.array.push_back(make_number_value(0.001));
+  matrix.array.push_back(make_number_value(0.0));
+  matrix.array.push_back(make_number_value(0.0));
+  matrix.array.push_back(make_number_value(0.001));
+  matrix.array.push_back(make_number_value(0.0));
+  matrix.array.push_back(make_number_value(0.0));
+  dict["Matrix"] = matrix;
+
+  nanopdf::Value resources(nanopdf::Value::DICTIONARY);
+  dict["Resources"] = resources;
+
+  nanopdf::Value pattern_dict(nanopdf::Value::DICTIONARY);
+  pattern_dict.dict["Ptiny"] = pattern_stream;
+  page.resources["Pattern"] = pattern_dict;
+
+  // Fill a medium rectangle so the pattern path is exercised.
+  page.contents.push_back(make_stream_value(
+      "/Pattern cs\n"
+      "/Ptiny scn\n"
+      "0 0 10 10 re\n"
+      "f\n"));
+
   return page;
 }
 
@@ -149,5 +209,39 @@ TEST_CASE_IN_SUITE("backends",
   }
 
   backend.clear_progress_callback();
+#endif
+}
+
+TEST_CASE_IN_SUITE("backends",
+                   "ThorVG tiny-scale tiling pattern renders without fallback placeholder") {
+#if !defined(NANOPDF_USE_THORVG)
+  SKIP_IF(true, "ThorVG backend is not enabled");
+#else
+  nanopdf::Pdf pdf;
+  auto page = make_tiny_scale_pattern_page();
+
+  nanopdf::ThorVGBackend backend;
+  REQUIRE(backend.initialize(64, 64));
+
+  auto result = backend.render_page(pdf, page);
+  REQUIRE(result.success);
+  REQUIRE(!result.pixels.empty());
+
+  // Fallback placeholder for colored patterns uses purple-ish (200,150,220).
+  // Assert we do not paint placeholder purple after tiny-scale composition.
+  bool found_placeholder_purple = false;
+  const size_t pixel_count = result.pixels.size() / 4;
+  for (size_t i = 0; i < pixel_count; ++i) {
+    uint8_t r = result.pixels[i * 4 + 0];
+    uint8_t g = result.pixels[i * 4 + 1];
+    uint8_t b = result.pixels[i * 4 + 2];
+    if (r >= 190 && r <= 210 &&
+        g >= 140 && g <= 160 &&
+        b >= 210 && b <= 230) {
+      found_placeholder_purple = true;
+      break;
+    }
+  }
+  CHECK(!found_placeholder_purple);
 #endif
 }

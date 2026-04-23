@@ -147,6 +147,34 @@ TEST_SUITE("TextExtraction") {
         CHECK(text.find("Hi") != std::string::npos);
     }
 
+    TEST_CASE("Type0 Identity-H literal string is not implicitly widened") {
+        Pdf pdf;
+        Page page;
+
+        auto type0 = std::unique_ptr<Type0Font>(new Type0Font());
+        type0->subtype = "Type0";
+        type0->encoding_cmap.name = "Identity-H";
+        // Distinguish strict two-byte decode from implicit byte widening:
+        // strict decode of "(Hi)" -> CID 0x4869 -> 'X'
+        // widened decode would become CIDs 0x0048,0x0069 -> "Hi"
+        type0->to_unicode_cmap.code_to_unicode[0x4869] = 'X';
+        type0->to_unicode_cmap.code_to_unicode[0x0048] = 'H';
+        type0->to_unicode_cmap.code_to_unicode[0x0069] = 'i';
+        page.fonts["F1"] = std::move(type0);
+        page.fonts_loaded = true;
+
+        page.contents.push_back(make_stream(
+            "BT\n"
+            "/F1 12 Tf\n"
+            "72 720 Td\n"
+            "(Hi) Tj\n"
+            "ET\n"));
+
+        std::string text = extract_text_from_page(pdf, page);
+        CHECK(text.find("X") != std::string::npos);
+        CHECK(text.find("Hi") == std::string::npos);
+    }
+
     TEST_CASE("Empty page with no content") {
         Pdf pdf;
         Page page;

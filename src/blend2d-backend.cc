@@ -2029,13 +2029,6 @@ float Blend2DBackend::render_text_string(const std::string& raw_text,
     float x, float y, float font_size,
     uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   std::string text = raw_text;
-  // Literal strings like "(Hi)" in a Type0/Identity-H content stream are
-  // single-byte-shaped but expected to map to two-byte CIDs <00 48><00 69>.
-  // Widen before the two-byte decoder below reads them as CID 0x4869.
-  // (The tokenizer already pads odd-length hex strings, so was_hex_odd is
-  // not observable here; this only handles the literal-string case.)
-  maybe_widen_for_type0_cid(as_type0_font(current_font_),
-                            /*was_hex_odd=*/false, text);
 
   // Check for Type 3 font (user-defined glyphs) first
   auto* type3_font = as_type3_font(current_font_);

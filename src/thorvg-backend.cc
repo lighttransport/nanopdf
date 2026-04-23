@@ -1747,13 +1747,6 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
 
         if (using_embedded) {
           bool drawn = false;
-          // Symbol-like Type0 fonts tend to have unreliable CID->GID maps in
-          // subsetted PDFs; prefer semantic ToUnicode when available.
-          if (is_symbolic_font_name(type0_font->base_font) && has_mapped_unicode) {
-            draw_glyph(static_cast<int>(mapped_unicode), draw_x, draw_y, size,
-                       r, g, b, a);
-            drawn = true;
-          }
           if (!drawn && !type0_font->cid_to_gid_map.empty() &&
               char_code < type0_font->cid_to_gid_map.size()) {
             drawn = try_draw_gid(type0_font->cid_to_gid_map[char_code]);
@@ -4607,16 +4600,9 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     float pattern_scale_x = state_.scale * mat_sx;
     float pattern_scale_y = state_.scale * mat_sy;
 
-    // Render the tile at a resolution that preserves pattern detail even when
-    // the on-page tile is small. We aim for at least ~2 px per pattern unit
-    // (so 6-unit features like the A64FX hatch stripes render as ≥12 px bars
-    // inside the tile buffer), then downsample at placement time via ThorVG
-    // Picture transform. Clamp to a sane upper bound.
-    const float kMinPxPerUnit = 2.0f;
-    float internal_scale_x =
-        std::max(pattern_scale_x, kMinPxPerUnit);
-    float internal_scale_y =
-        std::max(pattern_scale_y, kMinPxPerUnit);
+    // Render at matrix/page-derived scale and clamp only by global safety caps.
+    float internal_scale_x = pattern_scale_x;
+    float internal_scale_y = pattern_scale_y;
     int tile_px_w = static_cast<int>(std::ceil(tile_width * internal_scale_x));
     int tile_px_h = static_cast<int>(std::ceil(tile_height * internal_scale_y));
 
@@ -4757,6 +4743,8 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     // Compose at internal resolution; final Picture transform rescales.
     int tiled_w = static_cast<int>(tiles_x * step_ix);
     int tiled_h = static_cast<int>(tiles_y * step_iy);
+    if (tiled_w < 1) tiled_w = 1;
+    if (tiled_h < 1) tiled_h = 1;
 
     // Create the tiled bitmap
     std::vector<uint32_t> tiled_pixels(tiled_w * tiled_h);
@@ -4886,12 +4874,9 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
           }
           auto picture = tvg::Picture::gen();
           if (!picture) continue;
-          auto* data_copy = new uint32_t[tile_rgba.size()];
-          std::copy(tile_rgba.begin(), tile_rgba.end(), data_copy);
-          if (picture->load(data_copy, tile_px_w, tile_px_h,
+          if (picture->load(tile_rgba.data(), tile_px_w, tile_px_h,
                             tvg::ColorSpace::ARGB8888, true) !=
               tvg::Result::Success) {
-            delete[] data_copy;
             continue;
           }
           // Transform local tile pixels by a pure rotation about the origin,
@@ -4956,10 +4941,7 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     // Create ThorVG Picture from tiled bitmap
     auto picture = tvg::Picture::gen();
     if (picture) {
-      auto* data_copy = new uint32_t[tiled_pixels.size()];
-      std::copy(tiled_pixels.begin(), tiled_pixels.end(), data_copy);
-
-      auto result = picture->load(data_copy, tiled_w, tiled_h,
+      auto result = picture->load(tiled_pixels.data(), tiled_w, tiled_h,
                                    tvg::ColorSpace::ARGB8888, true);
       if (result == tvg::Result::Success) {
         // Position at shape origin and downsample from internal to final scale.
@@ -4988,8 +4970,6 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
         apply_soft_mask_opacity(picture);
         scene_->add(picture);
         return true;
-      } else {
-        delete[] data_copy;
       }
     }
   }
@@ -7292,7 +7272,6 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
           // Remove parentheses or angle brackets from text string
           std::string text = operands[0];
           bool was_literal = !text.empty() && text[0] == '(' && text.back() == ')';
-          bool was_hex_odd = false;
           if (was_literal) {
             text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
           } else if (!text.empty() && text[0] == '<' && text.back() == '>') {
@@ -7300,19 +7279,11 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             std::string hex_str = text.substr(1, text.length() - 2);
             text.clear();
             if (hex_str.size() % 2 == 1) hex_str.push_back('0');
-            size_t decoded = 0;
             for (size_t i = 0; i + 1 < hex_str.length(); i += 2) {
               char hex_byte[3] = {hex_str[i], hex_str[i+1], '\0'};
               int byte_val = static_cast<int>(strtol(hex_byte, nullptr, 16));
               text += static_cast<char>(byte_val);
-              decoded++;
             }
-            was_hex_odd = (decoded % 2 == 1);
-          }
-          if (!text.empty()) {
-            maybe_widen_for_type0_cid(
-                as_type0_font(current_font_), was_hex_odd,
-                text);
           }
 
           // Get text position from text matrix and apply CTM
@@ -7372,40 +7343,24 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
             is_vertical_tj = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
           }
 
-          // Identity-H / CID two-byte encoding hint. Some PDFs mix literal
-          // strings like (L) inside TJ arrays for two-byte-CID fonts — those
-          // bytes must be widened before the CID decoder in draw_text sees
-          // them (see maybe_widen_for_type0_cid).
-          const bool type0_two_byte_tj = is_type0_two_byte_cid(type0_font_tj);
-
           for (const auto& item : operands) {
             if (!item.empty() && (item[0] == '(' || item[0] == '<')) {
               // Text string element
               std::string text = item;
               bool was_literal = (text[0] == '(' && text.back() == ')');
-              bool was_hex_odd = false;
               if (was_literal) {
                 text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
               } else if (text[0] == '<' && text.back() == '>') {
                 // Hex string - decode hex pairs to bytes
                 std::string hex_str = text.substr(1, text.length() - 2);
                 text.clear();
-                // PDF spec: odd-length hex pads a trailing 0; we'll detect odd
-                // length to widen the decoded bytes as 1-byte-per-CID later.
+                // PDF spec: odd-length hex pads a trailing 0.
                 if (hex_str.size() % 2 == 1) hex_str.push_back('0');
-                size_t decoded = 0;
                 for (size_t i = 0; i + 1 < hex_str.length(); i += 2) {
                   char hex_byte[3] = {hex_str[i], hex_str[i+1], '\0'};
                   int byte_val = static_cast<int>(strtol(hex_byte, nullptr, 16));
                   text += static_cast<char>(byte_val);
-                  decoded++;
                 }
-                was_hex_odd = (decoded % 2 == 1);
-              }
-              // Widen single-byte-shaped literal / odd-length-hex strings
-              // before the two-byte CID decoder in draw_text sees them.
-              if (type0_two_byte_tj) {
-                maybe_widen_for_type0_cid(type0_font_tj, was_hex_odd, text);
               }
               if (!text.empty()) {
                 float text_x = state_.text_matrix.e;
