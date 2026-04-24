@@ -8,6 +8,8 @@ option('use_blend2d', type: 'boolean', value: false,
        description: 'Enable Blend2D rendering backend')
 option('use_libtiff', type: 'boolean', value: false,
        description: 'Use libtiff for CCITT/Fax decoding')
+option('use_cpp_image_bridge', type: 'boolean', value: false,
+       description: 'Enable the C API stream decoder bridge to the C++ JPX/JBIG2 decoders')
 option('use_builtin_ccitt', type: 'boolean', value: false,
        description: 'Use built-in CCITT decoder instead of PDFium-based')
 option('build_tests', type: 'boolean', value: true,

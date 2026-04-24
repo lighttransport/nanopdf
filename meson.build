@@ -1,6 +1,7 @@
 project('nanopdf', 'c', 'cpp',
   version: '1.0.0',
   license: 'Apache-2.0',
+  meson_version: '>=1.1.0',
   default_options: [
     'cpp_std=c++17',
     'c_std=c11',
@@ -15,10 +16,12 @@ opt_nanostl        = get_option('use_nanostl')
 opt_thorvg         = get_option('use_thorvg')
 opt_blend2d        = get_option('use_blend2d')
 opt_libtiff        = get_option('use_libtiff')
+opt_cpp_image_bridge = get_option('use_cpp_image_bridge')
 opt_builtin_ccitt  = get_option('use_builtin_ccitt')
 opt_build_tests    = get_option('build_tests')
 opt_build_mcp      = get_option('build_mcp')
 opt_log_level      = get_option('log_level')
+cpp = meson.get_compiler('cpp')
 
 # ── Core library sources ─────────────────────────────────────────────
 
@@ -125,6 +128,67 @@ nanopdf_dep = declare_dependency(
 )
 
 install_headers('src/nanopdf.hh')
+
+nanopdf_c_inc = include_directories('src/c')
+nanopdf_c_sources = files(
+  'src/c/nanopdf_alloc.c',
+  'src/c/nanopdf_context.c',
+  'src/c/nanopdf_crypto.c',
+  'src/c/nanopdf_image_decoder.c',
+  'src/c/nanopdf_object.c',
+  'src/c/nanopdf_basic_document.c',
+  'src/c/nanopdf_basic_layout.c',
+  'src/c/nanopdf_c_api.c',
+  'src/third_party/miniz.c',
+)
+nanopdf_c_bridge_cpp_args = []
+
+if opt_cpp_image_bridge
+  nanopdf_c_bridge_cpp_args = cpp.get_supported_arguments(
+    '-Wno-unused-function',
+    '-Wno-unused-parameter',
+    '-Wno-unused-variable',
+  )
+  nanopdf_c_sources += files(
+    'src/c/nanopdf_image_decoder_bridge.cc',
+    'src/jpx-decoder.cc',
+    'src/jbig2/JBig2_BitStream.cc',
+    'src/jbig2/JBig2_Image.cc',
+    'src/jbig2/JBig2_Segment.cc',
+    'src/jbig2/JBig2_SymbolDict.cc',
+    'src/jbig2/JBig2_PatternDict.cc',
+    'src/jbig2/JBig2_HuffmanTable.cc',
+    'src/jbig2/JBig2_ArithDecoder.cc',
+    'src/jbig2/JBig2_ArithIntDecoder.cc',
+    'src/jbig2/JBig2_GrdProc.cc',
+    'src/jbig2/JBig2_GrrdProc.cc',
+    'src/jbig2/JBig2_Context.cc',
+    'src/jbig2/JBig2_SddProc.cc',
+    'src/jbig2/JBig2_TrdProc.cc',
+  )
+endif
+
+nanopdf_c_lib = static_library('nanopdf-c',
+  nanopdf_c_sources,
+  include_directories: nanopdf_c_inc,
+  c_args: opt_cpp_image_bridge ? ['-DNANOPDF_C_USE_CPP_IMAGE_BRIDGE=1'] : [],
+  cpp_args: opt_cpp_image_bridge ? ['-DNANOPDF_C_USE_CPP_IMAGE_BRIDGE=1'] + nanopdf_c_bridge_cpp_args : [],
+  install: true,
+)
+
+nanopdf_c_dep = declare_dependency(
+  include_directories: include_directories('src/c'),
+  link_with: nanopdf_c_lib,
+)
+
+install_headers(
+  'src/c/nanopdf_types.h',
+  'src/c/nanopdf_c.h',
+  'src/c/nanopdf_parse.h',
+  'src/c/nanopdf_text.h',
+  'src/c/nanopdf_forms.h',
+  subdir: 'nanopdf-c',
+)
 
 # ── MCP server ───────────────────────────────────────────────────────
 
@@ -262,6 +326,15 @@ if opt_build_tests
   )
 
   test('nanopdf_unit_suite', nanopdf_unit_suite)
+
+  nanopdf_c_api_smoke = executable('nanopdf_c_api_smoke',
+    files('tests/c/test_nanopdf_c.c'),
+    include_directories: [include_directories('src/c'),
+                          include_directories('tests')],
+    link_with: nanopdf_c_lib,
+  )
+
+  test('nanopdf_c_api_smoke', nanopdf_c_api_smoke)
 
   # ── Integration tests ────────────────────────────────────────────
 

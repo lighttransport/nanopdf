@@ -15,6 +15,7 @@ option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
+option(NANOPDF_C_USE_CPP_IMAGE_BRIDGE "Enable the C API stream decoder bridge to the C++ JPX/JBIG2 decoders" OFF)
 option(NANOPDF_EXTERNAL_FONTS "Load fonts from external files instead of embedding" OFF)
 option(NANOPDF_NO_EXCEPTIONS "Build without C++ exceptions (-fno-exceptions / /EHs-c-)" ON)
 option(NANOPDF_NO_RTTI "Build without C++ RTTI (-fno-rtti / /GR-)" ON)
@@ -570,6 +571,73 @@ if(NOT NANOPDF_BUILD_WASM)
   add_sanitizers(${BUILD_TARGET})
 endif()
 
+set(NANOPDF_C_API_HEADERS
+  src/c/nanopdf_types.h
+  src/c/nanopdf_c.h
+  src/c/nanopdf_parse.h
+  src/c/nanopdf_text.h
+  src/c/nanopdf_forms.h
+)
+
+set(NANOPDF_C_API_SOURCES
+  src/c/nanopdf_alloc.c
+  src/c/nanopdf_context.c
+  src/c/nanopdf_crypto.c
+  src/c/nanopdf_image_decoder.c
+  src/c/nanopdf_object.c
+  src/c/nanopdf_basic_document.c
+  src/c/nanopdf_basic_layout.c
+  src/c/nanopdf_c_api.c
+  src/third_party/miniz.c
+)
+
+if(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  list(APPEND NANOPDF_C_API_SOURCES
+    src/c/nanopdf_image_decoder_bridge.cc
+    src/jpx-decoder.cc
+    src/jbig2/JBig2_BitStream.cc
+    src/jbig2/JBig2_Image.cc
+    src/jbig2/JBig2_Segment.cc
+    src/jbig2/JBig2_SymbolDict.cc
+    src/jbig2/JBig2_PatternDict.cc
+    src/jbig2/JBig2_HuffmanTable.cc
+    src/jbig2/JBig2_ArithDecoder.cc
+    src/jbig2/JBig2_ArithIntDecoder.cc
+    src/jbig2/JBig2_GrdProc.cc
+    src/jbig2/JBig2_GrrdProc.cc
+    src/jbig2/JBig2_Context.cc
+    src/jbig2/JBig2_SddProc.cc
+    src/jbig2/JBig2_TrdProc.cc
+  )
+endif()
+
+add_library(nanopdf-c STATIC ${NANOPDF_C_API_SOURCES})
+target_include_directories(nanopdf-c
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/c
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/c)
+set_property(TARGET nanopdf-c PROPERTY C_STANDARD 11)
+if(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  target_compile_definitions(nanopdf-c PRIVATE NANOPDF_C_USE_CPP_IMAGE_BRIDGE=1)
+  foreach(_nanopdf_cxx_option IN LISTS NANOPDF_CXX_OPTIONS)
+    target_compile_options(nanopdf-c PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${_nanopdf_cxx_option}>")
+  endforeach()
+  if(NOT MSVC)
+    target_compile_options(nanopdf-c PRIVATE
+      "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-function>"
+      "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>"
+      "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>")
+  endif()
+  target_compile_definitions(nanopdf-c PRIVATE ${NANOPDF_CXX_DEFINES})
+  set_property(TARGET nanopdf-c PROPERTY CXX_STANDARD 17)
+  set_property(TARGET nanopdf-c PROPERTY CXX_STANDARD_REQUIRED ON)
+endif()
+if(NOT NANOPDF_BUILD_WASM)
+  add_sanitizers(nanopdf-c)
+endif()
+
+install(TARGETS nanopdf-c DESTINATION lib)
+install(FILES ${NANOPDF_C_API_HEADERS} DESTINATION include/nanopdf-c)
+
 # ============================================================
 # MCP (Model Context Protocol) server
 # ============================================================
@@ -676,6 +744,15 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     target_compile_definitions(test_visual_blend2d PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     target_link_libraries(test_visual_blend2d PRIVATE blend2d::blend2d)
   endif()
+
+  add_executable(nanopdf_c_api_smoke tests/c/test_nanopdf_c.c)
+  target_link_libraries(nanopdf_c_api_smoke PRIVATE nanopdf-c)
+  target_include_directories(nanopdf_c_api_smoke PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/c
+    ${PROJECT_SOURCE_DIR}/tests)
+  set_property(TARGET nanopdf_c_api_smoke PROPERTY C_STANDARD 11)
+  add_test(NAME nanopdf_c_api_smoke COMMAND nanopdf_c_api_smoke)
+  set_tests_properties(nanopdf_c_api_smoke PROPERTIES LABELS "unit")
 endif()
 
 # Custom target to generate visual reference images
