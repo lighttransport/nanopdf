@@ -4,6 +4,9 @@
 #include "nanopdf_parse.h"
 #include "nanopdf_text.h"
 #include "../../src/c/nanopdf_crypto.h"
+#include "../../src/c/nanopdf_image_decoder.h"
+#include "../../src/c/nanopdf_jbig2.h"
+#include "../../src/c/nanopdf_jpx.h"
 #include "../../src/c/nanopdf_object.h"
 #include "../../src/third_party/miniz.h"
 
@@ -3916,6 +3919,2639 @@ static void test_nanopdf_c_jbig2_globals_cycle_is_bounded(void) {
   free(pdf);
 }
 
+static void test_nanopdf_c_jbig2_c_primitives(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_jbig2_bitstream stream;
+  nanopdf_jbig2_image image;
+  nanopdf_jbig2_image source;
+  nanopdf_jbig2_symbol_dict symbol_dict;
+  nanopdf_jbig2_symbol_dict symbol_copy;
+  nanopdf_jbig2_pattern_dict pattern_dict;
+  nanopdf_jbig2_segment segment;
+  nanopdf_jbig2_huffman_table huffman_table;
+  nanopdf_jbig2_arith_int_decoder int_decoder;
+  nanopdf_jbig2_arith_ctx arith_context;
+  nanopdf_jbig2_arith_decoder arith_decoder;
+  nanopdf_jbig2_grd_proc grd_proc;
+  nanopdf_jbig2_grd_proc parsed_grd_proc;
+  nanopdf_jbig2_image grd_image;
+  nanopdf_jbig2_image page_image;
+  nanopdf_jbig2_page_info page_info;
+  nanopdf_jbig2_region_info region_info;
+  nanopdf_jbig2_symbol_dict_header symbol_dict_header;
+  nanopdf_jbig2_text_region_header text_region_header;
+  nanopdf_jbig2_pattern_dict_header pattern_dict_header;
+  nanopdf_jbig2_generic_refinement_region_header refinement_region_header;
+  nanopdf_jbig2_halftone_region_header halftone_region_header;
+  static nanopdf_jbig2_arith_ctx grd_contexts[65536];
+  static const uint8_t data[] = {0xb2, 0x7c, 0x12, 0x34, 0x56, 0x78};
+  static const uint8_t arith_data[] = {0x00, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t segment_header_data[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x02,
+      0xaa, 0xbb};
+  static const uint8_t segment_ref_header_data[] = {
+      0x00, 0x00, 0x01, 0x2c,
+      0x00,
+      0x20,
+      0x00, 0x07,
+      0x01,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_info_data[] = {
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00};
+  static const uint8_t page_info_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00};
+  static const uint8_t end_of_stripe_data[] = {
+      0x00, 0x00, 0x00, 0x0f};
+  static const uint8_t unknown_height_page_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0xff, 0xff, 0xff, 0xff,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x01,
+      0x00, 0x08,
+      0x00, 0x00, 0x00, 0x02,
+      0x32,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x0f};
+  static const uint8_t page_with_eof_before_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x33,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x03,
+      0x06,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x17,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x01};
+  static const uint8_t page_with_empty_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x06,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x17,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x02, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_empty_refined_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x06,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x17,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x82, 0x02,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_empty_huffman_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x06,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x19,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x02, 0x01,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_intermediate_empty_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x04,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x17,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x02, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_intermediate_generic_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x24,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x1f,
+      0x00, 0x00, 0x00, 0x01,
+      0x00, 0x00, 0x00, 0x01,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00,
+      0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_empty_dict_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x00,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x0a,
+      0x00, 0x01,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x03,
+      0x06,
+      0x20,
+      0x02,
+      0x01,
+      0x00, 0x00, 0x00, 0x17,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x02, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t empty_dict_globals_stream[] = {
+      0x00, 0x00, 0x00, 0x02,
+      0x00,
+      0x00,
+      0x00,
+      0x00, 0x00, 0x00, 0x0a,
+      0x00, 0x01,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t unknown_globals_stream[] = {
+      0x00, 0x00, 0x00, 0x02,
+      0x3d,
+      0x00,
+      0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_global_empty_dict_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x03,
+      0x06,
+      0x20,
+      0x02,
+      0x01,
+      0x00, 0x00, 0x00, 0x17,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x02, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_text_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x06,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x17,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x00,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x01};
+  static const uint8_t page_with_pattern_dict_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x10,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x07,
+      0x04,
+      0x04,
+      0x02,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_pattern_bitmap_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x10,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x0e,
+      0x06,
+      0x01,
+      0x01,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_huffman_table_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x35,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x09,
+      0x00, 0x00, 0x00, 0x01,
+      0x20,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_unknown_segment_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x3d,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_refinement_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x2a,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x16,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x02,
+      0x04, 0xfc, 0x05, 0xfb};
+  static const uint8_t page_with_refinement_payload_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x2a,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x26,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x02,
+      0x04, 0xfc, 0x05, 0xfb,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_refinement_template1_payload_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x2a,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x22,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x01,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_intermediate_refinement_payload_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x28,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x26,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x02,
+      0x04, 0xfc, 0x05, 0xfb,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_referred_refinement_payload_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x28,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x26,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x02,
+      0x04, 0xfc, 0x05, 0xfb,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x03,
+      0x2a,
+      0x20,
+      0x02,
+      0x01,
+      0x00, 0x00, 0x00, 0x26,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x02,
+      0x04, 0xfc, 0x05, 0xfb,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t page_with_halftone_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x16,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x2a,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0xaa,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x05,
+      0x00, 0x01, 0x00, 0x00,
+      0x00, 0x02, 0x00, 0x00};
+  static const uint8_t page_with_empty_halftone_stream[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x30,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x13,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x48,
+      0x00, 0x00, 0x00, 0x48,
+      0x05,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x02,
+      0x16,
+      0x00,
+      0x01,
+      0x00, 0x00, 0x00, 0x2a,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x40,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x05,
+      0x00, 0x01, 0x00, 0x00,
+      0x00, 0x02, 0x00, 0x00};
+  static const uint8_t generic_region_header_data[] = {
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x0a,
+      0x03, 0xff};
+  static const uint8_t symbol_dict_header_data[] = {
+      0x04, 0x02,
+      0x03, 0xff,
+      0x01, 0xfe, 0x02, 0xfd,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x02};
+  static const uint8_t text_region_header_data[] = {
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x77, 0x7b,
+      0x6d, 0x39,
+      0x04, 0xfc, 0x05, 0xfb,
+      0x00, 0x00, 0x00, 0x05};
+  static const uint8_t pattern_dict_header_data[] = {
+      0x05,
+      0x04,
+      0x02,
+      0x00, 0x00, 0x00, 0x03};
+  static const uint8_t refinement_region_header_data[] = {
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0x02,
+      0x04, 0xfc, 0x05, 0xfb};
+  static const uint8_t halftone_region_header_data[] = {
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x05,
+      0x02,
+      0xaa,
+      0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x04,
+      0x00, 0x00, 0x00, 0x05,
+      0x00, 0x01, 0x00, 0x00,
+      0x00, 0x02, 0x00, 0x00};
+  static const uint8_t huffman_b2_zero[] = {0x00};
+  static const uint8_t huffman_b2_one[] = {0x80};
+  static const uint8_t huffman_b1_ten[] = {0x50};
+  static const uint8_t huffman_encoded_table_data[] = {
+      0x00, 0x00, 0x00, 0x01,
+      0x20,
+      0x00, 0x00, 0x00, 0x00};
+  static const uint8_t huffman_encoded_zero[] = {0x00};
+  uint32_t bits = 0;
+  uint32_t one_bit = 0;
+  uint8_t byte_value = 0;
+  uint8_t* decoded = NULL;
+  uint16_t short_value = 0;
+  uint32_t int_value = 0;
+  size_t decoded_size = 0;
+  int32_t huffman_value = 0;
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+
+  nanopdf_jbig2_bitstream_init(&stream, data, sizeof(data), 0);
+  TEST_CHECK(nanopdf_jbig2_bitstream_read_bits_u32(&stream, 4, &bits) == 0);
+  TEST_CHECK(bits == 0x0bu);
+  TEST_CHECK(nanopdf_jbig2_bitstream_read_bit_u32(&stream, &one_bit) == 0);
+  TEST_CHECK(one_bit == 0x00u);
+  nanopdf_jbig2_bitstream_align_byte(&stream);
+  TEST_CHECK(nanopdf_jbig2_bitstream_offset(&stream) == 1u);
+  TEST_CHECK(nanopdf_jbig2_bitstream_read_byte(&stream, &byte_value) == 0);
+  TEST_CHECK(byte_value == 0x7cu);
+  TEST_CHECK(nanopdf_jbig2_bitstream_read_u16(&stream, &short_value) == 0);
+  TEST_CHECK(short_value == 0x1234u);
+  nanopdf_jbig2_bitstream_set_offset(&stream, 2);
+  TEST_CHECK(nanopdf_jbig2_bitstream_read_u32(&stream, &int_value) == 0);
+  TEST_CHECK(int_value == 0x12345678u);
+
+  TEST_CHECK(nanopdf_jbig2_image_init(context, &image, 16, 4));
+  TEST_CHECK(nanopdf_jbig2_image_init(context, &source, 4, 2));
+  nanopdf_jbig2_image_set_pixel(&source, 0, 0, 1);
+  nanopdf_jbig2_image_set_pixel(&source, 3, 1, 1);
+  TEST_CHECK(nanopdf_jbig2_image_compose_from(
+                 &image, 2, 1, &source, NANOPDF_JBIG2_COMPOSE_REPLACE));
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&image, 2, 1) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&image, 5, 2) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_expand(context, &image, 6, 1));
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&image, 0, 5) == 1);
+
+  nanopdf_jbig2_symbol_dict_init(&symbol_dict);
+  nanopdf_jbig2_symbol_dict_init(&symbol_copy);
+  TEST_CHECK(nanopdf_jbig2_symbol_dict_add_image(context, &symbol_dict, &source));
+  TEST_CHECK(nanopdf_jbig2_symbol_dict_count(&symbol_dict) == 1u);
+  TEST_CHECK(nanopdf_jbig2_symbol_dict_deep_copy(context, &symbol_copy, &symbol_dict));
+  nanopdf_jbig2_image_set_pixel(&source, 0, 0, 0);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(
+                 nanopdf_jbig2_symbol_dict_get(&symbol_copy, 0), 0, 0) == 1);
+  nanopdf_jbig2_symbol_dict_destroy(context, &symbol_copy);
+  nanopdf_jbig2_symbol_dict_destroy(context, &symbol_dict);
+
+  nanopdf_jbig2_pattern_dict_init(&pattern_dict);
+  nanopdf_jbig2_pattern_dict_set_dimensions(&pattern_dict, 4, 2);
+  TEST_CHECK(pattern_dict.width == 4u);
+  TEST_CHECK(pattern_dict.height == 2u);
+  TEST_CHECK(nanopdf_jbig2_pattern_dict_add(context, &pattern_dict, &source));
+  TEST_CHECK(nanopdf_jbig2_pattern_dict_count(&pattern_dict) == 1u);
+  nanopdf_jbig2_pattern_dict_destroy(context, &pattern_dict);
+
+  nanopdf_jbig2_segment_init(&segment);
+  TEST_CHECK(segment.state == NANOPDF_JBIG2_SEGMENT_HEADER_UNPARSED);
+  TEST_CHECK(nanopdf_jbig2_segment_set_referred_count(context, &segment, 2));
+  TEST_CHECK(segment.referred_to_segment_count == 2);
+  segment.referred_to_segment_numbers[0] = 11;
+  segment.referred_to_segment_numbers[1] = 12;
+  TEST_CHECK(segment.referred_to_segment_numbers[1] == 12u);
+  nanopdf_jbig2_segment_destroy(context, &segment);
+
+  nanopdf_jbig2_bitstream_init(&stream, segment_header_data, sizeof(segment_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_segment_parse_header(context, &stream, &segment));
+  TEST_CHECK(segment.number == 1u);
+  TEST_CHECK(segment.type == 0x30u);
+  TEST_CHECK(segment.page_association == 1u);
+  TEST_CHECK(segment.data_length == 2u);
+  TEST_CHECK(segment.data_offset == 11u);
+  TEST_CHECK(nanopdf_jbig2_bitstream_offset(&stream) == sizeof(segment_header_data));
+  TEST_CHECK(segment.state == NANOPDF_JBIG2_SEGMENT_DATA_UNPARSED);
+  nanopdf_jbig2_segment_destroy(context, &segment);
+
+  nanopdf_jbig2_bitstream_init(&stream, segment_ref_header_data, sizeof(segment_ref_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_segment_parse_header(context, &stream, &segment));
+  TEST_CHECK(segment.number == 300u);
+  TEST_CHECK(segment.referred_to_segment_count == 1);
+  TEST_CHECK(segment.referred_to_segment_numbers[0] == 7u);
+  TEST_CHECK(segment.page_association == 1u);
+  TEST_CHECK(segment.data_length == 0u);
+  nanopdf_jbig2_segment_destroy(context, &segment);
+
+  nanopdf_jbig2_bitstream_init(&stream, page_info_data, sizeof(page_info_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_page_info(&stream, &page_info));
+  TEST_CHECK(page_info.width == 16u);
+  TEST_CHECK(page_info.height == 8u);
+  TEST_CHECK(page_info.x_resolution == 72u);
+  TEST_CHECK(page_info.y_resolution == 72u);
+  TEST_CHECK(page_info.default_pixel == 1u);
+  TEST_CHECK(page_info.is_lossless == 1u);
+  TEST_CHECK(page_info.stripe_height == 8u);
+  TEST_CHECK(nanopdf_jbig2_page_init_from_info(context, &page_info, &page_image));
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 0, 0) == 1);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+
+  nanopdf_jbig2_bitstream_init(
+      &stream, generic_region_header_data, sizeof(generic_region_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_generic_region_header(
+      &stream, &region_info, &parsed_grd_proc));
+  TEST_CHECK(region_info.width == 4u);
+  TEST_CHECK(region_info.height == 2u);
+  TEST_CHECK(region_info.x == 3u);
+  TEST_CHECK(region_info.y == 5u);
+  TEST_CHECK(region_info.flags == 2u);
+  TEST_CHECK(parsed_grd_proc.mmr == 0u);
+  TEST_CHECK(parsed_grd_proc.gb_template == 1u);
+  TEST_CHECK(parsed_grd_proc.tpgdon == 1u);
+  TEST_CHECK(parsed_grd_proc.width == 4u);
+  TEST_CHECK(parsed_grd_proc.height == 2u);
+  TEST_CHECK(parsed_grd_proc.gbat[0] == 3);
+  TEST_CHECK(parsed_grd_proc.gbat[1] == -1);
+
+  nanopdf_jbig2_bitstream_init(&stream, symbol_dict_header_data, sizeof(symbol_dict_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_symbol_dict_header(&stream, &symbol_dict_header));
+  TEST_CHECK(symbol_dict_header.huffman == 0u);
+  TEST_CHECK(symbol_dict_header.refagg == 1u);
+  TEST_CHECK(symbol_dict_header.template_id == 1u);
+  TEST_CHECK(symbol_dict_header.refinement_template == 0u);
+  TEST_CHECK(symbol_dict_header.sdat[0] == 3);
+  TEST_CHECK(symbol_dict_header.sdat[1] == -1);
+  TEST_CHECK(symbol_dict_header.sdrat[1] == -2);
+  TEST_CHECK(symbol_dict_header.sdrat[3] == -3);
+  TEST_CHECK(symbol_dict_header.num_exported_symbols == 3u);
+  TEST_CHECK(symbol_dict_header.num_new_symbols == 2u);
+
+  nanopdf_jbig2_bitstream_init(&stream, text_region_header_data, sizeof(text_region_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_text_region_header(&stream, &text_region_header));
+  TEST_CHECK(text_region_header.region.width == 4u);
+  TEST_CHECK(text_region_header.region.height == 2u);
+  TEST_CHECK(text_region_header.huffman == 1u);
+  TEST_CHECK(text_region_header.refine == 1u);
+  TEST_CHECK(text_region_header.strip_count_log == 2u);
+  TEST_CHECK(text_region_header.ref_corner == 3u);
+  TEST_CHECK(text_region_header.transposed == 1u);
+  TEST_CHECK(text_region_header.compose_op == NANOPDF_JBIG2_COMPOSE_XOR);
+  TEST_CHECK(text_region_header.default_pixel == 1u);
+  TEST_CHECK(text_region_header.ds_offset == -3);
+  TEST_CHECK(text_region_header.refinement_template == 0u);
+  TEST_CHECK(text_region_header.huff_fs == 1u);
+  TEST_CHECK(text_region_header.huff_ds == 2u);
+  TEST_CHECK(text_region_header.huff_rsize == 1u);
+  TEST_CHECK(text_region_header.sbrat[1] == -4);
+  TEST_CHECK(text_region_header.sbrat[3] == -5);
+  TEST_CHECK(text_region_header.num_instances == 5u);
+  nanopdf_jbig2_bitstream_init(
+      &stream, pattern_dict_header_data, sizeof(pattern_dict_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_pattern_dict_header(&stream, &pattern_dict_header));
+  TEST_CHECK(pattern_dict_header.mmr == 1u);
+  TEST_CHECK(pattern_dict_header.template_id == 2u);
+  TEST_CHECK(pattern_dict_header.width == 4u);
+  TEST_CHECK(pattern_dict_header.height == 2u);
+  TEST_CHECK(pattern_dict_header.gray_max == 3u);
+  nanopdf_jbig2_bitstream_init(
+      &stream, refinement_region_header_data, sizeof(refinement_region_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_generic_refinement_region_header(
+      &stream, &refinement_region_header));
+  TEST_CHECK(refinement_region_header.region.width == 4u);
+  TEST_CHECK(refinement_region_header.region.height == 2u);
+  TEST_CHECK(refinement_region_header.region.x == 3u);
+  TEST_CHECK(refinement_region_header.region.y == 5u);
+  TEST_CHECK(refinement_region_header.region.flags == 2u);
+  TEST_CHECK(refinement_region_header.template_id == 0u);
+  TEST_CHECK(refinement_region_header.typical_prediction == 1u);
+  TEST_CHECK(refinement_region_header.grat[1] == -4);
+  TEST_CHECK(refinement_region_header.grat[3] == -5);
+  nanopdf_jbig2_bitstream_init(
+      &stream, halftone_region_header_data, sizeof(halftone_region_header_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_halftone_region_header(&stream, &halftone_region_header));
+  TEST_CHECK(halftone_region_header.region.width == 4u);
+  TEST_CHECK(halftone_region_header.region.height == 2u);
+  TEST_CHECK(halftone_region_header.region.x == 3u);
+  TEST_CHECK(halftone_region_header.region.y == 5u);
+  TEST_CHECK(halftone_region_header.region.flags == 2u);
+  TEST_CHECK(halftone_region_header.mmr == 0u);
+  TEST_CHECK(halftone_region_header.template_id == 1u);
+  TEST_CHECK(halftone_region_header.enable_skip == 1u);
+  TEST_CHECK(halftone_region_header.compose_op == NANOPDF_JBIG2_COMPOSE_XOR);
+  TEST_CHECK(halftone_region_header.default_pixel == 1u);
+  TEST_CHECK(halftone_region_header.grid_width == 2u);
+  TEST_CHECK(halftone_region_header.grid_height == 3u);
+  TEST_CHECK(halftone_region_header.grid_x == 4);
+  TEST_CHECK(halftone_region_header.grid_y == 5);
+  TEST_CHECK(halftone_region_header.grid_vector_x == 65536);
+  TEST_CHECK(halftone_region_header.grid_vector_y == 131072);
+  nanopdf_jbig2_bitstream_init(&stream, end_of_stripe_data, sizeof(end_of_stripe_data), 0);
+  TEST_CHECK(nanopdf_jbig2_parse_end_of_stripe(&stream, &int_value));
+  TEST_CHECK(int_value == 15u);
+
+  page_info.default_pixel = 0;
+  TEST_CHECK(nanopdf_jbig2_page_init_from_info(context, &page_info, &page_image));
+  TEST_CHECK(nanopdf_jbig2_image_init(context, &grd_image, 4, 2));
+  nanopdf_jbig2_image_set_pixel(&grd_image, 0, 0, 1);
+  TEST_CHECK(nanopdf_jbig2_page_compose_region(&page_image, &region_info, &grd_image));
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 1);
+  nanopdf_jbig2_image_destroy(context, &grd_image);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+
+  TEST_CHECK(nanopdf__decode_jbig2(
+                 context,
+                 page_info_stream,
+                 sizeof(page_info_stream),
+                 NULL,
+                 &decoded,
+                 &decoded_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(decoded != NULL);
+  TEST_CHECK(decoded_size == 32u);
+  nanopdf_free(context, decoded);
+  nanopdf_jbig2_image_init_external(&page_image, 0, 0, 0, NULL);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_info_stream,
+                 sizeof(page_info_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 unknown_height_page_stream,
+                 sizeof(unknown_height_page_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 16);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_eof_before_text_stream,
+                 sizeof(page_with_eof_before_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_pattern_dict_stream,
+                 sizeof(page_with_pattern_dict_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_pattern_bitmap_stream,
+                 sizeof(page_with_pattern_bitmap_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_huffman_table_stream,
+                 sizeof(page_with_huffman_table_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_empty_text_stream,
+                 sizeof(page_with_empty_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 6, 6) == 1);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_empty_refined_text_stream,
+                 sizeof(page_with_empty_refined_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 6, 6) == 1);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_empty_huffman_text_stream,
+                 sizeof(page_with_empty_huffman_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 6, 6) == 1);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_intermediate_empty_text_stream,
+                 sizeof(page_with_intermediate_empty_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_intermediate_generic_stream,
+                 sizeof(page_with_intermediate_generic_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_empty_dict_text_stream,
+                 sizeof(page_with_empty_dict_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 6, 6) == 1);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_global_empty_dict_text_stream,
+                 sizeof(page_with_global_empty_dict_text_stream),
+                 unknown_globals_stream,
+                 sizeof(unknown_globals_stream),
+                 &page_image) == 0);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_global_empty_dict_text_stream,
+                 sizeof(page_with_global_empty_dict_text_stream),
+                 empty_dict_globals_stream,
+                 sizeof(empty_dict_globals_stream),
+                 &page_image) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 6, 6) == 1);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_global_empty_dict_text_stream,
+                 sizeof(page_with_global_empty_dict_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 0);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_unknown_segment_stream,
+                 sizeof(page_with_unknown_segment_stream),
+                 NULL,
+                 0,
+                 &page_image) == 0);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_text_stream,
+                 sizeof(page_with_text_stream),
+                 NULL,
+                 0,
+                 &page_image) == 0);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_refinement_stream,
+                 sizeof(page_with_refinement_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 0, 0) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 1);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_refinement_payload_stream,
+                 sizeof(page_with_refinement_payload_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_refinement_template1_payload_stream,
+                 sizeof(page_with_refinement_template1_payload_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_intermediate_refinement_payload_stream,
+                 sizeof(page_with_intermediate_refinement_payload_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_referred_refinement_payload_stream,
+                 sizeof(page_with_referred_refinement_payload_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(page_image.width == 16);
+  TEST_CHECK(page_image.height == 8);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_empty_halftone_stream,
+                 sizeof(page_with_empty_halftone_stream),
+                 NULL,
+                 0,
+                 &page_image) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 0, 0) == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 3, 5) == 0);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&page_image, 6, 6) == 0);
+  nanopdf_jbig2_image_destroy(context, &page_image);
+  TEST_CHECK(nanopdf_jbig2_decode_page(
+                 context,
+                 page_with_halftone_stream,
+                 sizeof(page_with_halftone_stream),
+                 NULL,
+                 0,
+                 &page_image) == 0);
+
+  nanopdf_jbig2_huffman_table_init(&huffman_table);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_init_standard(
+      context,
+      &huffman_table,
+      nanopdf_jbig2_huffman_table_b2,
+      nanopdf_jbig2_huffman_table_b2_size,
+      1));
+  nanopdf_jbig2_bitstream_init(&stream, huffman_b2_zero, sizeof(huffman_b2_zero), 0);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_decode(&huffman_table, &stream, &huffman_value) == 0);
+  TEST_CHECK(huffman_value == 0);
+  nanopdf_jbig2_bitstream_init(&stream, huffman_b2_one, sizeof(huffman_b2_one), 0);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_decode(&huffman_table, &stream, &huffman_value) == 0);
+  TEST_CHECK(huffman_value == 1);
+  nanopdf_jbig2_huffman_table_destroy(context, &huffman_table);
+
+  nanopdf_jbig2_huffman_table_init(&huffman_table);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_init_standard(
+      context,
+      &huffman_table,
+      nanopdf_jbig2_huffman_table_b1,
+      nanopdf_jbig2_huffman_table_b1_size,
+      1));
+  nanopdf_jbig2_bitstream_init(&stream, huffman_b1_ten, sizeof(huffman_b1_ten), 0);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_decode(&huffman_table, &stream, &huffman_value) == 0);
+  TEST_CHECK(huffman_value == 10);
+  nanopdf_jbig2_huffman_table_destroy(context, &huffman_table);
+
+  nanopdf_jbig2_huffman_table_init(&huffman_table);
+  nanopdf_jbig2_bitstream_init(
+      &stream, huffman_encoded_table_data, sizeof(huffman_encoded_table_data), 0);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_init_encoded(context, &huffman_table, &stream));
+  nanopdf_jbig2_bitstream_init(&stream, huffman_encoded_zero, sizeof(huffman_encoded_zero), 0);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_decode(&huffman_table, &stream, &huffman_value) == 0);
+  TEST_CHECK(huffman_value == 0);
+  nanopdf_jbig2_huffman_table_destroy(context, &huffman_table);
+
+  TEST_CHECK(nanopdf_jbig2_huffman_table_b15_size == 13u);
+  TEST_CHECK(nanopdf_jbig2_huffman_table_b15[5].range_low == 0);
+
+  nanopdf_jbig2_image_destroy(context, &source);
+  nanopdf_jbig2_image_destroy(context, &image);
+
+  nanopdf_jbig2_arith_int_decoder_init(&int_decoder);
+  nanopdf_jbig2_arith_ctx_init(&arith_context);
+  TEST_CHECK(arith_context.mps == 0);
+  TEST_CHECK(arith_context.index == 0);
+
+  for (int_value = 0; int_value < 65536u; ++int_value) {
+    nanopdf_jbig2_arith_ctx_init(&grd_contexts[int_value]);
+  }
+  nanopdf_jbig2_bitstream_init(&stream, arith_data, sizeof(arith_data), 0);
+  nanopdf_jbig2_arith_decoder_init(&arith_decoder, &stream);
+  nanopdf_jbig2_grd_proc_init(&grd_proc);
+  grd_proc.width = 1;
+  grd_proc.height = 1;
+  grd_proc.gb_template = 3;
+  TEST_CHECK(nanopdf_jbig2_grd_proc_decode_arith(
+      context,
+      &grd_proc,
+      &arith_decoder,
+      grd_contexts,
+      sizeof(grd_contexts) / sizeof(grd_contexts[0]),
+      &grd_image));
+  TEST_CHECK(grd_image.width == 1);
+  TEST_CHECK(grd_image.height == 1);
+  TEST_CHECK(nanopdf_jbig2_image_get_pixel(&grd_image, 0, 0) == 0 ||
+             nanopdf_jbig2_image_get_pixel(&grd_image, 0, 0) == 1);
+  nanopdf_jbig2_image_destroy(context, &grd_image);
+  nanopdf_jbig2_bitstream_init(&stream, NULL, 0, 0);
+  TEST_CHECK(!nanopdf_jbig2_grd_proc_decode_mmr(context, &grd_proc, &stream, &grd_image));
+
+  nanopdf_context_destroy(context);
+}
+
+static void test_nanopdf_c_jpx_c_header(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_jpx_bit_reader bit_reader;
+  nanopdf_jpx_codeblock codeblock;
+  nanopdf_jpx_header header;
+  nanopdf_jpx_header recon_header;
+  nanopdf_jpx_mq_decoder mq_decoder;
+  nanopdf_jpx_tag_tree tag_tree;
+  nanopdf_jpx_tile_component tile_component;
+  nanopdf_jpx_tile_component recon_components[3];
+  nanopdf_jpx_tile_part_header tile_part;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint16_t components = 0;
+  uint8_t bit_depth = 0;
+  int parsed = 0;
+  uint8_t state[9] = {0};
+  int32_t coeffs[9] = {0};
+  int32_t dwt53[4] = {4, 1, 2, 0};
+  float dwt97[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  int32_t mct0[2] = {10, 20};
+  int32_t mct1[2] = {4, 0};
+  int32_t mct2[2] = {8, -4};
+  int32_t recon0[2] = {10, 20};
+  int32_t recon1[2] = {30, 40};
+  int32_t recon1_sub[1] = {35};
+  int32_t recon2[2] = {50, 60};
+  int32_t origin0[6] = {1, 2, 3, 4, 5, 6};
+  int32_t origin1[6] = {11, 12, 13, 14, 15, 16};
+  int32_t origin2[6] = {21, 22, 23, 24, 25, 26};
+  int32_t origin_sub0[2] = {70, 90};
+  int32_t origin_sub1[4] = {11, 12, 13, 14};
+  int32_t origin_sub2[4] = {21, 22, 23, 24};
+  int32_t placed_coeffs[128] = {0};
+  int32_t* mct_components[3] = {mct0, mct1, mct2};
+  const int32_t* pixel_components[3] = {mct0, mct1, mct2};
+  uint8_t pixel_bit_depths[3] = {8, 8, 8};
+  uint8_t pixels[6] = {0};
+  uint8_t* reconstructed_pixels = NULL;
+  nanopdf_jpx_qcd_step_size qcd_step;
+  nanopdf_jpx_qcd_params qcd_params;
+  int sign_flip = 0;
+  const uint8_t* extracted_codestream = NULL;
+  size_t extracted_codestream_size = 0;
+  size_t reconstructed_size = 0;
+  size_t tile_data_offset = 0;
+  size_t tile_data_size = 0;
+  uint8_t jp2[12 + 8 + 83];
+  uint8_t codestream_coc_qcc[101];
+  uint8_t codestream_metadata[151];
+  uint8_t codestream_ppt_decode[109];
+  uint8_t codestream_split_ppt_decode[107];
+  uint8_t codestream_ppm_decode[93];
+  uint8_t codestream_real_ppm_decode[97];
+  uint8_t codestream_real_ppm_two_tile_decode[120];
+  uint8_t codestream_split_real_ppm_decode[102];
+  uint8_t codestream_split_ppm_decode[99];
+  uint8_t codestream_two_tile_part_decode[104];
+  uint8_t codestream_two_tile_decode[128];
+  uint8_t codestream_tile_marker_scope_decode[128];
+  uint8_t codestream_bad_component_cod_decode[99];
+  uint8_t codestream_origin[83];
+  size_t offset = 0;
+  size_t coc_qcc_offset = 0;
+  size_t metadata_offset = 0;
+  size_t ppt_decode_offset = 0;
+  size_t split_ppt_decode_offset = 0;
+  size_t ppm_decode_offset = 0;
+  size_t real_ppm_decode_offset = 0;
+  size_t real_ppm_two_tile_decode_offset = 0;
+  size_t split_real_ppm_decode_offset = 0;
+  size_t split_ppm_decode_offset = 0;
+  size_t two_tile_part_decode_offset = 0;
+  size_t two_tile_decode_offset = 0;
+  size_t tile_marker_scope_decode_offset = 0;
+  size_t bad_component_cod_decode_offset = 0;
+  size_t packet_offset = 0;
+  size_t saved_poc_entry_count = 0;
+  uint8_t* decoded_jpx = NULL;
+  size_t decoded_jpx_size = 0;
+  nanopdf_status jpx_status = NANOPDF_STATUS_OK;
+  static const uint8_t bits[] = {0xb2, 0x7c, 0xff, 0x00};
+  static const uint8_t codeblock_data[] = {0x00, 0x00, 0x00, 0x00};
+  static const uint8_t packet_data[] = {0xe2, 0xaa, 0xbb};
+  static const uint8_t truncated_packet_data[] = {0xe2, 0xaa};
+  static const uint8_t split_packet_header_data[] = {0xe8, 0x80, 0xaa, 0xbb};
+  static const uint8_t two_layer_packet_data[] = {0xe1, 0xaa, 0xc2, 0xbb};
+  static const uint8_t empty_after_included_packet_data[] = {0xe2, 0xaa, 0xbb, 0x00};
+  static const uint8_t empty_after_included_headers[] = {0xe2, 0x00};
+  static const uint8_t empty_after_included_body[] = {0xaa, 0xbb};
+  static const uint8_t separate_header_two_layer_headers[] = {0xe1, 0xc2};
+  static const uint8_t separate_header_two_layer_body[] = {0xaa, 0xbb};
+  static const uint8_t sop_eph_packet_data[] = {
+      0xff, 0x91, 0x00, 0x04,
+      0x00, 0x01,
+      0xe2,
+      0xff, 0x92,
+      0xaa, 0xbb};
+  static const uint8_t coc_marker[] = {
+      0xff, 0x53, 0x00, 0x09,
+      0x01,
+      0x00,
+      0x00,
+      0x03,
+      0x03,
+      0x00,
+      0x01};
+  static const uint8_t bad_coc_marker[] = {
+      0xff, 0x53, 0x00, 0x09,
+      0x01,
+      0x00,
+      0x00,
+      0x1f,
+      0x03,
+      0x00,
+      0x01};
+  static const uint8_t qcc_marker[] = {
+      0xff, 0x5d, 0x00, 0x05,
+      0x01,
+      0x20,
+      0x30};
+  static const uint8_t rgn_marker[] = {
+      0xff, 0x5e, 0x00, 0x05,
+      0x02,
+      0x00,
+      0x04};
+  static const uint8_t poc_marker[] = {
+      0xff, 0x5f, 0x00, 0x09,
+      0x00,
+      0x00,
+      0x00, 0x01,
+      0x01,
+      0x03,
+      0x04};
+  static const uint8_t crg_marker[] = {
+      0xff, 0x63, 0x00, 0x0e,
+      0x00, 0x01, 0x00, 0x02,
+      0x00, 0x03, 0x00, 0x04,
+      0x00, 0x05, 0x00, 0x06};
+  static const uint8_t com_marker[] = {
+      0xff, 0x64, 0x00, 0x06,
+      0x00, 0x01,
+      'O', 'K'};
+  static const uint8_t tlm_marker[] = {
+      0xff, 0x55, 0x00, 0x08,
+      0x02,
+      0x00,
+      0x00, 0x01, 0x00, 0x06};
+  static const uint8_t plm_marker[] = {
+      0xff, 0x57, 0x00, 0x06,
+      0x03,
+      0x05,
+      0x81, 0x00};
+  static const uint8_t ppm_marker[] = {
+      0xff, 0x60, 0x00, 0x06,
+      0x04,
+      0xaa, 0xbb, 0xcc};
+  static const uint8_t ppm_packet_header_marker[] = {
+      0xff, 0x60, 0x00, 0x04,
+      0x00,
+      0xe2};
+  static const uint8_t real_ppm_packet_header_marker[] = {
+      0xff, 0x60, 0x00, 0x08,
+      0x00,
+      0x00, 0x00, 0x00, 0x01,
+      0xe2};
+  static const uint8_t real_ppm_two_tile_packet_header_marker[] = {
+      0xff, 0x60, 0x00, 0x0d,
+      0x00,
+      0x00, 0x00, 0x00, 0x01,
+      0xe2,
+      0x00, 0x00, 0x00, 0x01,
+      0xe2};
+  static const uint8_t real_ppm_packet_header_marker_index1[] = {
+      0xff, 0x60, 0x00, 0x04,
+      0x01,
+      0xe2};
+  static const uint8_t real_ppm_packet_header_marker_index0[] = {
+      0xff, 0x60, 0x00, 0x07,
+      0x00,
+      0x00, 0x00, 0x00, 0x01};
+  static const uint8_t ppm_packet_header_marker_index1[] = {
+      0xff, 0x60, 0x00, 0x04,
+      0x01,
+      0x80};
+  static const uint8_t ppm_packet_header_marker_index0[] = {
+      0xff, 0x60, 0x00, 0x04,
+      0x00,
+      0xe8};
+  static const uint8_t tile_part_with_eoc[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00,
+      0x01,
+      0xaa, 0xbb,
+      0xff, 0xd9};
+  static const uint8_t tile_part_empty_packet_eoc[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x0f,
+      0x00,
+      0x01,
+      0xff, 0x93,
+      0x00,
+      0xff, 0xd9};
+  static const uint8_t tile_part_with_ppt_sod[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x24,
+      0x00,
+      0x01,
+      0xff, 0x61, 0x00, 0x04,
+      0x00,
+      0xe2,
+      0xff, 0x58, 0x00, 0x06,
+      0x05,
+      0x01,
+      0x82, 0x00,
+      0xff, 0x5c, 0x00, 0x04,
+      0x00,
+      0x30,
+      0xff, 0x93,
+      0x11, 0x22,
+      0xff, 0xd9};
+  static const uint8_t tile_part_with_ppt_sod_no_eoc[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x24,
+      0x00,
+      0x02,
+      0xff, 0x61, 0x00, 0x04,
+      0x00,
+      0xe2,
+      0xff, 0x58, 0x00, 0x06,
+      0x05,
+      0x01,
+      0x82, 0x00,
+      0xff, 0x5c, 0x00, 0x04,
+      0x00,
+      0x30,
+      0xff, 0x93,
+      0x11, 0x22};
+  static const uint8_t tile_part_with_split_ppt_sod[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x22,
+      0x00,
+      0x01,
+      0xff, 0x61, 0x00, 0x04,
+      0x01,
+      0x80,
+      0xff, 0x61, 0x00, 0x04,
+      0x00,
+      0xe8,
+      0xff, 0x5c, 0x00, 0x04,
+      0x00,
+      0x30,
+      0xff, 0x93,
+      0xaa, 0xbb,
+      0xff, 0xd9};
+  static const uint8_t tile_part_packet_header_only[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x11,
+      0x00,
+      0x02,
+      0xff, 0x93,
+      0xe2};
+  static const uint8_t tile_part_packet_body_only[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x10,
+      0x01,
+      0x02,
+      0xff, 0x93,
+      0xaa, 0xbb,
+      0xff, 0xd9};
+  static const uint8_t tile0_with_packet[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x11,
+      0x00,
+      0x02,
+      0xff, 0x93,
+      0xe2, 0xaa, 0xbb};
+  static const uint8_t tile1_with_packet_eoc[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x01,
+      0x00, 0x00, 0x00, 0x11,
+      0x01,
+      0x02,
+      0xff, 0x93,
+      0xe2, 0xaa, 0xbb,
+      0xff, 0xd9};
+  static const uint8_t tile0_body_only[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x10,
+      0x00,
+      0x02,
+      0xff, 0x93,
+      0xaa, 0xbb};
+  static const uint8_t tile1_body_only_eoc[] = {
+      0xff, 0x90,
+      0x00, 0x0a,
+      0x00, 0x01,
+      0x00, 0x00, 0x00, 0x10,
+      0x01,
+      0x02,
+      0xff, 0x93,
+      0xaa, 0xbb,
+      0xff, 0xd9};
+  static const uint8_t codestream[] = {
+      0xff, 0x4f,
+      0xff, 0x51, 0x00, 0x2f,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x10,
+      0x00, 0x00, 0x00, 0x08,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x03,
+      0x07, 0x01, 0x01,
+      0x07, 0x01, 0x01,
+      0x07, 0x01, 0x01,
+      0xff, 0x52, 0x00, 0x0c,
+      0x00,
+      0x00,
+      0x00, 0x01,
+      0x01,
+      0x00,
+      0x04,
+      0x04,
+      0x00,
+      0x01,
+      0xff, 0x5c, 0x00, 0x04,
+      0x00,
+      0x28,
+      0xff, 0x90, 0x00, 0x0a,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00,
+      0x01};
+
+  TEST_CHECK(sizeof(codestream) == 83u);
+
+  nanopdf_jpx_bit_reader_init(&bit_reader, bits, sizeof(bits));
+  TEST_CHECK(nanopdf_jpx_bit_reader_read_bits(&bit_reader, 4) == 0x0bu);
+  TEST_CHECK(nanopdf_jpx_bit_reader_read_bit(&bit_reader) == 0);
+  nanopdf_jpx_bit_reader_align_byte(&bit_reader);
+  TEST_CHECK(nanopdf_jpx_bit_reader_position(&bit_reader) == 1u);
+  TEST_CHECK(nanopdf_jpx_bit_reader_read_bits(&bit_reader, 8) == 0x7cu);
+  TEST_CHECK(nanopdf_jpx_bit_reader_read_bits(&bit_reader, 8) == 0xffu);
+  TEST_CHECK(nanopdf_jpx_bit_reader_read_bit(&bit_reader) == 0);
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  nanopdf_jpx_header_init(&header);
+  nanopdf_jpx_codeblock_init(&codeblock);
+  nanopdf_jpx_tag_tree_init(&tag_tree);
+  nanopdf_jpx_tile_component_init(&tile_component);
+
+  TEST_CHECK(nanopdf_jpx_get_info(
+                 codestream, sizeof(codestream), &width, &height, &components, &bit_depth));
+  TEST_CHECK(width == 16u);
+  TEST_CHECK(height == 8u);
+  TEST_CHECK(components == 3u);
+  TEST_CHECK(bit_depth == 8u);
+
+  memcpy(codestream_origin, codestream, sizeof(codestream_origin));
+  codestream_origin[11] = 0x12;
+  codestream_origin[15] = 0x09;
+  codestream_origin[19] = 0x02;
+  codestream_origin[23] = 0x01;
+  width = 0;
+  height = 0;
+  components = 0;
+  bit_depth = 0;
+  TEST_CHECK(nanopdf_jpx_get_info(
+      codestream_origin,
+      sizeof(codestream_origin),
+      &width,
+      &height,
+      &components,
+      &bit_depth));
+  TEST_CHECK(width == 16u);
+  TEST_CHECK(height == 8u);
+  TEST_CHECK(components == 3u);
+  TEST_CHECK(bit_depth == 8u);
+
+  parsed = nanopdf_jpx_parse_header(context, codestream, sizeof(codestream), &header);
+  TEST_CHECK(parsed);
+  if (parsed) {
+    TEST_CHECK(header.siz.width == 16u);
+    TEST_CHECK(header.siz.height == 8u);
+    TEST_CHECK(nanopdf_jpx_image_width(&header) == 16u);
+    TEST_CHECK(nanopdf_jpx_image_height(&header) == 8u);
+    TEST_CHECK(nanopdf_jpx_component_width(&header, 0) == 16u);
+    TEST_CHECK(nanopdf_jpx_component_height(&header, 0) == 8u);
+    TEST_CHECK(header.siz.num_components == 3u);
+    TEST_CHECK(header.siz.components[0].bit_depth == 8u);
+    TEST_CHECK(header.siz.components[2].x_separation == 1u);
+    TEST_CHECK(header.cod.num_layers == 1u);
+    TEST_CHECK(header.cod.mct == 1u);
+    TEST_CHECK(header.cod.wavelet == NANOPDF_JPX_WAVELET_REVERSIBLE_5_3);
+    TEST_CHECK(header.qcd.step_size_count == 1u);
+    TEST_CHECK(header.qcd.step_sizes[0].exponent == 5u);
+    TEST_CHECK(header.first_tile_part_offset == 71u);
+  }
+  TEST_CHECK(nanopdf_jpx_parse_tile_part_header(
+      codestream,
+      sizeof(codestream),
+      header.first_tile_part_offset,
+      &tile_part,
+      &tile_data_offset,
+      &tile_data_size));
+  TEST_CHECK(tile_part.tile_index == 0u);
+  TEST_CHECK(tile_part.tile_part_length == 0u);
+  TEST_CHECK(tile_part.tile_part_index == 0u);
+  TEST_CHECK(tile_part.num_tile_parts == 1u);
+  TEST_CHECK(tile_data_offset == sizeof(codestream));
+  TEST_CHECK(tile_data_size == 0u);
+  TEST_CHECK(nanopdf_jpx_parse_tile_part_header(
+      tile_part_with_eoc,
+      sizeof(tile_part_with_eoc),
+      0,
+      &tile_part,
+      &tile_data_offset,
+      &tile_data_size));
+  TEST_CHECK(tile_data_offset == 12u);
+  TEST_CHECK(tile_data_size == 2u);
+  TEST_CHECK(nanopdf_jpx_parse_tile_part_header(
+      tile_part_with_ppt_sod,
+      sizeof(tile_part_with_ppt_sod),
+      0,
+      &tile_part,
+      &tile_data_offset,
+      &tile_data_size));
+  TEST_CHECK(tile_data_offset == 34u);
+  TEST_CHECK(tile_data_size == 2u);
+  TEST_CHECK(nanopdf_jpx_parse_tile_part_markers(
+      context, tile_part_with_ppt_sod, sizeof(tile_part_with_ppt_sod), 0, &header));
+  TEST_CHECK(header.qcd.step_size_count == 1u);
+  TEST_CHECK(header.qcd.step_sizes[0].exponent == 6u);
+  TEST_CHECK(header.ppt_marker_count == 1u);
+  TEST_CHECK(header.ppt_markers[0].index == 0u);
+  TEST_CHECK(header.ppt_markers[0].size == 1u);
+  TEST_CHECK(header.ppt_markers[0].data[0] == 0xe2u);
+  TEST_CHECK(header.plt_marker_count == 1u);
+  TEST_CHECK(header.plt_markers[0].index == 5u);
+  TEST_CHECK(header.plt_markers[0].length_count == 2u);
+  TEST_CHECK(header.plt_markers[0].lengths[0] == 1u);
+  TEST_CHECK(header.plt_markers[0].lengths[1] == 256u);
+  memcpy(codestream_ppt_decode + ppt_decode_offset, codestream, 71u);
+  ppt_decode_offset += 71u;
+  memcpy(
+      codestream_ppt_decode + ppt_decode_offset,
+      tile_part_with_ppt_sod,
+      sizeof(tile_part_with_ppt_sod));
+  ppt_decode_offset += sizeof(tile_part_with_ppt_sod);
+  TEST_CHECK(ppt_decode_offset == sizeof(codestream_ppt_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_ppt_decode,
+      sizeof(codestream_ppt_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+    TEST_CHECK(decoded_jpx_size > 0u);
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_split_ppt_decode + split_ppt_decode_offset, codestream, 71u);
+  split_ppt_decode_offset += 71u;
+  memcpy(
+      codestream_split_ppt_decode + split_ppt_decode_offset,
+      tile_part_with_split_ppt_sod,
+      sizeof(tile_part_with_split_ppt_sod));
+  split_ppt_decode_offset += sizeof(tile_part_with_split_ppt_sod);
+  TEST_CHECK(split_ppt_decode_offset == sizeof(codestream_split_ppt_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_split_ppt_decode,
+      sizeof(codestream_split_ppt_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+    TEST_CHECK(decoded_jpx_size > 0u);
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_two_tile_part_decode + two_tile_part_decode_offset, codestream, 71u);
+  two_tile_part_decode_offset += 71u;
+  memcpy(
+      codestream_two_tile_part_decode + two_tile_part_decode_offset,
+      tile_part_packet_header_only,
+      sizeof(tile_part_packet_header_only));
+  two_tile_part_decode_offset += sizeof(tile_part_packet_header_only);
+  memcpy(
+      codestream_two_tile_part_decode + two_tile_part_decode_offset,
+      tile_part_packet_body_only,
+      sizeof(tile_part_packet_body_only));
+  two_tile_part_decode_offset += sizeof(tile_part_packet_body_only);
+  TEST_CHECK(two_tile_part_decode_offset == sizeof(codestream_two_tile_part_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_two_tile_part_decode,
+      sizeof(codestream_two_tile_part_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+    TEST_CHECK(decoded_jpx_size > 0u);
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_two_tile_decode + two_tile_decode_offset, codestream, 71u);
+  codestream_two_tile_decode[11] = 0x20;
+  two_tile_decode_offset += 71u;
+  memcpy(
+      codestream_two_tile_decode + two_tile_decode_offset,
+      tile0_with_packet,
+      sizeof(tile0_with_packet));
+  two_tile_decode_offset += sizeof(tile0_with_packet);
+  memcpy(
+      codestream_two_tile_decode + two_tile_decode_offset,
+      tile1_with_packet_eoc,
+      sizeof(tile1_with_packet_eoc));
+  two_tile_decode_offset += sizeof(tile1_with_packet_eoc);
+  TEST_CHECK(two_tile_decode_offset <= sizeof(codestream_two_tile_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_two_tile_decode,
+      two_tile_decode_offset,
+      &decoded_jpx,
+      &decoded_jpx_size);
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+#if !defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+    TEST_CHECK(decoded_jpx_size == 32u * 8u * 3u);
+#else
+    TEST_CHECK(decoded_jpx_size > 0u);
+#endif
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_tile_marker_scope_decode, codestream, 71u);
+  codestream_tile_marker_scope_decode[11] = 0x20;
+  tile_marker_scope_decode_offset += 71u;
+  memcpy(
+      codestream_tile_marker_scope_decode + tile_marker_scope_decode_offset,
+      tile_part_with_ppt_sod_no_eoc,
+      sizeof(tile_part_with_ppt_sod_no_eoc));
+  tile_marker_scope_decode_offset += sizeof(tile_part_with_ppt_sod_no_eoc);
+  memcpy(
+      codestream_tile_marker_scope_decode + tile_marker_scope_decode_offset,
+      tile1_with_packet_eoc,
+      sizeof(tile1_with_packet_eoc));
+  tile_marker_scope_decode_offset += sizeof(tile1_with_packet_eoc);
+  TEST_CHECK(tile_marker_scope_decode_offset <= sizeof(codestream_tile_marker_scope_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_tile_marker_scope_decode,
+      tile_marker_scope_decode_offset,
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+#if !defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+    TEST_CHECK(decoded_jpx_size == 32u * 8u * 3u);
+#else
+    TEST_CHECK(decoded_jpx_size > 0u);
+#endif
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_bad_component_cod_decode, codestream, 71u);
+  bad_component_cod_decode_offset += 71u;
+  memcpy(
+      codestream_bad_component_cod_decode + bad_component_cod_decode_offset,
+      bad_coc_marker,
+      sizeof(bad_coc_marker));
+  bad_component_cod_decode_offset += sizeof(bad_coc_marker);
+  memcpy(
+      codestream_bad_component_cod_decode + bad_component_cod_decode_offset,
+      tile_part_empty_packet_eoc,
+      sizeof(tile_part_empty_packet_eoc));
+  bad_component_cod_decode_offset += sizeof(tile_part_empty_packet_eoc);
+  TEST_CHECK(bad_component_cod_decode_offset == sizeof(codestream_bad_component_cod_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_bad_component_cod_decode,
+      sizeof(codestream_bad_component_cod_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_UNSUPPORTED);
+#endif
+  TEST_CHECK(decoded_jpx == NULL);
+  TEST_CHECK(decoded_jpx_size == 0u);
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_ppm_decode + ppm_decode_offset, codestream, 71u);
+  ppm_decode_offset += 71u;
+  memcpy(
+      codestream_ppm_decode + ppm_decode_offset,
+      ppm_packet_header_marker,
+      sizeof(ppm_packet_header_marker));
+  ppm_decode_offset += sizeof(ppm_packet_header_marker);
+  memcpy(
+      codestream_ppm_decode + ppm_decode_offset,
+      tile_part_with_eoc,
+      sizeof(tile_part_with_eoc));
+  ppm_decode_offset += sizeof(tile_part_with_eoc);
+  TEST_CHECK(ppm_decode_offset == sizeof(codestream_ppm_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_ppm_decode,
+      sizeof(codestream_ppm_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+    TEST_CHECK(decoded_jpx_size > 0u);
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_real_ppm_decode + real_ppm_decode_offset, codestream, 71u);
+  real_ppm_decode_offset += 71u;
+  memcpy(
+      codestream_real_ppm_decode + real_ppm_decode_offset,
+      real_ppm_packet_header_marker,
+      sizeof(real_ppm_packet_header_marker));
+  real_ppm_decode_offset += sizeof(real_ppm_packet_header_marker);
+  memcpy(
+      codestream_real_ppm_decode + real_ppm_decode_offset,
+      tile_part_with_eoc,
+      sizeof(tile_part_with_eoc));
+  real_ppm_decode_offset += sizeof(tile_part_with_eoc);
+  TEST_CHECK(real_ppm_decode_offset == sizeof(codestream_real_ppm_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_real_ppm_decode,
+      sizeof(codestream_real_ppm_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+    TEST_CHECK(decoded_jpx_size > 0u);
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_real_ppm_two_tile_decode, codestream, 71u);
+  codestream_real_ppm_two_tile_decode[11] = 0x20;
+  real_ppm_two_tile_decode_offset += 71u;
+  memcpy(
+      codestream_real_ppm_two_tile_decode + real_ppm_two_tile_decode_offset,
+      real_ppm_two_tile_packet_header_marker,
+      sizeof(real_ppm_two_tile_packet_header_marker));
+  real_ppm_two_tile_decode_offset += sizeof(real_ppm_two_tile_packet_header_marker);
+  memcpy(
+      codestream_real_ppm_two_tile_decode + real_ppm_two_tile_decode_offset,
+      tile0_body_only,
+      sizeof(tile0_body_only));
+  real_ppm_two_tile_decode_offset += sizeof(tile0_body_only);
+  memcpy(
+      codestream_real_ppm_two_tile_decode + real_ppm_two_tile_decode_offset,
+      tile1_body_only_eoc,
+      sizeof(tile1_body_only_eoc));
+  real_ppm_two_tile_decode_offset += sizeof(tile1_body_only_eoc);
+  TEST_CHECK(real_ppm_two_tile_decode_offset == sizeof(codestream_real_ppm_two_tile_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_real_ppm_two_tile_decode,
+      real_ppm_two_tile_decode_offset,
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+#if !defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+    TEST_CHECK(decoded_jpx_size == 32u * 8u * 3u);
+#else
+    TEST_CHECK(decoded_jpx_size > 0u);
+#endif
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_split_real_ppm_decode + split_real_ppm_decode_offset, codestream, 71u);
+  split_real_ppm_decode_offset += 71u;
+  memcpy(
+      codestream_split_real_ppm_decode + split_real_ppm_decode_offset,
+      real_ppm_packet_header_marker_index1,
+      sizeof(real_ppm_packet_header_marker_index1));
+  split_real_ppm_decode_offset += sizeof(real_ppm_packet_header_marker_index1);
+  memcpy(
+      codestream_split_real_ppm_decode + split_real_ppm_decode_offset,
+      real_ppm_packet_header_marker_index0,
+      sizeof(real_ppm_packet_header_marker_index0));
+  split_real_ppm_decode_offset += sizeof(real_ppm_packet_header_marker_index0);
+  memcpy(
+      codestream_split_real_ppm_decode + split_real_ppm_decode_offset,
+      tile_part_with_eoc,
+      sizeof(tile_part_with_eoc));
+  split_real_ppm_decode_offset += sizeof(tile_part_with_eoc);
+  TEST_CHECK(split_real_ppm_decode_offset == sizeof(codestream_split_real_ppm_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_split_real_ppm_decode,
+      sizeof(codestream_split_real_ppm_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+    TEST_CHECK(decoded_jpx_size > 0u);
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+  memcpy(codestream_split_ppm_decode + split_ppm_decode_offset, codestream, 71u);
+  split_ppm_decode_offset += 71u;
+  memcpy(
+      codestream_split_ppm_decode + split_ppm_decode_offset,
+      ppm_packet_header_marker_index1,
+      sizeof(ppm_packet_header_marker_index1));
+  split_ppm_decode_offset += sizeof(ppm_packet_header_marker_index1);
+  memcpy(
+      codestream_split_ppm_decode + split_ppm_decode_offset,
+      ppm_packet_header_marker_index0,
+      sizeof(ppm_packet_header_marker_index0));
+  split_ppm_decode_offset += sizeof(ppm_packet_header_marker_index0);
+  memcpy(
+      codestream_split_ppm_decode + split_ppm_decode_offset,
+      tile_part_with_eoc,
+      sizeof(tile_part_with_eoc));
+  split_ppm_decode_offset += sizeof(tile_part_with_eoc);
+  TEST_CHECK(split_ppm_decode_offset == sizeof(codestream_split_ppm_decode));
+  jpx_status = nanopdf__decode_jpx(
+      context,
+      codestream_split_ppm_decode,
+      sizeof(codestream_split_ppm_decode),
+      &decoded_jpx,
+      &decoded_jpx_size);
+#if defined(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  TEST_CHECK(jpx_status != NANOPDF_STATUS_INVALID_ARGUMENT);
+#else
+  TEST_CHECK(jpx_status == NANOPDF_STATUS_OK);
+#endif
+  if (jpx_status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(decoded_jpx != NULL);
+    TEST_CHECK(decoded_jpx_size > 0u);
+  } else {
+    TEST_CHECK(decoded_jpx == NULL);
+    TEST_CHECK(decoded_jpx_size == 0u);
+  }
+  nanopdf_free(context, decoded_jpx);
+  decoded_jpx = NULL;
+  decoded_jpx_size = 0u;
+
+  memcpy(jp2 + offset, "\x00\x00\x00\x0c" "jP  " "\x0d\x0a\x87\x0a", 12);
+  offset += 12u;
+  jp2[offset++] = 0x00;
+  jp2[offset++] = 0x00;
+  jp2[offset++] = 0x00;
+  jp2[offset++] = (uint8_t)(8u + sizeof(codestream));
+  memcpy(jp2 + offset, "jp2c", 4);
+  offset += 4u;
+  memcpy(jp2 + offset, codestream, sizeof(codestream));
+  offset += sizeof(codestream);
+  TEST_CHECK(offset == sizeof(jp2));
+
+  width = 0;
+  height = 0;
+  components = 0;
+  bit_depth = 0;
+  TEST_CHECK(nanopdf_jpx_get_info(jp2, sizeof(jp2), &width, &height, &components, &bit_depth));
+  TEST_CHECK(width == 16u);
+  TEST_CHECK(height == 8u);
+  TEST_CHECK(components == 3u);
+  TEST_CHECK(bit_depth == 8u);
+  TEST_CHECK(nanopdf_jpx_extract_codestream(
+      jp2, sizeof(jp2), &extracted_codestream, &extracted_codestream_size));
+  TEST_CHECK(extracted_codestream == jp2 + 20u);
+  TEST_CHECK(extracted_codestream_size == sizeof(codestream));
+  TEST_CHECK(nanopdf_jpx_parse_header(context, jp2, sizeof(jp2), &header));
+  TEST_CHECK(header.first_tile_part_offset == 71u);
+  TEST_CHECK(nanopdf_jpx_parse_tile_part_header(
+      extracted_codestream,
+      extracted_codestream_size,
+      header.first_tile_part_offset,
+      &tile_part,
+      &tile_data_offset,
+      &tile_data_size));
+  TEST_CHECK(tile_data_offset == extracted_codestream_size);
+  memcpy(codestream_coc_qcc + coc_qcc_offset, codestream, 65u);
+  coc_qcc_offset += 65u;
+  memcpy(codestream_coc_qcc + coc_qcc_offset, coc_marker, sizeof(coc_marker));
+  coc_qcc_offset += sizeof(coc_marker);
+  memcpy(codestream_coc_qcc + coc_qcc_offset, codestream + 65u, 6u);
+  coc_qcc_offset += 6u;
+  memcpy(codestream_coc_qcc + coc_qcc_offset, qcc_marker, sizeof(qcc_marker));
+  coc_qcc_offset += sizeof(qcc_marker);
+  memcpy(codestream_coc_qcc + coc_qcc_offset, codestream + 71u, sizeof(codestream) - 71u);
+  coc_qcc_offset += sizeof(codestream) - 71u;
+  TEST_CHECK(coc_qcc_offset == sizeof(codestream_coc_qcc));
+  TEST_CHECK(nanopdf_jpx_parse_header(
+      context, codestream_coc_qcc, sizeof(codestream_coc_qcc), &header));
+  TEST_CHECK(header.first_tile_part_offset == 89u);
+  TEST_CHECK(header.has_component_cod != NULL);
+  TEST_CHECK(header.has_component_cod[1] == 1u);
+  TEST_CHECK(header.component_cod[1].codeblock_width == 3u);
+  TEST_CHECK(header.component_cod[1].codeblock_height == 3u);
+  TEST_CHECK(header.has_component_qcd != NULL);
+  TEST_CHECK(header.has_component_qcd[1] == 1u);
+  TEST_CHECK(header.component_qcd[1].num_guard_bits == 1u);
+  TEST_CHECK(header.component_qcd[1].step_size_count == 1u);
+  TEST_CHECK(header.component_qcd[1].step_sizes[0].exponent == 6u);
+  memcpy(codestream_metadata + metadata_offset, codestream, 71u);
+  metadata_offset += 71u;
+  memcpy(codestream_metadata + metadata_offset, rgn_marker, sizeof(rgn_marker));
+  metadata_offset += sizeof(rgn_marker);
+  memcpy(codestream_metadata + metadata_offset, poc_marker, sizeof(poc_marker));
+  metadata_offset += sizeof(poc_marker);
+  memcpy(codestream_metadata + metadata_offset, crg_marker, sizeof(crg_marker));
+  metadata_offset += sizeof(crg_marker);
+  memcpy(codestream_metadata + metadata_offset, com_marker, sizeof(com_marker));
+  metadata_offset += sizeof(com_marker);
+  memcpy(codestream_metadata + metadata_offset, tlm_marker, sizeof(tlm_marker));
+  metadata_offset += sizeof(tlm_marker);
+  memcpy(codestream_metadata + metadata_offset, plm_marker, sizeof(plm_marker));
+  metadata_offset += sizeof(plm_marker);
+  memcpy(codestream_metadata + metadata_offset, ppm_marker, sizeof(ppm_marker));
+  metadata_offset += sizeof(ppm_marker);
+  memcpy(codestream_metadata + metadata_offset, codestream + 71u, sizeof(codestream) - 71u);
+  metadata_offset += sizeof(codestream) - 71u;
+  TEST_CHECK(metadata_offset == sizeof(codestream_metadata));
+  TEST_CHECK(nanopdf_jpx_parse_header(
+      context, codestream_metadata, sizeof(codestream_metadata), &header));
+  TEST_CHECK(header.first_tile_part_offset == 139u);
+  TEST_CHECK(header.has_component_rgn != NULL);
+  TEST_CHECK(header.has_component_rgn[2] == 1u);
+  TEST_CHECK(header.component_rgn[2].style == 0u);
+  TEST_CHECK(header.component_rgn[2].shift == 4u);
+  TEST_CHECK(header.poc_entry_count == 1u);
+  TEST_CHECK(header.poc_entries[0].resolution_start == 0u);
+  TEST_CHECK(header.poc_entries[0].component_start == 0u);
+  TEST_CHECK(header.poc_entries[0].layer_end == 1u);
+  TEST_CHECK(header.poc_entries[0].resolution_end == 1u);
+  TEST_CHECK(header.poc_entries[0].component_end == 3u);
+  TEST_CHECK(header.poc_entries[0].progression_order == NANOPDF_JPX_PROGRESSION_CPRL);
+  TEST_CHECK(header.crg_offset_count == 3u);
+  TEST_CHECK(header.crg_offsets[0].x == 1u);
+  TEST_CHECK(header.crg_offsets[1].y == 4u);
+  TEST_CHECK(header.crg_offsets[2].x == 5u);
+  TEST_CHECK(header.comment_count == 1u);
+  TEST_CHECK(header.comments[0].registration == 1u);
+  TEST_CHECK(header.comments[0].size == 2u);
+  TEST_CHECK(header.comments[0].data[0] == 'O');
+  TEST_CHECK(header.comments[0].data[1] == 'K');
+  TEST_CHECK(header.tlm_marker_count == 1u);
+  TEST_CHECK(header.tlm_markers[0].index == 2u);
+  TEST_CHECK(header.tlm_markers[0].style == 0u);
+  TEST_CHECK(header.tlm_markers[0].size == 4u);
+  TEST_CHECK(header.tlm_markers[0].data[1] == 1u);
+  TEST_CHECK(header.plm_marker_count == 1u);
+  TEST_CHECK(header.plm_markers[0].index == 3u);
+  TEST_CHECK(header.plm_markers[0].length_count == 2u);
+  TEST_CHECK(header.plm_markers[0].lengths[0] == 5u);
+  TEST_CHECK(header.plm_markers[0].lengths[1] == 128u);
+  TEST_CHECK(header.ppm_marker_count == 1u);
+  TEST_CHECK(header.ppm_markers[0].index == 4u);
+  TEST_CHECK(header.ppm_markers[0].size == 3u);
+  TEST_CHECK(header.ppm_markers[0].data[2] == 0xccu);
+
+  nanopdf_jpx_mq_decoder_init(&mq_decoder, codestream, 4);
+  TEST_CHECK(mq_decoder.a == 0x8000u);
+  TEST_CHECK(mq_decoder.cx_states[17] == 3u);
+  (void)nanopdf_jpx_mq_decode(&mq_decoder, 0);
+  TEST_CHECK(mq_decoder.cx_states[0] <= 46u);
+
+  TEST_CHECK(nanopdf_jpx_tag_tree_build(context, &tag_tree, 3, 2));
+  TEST_CHECK(tag_tree.level_count == 3u);
+  TEST_CHECK(tag_tree.levels[0].width == 3);
+  TEST_CHECK(tag_tree.levels[1].width == 2);
+  TEST_CHECK(tag_tree.levels[2].width == 1);
+  tag_tree.levels[0].nodes[4].value = 7;
+  TEST_CHECK(nanopdf_jpx_tag_tree_value(&tag_tree, 1, 1) == 7);
+  nanopdf_jpx_tag_tree_destroy(context, &tag_tree);
+
+  state[1] = NANOPDF_JPX_CODEBLOCK_STATE_SIG;
+  state[3] = NANOPDF_JPX_CODEBLOCK_STATE_SIG;
+  coeffs[1] = 5;
+  coeffs[3] = -2;
+  TEST_CHECK(nanopdf_jpx_get_significance_context(state, 1, 1, 3, 3, 0) == 7);
+  TEST_CHECK(nanopdf_jpx_get_significance_context(state, 1, 1, 3, 3, 1) == 7);
+  TEST_CHECK(nanopdf_jpx_get_sign_context(state, coeffs, 1, 1, 3, 3, &sign_flip) == 11);
+  TEST_CHECK(sign_flip == 1);
+  TEST_CHECK(nanopdf_jpx_get_magnitude_refinement_context(state, 1, 1, 3, 3) == 15);
+  state[4] = NANOPDF_JPX_CODEBLOCK_STATE_REFINED;
+  TEST_CHECK(nanopdf_jpx_get_magnitude_refinement_context(state, 1, 1, 3, 3) == 16);
+
+  TEST_CHECK(nanopdf_jpx_inverse_dwt_53(context, dwt53, 2, 2, 1));
+  TEST_CHECK(dwt53[0] == 2);
+  TEST_CHECK(dwt53[1] == 3);
+  TEST_CHECK(dwt53[2] == 4);
+  TEST_CHECK(dwt53[3] == 5);
+  TEST_CHECK(nanopdf_jpx_inverse_dwt_97(context, dwt97, 2, 2, 1));
+  TEST_CHECK(dwt97[0] == 0.0f);
+  TEST_CHECK(dwt97[3] == 0.0f);
+
+  nanopdf_jpx_apply_inverse_mct(
+      mct_components, 3, 2, NANOPDF_JPX_WAVELET_REVERSIBLE_5_3);
+  TEST_CHECK(mct0[0] == 15);
+  TEST_CHECK(mct1[0] == 7);
+  TEST_CHECK(mct2[0] == 11);
+  TEST_CHECK(mct0[1] == 17);
+  TEST_CHECK(mct1[1] == 21);
+  TEST_CHECK(mct2[1] == 21);
+  nanopdf_jpx_coeffs_to_pixels(
+      pixel_components, 3, pixel_bit_depths, 2, 1, pixels);
+  TEST_CHECK(pixels[0] == 15u);
+  TEST_CHECK(pixels[1] == 7u);
+  TEST_CHECK(pixels[2] == 11u);
+  TEST_CHECK(pixels[3] == 17u);
+  TEST_CHECK(pixels[4] == 21u);
+  TEST_CHECK(pixels[5] == 21u);
+
+  recon_header = header;
+  recon_header.siz.width = 2u;
+  recon_header.siz.height = 1u;
+  recon_header.siz.num_components = 3u;
+  recon_header.cod.num_decomp_levels = 0u;
+  recon_header.cod.mct = 0u;
+  nanopdf_jpx_tile_component_init(&recon_components[0]);
+  nanopdf_jpx_tile_component_init(&recon_components[1]);
+  nanopdf_jpx_tile_component_init(&recon_components[2]);
+  recon_components[0].width = 2;
+  recon_components[0].height = 1;
+  recon_components[0].coeffs = recon0;
+  recon_components[0].coeff_count = 2u;
+  recon_components[1].width = 2;
+  recon_components[1].height = 1;
+  recon_components[1].coeffs = recon1;
+  recon_components[1].coeff_count = 2u;
+  recon_components[2].width = 2;
+  recon_components[2].height = 1;
+  recon_components[2].coeffs = recon2;
+  recon_components[2].coeff_count = 2u;
+  TEST_CHECK(nanopdf_jpx_reconstruct_pixels(
+      context,
+      &recon_header,
+      recon_components,
+      3,
+      &reconstructed_pixels,
+      &reconstructed_size));
+  TEST_CHECK(reconstructed_size == 6u);
+  TEST_CHECK(reconstructed_pixels != NULL);
+  TEST_CHECK(reconstructed_pixels[0] == 10u);
+  TEST_CHECK(reconstructed_pixels[1] == 30u);
+  TEST_CHECK(reconstructed_pixels[2] == 50u);
+  TEST_CHECK(reconstructed_pixels[3] == 20u);
+  TEST_CHECK(reconstructed_pixels[4] == 40u);
+  TEST_CHECK(reconstructed_pixels[5] == 60u);
+  nanopdf_free(context, reconstructed_pixels);
+  reconstructed_pixels = NULL;
+  reconstructed_size = 0u;
+  recon_header.siz.components[1].x_separation = 2u;
+  recon_components[1].width = 1;
+  recon_components[1].coeffs = recon1_sub;
+  recon_components[1].coeff_count = 1u;
+  TEST_CHECK(nanopdf_jpx_reconstruct_pixels(
+      context,
+      &recon_header,
+      recon_components,
+      3,
+      &reconstructed_pixels,
+      &reconstructed_size));
+  TEST_CHECK(reconstructed_size == 6u);
+  TEST_CHECK(reconstructed_pixels[0] == 10u);
+  TEST_CHECK(reconstructed_pixels[1] == 35u);
+  TEST_CHECK(reconstructed_pixels[2] == 50u);
+  TEST_CHECK(reconstructed_pixels[3] == 20u);
+  TEST_CHECK(reconstructed_pixels[4] == 35u);
+  TEST_CHECK(reconstructed_pixels[5] == 60u);
+  nanopdf_free(context, reconstructed_pixels);
+  reconstructed_pixels = NULL;
+  reconstructed_size = 0u;
+  recon_header = header;
+  recon_header.siz.width = 4u;
+  recon_header.siz.height = 3u;
+  recon_header.siz.x_offset = 1u;
+  recon_header.siz.y_offset = 1u;
+  recon_header.siz.num_components = 3u;
+  recon_header.siz.components[0].x_separation = 1u;
+  recon_header.siz.components[0].y_separation = 1u;
+  recon_header.siz.components[1].x_separation = 1u;
+  recon_header.siz.components[1].y_separation = 1u;
+  recon_header.siz.components[2].x_separation = 1u;
+  recon_header.siz.components[2].y_separation = 1u;
+  recon_header.cod.num_decomp_levels = 0u;
+  recon_header.cod.mct = 0u;
+  recon_components[0].width = 3;
+  recon_components[0].height = 2;
+  recon_components[0].coeffs = origin0;
+  recon_components[0].coeff_count = 6u;
+  recon_components[1].width = 3;
+  recon_components[1].height = 2;
+  recon_components[1].coeffs = origin1;
+  recon_components[1].coeff_count = 6u;
+  recon_components[2].width = 3;
+  recon_components[2].height = 2;
+  recon_components[2].coeffs = origin2;
+  recon_components[2].coeff_count = 6u;
+  TEST_CHECK(nanopdf_jpx_image_width(&recon_header) == 3u);
+  TEST_CHECK(nanopdf_jpx_image_height(&recon_header) == 2u);
+  TEST_CHECK(nanopdf_jpx_component_width(&recon_header, 0) == 3u);
+  TEST_CHECK(nanopdf_jpx_component_height(&recon_header, 0) == 2u);
+  TEST_CHECK(nanopdf_jpx_reconstruct_pixels(
+      context,
+      &recon_header,
+      recon_components,
+      3,
+      &reconstructed_pixels,
+      &reconstructed_size));
+  TEST_CHECK(reconstructed_size == 18u);
+  TEST_CHECK(reconstructed_pixels[0] == 1u);
+  TEST_CHECK(reconstructed_pixels[1] == 11u);
+  TEST_CHECK(reconstructed_pixels[2] == 21u);
+  TEST_CHECK(reconstructed_pixels[15] == 6u);
+  TEST_CHECK(reconstructed_pixels[16] == 16u);
+  TEST_CHECK(reconstructed_pixels[17] == 26u);
+  nanopdf_free(context, reconstructed_pixels);
+  reconstructed_pixels = NULL;
+  reconstructed_size = 0u;
+  recon_header = header;
+  recon_header.siz.width = 6u;
+  recon_header.siz.height = 2u;
+  recon_header.siz.x_offset = 2u;
+  recon_header.siz.y_offset = 1u;
+  recon_header.siz.num_components = 3u;
+  recon_header.siz.components[0].x_separation = 2u;
+  recon_header.siz.components[0].y_separation = 1u;
+  recon_header.siz.components[1].x_separation = 1u;
+  recon_header.siz.components[1].y_separation = 1u;
+  recon_header.siz.components[2].x_separation = 1u;
+  recon_header.siz.components[2].y_separation = 1u;
+  recon_header.cod.num_decomp_levels = 0u;
+  recon_header.cod.mct = 0u;
+  recon_components[0].width = 2;
+  recon_components[0].height = 1;
+  recon_components[0].coeffs = origin_sub0;
+  recon_components[0].coeff_count = 2u;
+  recon_components[1].width = 4;
+  recon_components[1].height = 1;
+  recon_components[1].coeffs = origin_sub1;
+  recon_components[1].coeff_count = 4u;
+  recon_components[2].width = 4;
+  recon_components[2].height = 1;
+  recon_components[2].coeffs = origin_sub2;
+  recon_components[2].coeff_count = 4u;
+  TEST_CHECK(nanopdf_jpx_image_width(&recon_header) == 4u);
+  TEST_CHECK(nanopdf_jpx_image_height(&recon_header) == 1u);
+  TEST_CHECK(nanopdf_jpx_component_width(&recon_header, 0) == 2u);
+  TEST_CHECK(nanopdf_jpx_component_height(&recon_header, 0) == 1u);
+  TEST_CHECK(nanopdf_jpx_reconstruct_pixels(
+      context,
+      &recon_header,
+      recon_components,
+      3,
+      &reconstructed_pixels,
+      &reconstructed_size));
+  TEST_CHECK(reconstructed_size == 12u);
+  TEST_CHECK(reconstructed_pixels[0] == 70u);
+  TEST_CHECK(reconstructed_pixels[3] == 90u);
+  TEST_CHECK(reconstructed_pixels[6] == 90u);
+  TEST_CHECK(reconstructed_pixels[9] == 90u);
+  nanopdf_free(context, reconstructed_pixels);
+
+  codeblock.width = 1;
+  codeblock.height = 1;
+  codeblock.num_passes = 1;
+  codeblock.data = codeblock_data;
+  codeblock.data_size = sizeof(codeblock_data);
+  TEST_CHECK(nanopdf_jpx_decode_codeblock(context, &codeblock, 1, 0, 2));
+  TEST_CHECK(codeblock.coeff_count == 1u);
+  TEST_CHECK(codeblock.coeffs != NULL);
+  nanopdf_jpx_codeblock_destroy(context, &codeblock);
+
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  TEST_CHECK(tile_component.width == 16);
+  TEST_CHECK(tile_component.height == 8);
+  TEST_CHECK(tile_component.coeff_count == 128u);
+  TEST_CHECK(tile_component.res_level_count == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subband_count == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].type == NANOPDF_JPX_SUBBAND_LL);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblock_count == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].width == 16);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].height == 8);
+  TEST_CHECK(nanopdf_jpx_parse_packet_simple(
+      context,
+      packet_data,
+      sizeof(packet_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  TEST_CHECK(packet_offset == sizeof(packet_data));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].included == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].zero_bit_planes == 0);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes == 1);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].pass_length_count == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].pass_lengths[0] == 2);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data_size == 2u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[0] == 0xaau);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[1] == 0xbbu);
+  packet_offset = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].included = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].num_len_bits = 3;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].pass_length_count = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].data = NULL;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].data_size = 0;
+  TEST_CHECK(!nanopdf_jpx_parse_packet_simple(
+      context,
+      truncated_packet_data,
+      sizeof(truncated_packet_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  packet_offset = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].included = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].num_len_bits = 3;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].pass_length_count = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].data = NULL;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].data_size = 0;
+  TEST_CHECK(nanopdf_jpx_parse_packet_simple(
+      context,
+      split_packet_header_data,
+      sizeof(split_packet_header_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  TEST_CHECK(packet_offset == sizeof(split_packet_header_data));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].included == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].pass_lengths[0] == 2);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[0] == 0xaau);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[1] == 0xbbu);
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  packet_offset = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].included = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].num_len_bits = 3;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].pass_length_count = 0;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].data = NULL;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].data_size = 0;
+  TEST_CHECK(nanopdf_jpx_parse_packet_simple(
+      context,
+      two_layer_packet_data,
+      sizeof(two_layer_packet_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  TEST_CHECK(packet_offset == 2u);
+  TEST_CHECK(nanopdf_jpx_parse_packet_simple(
+      context,
+      two_layer_packet_data,
+      sizeof(two_layer_packet_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  TEST_CHECK(packet_offset == sizeof(two_layer_packet_data));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes == 2);
+  TEST_CHECK(
+      tile_component.res_levels[0].subbands[0].codeblocks[0].pass_length_count == 2u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data_size == 2u);
+  if (tile_component.res_levels[0].subbands[0].codeblocks[0].data &&
+      tile_component.res_levels[0].subbands[0].codeblocks[0].data_size >= 2u) {
+    TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[0] == 0xaau);
+    TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[1] == 0xbbu);
+  }
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  packet_offset = 0;
+  TEST_CHECK(nanopdf_jpx_parse_packet_simple(
+      context,
+      empty_after_included_packet_data,
+      sizeof(empty_after_included_packet_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  TEST_CHECK(packet_offset == 3u);
+  TEST_CHECK(nanopdf_jpx_parse_packet_simple(
+      context,
+      empty_after_included_packet_data,
+      sizeof(empty_after_included_packet_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  TEST_CHECK(packet_offset == sizeof(empty_after_included_packet_data));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes == 1);
+  TEST_CHECK(
+      tile_component.res_levels[0].subbands[0].codeblocks[0].pass_length_count == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data_size == 2u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[0] == 0xaau);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[1] == 0xbbu);
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  saved_poc_entry_count = header.poc_entry_count;
+  header.poc_entry_count = 0u;
+  header.cod.num_layers = 2u;
+  TEST_CHECK(nanopdf_jpx_decode_tile_data_with_packet_headers(
+      context,
+      empty_after_included_headers,
+      sizeof(empty_after_included_headers),
+      empty_after_included_body,
+      sizeof(empty_after_included_body),
+      &header,
+      &tile_component,
+      1));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes == 1);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data_size == 2u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[0] == 0xaau);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[1] == 0xbbu);
+  header.cod.num_layers = 1u;
+  header.poc_entry_count = saved_poc_entry_count;
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  saved_poc_entry_count = header.poc_entry_count;
+  header.poc_entry_count = 0u;
+  header.cod.num_layers = 2u;
+  TEST_CHECK(nanopdf_jpx_decode_tile_data_with_packet_headers(
+      context,
+      separate_header_two_layer_headers,
+      sizeof(separate_header_two_layer_headers),
+      separate_header_two_layer_body,
+      sizeof(separate_header_two_layer_body),
+      &header,
+      &tile_component,
+      1));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].num_passes == 2);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data_size == 2u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[0] == 0xaau);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[1] == 0xbbu);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].coeffs != NULL);
+  header.cod.num_layers = 1u;
+  header.poc_entry_count = saved_poc_entry_count;
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  packet_offset = 0;
+  header.cod.use_sop = 1u;
+  header.cod.use_eph = 1u;
+  TEST_CHECK(nanopdf_jpx_parse_packet_simple(
+      context,
+      sop_eph_packet_data,
+      sizeof(sop_eph_packet_data),
+      &packet_offset,
+      &header.cod,
+      tile_component.res_levels[0].subbands,
+      tile_component.res_levels[0].subband_count));
+  TEST_CHECK(packet_offset == sizeof(sop_eph_packet_data));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].included == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data_size == 2u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[0] == 0xaau);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].data[1] == 0xbbu);
+  header.cod.use_sop = 0u;
+  header.cod.use_eph = 0u;
+  placed_coeffs[0] = 3;
+  placed_coeffs[1] = -2;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].coeffs = placed_coeffs;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].coeff_count = 128u;
+  TEST_CHECK(nanopdf_jpx_place_codeblock_coeffs(
+      &tile_component,
+      &tile_component.res_levels[0].subbands[0],
+      &tile_component.res_levels[0].subbands[0].codeblocks[0],
+      header.cod.num_decomp_levels));
+  TEST_CHECK(tile_component.coeffs[0] == 3);
+  TEST_CHECK(tile_component.coeffs[1] == -2);
+  memset(&qcd_params, 0, sizeof(qcd_params));
+  qcd_step.exponent = 9;
+  qcd_step.mantissa = 0;
+  qcd_params.quant_style = 1;
+  qcd_params.step_sizes = &qcd_step;
+  qcd_params.step_size_count = 1u;
+  nanopdf_jpx_dequantize_subband(
+      &tile_component,
+      &tile_component.res_levels[0].subbands[0],
+      &qcd_params,
+      8,
+      header.cod.num_decomp_levels);
+  TEST_CHECK(tile_component.coeffs[0] == 6);
+  TEST_CHECK(tile_component.coeffs[1] == -4);
+  tile_component.res_levels[0].subbands[0].codeblocks[0].coeffs = NULL;
+  tile_component.res_levels[0].subbands[0].codeblocks[0].coeff_count = 0;
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  TEST_CHECK(nanopdf_jpx_decode_tile_data_simple(
+      context, packet_data, sizeof(packet_data), &header, &tile_component, 1));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].included == 1u);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].coeffs != NULL);
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].coeff_count == 128u);
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  header.cod.progression_order = NANOPDF_JPX_PROGRESSION_RPCL;
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  TEST_CHECK(nanopdf_jpx_decode_tile_data_simple(
+      context, packet_data, sizeof(packet_data), &header, &tile_component, 1));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].included == 1u);
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  header.cod.progression_order = NANOPDF_JPX_PROGRESSION_PCRL;
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  TEST_CHECK(nanopdf_jpx_decode_tile_data_simple(
+      context, packet_data, sizeof(packet_data), &header, &tile_component, 1));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].included == 1u);
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  header.cod.progression_order = NANOPDF_JPX_PROGRESSION_CPRL;
+  TEST_CHECK(nanopdf_jpx_build_tile_component(
+      context, &tile_component, &header.cod, 0, 0, 16, 8));
+  TEST_CHECK(nanopdf_jpx_decode_tile_data_simple(
+      context, packet_data, sizeof(packet_data), &header, &tile_component, 1));
+  TEST_CHECK(tile_component.res_levels[0].subbands[0].codeblocks[0].included == 1u);
+  nanopdf_jpx_tile_component_destroy(context, &tile_component);
+  header.cod.progression_order = NANOPDF_JPX_PROGRESSION_LRCP;
+
+  nanopdf_jpx_header_destroy(context, &header);
+  nanopdf_context_destroy(context);
+}
+
 static void test_nanopdf_c_crypto_vectors(void) {
   static const uint8_t md5_expected[16] = {
       0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0,
@@ -4434,6 +7070,8 @@ struct TEST_ENTRY TEST_LIST[] = {
     {"nanopdf_c_jpx_jbig2_invalid_payloads", test_nanopdf_c_jpx_jbig2_invalid_payloads},
     {"nanopdf_c_jbig2_globals_are_resolved", test_nanopdf_c_jbig2_globals_are_resolved},
     {"nanopdf_c_jbig2_globals_cycle_is_bounded", test_nanopdf_c_jbig2_globals_cycle_is_bounded},
+    {"nanopdf_c_jbig2_c_primitives", test_nanopdf_c_jbig2_c_primitives},
+    {"nanopdf_c_jpx_c_header", test_nanopdf_c_jpx_c_header},
     {"nanopdf_c_crypto_vectors", test_nanopdf_c_crypto_vectors},
     {"nanopdf_c_indirect_length", test_nanopdf_c_indirect_length},
     {"nanopdf_c_escaped_objects", test_nanopdf_c_escaped_objects},

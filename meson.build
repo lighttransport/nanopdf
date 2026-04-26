@@ -135,6 +135,8 @@ nanopdf_c_sources = files(
   'src/c/nanopdf_context.c',
   'src/c/nanopdf_crypto.c',
   'src/c/nanopdf_image_decoder.c',
+  'src/c/nanopdf_jbig2.c',
+  'src/c/nanopdf_jpx.c',
   'src/c/nanopdf_object.c',
   'src/c/nanopdf_basic_document.c',
   'src/c/nanopdf_basic_layout.c',
@@ -331,6 +333,7 @@ if opt_build_tests
     files('tests/c/test_nanopdf_c.c'),
     include_directories: [include_directories('src/c'),
                           include_directories('tests')],
+    c_args: opt_cpp_image_bridge ? ['-DNANOPDF_C_USE_CPP_IMAGE_BRIDGE=1'] : [],
     link_with: nanopdf_c_lib,
   )
 

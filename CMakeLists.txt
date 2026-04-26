@@ -584,6 +584,8 @@ set(NANOPDF_C_API_SOURCES
   src/c/nanopdf_context.c
   src/c/nanopdf_crypto.c
   src/c/nanopdf_image_decoder.c
+  src/c/nanopdf_jbig2.c
+  src/c/nanopdf_jpx.c
   src/c/nanopdf_object.c
   src/c/nanopdf_basic_document.c
   src/c/nanopdf_basic_layout.c
@@ -747,6 +749,9 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
 
   add_executable(nanopdf_c_api_smoke tests/c/test_nanopdf_c.c)
   target_link_libraries(nanopdf_c_api_smoke PRIVATE nanopdf-c)
+  if(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+    target_compile_definitions(nanopdf_c_api_smoke PRIVATE NANOPDF_C_USE_CPP_IMAGE_BRIDGE=1)
+  endif()
   target_include_directories(nanopdf_c_api_smoke PRIVATE
     ${PROJECT_SOURCE_DIR}/src/c
     ${PROJECT_SOURCE_DIR}/tests)
