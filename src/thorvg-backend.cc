@@ -3519,26 +3519,39 @@ static bool rasterize_function_shading(const Pdf& pdf, const Shading& shading,
   return true;
 }
 
-// Helper to lookup a resource, checking Form XObject resources first, then page resources
-const Value* ThorVGBackend::lookup_resource(const std::string& resource_type, const std::string& name) const {
+// Helper to lookup a resource, checking Form XObject resources first, then
+// page resources. Returns a pointer that is valid until the next render_page
+// (lookup_resolved_owned_ provides stable storage for resolved REFERENCEs;
+// otherwise the pointer is into the original page/form resource dict).
+const Value* ThorVGBackend::lookup_resource(const std::string& resource_type,
+                                            const std::string& name) const {
+  auto resolve_into_dict = [this](const Value& v,
+                                  const Value*& dict_out) -> bool {
+    if (v.type == Value::DICTIONARY) {
+      dict_out = &v;
+      return true;
+    }
+    if (v.type == Value::REFERENCE && current_pdf_) {
+      auto resolved = resolve_reference(*current_pdf_,
+                                        v.ref_object_number,
+                                        v.ref_generation_number);
+      if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+        lookup_resolved_owned_.push_back(std::move(resolved.value));
+        dict_out = &lookup_resolved_owned_.back();
+        return true;
+      }
+    }
+    return false;
+  };
+
   // Check Form XObject resources stack (from top to bottom)
   for (auto it = form_resources_stack_.rbegin(); it != form_resources_stack_.rend(); ++it) {
     auto type_it = it->find(resource_type);
     if (type_it != it->end()) {
-      Value resolved_dict = type_it->second;
-
-      // Resolve reference if needed
-      if (resolved_dict.type == Value::REFERENCE && current_pdf_) {
-        auto resolved = resolve_reference(*current_pdf_, resolved_dict.ref_object_number,
-                                          resolved_dict.ref_generation_number);
-        if (resolved.success) {
-          resolved_dict = resolved.value;
-        }
-      }
-
-      if (resolved_dict.type == Value::DICTIONARY) {
-        auto name_it = resolved_dict.dict.find(name);
-        if (name_it != resolved_dict.dict.end()) {
+      const Value* dict = nullptr;
+      if (resolve_into_dict(type_it->second, dict) && dict) {
+        auto name_it = dict->dict.find(name);
+        if (name_it != dict->dict.end()) {
           return &name_it->second;
         }
       }
@@ -3549,20 +3562,10 @@ const Value* ThorVGBackend::lookup_resource(const std::string& resource_type, co
   if (current_page_) {
     auto type_it = current_page_->resources.find(resource_type);
     if (type_it != current_page_->resources.end()) {
-      Value resolved_dict = type_it->second;
-
-      // Resolve reference if needed
-      if (resolved_dict.type == Value::REFERENCE && current_pdf_) {
-        auto resolved = resolve_reference(*current_pdf_, resolved_dict.ref_object_number,
-                                          resolved_dict.ref_generation_number);
-        if (resolved.success) {
-          resolved_dict = resolved.value;
-        }
-      }
-
-      if (resolved_dict.type == Value::DICTIONARY) {
-        auto name_it = resolved_dict.dict.find(name);
-        if (name_it != resolved_dict.dict.end()) {
+      const Value* dict = nullptr;
+      if (resolve_into_dict(type_it->second, dict) && dict) {
+        auto name_it = dict->dict.find(name);
+        if (name_it != dict->dict.end()) {
           return &name_it->second;
         }
       }
@@ -5810,6 +5813,10 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
                                                const ThorVGRenderOptions& options) {
   ThorVGRenderResult result;
 
+  // Reset per-page resource resolution storage so it doesn't grow unbounded
+  // across multi-page renders.
+  lookup_resolved_owned_.clear();
+
   // Get page dimensions
   float page_width = 612.0f;
   float page_height = 792.0f;
@@ -6001,6 +6008,9 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
 
 ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) {
   ThorVGRenderResult result;
+
+  // Reset per-page resource resolution storage so it doesn't grow unbounded.
+  lookup_resolved_owned_.clear();
 
   if (!initialized_) {
     result.error = "Backend not initialized";

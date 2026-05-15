@@ -6,6 +6,7 @@
 #ifdef NANOPDF_USE_THORVG
 
 #include <thorvg.h>
+#include <deque>
 #include <memory>
 #include <vector>
 #include <string>
@@ -382,6 +383,13 @@ private:
 
   // Helper to lookup a resource, checking Form resources first, then page resources
   const Value* lookup_resource(const std::string& resource_type, const std::string& name) const;
+
+  // Owns Values that lookup_resource() had to resolve from REFERENCE entries.
+  // Returned pointers reference entries inside these owned dicts, so the
+  // storage must outlive the caller's use of the pointer. Uses deque so
+  // emplace_back never invalidates existing addresses. Cleared at the start
+  // of each render_page().
+  mutable std::deque<Value> lookup_resolved_owned_;
 };
 
 }  // namespace nanopdf
