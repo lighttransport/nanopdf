@@ -102,9 +102,9 @@ struct Point {
 };
 
 struct Matrix {
-  float e11, e12, e13;
-  float e21, e22, e23;
-  float e31, e32, e33;
+  float e11{1.0f}, e12{0.0f}, e13{0.0f};
+  float e21{0.0f}, e22{1.0f}, e23{0.0f};
+  float e31{0.0f}, e32{0.0f}, e33{1.0f};
 };
 
 namespace Fill {

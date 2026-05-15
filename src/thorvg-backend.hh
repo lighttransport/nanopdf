@@ -211,14 +211,14 @@ private:
   // Font cache entry
   struct FontCache {
     std::vector<uint8_t> font_data;  // Raw font file data
-    stbtt_fontinfo font_info;
+    stbtt_fontinfo font_info{};      // Zero-init POD so any unread fields are deterministic
     bool initialized{false};
     bool is_embedded{false};  // true when loaded from PDF-embedded font stream
     std::vector<uint16_t> cid_to_gid;  // CFF charset CID→GID map (empty = identity)
 
     // ttf_parse context for kerning lookup (supports GPOS kerning)
     bool has_ttf_parse{false};
-    ttf_font_t ttf;
+    ttf_font_t ttf{};                 // Zero-init POD; only read when has_ttf_parse is true
   };
 
   // Glyph bitmap cache key: font_name + glyph_id + quantized_size
@@ -243,8 +243,8 @@ private:
 
   struct GlyphBitmapEntry {
     std::vector<uint8_t> bitmap;  // grayscale alpha
-    int width, height;
-    float xoff, yoff;  // offset from glyph origin (float for 2x precision)
+    int width{0}, height{0};
+    float xoff{0.0f}, yoff{0.0f};  // offset from glyph origin (float for 2x precision)
   };
 
   // Draw an outlined "tofu" box placeholder for a missing glyph
