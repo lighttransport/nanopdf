@@ -648,11 +648,94 @@ Result Paint::bounds(float* x, float* y, float* w, float* h,
     static_cast<const Shape*>(this)->compute_bbox(x, y, w, h);
     return Result::Success;
   }
+  if (kind() == kPicture) {
+    const Picture* pic = static_cast<const Picture*>(this);
+    pic->compute_bbox(x, y, w, h);
+    return Result::Success;
+  }
+  if (kind() == kScene) {
+    const Scene* sc = static_cast<const Scene*>(this);
+    sc->compute_bbox(x, y, w, h);
+    return Result::Success;
+  }
   if (x) *x = 0;
   if (y) *y = 0;
   if (w) *w = 0;
   if (h) *h = 0;
   return Result::Success;
+}
+
+// Snapshot-then-blend pattern for per-pixel soft masking. Captures pixels in
+// [x0..x1) x [y0..y1) (clamped to canvas clip), runs `draw`, then lerps each
+// pixel back using the mask: result = lerp(before, after, mask[px,py]).
+// Untouched pixels lerp identity → no change. The bbox can intentionally be
+// loose (e.g. full clip rect for scenes), since identity-lerping unmodified
+// pixels is a no-op.
+template <typename DrawFn>
+static void draw_with_soft_mask(lui_canvas_t* canvas,
+                                const SoftMaskData& mask,
+                                int x0, int y0, int x1, int y1,
+                                DrawFn draw) {
+  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  x0 = std::max(x0, clip.x);
+  y0 = std::max(y0, clip.y);
+  x1 = std::min(x1, clip.x + clip.width);
+  y1 = std::min(y1, clip.y + clip.height);
+  if (x0 >= x1 || y0 >= y1) {
+    draw(canvas);
+    return;
+  }
+  lui_surface_t* surf = lui_canvas_get_surface(canvas);
+  if (!surf || !surf->pixels) {
+    draw(canvas);
+    return;
+  }
+  int w = x1 - x0;
+  int h = y1 - y0;
+  std::vector<uint32_t> snapshot(static_cast<size_t>(w) * h);
+  for (int y = 0; y < h; ++y) {
+    const uint32_t* src_row = surf->pixels + (y0 + y) * surf->stride + x0;
+    std::memcpy(snapshot.data() + static_cast<size_t>(y) * w, src_row,
+                static_cast<size_t>(w) * sizeof(uint32_t));
+  }
+
+  draw(canvas);
+
+  for (int y = 0; y < h; ++y) {
+    int my = y0 + y;
+    if (my < 0 || static_cast<uint32_t>(my) >= mask.h) continue;
+    const uint8_t* mask_row = mask.data.data() +
+                              static_cast<size_t>(my) * mask.w;
+    uint32_t* dst_row = surf->pixels + (y0 + y) * surf->stride + x0;
+    const uint32_t* snap_row = snapshot.data() + static_cast<size_t>(y) * w;
+    for (int x = 0; x < w; ++x) {
+      int mx = x0 + x;
+      if (mx < 0 || static_cast<uint32_t>(mx) >= mask.w) continue;
+      uint8_t a = mask_row[mx];
+      if (a == 255) continue;
+      uint32_t before = snap_row[x];
+      if (a == 0) { dst_row[x] = before; continue; }
+      uint32_t after = dst_row[x];
+      // Per-channel lerp: out = before + (after - before) * a / 255.
+      uint16_t inv = static_cast<uint16_t>(255 - a);
+      uint8_t ab = static_cast<uint8_t>((before >> 24) & 0xff);
+      uint8_t rb = static_cast<uint8_t>((before >> 16) & 0xff);
+      uint8_t gb = static_cast<uint8_t>((before >> 8)  & 0xff);
+      uint8_t bb = static_cast<uint8_t>(before & 0xff);
+      uint8_t aa = static_cast<uint8_t>((after >> 24) & 0xff);
+      uint8_t ra = static_cast<uint8_t>((after >> 16) & 0xff);
+      uint8_t ga = static_cast<uint8_t>((after >> 8)  & 0xff);
+      uint8_t ba = static_cast<uint8_t>(after & 0xff);
+      uint8_t ao = static_cast<uint8_t>((ab * inv + aa * a) / 255);
+      uint8_t ro = static_cast<uint8_t>((rb * inv + ra * a) / 255);
+      uint8_t go = static_cast<uint8_t>((gb * inv + ga * a) / 255);
+      uint8_t bo = static_cast<uint8_t>((bb * inv + ba * a) / 255);
+      dst_row[x] = (static_cast<uint32_t>(ao) << 24) |
+                   (static_cast<uint32_t>(ro) << 16) |
+                   (static_cast<uint32_t>(go) << 8) |
+                    static_cast<uint32_t>(bo);
+    }
+  }
 }
 
 // =========================================================================
@@ -814,6 +897,23 @@ void Shape::compute_bbox(float* x, float* y, float* w, float* h) const {
 
 void Shape::draw_on(lui_canvas_t* canvas) {
   if (!canvas || cmds_.empty()) return;
+
+  // Per-pixel soft mask: snapshot dest, draw without mask, lerp back through
+  // the mask. Reset member to avoid infinite recursion in the lambda.
+  if (soft_mask_) {
+    auto mask = soft_mask_;
+    soft_mask_.reset();
+    float bx, by, bw, bh;
+    compute_bbox(&bx, &by, &bw, &bh);
+    int x0 = static_cast<int>(std::floor(bx));
+    int y0 = static_cast<int>(std::floor(by));
+    int x1 = static_cast<int>(std::ceil(bx + bw));
+    int y1 = static_cast<int>(std::ceil(by + bh));
+    draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
+                        [this](lui_canvas_t* c) { draw_on(c); });
+    soft_mask_ = mask;
+    return;
+  }
 
   // -- Set up clipping. Three modes:
   //    0 = no clip change
@@ -1113,8 +1213,46 @@ Result Picture::translate(float x, float y) {
   return Result::Success;
 }
 
+void Picture::compute_bbox(float* x, float* y, float* w, float* h) const {
+  if (!x || !y || !w || !h) return;
+  if (width_ == 0 || height_ == 0) {
+    *x = *y = *w = *h = 0;
+    return;
+  }
+  const Matrix& m = transform_;
+  float sw = static_cast<float>(width_);
+  float sh = static_cast<float>(height_);
+  auto fx = [&](float u, float v) { return m.e11 * u + m.e12 * v + m.e13; };
+  auto fy = [&](float u, float v) { return m.e21 * u + m.e22 * v + m.e23; };
+  float xs[4] = {fx(0, 0), fx(sw, 0), fx(sw, sh), fx(0, sh)};
+  float ys[4] = {fy(0, 0), fy(sw, 0), fy(sw, sh), fy(0, sh)};
+  float minx = std::min({xs[0], xs[1], xs[2], xs[3]});
+  float maxx = std::max({xs[0], xs[1], xs[2], xs[3]});
+  float miny = std::min({ys[0], ys[1], ys[2], ys[3]});
+  float maxy = std::max({ys[0], ys[1], ys[2], ys[3]});
+  *x = minx;
+  *y = miny;
+  *w = maxx - minx;
+  *h = maxy - miny;
+}
+
 void Picture::draw_on(lui_canvas_t* canvas) {
   if (!canvas || pixels_.empty() || width_ == 0 || height_ == 0) return;
+
+  if (soft_mask_) {
+    auto mask = soft_mask_;
+    soft_mask_.reset();
+    float bx, by, bw, bh;
+    compute_bbox(&bx, &by, &bw, &bh);
+    int x0 = static_cast<int>(std::floor(bx));
+    int y0 = static_cast<int>(std::floor(by));
+    int x1 = static_cast<int>(std::ceil(bx + bw));
+    int y1 = static_cast<int>(std::ceil(by + bh));
+    draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
+                        [this](lui_canvas_t* c) { draw_on(c); });
+    soft_mask_ = mask;
+    return;
+  }
 
   // Axis-aligned scale + translate? Use fast path through lui_canvas.
   if (std::fabs(transform_.e12) < 1e-4f &&
@@ -1364,8 +1502,51 @@ void Scene::clear() {
   paints_.clear();
 }
 
+void Scene::compute_bbox(float* x, float* y, float* w, float* h) const {
+  if (!x || !y || !w || !h) return;
+  if (paints_.empty()) {
+    *x = *y = *w = *h = 0;
+    return;
+  }
+  float minx =  std::numeric_limits<float>::infinity();
+  float miny =  std::numeric_limits<float>::infinity();
+  float maxx = -std::numeric_limits<float>::infinity();
+  float maxy = -std::numeric_limits<float>::infinity();
+  for (const Paint* p : paints_) {
+    if (!p) continue;
+    float bx, by, bw, bh;
+    p->bounds(&bx, &by, &bw, &bh);
+    if (bw <= 0.0f || bh <= 0.0f) continue;
+    if (bx < minx) minx = bx;
+    if (by < miny) miny = by;
+    if (bx + bw > maxx) maxx = bx + bw;
+    if (by + bh > maxy) maxy = by + bh;
+  }
+  if (minx == std::numeric_limits<float>::infinity()) {
+    *x = *y = *w = *h = 0;
+    return;
+  }
+  *x = minx;
+  *y = miny;
+  *w = maxx - minx;
+  *h = maxy - miny;
+}
+
 void Scene::draw_on(lui_canvas_t* canvas) {
   if (!canvas) return;
+
+  if (soft_mask_) {
+    auto mask = soft_mask_;
+    soft_mask_.reset();
+    // Use canvas clip as the loose bbox — identity-lerping untouched pixels
+    // is a no-op, and computing the tight scene bbox iterates every child.
+    lui_rect_t clip = lui_canvas_get_clip(canvas);
+    draw_with_soft_mask(canvas, *mask, clip.x, clip.y,
+                        clip.x + clip.width, clip.y + clip.height,
+                        [this](lui_canvas_t* c) { draw_on(c); });
+    soft_mask_ = mask;
+    return;
+  }
   // Apply scene-level clip (bbox of clipper) the same way Shape does.
   lui_rect_t saved_clip = lui_canvas_get_clip(canvas);
   bool clip_changed = false;

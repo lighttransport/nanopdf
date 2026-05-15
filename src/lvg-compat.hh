@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 extern "C" {
@@ -125,6 +126,15 @@ class LinearGradient;
 class RadialGradient;
 class SwCanvas;
 
+// Canvas-resolution alpha bitmap used by Paint::softMask. Shared between
+// paints via shared_ptr — the backend builds one per soft-mask state change
+// and assigns it to each masked paint, so we avoid per-paint copies.
+struct SoftMaskData {
+  std::vector<uint8_t> data;  // grayscale 0..255
+  uint32_t w{0};
+  uint32_t h{0};
+};
+
 // ---------------------------------------------------------------------------
 // Paint base
 // ---------------------------------------------------------------------------
@@ -152,6 +162,14 @@ class Paint {
     return Result::Success;
   }
 
+  // Attach a soft mask. When set, the Paint snapshots the canvas before
+  // drawing and lerps the pre/post pixels back per-mask-pixel after, so the
+  // mask varies opacity across the paint rather than applying a scalar.
+  Result softMask(std::shared_ptr<const SoftMaskData> m) {
+    soft_mask_ = std::move(m);
+    return Result::Success;
+  }
+
   // ThorVG: get axis-aligned bounding box. `transformed` ignored for now.
   Result bounds(float* x, float* y, float* w, float* h,
                 bool transformed = false) const;
@@ -168,6 +186,10 @@ class Paint {
 
   // Clipper (axis-aligned bbox applied on draw_on).
   Shape* clipper_{nullptr};
+
+  // Optional soft mask. When non-null, draw_on dispatches through
+  // draw_with_soft_mask() in lvg-compat.cc.
+  std::shared_ptr<const SoftMaskData> soft_mask_;
 };
 
 // ---------------------------------------------------------------------------
@@ -274,6 +296,9 @@ class Picture : public Paint {
 
   Kind kind() const override { return kPicture; }
   void draw_on(lui_canvas_t* canvas) override;
+
+  // Forward-transformed bbox of the source image rectangle.
+  void compute_bbox(float* x, float* y, float* w, float* h) const;
 
  private:
   Picture() = default;
@@ -382,6 +407,9 @@ class Scene : public Paint {
 
   // Reset state without destroying.
   void clear();
+
+  // Axis-aligned union of all child paints' bounding boxes.
+  void compute_bbox(float* x, float* y, float* w, float* h) const;
 
  private:
   Scene() = default;

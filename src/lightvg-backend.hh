@@ -390,6 +390,11 @@ private:
   // emplace_back never invalidates existing addresses. Cleared at the start
   // of each render_page().
   mutable std::deque<Value> lookup_resolved_owned_;
+
+  // Shared snapshot of the active soft mask. Built lazily in
+  // apply_soft_mask_opacity() so each masked paint shares one allocation.
+  // Cleared via cache-key mismatch when the underlying soft_mask_data changes.
+  std::shared_ptr<const lvg::SoftMaskData> current_soft_mask_;
 };
 
 }  // namespace nanopdf

@@ -2786,30 +2786,35 @@ float LightVGBackend::calculate_vertical_advance(const std::string& text, float 
   return advance;
 }
 
-// Apply soft mask opacity to a paint object (shape or picture).
-// Samples the center region of the soft mask for an average opacity value.
+// Attach the current soft mask to a paint for per-pixel modulation.
+// Cached shared_ptr so multiple paints with the same mask share one copy.
 void LightVGBackend::apply_soft_mask_opacity(lvg::Paint* paint) {
   if (!paint || !state_.has_soft_mask || state_.soft_mask_data.empty()) return;
   if (state_.soft_mask_width == 0 || state_.soft_mask_height == 0) return;
 
-  // Sample center 50% region for average opacity
-  uint32_t x0 = state_.soft_mask_width / 4;
-  uint32_t x1 = state_.soft_mask_width * 3 / 4;
-  uint32_t y0 = state_.soft_mask_height / 4;
-  uint32_t y1 = state_.soft_mask_height * 3 / 4;
-  if (x1 <= x0) x1 = x0 + 1;
-  if (y1 <= y0) y1 = y0 + 1;
-
-  uint64_t sum = 0;
-  uint32_t count = 0;
-  for (uint32_t y = y0; y < y1 && y < state_.soft_mask_height; ++y) {
-    for (uint32_t x = x0; x < x1 && x < state_.soft_mask_width; ++x) {
-      sum += state_.soft_mask_data[y * state_.soft_mask_width + x];
-      ++count;
+  // Detect cache miss by size + dimensions + a few sentinel bytes. We
+  // intentionally don't memcmp the whole mask each paint.
+  bool rebuild = !current_soft_mask_ ||
+                 current_soft_mask_->w != state_.soft_mask_width ||
+                 current_soft_mask_->h != state_.soft_mask_height ||
+                 current_soft_mask_->data.size() !=
+                     state_.soft_mask_data.size();
+  if (!rebuild && !state_.soft_mask_data.empty()) {
+    size_t n = state_.soft_mask_data.size();
+    if (current_soft_mask_->data.front() != state_.soft_mask_data.front() ||
+        current_soft_mask_->data[n / 2] != state_.soft_mask_data[n / 2] ||
+        current_soft_mask_->data.back() != state_.soft_mask_data.back()) {
+      rebuild = true;
     }
   }
-  uint8_t mask_opacity = count > 0 ? static_cast<uint8_t>(sum / count) : 255;
-  paint->opacity(mask_opacity);
+  if (rebuild) {
+    auto sm = std::make_shared<lvg::SoftMaskData>();
+    sm->w = state_.soft_mask_width;
+    sm->h = state_.soft_mask_height;
+    sm->data = state_.soft_mask_data;
+    current_soft_mask_ = sm;
+  }
+  paint->softMask(current_soft_mask_);
 }
 
 bool LightVGBackend::push_with_clip(lvg::Shape* shape) {
