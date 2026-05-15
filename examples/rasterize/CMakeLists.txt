@@ -15,6 +15,14 @@ endif()
 include_directories(${NANOPDF_ROOT}/src)
 include_directories(${NANOPDF_ROOT}/src/third_party)
 
+# Render backends
+option(USE_LIGHTVG "Enable lightui VG software backend (default)" ON)
+if(USE_LIGHTVG)
+  add_compile_definitions(NANOPDF_USE_LIGHTVG)
+  include_directories(${NANOPDF_ROOT}/src/third_party/lightui_vg/include
+                      ${NANOPDF_ROOT}/src/third_party/lightui_vg/src)
+endif()
+
 # Find ThorVG if enabled
 option(USE_THORVG "Enable ThorVG backend" ON)
 if(USE_THORVG)
@@ -213,6 +221,7 @@ install(TARGETS rasterize DESTINATION bin)
 # Print configuration summary
 message(STATUS "")
 message(STATUS "Rasterize Example Configuration:")
+message(STATUS "  LightVG support: ${USE_LIGHTVG}")
 message(STATUS "  ThorVG support: ${THORVG_FOUND}")
 if(THORVG_FOUND)
   message(STATUS "  ThorVG include: ${THORVG_INCLUDE_DIRS}")

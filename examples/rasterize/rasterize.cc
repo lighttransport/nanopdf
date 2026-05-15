@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache 2.0
 // Copyright 2024 - Present, Light Transport Entertainment Inc.
 //
-// PDF to PNG rasterizer using nanopdf and ThorVG backend
+// PDF to PNG rasterizer using nanopdf
+//
+// Backends:
+//   lightvg  — lightui VG software rasterizer (default, no external deps)
+//   thorvg   — ThorVG (requires nanopdf built with -DNANOPDF_USE_THORVG=ON)
 //
 // Usage: rasterize <input.pdf> <output.png> [options]
 //
 // Options:
+//   --backend <name>   Renderer: lightvg (default) or thorvg
 //   -p, --page <n>     Page number to render (default: 1)
 //   --pages <spec>     Page selection (e.g. 1-3,7,10-12)
 //   -w, --width <n>    Output width in pixels (default: 800)
@@ -28,11 +33,9 @@
 #include <iomanip>
 #include <sstream>
 #include <set>
+#include <memory>
 
-#ifdef NANOPDF_USE_THORVG
-#include "../../src/thorvg-backend.hh"
-#endif
-
+#include "../../src/render-backend.hh"
 #include "../../src/nanopdf.hh"
 #include "../../src/nanopdf-log.hh"
 
@@ -62,14 +65,16 @@ struct RasterizeOptions {
   bool render_all_pages = false;
   bool verbose = false;
   int log_level = 3;  // Default: Info
+  nanopdf::BackendKind backend = nanopdf::BackendKind::LightVG;
 };
 
 void print_usage(const char* program_name) {
-  std::cout << "PDF to PNG Rasterizer using nanopdf and ThorVG\n";
+  std::cout << "PDF to PNG Rasterizer using nanopdf\n";
   std::cout << "\n";
   std::cout << "Usage: " << program_name << " <input.pdf> <output.png> [options]\n";
   std::cout << "\n";
   std::cout << "Options:\n";
+  std::cout << "  --backend <name>   Renderer: lightvg (default) or thorvg\n";
   std::cout << "  -p, --page <n>     Page number to render (default: 1)\n";
   std::cout << "  --pages <spec>     Page selection (e.g. 1-3,7,10-12)\n";
   std::cout << "  -w, --width <n>    Output width in pixels (default: 800)\n";
@@ -161,6 +166,13 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
       options.log_level = std::atoi(argv[++i]);
       if (options.log_level < 0 || options.log_level > 5) {
         std::cerr << "Error: Log level must be 0-5\n";
+        return false;
+      }
+    } else if (arg == "--backend" && i + 1 < argc) {
+      std::string name = argv[++i];
+      if (!nanopdf::parse_backend_kind(name, &options.backend)) {
+        std::cerr << "Error: Unknown backend: " << name
+                  << " (expected: lightvg, thorvg)\n";
         return false;
       }
     } else if (arg == "--help") {
@@ -365,7 +377,6 @@ std::vector<uint8_t> rotate_pixels(const std::vector<uint8_t>& src,
 
 bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_num,
                 const RasterizeOptions& options, const std::string& output_file) {
-#ifdef NANOPDF_USE_THORVG
   // Get page dimensions from media_box [left, bottom, right, top]
   double page_width = 612.0;  // Default US Letter
   double page_height = 792.0;
@@ -406,15 +417,27 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     std::cout << "  Output dimensions: " << output_width << " x " << output_height << " px\n";
   }
 
-  // Initialize ThorVG backend
-  nanopdf::ThorVGBackend backend;
-  if (!backend.initialize(output_width, output_height)) {
-    std::cerr << "Error: Failed to initialize ThorVG backend\n";
+  // Create selected backend.
+  auto backend = nanopdf::make_backend(options.backend);
+  if (!backend) {
+    std::cerr << "Error: Backend '" << nanopdf::backend_kind_name(options.backend)
+              << "' is not compiled into this build of nanopdf.\n";
+    if (options.backend == nanopdf::BackendKind::ThorVG) {
+      std::cerr << "  Rebuild nanopdf with -DNANOPDF_USE_THORVG=ON to enable it.\n";
+    } else if (options.backend == nanopdf::BackendKind::LightVG) {
+      std::cerr << "  Rebuild nanopdf with -DNANOPDF_USE_LIGHTVG=ON to enable it.\n";
+    }
+    return false;
+  }
+
+  if (!backend->initialize(output_width, output_height)) {
+    std::cerr << "Error: Failed to initialize "
+              << nanopdf::backend_kind_name(options.backend) << " backend\n";
     return false;
   }
 
   if (options.verbose) {
-    backend.set_progress_callback(
+    backend->set_progress_callback(
         [page_num](const nanopdf::RenderProgressInfo& progress) {
           std::cout << "\r  Rendering page " << page_num << ": "
                     << std::setw(3) << progress.percent << "%" << std::flush;
@@ -423,15 +446,17 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
           }
         });
   } else {
-    backend.clear_progress_callback();
+    backend->clear_progress_callback();
   }
 
   // Render the page
   if (options.verbose) {
-    std::cout << "  Rendering page " << page_num << "...\n";
+    std::cout << "  Rendering page " << page_num
+              << " with backend '" << nanopdf::backend_kind_name(options.backend)
+              << "'...\n";
   }
 
-  auto result = backend.render_page(pdf, page);
+  auto result = backend->render_page(pdf, page);
   if (!result.success) {
     std::cerr << "Error: Failed to render page " << page_num << ": " << result.error << "\n";
     return false;
@@ -439,7 +464,7 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
 
   // Apply post-processing (rotation and/or grayscale) if needed
   if (options.rotation != 0 || options.grayscale) {
-    auto buffer = backend.get_buffer();
+    auto buffer = backend->get_buffer();
     if (buffer.pixels.empty()) {
       std::cerr << "Error: Failed to get render buffer\n";
       return false;
@@ -480,7 +505,7 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
   }
 
   // No post-processing needed, save directly
-  if (backend.save_to_png(output_file)) {
+  if (backend->save_to_png(output_file)) {
     if (options.verbose) {
       std::cout << "  Saved to: " << output_file << "\n";
     }
@@ -489,11 +514,6 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     std::cerr << "Error: Failed to save PNG file: " << output_file << "\n";
     return false;
   }
-
-#else
-  std::cerr << "Error: ThorVG support not enabled. Please rebuild nanopdf with -DNANOPDF_USE_THORVG=ON\n";
-  return false;
-#endif
 }
 
 int main(int argc, char* argv[]) {
@@ -508,15 +528,21 @@ int main(int argc, char* argv[]) {
   // Set log level from command line option
   nanopdf::log::set_log_level(static_cast<nanopdf::log::Level>(options.log_level));
 
-  // Check for ThorVG support
-#ifndef NANOPDF_USE_THORVG
-  std::cerr << "Error: This program requires ThorVG support.\n";
-  std::cerr << "Please rebuild nanopdf with -DNANOPDF_USE_THORVG=ON\n";
-  return 1;
-#endif
+  // Verify that the requested backend is compiled in.
+  if (!nanopdf::backend_available(options.backend)) {
+    std::cerr << "Error: Backend '" << nanopdf::backend_kind_name(options.backend)
+              << "' is not compiled into this build of nanopdf.\n";
+    if (options.backend == nanopdf::BackendKind::ThorVG) {
+      std::cerr << "  Rebuild nanopdf with -DNANOPDF_USE_THORVG=ON to enable it.\n";
+    } else if (options.backend == nanopdf::BackendKind::LightVG) {
+      std::cerr << "  Rebuild nanopdf with -DNANOPDF_USE_LIGHTVG=ON to enable it.\n";
+    }
+    return 1;
+  }
 
   if (options.verbose) {
-    std::cout << "PDF to PNG Rasterizer\n";
+    std::cout << "PDF to PNG Rasterizer (backend: "
+              << nanopdf::backend_kind_name(options.backend) << ")\n";
     std::cout << "Input: " << options.input_file << "\n";
     std::cout << "Output: " << options.output_file << "\n";
   }

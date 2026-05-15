@@ -1,0 +1,1108 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 - Present, Light Transport Entertainment Inc.
+
+#ifdef NANOPDF_USE_LIGHTVG
+
+#include "lvg-compat.hh"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+namespace lvg {
+
+namespace {
+
+// Pack an 0xAARRGGBB lui_color from straight RGBA.
+inline uint32_t pack_argb(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  return (static_cast<uint32_t>(a) << 24) |
+         (static_cast<uint32_t>(r) << 16) |
+         (static_cast<uint32_t>(g) << 8) |
+         static_cast<uint32_t>(b);
+}
+
+// Adaptive cubic Bezier flattening using midpoint subdivision. `depth` caps
+// recursion; the flatness test is the chordal distance of control points
+// from the chord.
+void flatten_cubic(float x0, float y0, float x1, float y1, float x2, float y2,
+                   float x3, float y3, std::vector<lui_pointf_t>& out,
+                   int depth = 0) {
+  // Flatness: max deviation of control points from line P0..P3.
+  float dx = x3 - x0;
+  float dy = y3 - y0;
+  float len2 = dx * dx + dy * dy;
+  float d1 = std::fabs((x1 - x0) * dy - (y1 - y0) * dx);
+  float d2 = std::fabs((x2 - x0) * dy - (y2 - y0) * dx);
+  float dev = (d1 + d2) * (d1 + d2);
+  // If the squared deviation is small relative to chord squared (~0.5 px),
+  // we're done.
+  if (depth >= 6 || dev <= 0.25f * len2 + 0.25f) {
+    out.push_back({x3, y3});
+    return;
+  }
+  float x01 = (x0 + x1) * 0.5f, y01 = (y0 + y1) * 0.5f;
+  float x12 = (x1 + x2) * 0.5f, y12 = (y1 + y2) * 0.5f;
+  float x23 = (x2 + x3) * 0.5f, y23 = (y2 + y3) * 0.5f;
+  float x012 = (x01 + x12) * 0.5f, y012 = (y01 + y12) * 0.5f;
+  float x123 = (x12 + x23) * 0.5f, y123 = (y12 + y23) * 0.5f;
+  float x0123 = (x012 + x123) * 0.5f, y0123 = (y012 + y123) * 0.5f;
+  flatten_cubic(x0, y0, x01, y01, x012, y012, x0123, y0123, out, depth + 1);
+  flatten_cubic(x0123, y0123, x123, y123, x23, y23, x3, y3, out, depth + 1);
+}
+
+// Convert a list of (cmd, point) into one-or-more closed contours, each a
+// run of polygon vertices in `out_contours`.
+struct Contour {
+  std::vector<lui_pointf_t> pts;
+};
+
+void flatten_path(const std::vector<PathCommand>& cmds,
+                  const std::vector<Point>& pts,
+                  std::vector<Contour>& out) {
+  Contour cur;
+  size_t pi = 0;
+  float lastx = 0, lasty = 0;
+  float startx = 0, starty = 0;
+  for (size_t ci = 0; ci < cmds.size(); ++ci) {
+    switch (cmds[ci]) {
+      case PathCommand::MoveTo: {
+        if (pi >= pts.size()) return;
+        if (!cur.pts.empty()) {
+          out.push_back(std::move(cur));
+          cur = Contour();
+        }
+        const Point& p = pts[pi++];
+        cur.pts.push_back({p.x, p.y});
+        lastx = startx = p.x;
+        lasty = starty = p.y;
+        break;
+      }
+      case PathCommand::LineTo: {
+        if (pi >= pts.size()) return;
+        const Point& p = pts[pi++];
+        cur.pts.push_back({p.x, p.y});
+        lastx = p.x;
+        lasty = p.y;
+        break;
+      }
+      case PathCommand::CubicTo: {
+        if (pi + 2 >= pts.size()) return;
+        const Point& c1 = pts[pi++];
+        const Point& c2 = pts[pi++];
+        const Point& p3 = pts[pi++];
+        flatten_cubic(lastx, lasty, c1.x, c1.y, c2.x, c2.y, p3.x, p3.y,
+                      cur.pts);
+        lastx = p3.x;
+        lasty = p3.y;
+        break;
+      }
+      case PathCommand::Close: {
+        if (!cur.pts.empty()) {
+          // Close the contour by appending the start point if not already
+          // there.
+          const lui_pointf_t& first = cur.pts.front();
+          const lui_pointf_t& last  = cur.pts.back();
+          if (first.x != last.x || first.y != last.y) {
+            cur.pts.push_back(first);
+          }
+          out.push_back(std::move(cur));
+          cur = Contour();
+        }
+        lastx = startx;
+        lasty = starty;
+        break;
+      }
+    }
+  }
+  if (!cur.pts.empty()) {
+    out.push_back(std::move(cur));
+  }
+}
+
+lui_fill_rule_t to_lui_fill_rule(FillRule r) {
+  return r == FillRule::EvenOdd ? LUI_FILL_RULE_EVENODD
+                                : LUI_FILL_RULE_NONZERO;
+}
+
+lui_line_cap_t to_lui_cap(StrokeCap c) {
+  switch (c) {
+    case StrokeCap::Round:  return LUI_LINE_CAP_ROUND;
+    case StrokeCap::Square: return LUI_LINE_CAP_SQUARE;
+    case StrokeCap::Butt:   default: return LUI_LINE_CAP_BUTT;
+  }
+}
+
+lui_line_join_t to_lui_join(StrokeJoin j) {
+  switch (j) {
+    case StrokeJoin::Round: return LUI_LINE_JOIN_ROUND;
+    case StrokeJoin::Bevel: return LUI_LINE_JOIN_BEVEL;
+    case StrokeJoin::Miter: default: return LUI_LINE_JOIN_MITER;
+  }
+}
+
+lui_canvas_blend_mode_t to_lui_blend(BlendMethod m) {
+  switch (m) {
+    case BlendMethod::Multiply:   return LUI_CANVAS_BLEND_MULTIPLY;
+    case BlendMethod::Screen:     return LUI_CANVAS_BLEND_SCREEN;
+    case BlendMethod::Overlay:    return LUI_CANVAS_BLEND_OVERLAY;
+    case BlendMethod::Darken:     return LUI_CANVAS_BLEND_DARKEN;
+    case BlendMethod::Lighten:    return LUI_CANVAS_BLEND_LIGHTEN;
+    case BlendMethod::Difference: return LUI_CANVAS_BLEND_DIFFERENCE;
+    case BlendMethod::Exclusion:  return LUI_CANVAS_BLEND_EXCLUSION;
+    case BlendMethod::Normal:
+    default:                      return LUI_CANVAS_BLEND_SRC_OVER;
+  }
+}
+
+bool blend_mode_supported(BlendMethod m) {
+  switch (m) {
+    case BlendMethod::Multiply:
+    case BlendMethod::Screen:
+    case BlendMethod::Overlay:
+    case BlendMethod::Darken:
+    case BlendMethod::Lighten:
+    case BlendMethod::Difference:
+    case BlendMethod::Exclusion:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Detect whether (cmds, pts) describe a single axis-aligned rectangle.
+// Returns true and fills out_x/y/w/h on success.
+bool detect_axis_aligned_rect(const std::vector<PathCommand>& cmds,
+                              const std::vector<Point>& pts,
+                              float& out_x, float& out_y,
+                              float& out_w, float& out_h) {
+  std::vector<Point> verts;
+  size_t pi = 0;
+  for (PathCommand c : cmds) {
+    switch (c) {
+      case PathCommand::MoveTo:
+        if (!verts.empty()) return false;  // multi-contour rejected
+        if (pi >= pts.size()) return false;
+        verts.push_back(pts[pi++]);
+        break;
+      case PathCommand::LineTo:
+        if (pi >= pts.size()) return false;
+        verts.push_back(pts[pi++]);
+        break;
+      case PathCommand::CubicTo:
+        return false;
+      case PathCommand::Close:
+        break;
+    }
+  }
+  if (verts.size() < 4) return false;
+  // Allow a redundant 5th vertex equal to the first (explicit close-as-line).
+  if (verts.size() == 5) {
+    if (verts[0].x != verts[4].x || verts[0].y != verts[4].y) return false;
+  } else if (verts.size() != 4) {
+    return false;
+  }
+  const Point& a = verts[0];
+  const Point& b = verts[1];
+  const Point& c = verts[2];
+  const Point& d = verts[3];
+  bool axisA = (a.y == b.y) && (b.x == c.x) && (c.y == d.y) && (d.x == a.x);
+  bool axisB = (a.x == b.x) && (b.y == c.y) && (c.x == d.x) && (d.y == a.y);
+  if (!axisA && !axisB) return false;
+  float minx = std::min({a.x, b.x, c.x, d.x});
+  float maxx = std::max({a.x, b.x, c.x, d.x});
+  float miny = std::min({a.y, b.y, c.y, d.y});
+  float maxy = std::max({a.y, b.y, c.y, d.y});
+  out_x = minx;
+  out_y = miny;
+  out_w = maxx - minx;
+  out_h = maxy - miny;
+  return out_w > 0 && out_h > 0;
+}
+
+// Translate an lvg gradient to a lui_canvas_gradient_t. Returns false on
+// empty/invalid input.
+bool build_lui_gradient(Paint* grad, lui_canvas_gradient_t& out,
+                        uint8_t opacity_mul) {
+  if (!grad) return false;
+  if (grad->kind() == Paint::kLinear) {
+    auto* lg = static_cast<LinearGradient*>(grad);
+    int count = std::min<int>(lg->stop_count(), LUI_CANVAS_GRADIENT_MAX_STOPS);
+    if (count == 0) return false;
+    out.type = LUI_CANVAS_GRADIENT_LINEAR;
+    out.x0 = lg->x1(); out.y0 = lg->y1();
+    out.x1 = lg->x2(); out.y1 = lg->y2();
+    out.cx = 0; out.cy = 0; out.r = 0;
+    out.stop_count = count;
+    for (int i = 0; i < count; ++i) {
+      const Fill::ColorStop& s = lg->stop_at(i);
+      uint8_t a = static_cast<uint8_t>((s.a * opacity_mul) / 255);
+      out.stops[i].position = s.offset;
+      out.stops[i].color    = pack_argb(s.r, s.g, s.b, a);
+    }
+    return true;
+  }
+  if (grad->kind() == Paint::kRadial) {
+    auto* rg = static_cast<RadialGradient*>(grad);
+    int count = std::min<int>(rg->stop_count(), LUI_CANVAS_GRADIENT_MAX_STOPS);
+    if (count == 0) return false;
+    out.type = LUI_CANVAS_GRADIENT_RADIAL;
+    out.cx = rg->cx(); out.cy = rg->cy(); out.r = rg->r();
+    out.x0 = 0; out.y0 = 0; out.x1 = 0; out.y1 = 0;
+    out.stop_count = count;
+    for (int i = 0; i < count; ++i) {
+      const Fill::ColorStop& s = rg->stop_at(i);
+      uint8_t a = static_cast<uint8_t>((s.a * opacity_mul) / 255);
+      out.stops[i].position = s.offset;
+      out.stops[i].color    = pack_argb(s.r, s.g, s.b, a);
+    }
+    return true;
+  }
+  return false;
+}
+
+// Rasterize an arbitrary path to an 8-bit alpha mask of `bbox_w` × `bbox_h`.
+// Path is translated so (bbox_x, bbox_y) becomes (0, 0) before rasterizing.
+std::vector<uint8_t> rasterize_path_to_mask(
+    const std::vector<PathCommand>& cmds, const std::vector<Point>& pts,
+    int bbox_x, int bbox_y, int bbox_w, int bbox_h, FillRule rule) {
+  std::vector<uint8_t> mask(static_cast<size_t>(bbox_w) * bbox_h, 0u);
+  if (bbox_w <= 0 || bbox_h <= 0) return mask;
+
+  std::vector<uint32_t> pixels(static_cast<size_t>(bbox_w) * bbox_h, 0u);
+  lui_surface_t s = lui_surface_wrap(pixels.data(), bbox_w, bbox_h, bbox_w);
+  lui_canvas_t  c;
+  lui_canvas_init(&c, &s);
+
+  std::vector<Contour> contours;
+  flatten_path(cmds, pts, contours);
+  for (Contour& contour : contours) {
+    if (contour.pts.size() < 3) continue;
+    for (lui_pointf_t& p : contour.pts) {
+      p.x -= static_cast<float>(bbox_x);
+      p.y -= static_cast<float>(bbox_y);
+    }
+    lui_canvas_fill_polygonf_ex(&c, contour.pts.data(),
+                                static_cast<int>(contour.pts.size()),
+                                0xFFFFFFFFu, to_lui_fill_rule(rule));
+  }
+  lui_canvas_destroy(&c);
+
+  // Extract alpha channel.
+  for (size_t i = 0; i < mask.size(); ++i) {
+    mask[i] = static_cast<uint8_t>((pixels[i] >> 24) & 0xff);
+  }
+  return mask;
+}
+
+}  // namespace
+
+// =========================================================================
+// Paint
+// =========================================================================
+void Paint::unref() { delete this; }
+
+Result Paint::clip(Shape* clipper) {
+  if (clipper_) delete clipper_;
+  clipper_ = clipper;
+  return Result::Success;
+}
+
+Result Paint::bounds(float* x, float* y, float* w, float* h,
+                     bool /*transformed*/) const {
+  if (kind() == kShape) {
+    static_cast<const Shape*>(this)->compute_bbox(x, y, w, h);
+    return Result::Success;
+  }
+  if (x) *x = 0;
+  if (y) *y = 0;
+  if (w) *w = 0;
+  if (h) *h = 0;
+  return Result::Success;
+}
+
+// =========================================================================
+// Shape
+// =========================================================================
+Shape* Shape::gen() { return new Shape(); }
+
+Shape::~Shape() {
+  if (fill_gradient_)   delete fill_gradient_;
+  if (stroke_gradient_) delete stroke_gradient_;
+  if (clipper_)         delete clipper_;
+}
+
+Result Shape::moveTo(float x, float y) {
+  cmds_.push_back(PathCommand::MoveTo);
+  pts_.push_back({x, y});
+  pen_ = {x, y};
+  return Result::Success;
+}
+
+Result Shape::lineTo(float x, float y) {
+  cmds_.push_back(PathCommand::LineTo);
+  pts_.push_back({x, y});
+  pen_ = {x, y};
+  return Result::Success;
+}
+
+Result Shape::cubicTo(float c1x, float c1y, float c2x, float c2y, float ex,
+                      float ey) {
+  cmds_.push_back(PathCommand::CubicTo);
+  pts_.push_back({c1x, c1y});
+  pts_.push_back({c2x, c2y});
+  pts_.push_back({ex, ey});
+  pen_ = {ex, ey};
+  return Result::Success;
+}
+
+Result Shape::close() {
+  cmds_.push_back(PathCommand::Close);
+  return Result::Success;
+}
+
+Result Shape::appendRect(float x, float y, float w, float h, float /*rx*/,
+                         float /*ry*/) {
+  moveTo(x, y);
+  lineTo(x + w, y);
+  lineTo(x + w, y + h);
+  lineTo(x, y + h);
+  close();
+  return Result::Success;
+}
+
+Result Shape::appendCircle(float cx, float cy, float rx, float ry) {
+  // Approximate an ellipse with 4 cubic Bezier segments (Kappa = 0.5522847).
+  constexpr float K = 0.5522847498307933f;
+  float kx = rx * K;
+  float ky = ry * K;
+  moveTo(cx, cy - ry);
+  cubicTo(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
+  cubicTo(cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
+  cubicTo(cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
+  cubicTo(cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
+  close();
+  return Result::Success;
+}
+
+Result Shape::appendPath(const PathCommand* cmds, uint32_t cmd_cnt,
+                         const Point* pts, uint32_t pt_cnt) {
+  cmds_.reserve(cmds_.size() + cmd_cnt);
+  for (uint32_t i = 0; i < cmd_cnt; ++i) cmds_.push_back(cmds[i]);
+  pts_.reserve(pts_.size() + pt_cnt);
+  for (uint32_t i = 0; i < pt_cnt; ++i) pts_.push_back(pts[i]);
+  return Result::Success;
+}
+
+Result Shape::fill(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  fill_r_ = r;
+  fill_g_ = g;
+  fill_b_ = b;
+  fill_a_ = a;
+  has_solid_fill_ = true;
+  if (fill_gradient_) {
+    delete fill_gradient_;
+    fill_gradient_ = nullptr;
+  }
+  return Result::Success;
+}
+
+Result Shape::fill(LinearGradient* g) {
+  if (fill_gradient_) delete fill_gradient_;
+  fill_gradient_ = g;
+  has_solid_fill_ = false;
+  return Result::Success;
+}
+
+Result Shape::fill(RadialGradient* g) {
+  if (fill_gradient_) delete fill_gradient_;
+  fill_gradient_ = g;
+  has_solid_fill_ = false;
+  return Result::Success;
+}
+
+Result Shape::strokeFill(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  stroke_r_ = r;
+  stroke_g_ = g;
+  stroke_b_ = b;
+  stroke_a_ = a;
+  has_stroke_color_ = true;
+  if (stroke_gradient_) {
+    delete stroke_gradient_;
+    stroke_gradient_ = nullptr;
+  }
+  return Result::Success;
+}
+
+Result Shape::strokeFill(LinearGradient* g) {
+  if (stroke_gradient_) delete stroke_gradient_;
+  stroke_gradient_ = g;
+  has_stroke_color_ = false;
+  return Result::Success;
+}
+
+Result Shape::strokeFill(RadialGradient* g) {
+  if (stroke_gradient_) delete stroke_gradient_;
+  stroke_gradient_ = g;
+  has_stroke_color_ = false;
+  return Result::Success;
+}
+
+Result Shape::strokeDash(const float* pattern, uint32_t count, float phase) {
+  stroke_dash_.assign(pattern, pattern + count);
+  stroke_dash_phase_ = phase;
+  return Result::Success;
+}
+
+void Shape::compute_bbox(float* x, float* y, float* w, float* h) const {
+  if (pts_.empty()) {
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (w) *w = 0;
+    if (h) *h = 0;
+    return;
+  }
+  float minx = std::numeric_limits<float>::infinity();
+  float maxx = -std::numeric_limits<float>::infinity();
+  float miny = minx;
+  float maxy = maxx;
+  for (const Point& p : pts_) {
+    if (p.x < minx) minx = p.x;
+    if (p.x > maxx) maxx = p.x;
+    if (p.y < miny) miny = p.y;
+    if (p.y > maxy) maxy = p.y;
+  }
+  if (x) *x = minx;
+  if (y) *y = miny;
+  if (w) *w = maxx - minx;
+  if (h) *h = maxy - miny;
+}
+
+void Shape::draw_on(lui_canvas_t* canvas) {
+  if (!canvas || cmds_.empty()) return;
+
+  // -- Set up clipping. Three modes:
+  //    0 = no clip change
+  //    1 = exact rect clip (clipper is an axis-aligned rectangle)
+  //    2 = mask-based clip (arbitrary clip path; rasterize to alpha mask,
+  //        snapshot dest, draw, composite back)
+  lui_rect_t saved_clip = lui_canvas_get_clip(canvas);
+  int clip_mode = 0;
+  lui_rect_t clip_bbox{0, 0, 0, 0};
+  if (clipper_) {
+    float crx, cry, crw, crh;
+    if (detect_axis_aligned_rect(clipper_->cmds_, clipper_->pts_, crx, cry,
+                                 crw, crh)) {
+      int x0 = std::max(static_cast<int>(std::floor(crx)), saved_clip.x);
+      int y0 = std::max(static_cast<int>(std::floor(cry)), saved_clip.y);
+      int x1 = std::min(static_cast<int>(std::ceil(crx + crw)),
+                        saved_clip.x + saved_clip.width);
+      int y1 = std::min(static_cast<int>(std::ceil(cry + crh)),
+                        saved_clip.y + saved_clip.height);
+      clip_bbox.x = x0;
+      clip_bbox.y = y0;
+      clip_bbox.width  = std::max(0, x1 - x0);
+      clip_bbox.height = std::max(0, y1 - y0);
+      if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
+      lui_canvas_set_clip(canvas, &clip_bbox);
+      clip_mode = 1;
+    } else {
+      float cx, cy, cw, ch;
+      clipper_->compute_bbox(&cx, &cy, &cw, &ch);
+      int x0 = std::max(static_cast<int>(std::floor(cx)), saved_clip.x);
+      int y0 = std::max(static_cast<int>(std::floor(cy)), saved_clip.y);
+      int x1 = std::min(static_cast<int>(std::ceil(cx + cw)),
+                        saved_clip.x + saved_clip.width);
+      int y1 = std::min(static_cast<int>(std::ceil(cy + ch)),
+                        saved_clip.y + saved_clip.height);
+      clip_bbox.x = x0;
+      clip_bbox.y = y0;
+      clip_bbox.width  = std::max(0, x1 - x0);
+      clip_bbox.height = std::max(0, y1 - y0);
+      if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
+      lui_canvas_set_clip(canvas, &clip_bbox);
+      clip_mode = 2;
+    }
+  }
+
+  // For mask-based clip: snapshot dest pixels, rasterize mask, draw normally,
+  // composite back at the end.
+  std::vector<uint32_t> snapshot;
+  std::vector<uint8_t>  mask;
+  if (clip_mode == 2) {
+    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    if (dst && dst->pixels) {
+      snapshot.resize(static_cast<size_t>(clip_bbox.width) * clip_bbox.height);
+      for (int y = 0; y < clip_bbox.height; ++y) {
+        const uint32_t* row = dst->pixels +
+            (clip_bbox.y + y) * dst->stride + clip_bbox.x;
+        std::memcpy(snapshot.data() + static_cast<size_t>(y) * clip_bbox.width,
+                    row, static_cast<size_t>(clip_bbox.width) * sizeof(uint32_t));
+      }
+    }
+    mask = rasterize_path_to_mask(clipper_->cmds_, clipper_->pts_,
+                                  clip_bbox.x, clip_bbox.y,
+                                  clip_bbox.width, clip_bbox.height,
+                                  FillRule::NonZero);
+  }
+
+  // -- Detect axis-aligned rect for the fast paths.
+  float rx, ry, rw, rh;
+  bool is_rect = detect_axis_aligned_rect(cmds_, pts_, rx, ry, rw, rh);
+
+  // -- Resolve fill state.
+  bool fill_active = (has_solid_fill_ && fill_a_ > 0) || fill_gradient_;
+  bool fill_handled = false;
+
+  if (fill_active && is_rect) {
+    int ix = static_cast<int>(std::floor(rx));
+    int iy = static_cast<int>(std::floor(ry));
+    int iw = static_cast<int>(std::ceil(rx + rw)) - ix;
+    int ih = static_cast<int>(std::ceil(ry + rh)) - iy;
+    if (iw > 0 && ih > 0) {
+      if (fill_gradient_) {
+        lui_canvas_gradient_t lg{};
+        if (build_lui_gradient(fill_gradient_, lg, opacity_)) {
+          lui_canvas_fill_rect_gradient(canvas, ix, iy, iw, ih, &lg);
+          fill_handled = true;
+        }
+      } else if (has_solid_fill_) {
+        uint8_t fa = fill_a_;
+        if (opacity_ < 255) fa = static_cast<uint8_t>((fa * opacity_) / 255);
+        if (fa > 0) {
+          uint32_t color = pack_argb(fill_r_, fill_g_, fill_b_, fa);
+          if (blend_mode_ != BlendMethod::Normal &&
+              blend_mode_supported(blend_mode_)) {
+            lui_canvas_fill_rect_blended(canvas, ix, iy, iw, ih, color,
+                                         to_lui_blend(blend_mode_));
+          } else {
+            lui_canvas_fill_rect(canvas, ix, iy, iw, ih, color);
+          }
+          fill_handled = true;
+        }
+      }
+    }
+  }
+
+  // -- Generic (non-rect) fill path: flatten + polygon fill.
+  std::vector<Contour> contours;  // shared by fill + stroke
+  bool contours_built = false;
+
+  if (fill_active && !fill_handled) {
+    flatten_path(cmds_, pts_, contours);
+    contours_built = true;
+
+    uint8_t fr, fg, fb, fa;
+    if (fill_gradient_) {
+      if (fill_gradient_->kind() == kLinear) {
+        static_cast<LinearGradient*>(fill_gradient_)->sample(0.5f, fr, fg, fb, fa);
+      } else {
+        static_cast<RadialGradient*>(fill_gradient_)->sample(0.5f, fr, fg, fb, fa);
+      }
+    } else {
+      fr = fill_r_; fg = fill_g_; fb = fill_b_; fa = fill_a_;
+    }
+    if (opacity_ < 255) fa = static_cast<uint8_t>((fa * opacity_) / 255);
+    if (fa > 0) {
+      uint32_t color = pack_argb(fr, fg, fb, fa);
+      for (const Contour& c : contours) {
+        if (c.pts.size() >= 3) {
+          lui_canvas_fill_polygonf_ex(canvas, c.pts.data(),
+                                      static_cast<int>(c.pts.size()), color,
+                                      to_lui_fill_rule(fill_rule_));
+        }
+      }
+    }
+  }
+
+  // -- Stroke.
+  if (has_stroke_ && (has_stroke_color_ || stroke_gradient_)) {
+    if (!contours_built) {
+      flatten_path(cmds_, pts_, contours);
+      contours_built = true;
+    }
+    uint8_t sr = stroke_r_, sg = stroke_g_, sb = stroke_b_, sa = stroke_a_;
+    if (stroke_gradient_) {
+      uint8_t r, g, b, a;
+      if (stroke_gradient_->kind() == kLinear) {
+        static_cast<LinearGradient*>(stroke_gradient_)->sample(0.5f, r, g, b, a);
+      } else {
+        static_cast<RadialGradient*>(stroke_gradient_)->sample(0.5f, r, g, b, a);
+      }
+      sr = r; sg = g; sb = b; sa = a;
+    }
+    if (opacity_ < 255) sa = static_cast<uint8_t>((sa * opacity_) / 255);
+    if (sa > 0) {
+      uint32_t color = pack_argb(sr, sg, sb, sa);
+      for (const Contour& c : contours) {
+        if (c.pts.size() < 2) continue;
+        bool closed = false;
+        if (c.pts.size() >= 3) {
+          const lui_pointf_t& f = c.pts.front();
+          const lui_pointf_t& l = c.pts.back();
+          closed = (f.x == l.x && f.y == l.y);
+        }
+        lui_canvas_draw_styled_polyline(
+            canvas, c.pts.data(), static_cast<int>(c.pts.size()), color,
+            stroke_width_ > 0.5f ? stroke_width_ : 0.5f, closed,
+            to_lui_cap(stroke_cap_), to_lui_join(stroke_join_));
+      }
+    }
+  }
+
+  // -- Mask-based clip: composite drawn pixels with snapshot via mask.
+  if (clip_mode == 2 && !mask.empty() && !snapshot.empty()) {
+    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    if (dst && dst->pixels) {
+      for (int y = 0; y < clip_bbox.height; ++y) {
+        uint32_t* dst_row = dst->pixels +
+            (clip_bbox.y + y) * dst->stride + clip_bbox.x;
+        const uint32_t* snap_row = snapshot.data() +
+            static_cast<size_t>(y) * clip_bbox.width;
+        const uint8_t*  mask_row = mask.data() +
+            static_cast<size_t>(y) * clip_bbox.width;
+        for (int x = 0; x < clip_bbox.width; ++x) {
+          uint8_t m = mask_row[x];
+          if (m == 255) continue;
+          if (m == 0) {
+            dst_row[x] = snap_row[x];
+            continue;
+          }
+          uint32_t snap = snap_row[x];
+          uint32_t curr = dst_row[x];
+          uint16_t inv = static_cast<uint16_t>(255 - m);
+          uint8_t sa = static_cast<uint8_t>((snap >> 24) & 0xff);
+          uint8_t sr = static_cast<uint8_t>((snap >> 16) & 0xff);
+          uint8_t sg = static_cast<uint8_t>((snap >> 8) & 0xff);
+          uint8_t sb = static_cast<uint8_t>(snap & 0xff);
+          uint8_t ca = static_cast<uint8_t>((curr >> 24) & 0xff);
+          uint8_t cr = static_cast<uint8_t>((curr >> 16) & 0xff);
+          uint8_t cg = static_cast<uint8_t>((curr >> 8) & 0xff);
+          uint8_t cb = static_cast<uint8_t>(curr & 0xff);
+          uint8_t oa = static_cast<uint8_t>((ca * m + sa * inv) / 255);
+          uint8_t orr = static_cast<uint8_t>((cr * m + sr * inv) / 255);
+          uint8_t og = static_cast<uint8_t>((cg * m + sg * inv) / 255);
+          uint8_t ob = static_cast<uint8_t>((cb * m + sb * inv) / 255);
+          dst_row[x] = pack_argb(orr, og, ob, oa);
+        }
+      }
+    }
+  }
+
+  if (clip_mode != 0) {
+    lui_canvas_set_clip(canvas, &saved_clip);
+  }
+}
+
+// =========================================================================
+// Picture
+// =========================================================================
+Picture* Picture::gen() { return new Picture(); }
+Picture::~Picture() {
+  if (clipper_) delete clipper_;
+}
+
+Result Picture::load(uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs,
+                     bool premultiplied) {
+  if (!data || w == 0 || h == 0) return Result::InvalidArguments;
+  width_  = w;
+  height_ = h;
+  pixels_.resize(static_cast<size_t>(w) * h);
+
+  // Convert source to lui_canvas's expected ARGB-packed
+  // (0xAARRGGBB straight) layout.
+  for (uint32_t i = 0; i < w * h; ++i) {
+    uint32_t p = data[i];
+    uint8_t a, r, g, b;
+    switch (cs) {
+      case ColorSpace::ABGR8888:
+      case ColorSpace::ABGR8888S:
+        // ABGR8888 packs A,B,G,R in nibbles 31..0:
+        //   A = bits 31..24, B = 23..16, G = 15..8, R = 7..0
+        a = static_cast<uint8_t>((p >> 24) & 0xff);
+        b = static_cast<uint8_t>((p >> 16) & 0xff);
+        g = static_cast<uint8_t>((p >> 8) & 0xff);
+        r = static_cast<uint8_t>(p & 0xff);
+        break;
+      case ColorSpace::ARGB8888:
+      case ColorSpace::ARGB8888S:
+      default:
+        a = static_cast<uint8_t>((p >> 24) & 0xff);
+        r = static_cast<uint8_t>((p >> 16) & 0xff);
+        g = static_cast<uint8_t>((p >> 8) & 0xff);
+        b = static_cast<uint8_t>(p & 0xff);
+        break;
+    }
+    // Undo pre-multiplication.
+    if (premultiplied && a > 0 && a < 255) {
+      r = static_cast<uint8_t>(std::min(255, (r * 255) / a));
+      g = static_cast<uint8_t>(std::min(255, (g * 255) / a));
+      b = static_cast<uint8_t>(std::min(255, (b * 255) / a));
+    }
+    pixels_[i] = pack_argb(r, g, b, a);
+  }
+  return Result::Success;
+}
+
+Result Picture::transform(const Matrix& m) {
+  transform_ = m;
+  return Result::Success;
+}
+
+Result Picture::translate(float x, float y) {
+  transform_.e13 += x;
+  transform_.e23 += y;
+  return Result::Success;
+}
+
+void Picture::draw_on(lui_canvas_t* canvas) {
+  if (!canvas || pixels_.empty() || width_ == 0 || height_ == 0) return;
+
+  // Axis-aligned scale + translate? Use fast path through lui_canvas.
+  if (std::fabs(transform_.e12) < 1e-4f &&
+      std::fabs(transform_.e21) < 1e-4f) {
+    lui_surface_t src = lui_surface_wrap(pixels_.data(),
+                                         static_cast<int>(width_),
+                                         static_cast<int>(height_),
+                                         static_cast<int>(width_));
+    float sx = transform_.e11;
+    float sy = transform_.e22;
+    int dst_w = static_cast<int>(std::round(std::fabs(sx) * width_));
+    int dst_h = static_cast<int>(std::round(std::fabs(sy) * height_));
+    if (dst_w <= 0 || dst_h <= 0) return;
+    int dst_x = static_cast<int>(std::round(transform_.e13));
+    int dst_y = static_cast<int>(std::round(transform_.e23));
+    if (sx < 0) dst_x -= dst_w;
+    if (sy < 0) dst_y -= dst_h;
+    lui_canvas_draw_image(canvas, dst_x, dst_y, dst_w, dst_h, &src, nullptr,
+                          LUI_IMAGE_FILTER_BILINEAR);
+    return;
+  }
+
+  // Rotation/shear: per-pixel inverse transform sample.
+  draw_transformed(canvas);
+}
+
+void Picture::draw_transformed(lui_canvas_t* canvas) {
+  // Compute inverse of the 2x2 transform part.
+  const Matrix& m = transform_;
+  float det = m.e11 * m.e22 - m.e12 * m.e21;
+  if (std::fabs(det) < 1e-8f) return;
+  float inv_det = 1.0f / det;
+  float i11 =  m.e22 * inv_det;
+  float i12 = -m.e12 * inv_det;
+  float i21 = -m.e21 * inv_det;
+  float i22 =  m.e11 * inv_det;
+
+  // Output bbox by transforming the four source corners.
+  float sw = static_cast<float>(width_);
+  float sh = static_cast<float>(height_);
+  auto fwd_x = [&](float u, float v) { return m.e11 * u + m.e12 * v + m.e13; };
+  auto fwd_y = [&](float u, float v) { return m.e21 * u + m.e22 * v + m.e23; };
+  float xs[4] = {fwd_x(0, 0), fwd_x(sw, 0), fwd_x(sw, sh), fwd_x(0, sh)};
+  float ys[4] = {fwd_y(0, 0), fwd_y(sw, 0), fwd_y(sw, sh), fwd_y(0, sh)};
+  float minx = std::min({xs[0], xs[1], xs[2], xs[3]});
+  float maxx = std::max({xs[0], xs[1], xs[2], xs[3]});
+  float miny = std::min({ys[0], ys[1], ys[2], ys[3]});
+  float maxy = std::max({ys[0], ys[1], ys[2], ys[3]});
+
+  // Clip to canvas clip rect.
+  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  int ix0 = std::max(static_cast<int>(std::floor(minx)), clip.x);
+  int iy0 = std::max(static_cast<int>(std::floor(miny)), clip.y);
+  int ix1 = std::min(static_cast<int>(std::ceil(maxx)),  clip.x + clip.width);
+  int iy1 = std::min(static_cast<int>(std::ceil(maxy)),  clip.y + clip.height);
+  if (ix0 >= ix1 || iy0 >= iy1) return;
+
+  lui_surface_t* dst = lui_canvas_get_surface(canvas);
+  if (!dst || !dst->pixels) return;
+
+  int sw_int = static_cast<int>(width_);
+  int sh_int = static_cast<int>(height_);
+
+  for (int py = iy0; py < iy1; ++py) {
+    uint32_t* dst_row = dst->pixels + py * dst->stride;
+    for (int px = ix0; px < ix1; ++px) {
+      // Sample at the pixel centre.
+      float ox = (px + 0.5f) - m.e13;
+      float oy = (py + 0.5f) - m.e23;
+      float u = i11 * ox + i12 * oy;
+      float v = i21 * ox + i22 * oy;
+      if (u < 0.0f || u >= sw || v < 0.0f || v >= sh) continue;
+
+      int u0 = static_cast<int>(std::floor(u));
+      int v0 = static_cast<int>(std::floor(v));
+      float fu = u - u0;
+      float fv = v - v0;
+      int u1 = std::min(u0 + 1, sw_int - 1);
+      int v1 = std::min(v0 + 1, sh_int - 1);
+      if (u0 < 0) u0 = 0;
+      if (v0 < 0) v0 = 0;
+
+      auto idx = [&](int x, int y) {
+        return static_cast<size_t>(y) * sw_int + x;
+      };
+      uint32_t p00 = pixels_[idx(u0, v0)];
+      uint32_t p10 = pixels_[idx(u1, v0)];
+      uint32_t p01 = pixels_[idx(u0, v1)];
+      uint32_t p11 = pixels_[idx(u1, v1)];
+
+      auto comp = [&](int shift) -> uint8_t {
+        float c00 = static_cast<float>((p00 >> shift) & 0xff);
+        float c10 = static_cast<float>((p10 >> shift) & 0xff);
+        float c01 = static_cast<float>((p01 >> shift) & 0xff);
+        float c11 = static_cast<float>((p11 >> shift) & 0xff);
+        float c0 = c00 * (1.0f - fu) + c10 * fu;
+        float c1 = c01 * (1.0f - fu) + c11 * fu;
+        float c  = c0 * (1.0f - fv) + c1 * fv;
+        return static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, c + 0.5f)));
+      };
+
+      uint8_t sa = comp(24);
+      if (sa == 0) continue;
+      uint8_t sr = comp(16);
+      uint8_t sg = comp(8);
+      uint8_t sb = comp(0);
+
+      // SRC_OVER composite onto dst pixel.
+      uint32_t cur = dst_row[px];
+      uint8_t da = static_cast<uint8_t>((cur >> 24) & 0xff);
+      uint8_t dr = static_cast<uint8_t>((cur >> 16) & 0xff);
+      uint8_t dg = static_cast<uint8_t>((cur >> 8) & 0xff);
+      uint8_t db = static_cast<uint8_t>(cur & 0xff);
+      uint16_t inv_sa = static_cast<uint16_t>(255 - sa);
+      uint8_t oa = static_cast<uint8_t>(sa + (da * inv_sa) / 255);
+      uint8_t orr = static_cast<uint8_t>((sr * sa + dr * inv_sa) / 255);
+      uint8_t og = static_cast<uint8_t>((sg * sa + dg * inv_sa) / 255);
+      uint8_t ob = static_cast<uint8_t>((sb * sa + db * inv_sa) / 255);
+      dst_row[px] = pack_argb(orr, og, ob, oa);
+    }
+  }
+}
+
+// =========================================================================
+// LinearGradient / RadialGradient
+// =========================================================================
+LinearGradient* LinearGradient::gen() { return new LinearGradient(); }
+
+Result LinearGradient::colorStops(const Fill::ColorStop* stops,
+                                  uint32_t count) {
+  stops_.assign(stops, stops + count);
+  return Result::Success;
+}
+
+void LinearGradient::sample(float t, uint8_t& r, uint8_t& g, uint8_t& b,
+                            uint8_t& a) const {
+  if (stops_.empty()) {
+    r = g = b = 0;
+    a = 0;
+    return;
+  }
+  if (t <= stops_.front().offset) {
+    r = stops_.front().r;
+    g = stops_.front().g;
+    b = stops_.front().b;
+    a = stops_.front().a;
+    return;
+  }
+  if (t >= stops_.back().offset) {
+    r = stops_.back().r;
+    g = stops_.back().g;
+    b = stops_.back().b;
+    a = stops_.back().a;
+    return;
+  }
+  for (size_t i = 1; i < stops_.size(); ++i) {
+    if (t <= stops_[i].offset) {
+      float t0 = stops_[i - 1].offset;
+      float t1 = stops_[i].offset;
+      float u  = (t - t0) / std::max(1e-6f, t1 - t0);
+      r = static_cast<uint8_t>(stops_[i - 1].r + u * (stops_[i].r - stops_[i - 1].r));
+      g = static_cast<uint8_t>(stops_[i - 1].g + u * (stops_[i].g - stops_[i - 1].g));
+      b = static_cast<uint8_t>(stops_[i - 1].b + u * (stops_[i].b - stops_[i - 1].b));
+      a = static_cast<uint8_t>(stops_[i - 1].a + u * (stops_[i].a - stops_[i - 1].a));
+      return;
+    }
+  }
+  r = stops_.back().r;
+  g = stops_.back().g;
+  b = stops_.back().b;
+  a = stops_.back().a;
+}
+
+RadialGradient* RadialGradient::gen() { return new RadialGradient(); }
+
+Result RadialGradient::radial(float cx, float cy, float r, float /*fx*/,
+                              float /*fy*/, float /*fr*/) {
+  cx_ = cx;
+  cy_ = cy;
+  r_  = r;
+  return Result::Success;
+}
+
+Result RadialGradient::colorStops(const Fill::ColorStop* stops,
+                                  uint32_t count) {
+  stops_.assign(stops, stops + count);
+  return Result::Success;
+}
+
+void RadialGradient::sample(float t, uint8_t& r, uint8_t& g, uint8_t& b,
+                            uint8_t& a) const {
+  // Same logic as linear (already factored on offset).
+  if (stops_.empty()) {
+    r = g = b = 0;
+    a = 0;
+    return;
+  }
+  if (t <= stops_.front().offset) {
+    r = stops_.front().r;
+    g = stops_.front().g;
+    b = stops_.front().b;
+    a = stops_.front().a;
+    return;
+  }
+  if (t >= stops_.back().offset) {
+    r = stops_.back().r;
+    g = stops_.back().g;
+    b = stops_.back().b;
+    a = stops_.back().a;
+    return;
+  }
+  for (size_t i = 1; i < stops_.size(); ++i) {
+    if (t <= stops_[i].offset) {
+      float t0 = stops_[i - 1].offset;
+      float t1 = stops_[i].offset;
+      float u  = (t - t0) / std::max(1e-6f, t1 - t0);
+      r = static_cast<uint8_t>(stops_[i - 1].r + u * (stops_[i].r - stops_[i - 1].r));
+      g = static_cast<uint8_t>(stops_[i - 1].g + u * (stops_[i].g - stops_[i - 1].g));
+      b = static_cast<uint8_t>(stops_[i - 1].b + u * (stops_[i].b - stops_[i - 1].b));
+      a = static_cast<uint8_t>(stops_[i - 1].a + u * (stops_[i].a - stops_[i - 1].a));
+      return;
+    }
+  }
+  r = stops_.back().r;
+  g = stops_.back().g;
+  b = stops_.back().b;
+  a = stops_.back().a;
+}
+
+// =========================================================================
+// Scene
+// =========================================================================
+Scene* Scene::gen() { return new Scene(); }
+
+Scene::~Scene() {
+  for (Paint* p : paints_) delete p;
+}
+
+Result Scene::add(Paint* p) {
+  if (!p) return Result::InvalidArguments;
+  paints_.push_back(p);
+  return Result::Success;
+}
+
+void Scene::clear() {
+  for (Paint* p : paints_) delete p;
+  paints_.clear();
+}
+
+void Scene::draw_on(lui_canvas_t* canvas) {
+  if (!canvas) return;
+  // Apply scene-level clip (bbox of clipper) the same way Shape does.
+  lui_rect_t saved_clip = lui_canvas_get_clip(canvas);
+  bool clip_changed = false;
+  if (clipper_) {
+    float cx, cy, cw, ch;
+    clipper_->compute_bbox(&cx, &cy, &cw, &ch);
+    int x0 = std::max(static_cast<int>(std::floor(cx)), saved_clip.x);
+    int y0 = std::max(static_cast<int>(std::floor(cy)), saved_clip.y);
+    int x1 = std::min(static_cast<int>(std::ceil(cx + cw)),
+                      saved_clip.x + saved_clip.width);
+    int y1 = std::min(static_cast<int>(std::ceil(cy + ch)),
+                      saved_clip.y + saved_clip.height);
+    lui_rect_t cr;
+    cr.x = x0;
+    cr.y = y0;
+    cr.width  = std::max(0, x1 - x0);
+    cr.height = std::max(0, y1 - y0);
+    lui_canvas_set_clip(canvas, &cr);
+    clip_changed = true;
+  }
+  for (Paint* p : paints_) p->draw_on(canvas);
+  if (clip_changed) {
+    lui_canvas_set_clip(canvas, &saved_clip);
+  }
+}
+
+// =========================================================================
+// SwCanvas
+// =========================================================================
+SwCanvas* SwCanvas::gen() { return new SwCanvas(); }
+
+SwCanvas::~SwCanvas() {
+  for (Paint* p : paints_) delete p;
+  if (have_canvas_) {
+    lui_canvas_destroy(&canvas_);
+  }
+}
+
+Result SwCanvas::target(uint32_t* buffer, uint32_t stride, uint32_t width,
+                        uint32_t height, ColorSpace cs) {
+  if (!buffer || width == 0 || height == 0) {
+    return Result::InvalidArguments;
+  }
+  if (have_canvas_) {
+    lui_canvas_destroy(&canvas_);
+    have_canvas_ = false;
+  }
+  surface_ = lui_surface_wrap(buffer, static_cast<int>(width),
+                              static_cast<int>(height),
+                              static_cast<int>(stride));
+  lui_canvas_init(&canvas_, &surface_);
+  have_canvas_ = true;
+  cs_ = cs;
+  return Result::Success;
+}
+
+Result SwCanvas::add(Paint* p) {
+  if (!p) return Result::InvalidArguments;
+  paints_.push_back(p);
+  return Result::Success;
+}
+
+Result SwCanvas::draw(bool clear_first) {
+  if (!have_canvas_) return Result::InsufficientCondition;
+  if (clear_first) {
+    // Transparent black; the caller (backend) fills its own background.
+    lui_canvas_clear(&canvas_, 0u);
+  }
+  for (Paint* p : paints_) p->draw_on(&canvas_);
+
+  // After draw, swizzle the surface in-place if the requested colorspace
+  // expects ABGR byte order (R,G,B,A in memory) — lui_canvas writes ARGB
+  // (B,G,R,A in memory). PDF backends pass ABGR8888 and read pixels back
+  // expecting R,G,B,A byte order; swap R and B per pixel.
+  if (cs_ == ColorSpace::ABGR8888 || cs_ == ColorSpace::ABGR8888S) {
+    uint32_t* pix = surface_.pixels;
+    int n = surface_.height * surface_.stride;
+    for (int i = 0; i < n; ++i) {
+      uint32_t p = pix[i];
+      uint8_t a = static_cast<uint8_t>((p >> 24) & 0xff);
+      uint8_t r = static_cast<uint8_t>((p >> 16) & 0xff);
+      uint8_t g = static_cast<uint8_t>((p >> 8) & 0xff);
+      uint8_t b = static_cast<uint8_t>(p & 0xff);
+      // Repack as 0xAA BB GG RR (ABGR8888 word).
+      pix[i] = (static_cast<uint32_t>(a) << 24) |
+               (static_cast<uint32_t>(b) << 16) |
+               (static_cast<uint32_t>(g) << 8) |
+               static_cast<uint32_t>(r);
+    }
+  }
+  return Result::Success;
+}
+
+Result SwCanvas::sync() { return Result::Success; }
+
+}  // namespace lvg
+
+#endif  // NANOPDF_USE_LIGHTVG

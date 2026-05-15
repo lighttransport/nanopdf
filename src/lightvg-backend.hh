@@ -3,9 +3,9 @@
 
 #pragma once
 
-#ifdef NANOPDF_USE_THORVG
+#ifdef NANOPDF_USE_LIGHTVG
 
-#include <thorvg.h>
+#include "lvg-compat.hh"
 #include <memory>
 #include <vector>
 #include <string>
@@ -39,25 +39,25 @@ namespace nanopdf {
 
 // Backwards-compat aliases: legacy callers use these names, the actual
 // type lives in render-backend.hh now.
-using ThorVGRenderResult  = RenderResult;
-using ThorVGRenderOptions = RenderOptions;
+using LightVGRenderResult  = RenderResult;
+using LightVGRenderOptions = RenderOptions;
 
-class ThorVGBackend : public RenderBackend {
+class LightVGBackend : public RenderBackend {
 public:
-  ThorVGBackend();
-  ~ThorVGBackend() override;
+  LightVGBackend();
+  ~LightVGBackend() override;
 
   // Initialize ThorVG with given canvas size
   bool initialize(uint32_t width, uint32_t height) override;
 
   // Render a PDF page
-  ThorVGRenderResult render_page(const Pdf& pdf, const Page& page) override;
+  LightVGRenderResult render_page(const Pdf& pdf, const Page& page) override;
   void set_progress_callback(RenderProgressCallback callback,
                              size_t object_threshold = 100,
                              uint32_t percent_step = 1) override;
   void clear_progress_callback() override;
 
-  BackendKind kind() const override { return BackendKind::ThorVG; }
+  BackendKind kind() const override { return BackendKind::LightVG; }
 
   // Direct drawing API for testing
   bool begin_scene();
@@ -68,7 +68,7 @@ public:
                       uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
   bool draw_circle(float cx, float cy, float radius,
                   uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
-  bool draw_path(const std::vector<tvg::PathCommand>& cmds, const std::vector<tvg::Point>& pts,
+  bool draw_path(const std::vector<lvg::PathCommand>& cmds, const std::vector<lvg::Point>& pts,
                 uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
 
   // Text drawing (basic support)
@@ -80,18 +80,18 @@ public:
                 uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
 
   // Get rendered buffer
-  ThorVGRenderResult get_buffer() override;
+  LightVGRenderResult get_buffer() override;
 
   // Save to PNG file
   bool save_to_png(const std::string& filename) override;
 
   // Save to file with options
   bool save_to_file(const std::string& filename,
-                    const ThorVGRenderOptions& options = ThorVGRenderOptions()) override;
+                    const LightVGRenderOptions& options = LightVGRenderOptions()) override;
 
   // Render page with options (handles DPI scaling)
-  ThorVGRenderResult render_page(const Pdf& pdf, const Page& page,
-                                 const ThorVGRenderOptions& options) override;
+  LightVGRenderResult render_page(const Pdf& pdf, const Page& page,
+                                 const LightVGRenderOptions& options) override;
 
 private:
   // Parse PDF content stream and convert to ThorVG shapes
@@ -139,14 +139,14 @@ private:
 
     bool in_text_block{false};
     bool in_path{false};
-    std::vector<tvg::PathCommand> path_commands;
-    std::vector<tvg::Point> path_points;
+    std::vector<lvg::PathCommand> path_commands;
+    std::vector<lvg::Point> path_points;
 
     // Clipping path state
     bool has_clip{false};
     bool clip_even_odd{false};  // true for W* (even-odd), false for W (non-zero)
-    std::vector<tvg::PathCommand> clip_commands;
-    std::vector<tvg::Point> clip_points;
+    std::vector<lvg::PathCommand> clip_commands;
+    std::vector<lvg::Point> clip_points;
 
     // Page coordinate system info (set by render_page)
     float page_width{612.0f};
@@ -163,8 +163,8 @@ private:
 
     // Text clipping path (accumulated during text block for modes 4-7)
     bool text_clip_active{false};    // True when accumulating text for clipping
-    std::vector<tvg::PathCommand> text_clip_commands;
-    std::vector<tvg::Point> text_clip_points;
+    std::vector<lvg::PathCommand> text_clip_commands;
+    std::vector<lvg::Point> text_clip_points;
 
     // Transformation matrix [a b c d e f]
     // Maps (x, y) -> (ax + cy + e, bx + dy + f)
@@ -297,17 +297,17 @@ private:
   bool draw_shading(const std::string& shading_name);
 
   // Apply pattern fill to a shape
-  bool apply_pattern_fill(tvg::Shape* shape, const std::string& pattern_name, bool is_stroke);
+  bool apply_pattern_fill(lvg::Shape* shape, const std::string& pattern_name, bool is_stroke);
 
   // Apply tiling pattern fill
-  bool apply_tiling_pattern(tvg::Shape* shape, const TilingPattern* tiling,
+  bool apply_tiling_pattern(lvg::Shape* shape, const TilingPattern* tiling,
                             const std::vector<double>& matrix, bool is_stroke);
 
   // Apply clipping path and push shape to scene
-  bool push_with_clip(tvg::Shape* shape);
+  bool push_with_clip(lvg::Shape* shape);
 
   // Apply soft mask opacity to a paint object (shape or picture)
-  void apply_soft_mask_opacity(tvg::Paint* paint);
+  void apply_soft_mask_opacity(lvg::Paint* paint);
 
   // Parse and render inline image (BI/ID/EI operators)
   bool parse_inline_image(const std::string& content, size_t& pos);
@@ -345,8 +345,8 @@ private:
     uint32_t percent_step{1};
   };
 
-  tvg::SwCanvas* canvas_{nullptr};
-  tvg::Scene* scene_{nullptr};
+  lvg::SwCanvas* canvas_{nullptr};
+  lvg::Scene* scene_{nullptr};
   std::vector<uint32_t> buffer_;
   uint32_t width_{0};
   uint32_t height_{0};
@@ -386,4 +386,4 @@ private:
 
 }  // namespace nanopdf
 
-#endif // NANOPDF_USE_THORVG
+#endif // NANOPDF_USE_LIGHTVG

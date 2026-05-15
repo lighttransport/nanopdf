@@ -12,6 +12,7 @@ option(NANOPDF_USE_NANOSTL "Use nanostl." OFF)
 option(NANOPDF_USE_STB_TRUETYPE "Use stb_truetype to load fonts." ON)
 option(NANOPDF_BUILD_TESTS "Build test executables" ${BUILD_TESTING})
 option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
+option(NANOPDF_USE_LIGHTVG "Use lightui VG software rasterizer (default backend)" ON)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
@@ -174,6 +175,23 @@ set(NANOPDF_SOURCES
   # Font provider (runtime font registration)
   src/font-provider.cc
 )
+
+# Always-on render-backend abstraction (factory + parse helpers).
+list(APPEND NANOPDF_SOURCES src/render-backend.cc)
+
+if(NANOPDF_USE_LIGHTVG)
+  # scene.c depends on lightui/layer.h + dirty.h (UI-side compositor); not
+  # needed for raster output, so we skip it. nanopdf only uses lui_canvas
+  # directly.
+  list(APPEND NANOPDF_SOURCES
+    src/lightvg-backend.cc
+    src/lvg-compat.cc
+    src/third_party/lightui_vg/src/canvas.c
+    src/third_party/lightui_vg/src/surface.c
+    src/third_party/lightui_vg/src/backend_registry.c
+    src/third_party/lightui_vg/src/internal/lui_log.c
+  )
+endif()
 
 if(NANOPDF_USE_THORVG)
   list(APPEND NANOPDF_SOURCES src/thorvg-backend.cc)
@@ -348,6 +366,15 @@ endif ()
 
 if (NANOPDF_USE_STB_TRUETYPE)
   target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_STB_TRUETYPE")
+endif ()
+
+if (NANOPDF_USE_LIGHTVG)
+  target_include_directories(${BUILD_TARGET} PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightui_vg/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightui_vg/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightui_vg/src/internal
+  )
+  target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_LIGHTVG")
 endif ()
 
 if (NANOPDF_USE_THORVG)
