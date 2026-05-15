@@ -76,7 +76,7 @@ are intercepted by an `lvg::` shim (`src/lvg-compat.{hh,cc}`) that emits to
 | Solid axis-aligned rect fills    | `lui_canvas_fill_rect`                                    |
 | Stroked paths (cap, join, miter) | `lui_canvas_draw_styled_polyline`                         |
 | Gradient fills on rects          | `lui_canvas_fill_rect_gradient` (linear + radial)         |
-| Gradient fills on polygons       | Mid-stop sample (degraded — no polygon-gradient prim)     |
+| Gradient fills on polygons       | Per-pixel sample via `fill_polygon_with_source` template  |
 | Gradient strokes                 | Mid-stop sample (degraded)                                |
 | Image blits (scale + translate)  | `lui_canvas_draw_image` with bilinear filter              |
 | Image rotation / shear           | Per-pixel inverse-transform sample with bilinear + SRC_OVER |
@@ -84,19 +84,13 @@ are intercepted by an `lvg::` shim (`src/lvg-compat.{hh,cc}`) that emits to
 | Rectangle clipping (W on rect)   | `lui_canvas_set_clip` (exact)                             |
 | Vector clipping (W on path)      | Alpha-mask compositing: rasterize clip path to mask, snapshot dest, draw, lerp back |
 | Blend mode on axis-aligned rect  | `lui_canvas_fill_rect_blended` (Multiply, Screen, Overlay, Darken, Lighten, Difference, Exclusion) |
-| Blend mode on non-rect shapes    | Falls back to SRC_OVER                                    |
+| Blend mode on non-rect shapes    | Per-pixel via `composite_pixel` — all 11 separable + 4 HSL (Hue, Saturation, Color, Luminosity) |
 
 ### Known gaps
 
-1. **Polygon gradient fills** — lui_canvas has no polygon-gradient primitive.
-   PDF axial/radial shadings on rectangular regions render correctly; on
-   arbitrary shapes the gradient degrades to its mid-stop colour.
-2. **Blend modes on non-rect shapes** — `lui_canvas_fill_rect_blended` is
-   rectangle-only. Non-Normal blend modes on circles / arbitrary paths fall
-   back to SRC_OVER.
-3. **PDF-specific blend modes** — ColorDodge, ColorBurn, HardLight,
-   SoftLight, Hue, Saturation, Color, Luminosity have no lui_canvas
-   counterpart; they degrade to SRC_OVER.
-4. **Per-pixel soft masks** — opacity is multiplied through correctly, but
-   the per-pixel mask sampling that varies opacity across a paint isn't
-   wired through `lui_canvas`.
+1. **Gradient strokes** — gradient-on-stroke degrades to its mid-stop
+   colour. The polygon-fill custom-source path doesn't have a stroke
+   analogue yet.
+2. **Per-pixel soft masks** — opacity is sampled as an averaged scalar from
+   the centre 50 % of the soft-mask bitmap, not modulated per-pixel.
+   Smooth soft-mask gradients look uniformly dimmed.
