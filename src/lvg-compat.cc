@@ -261,6 +261,340 @@ bool build_lui_gradient(Paint* grad, lui_canvas_gradient_t& out,
   return false;
 }
 
+// Separable blend functions per W3C Compositing and Blending Level 1.
+// Inputs/outputs are 0-255 channel values (non-premultiplied "straight").
+uint8_t blend_separable(uint8_t cb, uint8_t cs, BlendMethod m) {
+  switch (m) {
+    case BlendMethod::Multiply:   return static_cast<uint8_t>((cb * cs + 127) / 255);
+    case BlendMethod::Screen:     return static_cast<uint8_t>(cb + cs - (cb * cs + 127) / 255);
+    case BlendMethod::Overlay: {
+      // Overlay(Cb, Cs) = HardLight(Cs, Cb) — i.e. branch on Cb.
+      if (cb <= 127) return static_cast<uint8_t>((2 * cb * cs + 127) / 255);
+      return static_cast<uint8_t>(255 - (2 * (255 - cb) * (255 - cs) + 127) / 255);
+    }
+    case BlendMethod::Darken:     return std::min(cb, cs);
+    case BlendMethod::Lighten:    return std::max(cb, cs);
+    case BlendMethod::Difference: return cb > cs ? static_cast<uint8_t>(cb - cs)
+                                                  : static_cast<uint8_t>(cs - cb);
+    case BlendMethod::Exclusion:  return static_cast<uint8_t>(cb + cs - (2 * cb * cs + 127) / 255);
+    case BlendMethod::ColorDodge: {
+      if (cs == 255) return 255;
+      if (cb == 0)   return 0;
+      int v = (cb * 255) / (255 - cs);
+      return v > 255 ? static_cast<uint8_t>(255) : static_cast<uint8_t>(v);
+    }
+    case BlendMethod::ColorBurn: {
+      if (cs == 0)   return 0;
+      if (cb == 255) return 255;
+      int v = ((255 - cb) * 255) / cs;
+      return v > 255 ? static_cast<uint8_t>(0) : static_cast<uint8_t>(255 - v);
+    }
+    case BlendMethod::HardLight: {
+      if (cs <= 127) return static_cast<uint8_t>((2 * cb * cs + 127) / 255);
+      return static_cast<uint8_t>(255 - (2 * (255 - cb) * (255 - cs) + 127) / 255);
+    }
+    case BlendMethod::SoftLight: {
+      float Cb = cb / 255.0f;
+      float Cs = cs / 255.0f;
+      float result;
+      if (Cs <= 0.5f) {
+        result = Cb - (1.0f - 2.0f * Cs) * Cb * (1.0f - Cb);
+      } else {
+        float d = Cb <= 0.25f
+                      ? ((16.0f * Cb - 12.0f) * Cb + 4.0f) * Cb
+                      : std::sqrt(Cb);
+        result = Cb + (2.0f * Cs - 1.0f) * (d - Cb);
+      }
+      int v = static_cast<int>(result * 255.0f + 0.5f);
+      if (v < 0)   v = 0;
+      if (v > 255) v = 255;
+      return static_cast<uint8_t>(v);
+    }
+    case BlendMethod::Normal:
+    default:
+      return cs;
+  }
+}
+
+// ---- Non-separable (HSL) blend helpers ----
+
+inline float luma(float r, float g, float b) {
+  return 0.3f * r + 0.59f * g + 0.11f * b;
+}
+
+inline void clip_color(float& r, float& g, float& b) {
+  float l = luma(r, g, b);
+  float n = std::min({r, g, b});
+  float x = std::max({r, g, b});
+  if (n < 0.0f) {
+    float k = l / (l - n);
+    r = l + (r - l) * k;
+    g = l + (g - l) * k;
+    b = l + (b - l) * k;
+  }
+  if (x > 1.0f) {
+    float k = (1.0f - l) / (x - l);
+    r = l + (r - l) * k;
+    g = l + (g - l) * k;
+    b = l + (b - l) * k;
+  }
+}
+
+inline void set_lum(float& r, float& g, float& b, float L) {
+  float d = L - luma(r, g, b);
+  r += d;
+  g += d;
+  b += d;
+  clip_color(r, g, b);
+}
+
+inline float sat_of(float r, float g, float b) {
+  return std::max({r, g, b}) - std::min({r, g, b});
+}
+
+// Set saturation of (r,g,b) to S, preserving the channel ordering.
+inline void set_sat(float& r, float& g, float& b, float S) {
+  float* chans[3] = {&r, &g, &b};
+  // Sort references by channel value.
+  if (*chans[0] > *chans[1]) std::swap(chans[0], chans[1]);
+  if (*chans[1] > *chans[2]) std::swap(chans[1], chans[2]);
+  if (*chans[0] > *chans[1]) std::swap(chans[0], chans[1]);
+  // chans[0] = Cmin, chans[1] = Cmid, chans[2] = Cmax.
+  if (*chans[2] > *chans[0]) {
+    *chans[1] = ((*chans[1] - *chans[0]) * S) / (*chans[2] - *chans[0]);
+    *chans[2] = S;
+  } else {
+    *chans[1] = 0.0f;
+    *chans[2] = 0.0f;
+  }
+  *chans[0] = 0.0f;
+}
+
+// HSL blends. Returns the (r,g,b) result in [0,1] for a single pixel.
+void blend_nonseparable(float Cb_r, float Cb_g, float Cb_b,
+                        float Cs_r, float Cs_g, float Cs_b, BlendMethod m,
+                        float& out_r, float& out_g, float& out_b) {
+  switch (m) {
+    case BlendMethod::Hue: {
+      // SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb))
+      out_r = Cs_r; out_g = Cs_g; out_b = Cs_b;
+      set_sat(out_r, out_g, out_b, sat_of(Cb_r, Cb_g, Cb_b));
+      set_lum(out_r, out_g, out_b, luma(Cb_r, Cb_g, Cb_b));
+      return;
+    }
+    case BlendMethod::Saturation: {
+      // SetLum(SetSat(Cb, Sat(Cs)), Lum(Cb))
+      out_r = Cb_r; out_g = Cb_g; out_b = Cb_b;
+      set_sat(out_r, out_g, out_b, sat_of(Cs_r, Cs_g, Cs_b));
+      set_lum(out_r, out_g, out_b, luma(Cb_r, Cb_g, Cb_b));
+      return;
+    }
+    case BlendMethod::Color: {
+      // SetLum(Cs, Lum(Cb))
+      out_r = Cs_r; out_g = Cs_g; out_b = Cs_b;
+      set_lum(out_r, out_g, out_b, luma(Cb_r, Cb_g, Cb_b));
+      return;
+    }
+    case BlendMethod::Luminosity: {
+      // SetLum(Cb, Lum(Cs))
+      out_r = Cb_r; out_g = Cb_g; out_b = Cb_b;
+      set_lum(out_r, out_g, out_b, luma(Cs_r, Cs_g, Cs_b));
+      return;
+    }
+    default:
+      out_r = Cs_r;
+      out_g = Cs_g;
+      out_b = Cs_b;
+      return;
+  }
+}
+
+inline bool is_nonseparable_blend(BlendMethod m) {
+  return m == BlendMethod::Hue || m == BlendMethod::Saturation ||
+         m == BlendMethod::Color || m == BlendMethod::Luminosity;
+}
+
+// Composite a source pixel (straight RGBA) onto a destination pixel (straight
+// RGBA) with the chosen blend mode. Both are 0xAARRGGBB packed.
+uint32_t composite_pixel(uint32_t dst, uint32_t src, BlendMethod m) {
+  uint8_t sa = static_cast<uint8_t>((src >> 24) & 0xff);
+  if (sa == 0) return dst;
+  uint8_t sr = static_cast<uint8_t>((src >> 16) & 0xff);
+  uint8_t sg = static_cast<uint8_t>((src >> 8) & 0xff);
+  uint8_t sb = static_cast<uint8_t>(src & 0xff);
+  uint8_t da = static_cast<uint8_t>((dst >> 24) & 0xff);
+  uint8_t dr = static_cast<uint8_t>((dst >> 16) & 0xff);
+  uint8_t dg = static_cast<uint8_t>((dst >> 8) & 0xff);
+  uint8_t db = static_cast<uint8_t>(dst & 0xff);
+
+  // Per W3C compositing: co = (1 - αb) × Cs + αb × B(Cb, Cs), then SRC_OVER.
+  uint8_t Br, Bg, Bb;
+  if (is_nonseparable_blend(m)) {
+    float fbr = dr / 255.0f, fbg = dg / 255.0f, fbb = db / 255.0f;
+    float fsr = sr / 255.0f, fsg = sg / 255.0f, fsb = sb / 255.0f;
+    float orf, ogf, obf;
+    blend_nonseparable(fbr, fbg, fbb, fsr, fsg, fsb, m, orf, ogf, obf);
+    Br = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, orf * 255.0f + 0.5f)));
+    Bg = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, ogf * 255.0f + 0.5f)));
+    Bb = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, obf * 255.0f + 0.5f)));
+  } else {
+    Br = blend_separable(dr, sr, m);
+    Bg = blend_separable(dg, sg, m);
+    Bb = blend_separable(db, sb, m);
+  }
+
+  // co_channel = (255 - αb) × Cs + αb × B, then ÷ 255 to keep in [0,255].
+  uint16_t inv_da = static_cast<uint16_t>(255 - da);
+  uint8_t co_r = static_cast<uint8_t>((inv_da * sr + da * Br) / 255);
+  uint8_t co_g = static_cast<uint8_t>((inv_da * sg + da * Bg) / 255);
+  uint8_t co_b = static_cast<uint8_t>((inv_da * sb + da * Bb) / 255);
+
+  // SRC_OVER with co as the source pre-multiplied? We work straight.
+  // αo = αs + αb × (1 - αs)
+  // Co = (αs × co + (1 - αs) × αb × Cb) / αo
+  uint16_t inv_sa = static_cast<uint16_t>(255 - sa);
+  uint8_t a_out = static_cast<uint8_t>(sa + (da * inv_sa) / 255);
+  if (a_out == 0) return 0;
+  // numerator channels in 16-bit space (uint will fit: 255*255 = 65025)
+  uint32_t num_r = sa * static_cast<uint32_t>(co_r) +
+                   (inv_sa * static_cast<uint32_t>(da) * dr) / 255;
+  uint32_t num_g = sa * static_cast<uint32_t>(co_g) +
+                   (inv_sa * static_cast<uint32_t>(da) * dg) / 255;
+  uint32_t num_b = sa * static_cast<uint32_t>(co_b) +
+                   (inv_sa * static_cast<uint32_t>(da) * db) / 255;
+  uint8_t o_r = static_cast<uint8_t>(num_r / a_out);
+  uint8_t o_g = static_cast<uint8_t>(num_g / a_out);
+  uint8_t o_b = static_cast<uint8_t>(num_b / a_out);
+  return (static_cast<uint32_t>(a_out) << 24) |
+         (static_cast<uint32_t>(o_r) << 16) |
+         (static_cast<uint32_t>(o_g) << 8) |
+         static_cast<uint32_t>(o_b);
+}
+
+// Compute the axis-aligned bounding box of all contour points.
+void contours_bbox(const std::vector<Contour>& contours, float& minx,
+                   float& miny, float& maxx, float& maxy) {
+  minx = miny = std::numeric_limits<float>::infinity();
+  maxx = maxy = -std::numeric_limits<float>::infinity();
+  for (const Contour& c : contours) {
+    for (const lui_pointf_t& p : c.pts) {
+      if (p.x < minx) minx = p.x;
+      if (p.x > maxx) maxx = p.x;
+      if (p.y < miny) miny = p.y;
+      if (p.y > maxy) maxy = p.y;
+    }
+  }
+}
+
+// Rasterize a sequence of contours to an 8-bit alpha mask of `bbox_w` × `bbox_h`.
+// Contours are translated so (bbox_x, bbox_y) becomes (0, 0) before rasterizing.
+std::vector<uint8_t> rasterize_contours_to_mask(
+    const std::vector<Contour>& contours, int bbox_x, int bbox_y,
+    int bbox_w, int bbox_h, FillRule rule) {
+  std::vector<uint8_t> mask(static_cast<size_t>(bbox_w) * bbox_h, 0u);
+  if (bbox_w <= 0 || bbox_h <= 0) return mask;
+  std::vector<uint32_t> pixels(static_cast<size_t>(bbox_w) * bbox_h, 0u);
+  lui_surface_t s = lui_surface_wrap(pixels.data(), bbox_w, bbox_h, bbox_w);
+  lui_canvas_t  c;
+  lui_canvas_init(&c, &s);
+  for (Contour contour : contours) {
+    if (contour.pts.size() < 3) continue;
+    for (lui_pointf_t& p : contour.pts) {
+      p.x -= static_cast<float>(bbox_x);
+      p.y -= static_cast<float>(bbox_y);
+    }
+    lui_canvas_fill_polygonf_ex(&c, contour.pts.data(),
+                                static_cast<int>(contour.pts.size()),
+                                0xFFFFFFFFu, to_lui_fill_rule(rule));
+  }
+  lui_canvas_destroy(&c);
+  for (size_t i = 0; i < mask.size(); ++i) {
+    mask[i] = static_cast<uint8_t>((pixels[i] >> 24) & 0xff);
+  }
+  return mask;
+}
+
+// Fill polygon contours with a per-pixel source colour and arbitrary blend
+// mode. Coverage from the polygon's alpha-AA rasterization is multiplied
+// into the source alpha before compositing.
+//
+// @color_at returns the 0xAARRGGBB source colour at canvas pixel (x, y).
+template <typename ColorFn>
+void fill_polygon_with_source(lui_canvas_t* canvas,
+                              const std::vector<Contour>& contours,
+                              FillRule rule, ColorFn color_at,
+                              BlendMethod blend_mode) {
+  if (!canvas || contours.empty()) return;
+  lui_surface_t* dst = lui_canvas_get_surface(canvas);
+  if (!dst || !dst->pixels) return;
+
+  // Compute bbox of all contours, clip to canvas clip rect.
+  float minx, miny, maxx, maxy;
+  contours_bbox(contours, minx, miny, maxx, maxy);
+  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  int x0 = std::max(static_cast<int>(std::floor(minx)), clip.x);
+  int y0 = std::max(static_cast<int>(std::floor(miny)), clip.y);
+  int x1 = std::min(static_cast<int>(std::ceil(maxx)),  clip.x + clip.width);
+  int y1 = std::min(static_cast<int>(std::ceil(maxy)),  clip.y + clip.height);
+  if (x0 >= x1 || y0 >= y1) return;
+
+  int bbox_w = x1 - x0;
+  int bbox_h = y1 - y0;
+  std::vector<uint8_t> mask =
+      rasterize_contours_to_mask(contours, x0, y0, bbox_w, bbox_h, rule);
+
+  for (int y = 0; y < bbox_h; ++y) {
+    int canvas_y = y0 + y;
+    uint32_t* dst_row = dst->pixels + canvas_y * dst->stride;
+    const uint8_t* mask_row = mask.data() + static_cast<size_t>(y) * bbox_w;
+    for (int x = 0; x < bbox_w; ++x) {
+      uint8_t m = mask_row[x];
+      if (m == 0) continue;
+      int canvas_x = x0 + x;
+      uint32_t src = color_at(canvas_x, canvas_y);
+      // Multiply src alpha by coverage.
+      uint32_t sa  = (src >> 24) & 0xff;
+      if (sa == 0) continue;
+      sa = (sa * m + 127) / 255;
+      if (sa == 0) continue;
+      uint32_t src_with_cov = (src & 0x00ffffffu) | (sa << 24);
+      dst_row[canvas_x] =
+          composite_pixel(dst_row[canvas_x], src_with_cov, blend_mode);
+    }
+  }
+}
+
+// Sample an lvg gradient at (canvas_x, canvas_y). Returns 0xAARRGGBB.
+uint32_t sample_gradient_at(const Paint* grad, float x, float y,
+                            uint8_t opacity_mul) {
+  if (!grad) return 0;
+  uint8_t r = 0, g = 0, b = 0, a = 0;
+  if (grad->kind() == Paint::kLinear) {
+    const auto* lg = static_cast<const LinearGradient*>(grad);
+    float dx = lg->x2() - lg->x1();
+    float dy = lg->y2() - lg->y1();
+    float len2 = dx * dx + dy * dy;
+    float t = 0.5f;
+    if (len2 > 1e-8f) {
+      t = ((x - lg->x1()) * dx + (y - lg->y1()) * dy) / len2;
+    }
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    lg->sample(t, r, g, b, a);
+  } else if (grad->kind() == Paint::kRadial) {
+    const auto* rg = static_cast<const RadialGradient*>(grad);
+    float dx = x - rg->cx();
+    float dy = y - rg->cy();
+    float d  = std::sqrt(dx * dx + dy * dy);
+    float t  = rg->r() > 1e-8f ? d / rg->r() : 1.0f;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    rg->sample(t, r, g, b, a);
+  }
+  if (opacity_mul < 255) a = static_cast<uint8_t>((a * opacity_mul) / 255);
+  return pack_argb(r, g, b, a);
+}
+
 // Rasterize an arbitrary path to an 8-bit alpha mask of `bbox_w` × `bbox_h`.
 // Path is translated so (bbox_x, bbox_y) becomes (0, 0) before rasterizing.
 std::vector<uint8_t> rasterize_path_to_mask(
@@ -560,7 +894,9 @@ void Shape::draw_on(lui_canvas_t* canvas) {
     int iw = static_cast<int>(std::ceil(rx + rw)) - ix;
     int ih = static_cast<int>(std::ceil(ry + rh)) - iy;
     if (iw > 0 && ih > 0) {
-      if (fill_gradient_) {
+      // Gradient fast path is Normal-blend-only. Non-Normal blends with a
+      // gradient fill on a rect fall through to the polygon-custom path.
+      if (fill_gradient_ && blend_mode_ == BlendMethod::Normal) {
         lui_canvas_gradient_t lg{};
         if (build_lui_gradient(fill_gradient_, lg, opacity_)) {
           lui_canvas_fill_rect_gradient(canvas, ix, iy, iw, ih, &lg);
@@ -592,24 +928,46 @@ void Shape::draw_on(lui_canvas_t* canvas) {
     flatten_path(cmds_, pts_, contours);
     contours_built = true;
 
-    uint8_t fr, fg, fb, fa;
-    if (fill_gradient_) {
-      if (fill_gradient_->kind() == kLinear) {
-        static_cast<LinearGradient*>(fill_gradient_)->sample(0.5f, fr, fg, fb, fa);
-      } else {
-        static_cast<RadialGradient*>(fill_gradient_)->sample(0.5f, fr, fg, fb, fa);
+    // Pick the right rendering path:
+    //   * gradient OR non-Normal blend → per-pixel custom path
+    //   * solid + Normal               → lui_canvas_fill_polygonf_ex (fast)
+    bool needs_custom = fill_gradient_ ||
+                        (blend_mode_ != BlendMethod::Normal);
+
+    if (needs_custom) {
+      if (fill_gradient_) {
+        Paint* g = fill_gradient_;
+        uint8_t opc = opacity_;
+        BlendMethod bm = blend_mode_;
+        fill_polygon_with_source(
+            canvas, contours, fill_rule_,
+            [g, opc](int x, int y) {
+              return sample_gradient_at(g, static_cast<float>(x) + 0.5f,
+                                        static_cast<float>(y) + 0.5f, opc);
+            },
+            bm);
+      } else if (has_solid_fill_) {
+        uint8_t fa = fill_a_;
+        if (opacity_ < 255) fa = static_cast<uint8_t>((fa * opacity_) / 255);
+        if (fa > 0) {
+          uint32_t color = pack_argb(fill_r_, fill_g_, fill_b_, fa);
+          BlendMethod bm = blend_mode_;
+          fill_polygon_with_source(
+              canvas, contours, fill_rule_,
+              [color](int /*x*/, int /*y*/) { return color; }, bm);
+        }
       }
-    } else {
-      fr = fill_r_; fg = fill_g_; fb = fill_b_; fa = fill_a_;
-    }
-    if (opacity_ < 255) fa = static_cast<uint8_t>((fa * opacity_) / 255);
-    if (fa > 0) {
-      uint32_t color = pack_argb(fr, fg, fb, fa);
-      for (const Contour& c : contours) {
-        if (c.pts.size() >= 3) {
-          lui_canvas_fill_polygonf_ex(canvas, c.pts.data(),
-                                      static_cast<int>(c.pts.size()), color,
-                                      to_lui_fill_rule(fill_rule_));
+    } else if (has_solid_fill_) {
+      uint8_t fa = fill_a_;
+      if (opacity_ < 255) fa = static_cast<uint8_t>((fa * opacity_) / 255);
+      if (fa > 0) {
+        uint32_t color = pack_argb(fill_r_, fill_g_, fill_b_, fa);
+        for (const Contour& c : contours) {
+          if (c.pts.size() >= 3) {
+            lui_canvas_fill_polygonf_ex(canvas, c.pts.data(),
+                                        static_cast<int>(c.pts.size()), color,
+                                        to_lui_fill_rule(fill_rule_));
+          }
         }
       }
     }
