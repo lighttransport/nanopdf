@@ -35,7 +35,12 @@ jobs:
         run: |
           ./scripts/generate-visual-refs.sh
 
-      - name: Run visual regression tests
+      - name: Run visual regression tests (LightVG, default backend)
+        run: |
+          cd build
+          ./test_visual_lightvg --generate-report
+
+      - name: Run visual regression tests (ThorVG)
         run: |
           cd build
           ./test_visual_thorvg --generate-report
