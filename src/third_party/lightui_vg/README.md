@@ -1,8 +1,7 @@
 # lightui_vg — vendored snapshot
 
-Snapshot of the lightui vector-graphics engine, vendored from
-`/home/syoyo/work/lightui/src/vg/` + `/home/syoyo/work/lightui/include/lightui/vg/`
-+ `/home/syoyo/work/lightui/src/internal/`.
+Snapshot of the lightui vector-graphics engine, vendored from the lightui
+source tree (`src/vg/`, `include/lightui/vg/`, and `src/internal/`).
 
 Used by `src/lightvg-backend.{hh,cc}` (the default `RenderBackend` in nanopdf)
 to rasterize PDF pages with the lui_canvas software rasterizer. No external
@@ -36,10 +35,10 @@ software rasterizer only.
 ## Sync-back policy
 
 Per the project owner, whenever a fix is applied to one of these vendored
-files, mirror the same fix into upstream lightui:
+files, mirror the same fix into the upstream lightui source tree:
 
-* VG fixes: `/home/syoyo/work/lightui/src/vg/`
-* Font fixes (`ttf_parse.c`, `rasterize.c`, etc.): `/home/syoyo/work/lightui/src/fonts/`
+* VG fixes: lightui `src/vg/`
+* Font fixes (`ttf_parse.c`, `rasterize.c`, etc.): lightui `src/fonts/`
 
 Already mirrored:
 
