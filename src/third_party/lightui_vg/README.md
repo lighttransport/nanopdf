@@ -77,7 +77,7 @@ are intercepted by an `lvg::` shim (`src/lvg-compat.{hh,cc}`) that emits to
 | Stroked paths (cap, join, miter) | `lui_canvas_draw_styled_polyline`                         |
 | Gradient fills on rects          | `lui_canvas_fill_rect_gradient` (linear + radial)         |
 | Gradient fills on polygons       | Per-pixel sample via `fill_polygon_with_source` template  |
-| Gradient strokes                 | Mid-stop sample (degraded)                                |
+| Gradient strokes                 | Stroke to temp buffer, then per-pixel gradient composite  |
 | Image blits (scale + translate)  | `lui_canvas_draw_image` with bilinear filter              |
 | Image rotation / shear           | Per-pixel inverse-transform sample with bilinear + SRC_OVER |
 | Glyph bitmaps                    | ARGB blit through Picture → lui_canvas_draw_image         |
@@ -85,12 +85,11 @@ are intercepted by an `lvg::` shim (`src/lvg-compat.{hh,cc}`) that emits to
 | Vector clipping (W on path)      | Alpha-mask compositing: rasterize clip path to mask, snapshot dest, draw, lerp back |
 | Blend mode on axis-aligned rect  | `lui_canvas_fill_rect_blended` (Multiply, Screen, Overlay, Darken, Lighten, Difference, Exclusion) |
 | Blend mode on non-rect shapes    | Per-pixel via `composite_pixel` — all 11 separable + 4 HSL (Hue, Saturation, Color, Luminosity) |
+| Soft masks                       | Per-pixel snapshot + lerp through canvas-resolution mask bitmap |
 
 ### Known gaps
 
-1. **Gradient strokes** — gradient-on-stroke degrades to its mid-stop
-   colour. The polygon-fill custom-source path doesn't have a stroke
-   analogue yet.
-2. **Per-pixel soft masks** — opacity is sampled as an averaged scalar from
-   the centre 50 % of the soft-mask bitmap, not modulated per-pixel.
-   Smooth soft-mask gradients look uniformly dimmed.
+PDF-feature parity with the ThorVG path is now essentially complete for
+the documented surface. Remaining performance work: the snapshot+blend
+path for masking and gradient strokes allocates per-paint temp buffers.
+Pooling them across a render would amortise allocation cost.

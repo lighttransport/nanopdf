@@ -1079,31 +1079,102 @@ void Shape::draw_on(lui_canvas_t* canvas) {
       flatten_path(cmds_, pts_, contours);
       contours_built = true;
     }
-    uint8_t sr = stroke_r_, sg = stroke_g_, sb = stroke_b_, sa = stroke_a_;
+    float sw = stroke_width_ > 0.5f ? stroke_width_ : 0.5f;
+    auto to_cap  = to_lui_cap(stroke_cap_);
+    auto to_join = to_lui_join(stroke_join_);
+
     if (stroke_gradient_) {
-      uint8_t r, g, b, a;
-      if (stroke_gradient_->kind() == kLinear) {
-        static_cast<LinearGradient*>(stroke_gradient_)->sample(0.5f, r, g, b, a);
-      } else {
-        static_cast<RadialGradient*>(stroke_gradient_)->sample(0.5f, r, g, b, a);
-      }
-      sr = r; sg = g; sb = b; sa = a;
-    }
-    if (opacity_ < 255) sa = static_cast<uint8_t>((sa * opacity_) / 255);
-    if (sa > 0) {
-      uint32_t color = pack_argb(sr, sg, sb, sa);
+      // Per-pixel gradient stroke: rasterize the stroke into a temp ARGB
+      // buffer (white-on-clear), then composite onto the canvas sampling
+      // the gradient at each pixel's canvas position.
+      lui_rect_t clip = lui_canvas_get_clip(canvas);
+      float minx = std::numeric_limits<float>::infinity();
+      float miny = std::numeric_limits<float>::infinity();
+      float maxx = -std::numeric_limits<float>::infinity();
+      float maxy = -std::numeric_limits<float>::infinity();
       for (const Contour& c : contours) {
-        if (c.pts.size() < 2) continue;
-        bool closed = false;
-        if (c.pts.size() >= 3) {
-          const lui_pointf_t& f = c.pts.front();
-          const lui_pointf_t& l = c.pts.back();
-          closed = (f.x == l.x && f.y == l.y);
+        for (const lui_pointf_t& p : c.pts) {
+          if (p.x < minx) minx = p.x;
+          if (p.x > maxx) maxx = p.x;
+          if (p.y < miny) miny = p.y;
+          if (p.y > maxy) maxy = p.y;
         }
-        lui_canvas_draw_styled_polyline(
-            canvas, c.pts.data(), static_cast<int>(c.pts.size()), color,
-            stroke_width_ > 0.5f ? stroke_width_ : 0.5f, closed,
-            to_lui_cap(stroke_cap_), to_lui_join(stroke_join_));
+      }
+      if (minx <= maxx && miny <= maxy) {
+        float pad = sw * 0.5f + 1.5f;
+        int x0 = std::max(static_cast<int>(std::floor(minx - pad)), clip.x);
+        int y0 = std::max(static_cast<int>(std::floor(miny - pad)), clip.y);
+        int x1 = std::min(static_cast<int>(std::ceil(maxx + pad)),
+                          clip.x + clip.width);
+        int y1 = std::min(static_cast<int>(std::ceil(maxy + pad)),
+                          clip.y + clip.height);
+        int tw = x1 - x0;
+        int th = y1 - y0;
+        if (tw > 0 && th > 0) {
+          std::vector<uint32_t> tmp(static_cast<size_t>(tw) * th, 0u);
+          lui_surface_t ts = lui_surface_wrap(tmp.data(), tw, th, tw);
+          lui_canvas_t  tc;
+          lui_canvas_init(&tc, &ts);
+          for (Contour c : contours) {
+            if (c.pts.size() < 2) continue;
+            for (lui_pointf_t& p : c.pts) {
+              p.x -= static_cast<float>(x0);
+              p.y -= static_cast<float>(y0);
+            }
+            bool closed = false;
+            if (c.pts.size() >= 3) {
+              const lui_pointf_t& f = c.pts.front();
+              const lui_pointf_t& l = c.pts.back();
+              closed = (f.x == l.x && f.y == l.y);
+            }
+            lui_canvas_draw_styled_polyline(
+                &tc, c.pts.data(), static_cast<int>(c.pts.size()),
+                0xFFFFFFFFu, sw, closed, to_cap, to_join);
+          }
+          // Composite temp onto canvas with per-pixel gradient color.
+          lui_surface_t* dst = lui_canvas_get_surface(canvas);
+          if (dst && dst->pixels) {
+            for (int y = 0; y < th; ++y) {
+              uint32_t* dst_row = dst->pixels + (y0 + y) * dst->stride + x0;
+              const uint32_t* src_row = tmp.data() +
+                                        static_cast<size_t>(y) * tw;
+              for (int x = 0; x < tw; ++x) {
+                uint8_t cov = static_cast<uint8_t>((src_row[x] >> 24) & 0xff);
+                if (cov == 0) continue;
+                uint32_t grad_argb = sample_gradient_at(
+                    stroke_gradient_,
+                    static_cast<float>(x0 + x) + 0.5f,
+                    static_cast<float>(y0 + y) + 0.5f, opacity_);
+                uint8_t ga = static_cast<uint8_t>((grad_argb >> 24) & 0xff);
+                if (ga == 0) continue;
+                uint8_t fa = static_cast<uint8_t>((ga * cov) / 255);
+                if (fa == 0) continue;
+                uint32_t src = (grad_argb & 0x00ffffffu) |
+                               (static_cast<uint32_t>(fa) << 24);
+                dst_row[x] = composite_pixel(dst_row[x], src,
+                                             blend_mode_);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      uint8_t sr = stroke_r_, sg = stroke_g_, sb = stroke_b_, sa = stroke_a_;
+      if (opacity_ < 255) sa = static_cast<uint8_t>((sa * opacity_) / 255);
+      if (sa > 0) {
+        uint32_t color = pack_argb(sr, sg, sb, sa);
+        for (const Contour& c : contours) {
+          if (c.pts.size() < 2) continue;
+          bool closed = false;
+          if (c.pts.size() >= 3) {
+            const lui_pointf_t& f = c.pts.front();
+            const lui_pointf_t& l = c.pts.back();
+            closed = (f.x == l.x && f.y == l.y);
+          }
+          lui_canvas_draw_styled_polyline(
+              canvas, c.pts.data(), static_cast<int>(c.pts.size()), color,
+              sw, closed, to_cap, to_join);
+        }
       }
     }
   }
