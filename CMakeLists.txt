@@ -751,10 +751,21 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     ${PROJECT_SOURCE_DIR}/src/third_party)
   add_sanitizers(visual_compare)
 
+  # Visual regression test (LightVG backend — default; pure software, no
+  # external graphics dependency).
+  if(NANOPDF_USE_LIGHTVG)
+    add_nanopdf_test(test_visual_lightvg src/test-visual-regression.cc)
+    target_compile_definitions(test_visual_lightvg PRIVATE
+      NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+      TEST_VISUAL_BACKEND_LIGHTVG)
+  endif()
+
   # Visual regression test (ThorVG backend)
   if(NANOPDF_USE_THORVG AND THORVG_FOUND)
     add_nanopdf_test(test_visual_thorvg src/test-visual-regression.cc)
-    target_compile_definitions(test_visual_thorvg PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    target_compile_definitions(test_visual_thorvg PRIVATE
+      NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+      TEST_VISUAL_BACKEND_THORVG)
     if (TARGET PkgConfig::THORVG)
       target_link_libraries(test_visual_thorvg PRIVATE PkgConfig::THORVG)
     else()
@@ -770,7 +781,9 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
   # Visual regression test (Blend2D backend)
   if(NANOPDF_USE_BLEND2D)
     add_nanopdf_test(test_visual_blend2d src/test-visual-regression.cc)
-    target_compile_definitions(test_visual_blend2d PRIVATE NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    target_compile_definitions(test_visual_blend2d PRIVATE
+      NANOPDF_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+      TEST_VISUAL_BACKEND_BLEND2D)
     target_link_libraries(test_visual_blend2d PRIVATE blend2d::blend2d)
   endif()
 
