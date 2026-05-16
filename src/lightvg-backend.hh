@@ -48,7 +48,7 @@ public:
   LightVGBackend();
   ~LightVGBackend() override;
 
-  // Initialize ThorVG with given canvas size
+  // Initialize the lvg backend for a canvas of the given size.
   bool initialize(uint32_t width, uint32_t height) override;
 
   // Render a PDF page
@@ -95,7 +95,7 @@ public:
                                  const LightVGRenderOptions& options) override;
 
 private:
-  // Parse PDF content stream and convert to ThorVG shapes
+  // Parse PDF content stream and emit lvg paints into the active scene.
   bool parse_pdf_content(const std::vector<uint8_t>& content_data);
 
   // Graphics state for PDF rendering

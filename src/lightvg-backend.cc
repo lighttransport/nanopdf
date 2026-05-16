@@ -34,7 +34,7 @@ extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
 
-struct ThorVGRect {
+struct LightVGRect {
   float x{0.0f};
   float y{0.0f};
   float w{0.0f};
@@ -341,7 +341,7 @@ static size_t count_render_objects_impl(std::string_view content) {
 
 static bool is_rectangular_path(const std::vector<lvg::PathCommand>& commands,
                                 const std::vector<lvg::Point>& points,
-                                ThorVGRect& rect) {
+                                LightVGRect& rect) {
   if (commands.size() != 5 || points.size() != 4) {
     return false;
   }
@@ -391,7 +391,7 @@ static bool is_rectangular_path(const std::vector<lvg::PathCommand>& commands,
 static void append_shape_geometry(lvg::Shape* shape,
                                   const std::vector<lvg::PathCommand>& commands,
                                   const std::vector<lvg::Point>& points) {
-  ThorVGRect rect;
+  LightVGRect rect;
   if (is_rectangular_path(commands, points, rect)) {
     shape->appendRect(rect.x, rect.y, rect.w, rect.h, 0, 0);
     return;
@@ -1335,19 +1335,16 @@ static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
 }
 
 LightVGBackend::LightVGBackend() {
-  // Initialize ThorVG engine (v1.0+ API - no canvas engine param)
   if (lvg::Initializer::init(0) != lvg::Result::Success) {
-    NANOPDF_LOG_ERROR("ThorVG", "Failed to initialize ThorVG engine");
+    NANOPDF_LOG_ERROR("LightVG", "Failed to initialize lvg engine");
   }
 }
 
 LightVGBackend::~LightVGBackend() {
-  // Clean up canvas (will delete scene if pushed)
   if (canvas_) {
     delete canvas_;
     canvas_ = nullptr;
   }
-  // Terminate ThorVG engine (v1.0+ API - no canvas engine param)
   lvg::Initializer::term();
 }
 
@@ -1394,13 +1391,12 @@ bool LightVGBackend::end_scene() {
     return false;
   }
 
-  // Push scene to canvas (v1.0+ API takes raw Paint*, canvas owns it)
+  // Hand the scene over to the canvas; canvas owns it from here.
   if (canvas_->add(scene_) != lvg::Result::Success) {
-    // Don't delete scene_ - ThorVG manages memory
     scene_ = nullptr;
     return false;
   }
-  scene_ = nullptr;  // canvas owns it now
+  scene_ = nullptr;
 
   // Draw the canvas (with clear=true to clear the buffer first)
   if (canvas_->draw(true) != lvg::Result::Success) {
@@ -1432,9 +1428,8 @@ bool LightVGBackend::draw_rectangle(float x, float y, float width, float height,
   // Set fill color
   shape->fill(r, g, b, a);
 
-  // Add to scene (v1.0+ API takes raw Paint*, scene owns it after push)
+  // Hand the shape over to the scene; scene owns it from here.
   if (scene_->add(shape) != lvg::Result::Success) {
-    // ThorVG manages memory - don't delete
     return false;
   }
 
@@ -1946,7 +1941,7 @@ static bool load_font_file(const std::string& path, std::vector<uint8_t>& data) 
 // Helper to determine font category from name
 // Helper to determine font category from name
 // Returns: 0=sans-serif, 1=monospace, 2=serif, 3=symbol, 4=CJK
-static int get_thorvg_font_category(const std::string& font_name) {
+static int get_lightvg_font_category(const std::string& font_name) {
   // Convert to lowercase for comparison
   std::string lower_name;
   for (char c : font_name) {
@@ -2082,7 +2077,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
       (font && !font->base_font.empty()) ? font->base_font : font_name;
 
   // Determine font category for better substitution
-  int category = get_thorvg_font_category(hint_name);
+  int category = get_lightvg_font_category(hint_name);
 
   // Override category to CJK if font structure indicates CJK
   if (is_cjk_font(font)) {
@@ -2240,7 +2235,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
       if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
         cache.initialized = true;
         font_cache_[font_name] = std::move(cache);
-        NANOPDF_LOG_DEBUG("ThorVG", "Using FontProvider font: %s for '%s'", pf->name.c_str(), font_name.c_str());
+        NANOPDF_LOG_DEBUG("LightVG", "Using FontProvider font: %s for '%s'", pf->name.c_str(), font_name.c_str());
         return true;
       }
     }
@@ -2286,7 +2281,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
           }
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
-          NANOPDF_LOG_DEBUG("ThorVG", "Using embedded font: %s for '%s'",
+          NANOPDF_LOG_DEBUG("LightVG", "Using embedded font: %s for '%s'",
                            entry->base_name, font_name.c_str());
           return true;
         }
@@ -2311,7 +2306,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
             cache.has_ttf_parse = true;
           }
           font_cache_[font_name] = std::move(cache);
-          NANOPDF_LOG_DEBUG("ThorVG", "Using embedded CJK font: %s for '%s'", target, font_name.c_str());
+          NANOPDF_LOG_DEBUG("LightVG", "Using embedded CJK font: %s for '%s'", target, font_name.c_str());
           return true;
         }
       }
@@ -2327,7 +2322,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
       if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
         cache.initialized = true;
         font_cache_[font_name] = std::move(cache);
-        NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s' (cat=%d)", *path, font_name.c_str(), category);
+        NANOPDF_LOG_DEBUG("LightVG", "Using fallback font: %s for '%s' (cat=%d)", *path, font_name.c_str(), category);
         return true;
       }
     }
@@ -2342,14 +2337,14 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
-          NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s' (fallback)", *path, font_name.c_str());
+          NANOPDF_LOG_DEBUG("LightVG", "Using fallback font: %s for '%s' (fallback)", *path, font_name.c_str());
           return true;
         }
       }
     }
   }
 
-  NANOPDF_LOG_WARN("ThorVG", "Font '%s' - no fallback font found", font_name.c_str());
+  NANOPDF_LOG_WARN("LightVG", "Font '%s' - no fallback font found", font_name.c_str());
   return false;
 }
 
@@ -2413,7 +2408,7 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
       return load_fallback_font_with_hint(font_name, font);
     }
     decoded.data = std::move(wrapped);
-    NANOPDF_LOG_INFO("ThorVG", "Wrapped raw CFF font '%s' in OpenType container"
+    NANOPDF_LOG_INFO("LightVG", "Wrapped raw CFF font '%s' in OpenType container"
                      " (CID->GID map: %s)",
                      font_name.c_str(),
                      cff_cid_to_gid.empty() ? "identity" : "custom");
@@ -2435,7 +2430,7 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
   // the only outline reader we can use.
   if (ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
     cache.has_ttf_parse = true;
-    NANOPDF_LOG_DEBUG("ThorVG", "ttf_parse: kerning available for '%s' (kern=%d, GPOS_count=%d)",
+    NANOPDF_LOG_DEBUG("LightVG", "ttf_parse: kerning available for '%s' (kern=%d, GPOS_count=%d)",
                       font_name.c_str(),
                       cache.ttf.tab_kern.len > 0 ? 1 : 0,
                       cache.ttf.gpos_kern_count);
@@ -2448,7 +2443,7 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
   cache.initialized = true;
   cache.is_embedded = true;
   cache.cid_to_gid = std::move(cff_cid_to_gid);
-  NANOPDF_LOG_INFO("ThorVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), cache.font_data.size());
+  NANOPDF_LOG_INFO("LightVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), cache.font_data.size());
   font_cache_[font_name] = std::move(cache);
   return true;
 }
@@ -2866,11 +2861,11 @@ static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
 
 bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height,
                                uint8_t fill_r, uint8_t fill_g, uint8_t fill_b) {
-  NANOPDF_LOG_DEBUG("ThorVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
+  NANOPDF_LOG_DEBUG("LightVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
                     image.width, image.height, x, y, width, height, image.data.size());
 
   if (!scene_ || image.data.empty()) {
-    NANOPDF_LOG_WARN("ThorVG", "draw_image: skipped (scene=%p, data.empty=%d)",
+    NANOPDF_LOG_WARN("LightVG", "draw_image: skipped (scene=%p, data.empty=%d)",
                      (void*)scene_, image.data.empty() ? 1 : 0);
     return false;
   }
@@ -3245,7 +3240,7 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   float canvas_x = x * state_.scale;
   float canvas_y = (state_.page_height - y - height) * state_.scale;
 
-  NANOPDF_LOG_DEBUG("ThorVG", "draw_image transform: page_h=%.1f, scale=%.3f, canvas=(%.1f,%.1f)",
+  NANOPDF_LOG_DEBUG("LightVG", "draw_image transform: page_h=%.1f, scale=%.3f, canvas=(%.1f,%.1f)",
                     state_.page_height, state_.scale, canvas_x, canvas_y);
 
   // Apply transformation using matrix for non-uniform scaling
@@ -3269,7 +3264,7 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   // Push to scene
   apply_soft_mask_opacity(picture);
   auto push_result = scene_->add(picture);
-  NANOPDF_LOG_DEBUG("ThorVG", "draw_image: pushed to scene, result=%d", static_cast<int>(push_result));
+  NANOPDF_LOG_DEBUG("LightVG", "draw_image: pushed to scene, result=%d", static_cast<int>(push_result));
 
   return true;
 }
@@ -4392,7 +4387,7 @@ bool LightVGBackend::apply_pattern_fill(lvg::Shape* shape, const std::string& pa
   // Look up pattern from page resources
   auto pattern_dict_it = current_page_->resources.find("Pattern");
   if (pattern_dict_it == current_page_->resources.end()) {
-    NANOPDF_LOG_TRACE("ThorVG", "No Pattern resources in page");
+    NANOPDF_LOG_TRACE("LightVG", "No Pattern resources in page");
     return false;
   }
 
@@ -4415,7 +4410,7 @@ bool LightVGBackend::apply_pattern_fill(lvg::Shape* shape, const std::string& pa
   // Look up the specific pattern
   auto pattern_it = pattern_resources.find(pattern_name);
   if (pattern_it == pattern_resources.end()) {
-    NANOPDF_LOG_DEBUG("ThorVG", "Pattern '%s' not found", pattern_name.c_str());
+    NANOPDF_LOG_DEBUG("LightVG", "Pattern '%s' not found", pattern_name.c_str());
     return false;
   }
 
@@ -4423,11 +4418,11 @@ bool LightVGBackend::apply_pattern_fill(lvg::Shape* shape, const std::string& pa
   // Tiling patterns, decodes the stream body into pattern->tiling->content_stream.
   auto pattern = parse_pattern(*current_pdf_, pattern_it->second, 0, 0);
   if (!pattern) {
-    NANOPDF_LOG_DEBUG("ThorVG", "Failed to parse pattern '%s'", pattern_name.c_str());
+    NANOPDF_LOG_DEBUG("LightVG", "Failed to parse pattern '%s'", pattern_name.c_str());
     return false;
   }
 
-  NANOPDF_LOG_TRACE("ThorVG", "Applying pattern '%s', type=%d", pattern_name.c_str(),
+  NANOPDF_LOG_TRACE("LightVG", "Applying pattern '%s', type=%d", pattern_name.c_str(),
                     static_cast<int>(pattern->type));
 
   if (pattern->type == PatternType::Shading && pattern->shading) {
@@ -5835,7 +5830,7 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   // Store antialias option (ThorVG always applies AA internally)
   antialias_ = options.antialias;
   if (!antialias_) {
-    NANOPDF_LOG_DEBUG("ThorVG", "antialias=false requested, but ThorVG's built-in AA cannot be disabled");
+    NANOPDF_LOG_DEBUG("LightVG", "antialias=false requested, but ThorVG's built-in AA cannot be disabled");
   }
 
   // Calculate scale based on DPI (72 DPI is standard PDF resolution)
@@ -6830,7 +6825,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
           state_.fill_color_space = cs_name;
           state_.fill_pattern.clear();  // Clear any previous pattern
-          NANOPDF_LOG_TRACE("ThorVG", "cs: set fill color space to '%s'", cs_name.c_str());
+          NANOPDF_LOG_TRACE("LightVG", "cs: set fill color space to '%s'", cs_name.c_str());
         }
       } else if (token == "CS") {  // Set stroking color space
         if (operands.size() >= 1) {
@@ -6840,7 +6835,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
           state_.stroke_color_space = cs_name;
           state_.stroke_pattern.clear();  // Clear any previous pattern
-          NANOPDF_LOG_TRACE("ThorVG", "CS: set stroke color space to '%s'", cs_name.c_str());
+          NANOPDF_LOG_TRACE("LightVG", "CS: set stroke color space to '%s'", cs_name.c_str());
         }
       } else if (token == "sc" || token == "scn") {  // Set non-stroking color
         // Check if last operand is a pattern name (starts with /)
@@ -6852,7 +6847,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             std::string pattern_name = last.substr(1);
             state_.fill_pattern = pattern_name;
             is_pattern = true;
-            NANOPDF_LOG_TRACE("ThorVG", "scn: set fill pattern to '%s'", pattern_name.c_str());
+            NANOPDF_LOG_TRACE("LightVG", "scn: set fill pattern to '%s'", pattern_name.c_str());
           }
         }
 
@@ -6879,7 +6874,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             std::string pattern_name = last.substr(1);
             state_.stroke_pattern = pattern_name;
             is_pattern = true;
-            NANOPDF_LOG_TRACE("ThorVG", "SCN: set stroke pattern to '%s'", pattern_name.c_str());
+            NANOPDF_LOG_TRACE("LightVG", "SCN: set stroke pattern to '%s'", pattern_name.c_str());
           }
         }
 
@@ -7257,7 +7252,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         // 4 = Fill+Clip, 5 = Stroke+Clip, 6 = Fill+Stroke+Clip, 7 = Clip only
         if (operands.size() >= 1) {
           state_.text_render_mode = nanopdf::stoi_or(operands[0]);
-          NANOPDF_LOG_TRACE("ThorVG", "Tr: set text rendering mode to %d", state_.text_render_mode);
+          NANOPDF_LOG_TRACE("LightVG", "Tr: set text rendering mode to %d", state_.text_render_mode);
         }
       } else if (token == "Tf") {  // Set font and size
         if (operands.size() >= 2) {
@@ -7278,7 +7273,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
               load_font(*current_pdf_, font_name, current_font_);
             } else {
               // Font not in page dictionary — attempt fallback using name hint
-              NANOPDF_LOG_DEBUG("ThorVG", "Font '%s' not in page resources, trying fallback", font_name.c_str());
+              NANOPDF_LOG_DEBUG("LightVG", "Font '%s' not in page resources, trying fallback", font_name.c_str());
               load_fallback_font_with_hint(font_name, nullptr);
             }
           }
@@ -7595,7 +7590,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             xobj_name = xobj_name.substr(1);
           }
 
-          NANOPDF_LOG_DEBUG("ThorVG", "Do operator: looking up XObject '%s'", xobj_name.c_str());
+          NANOPDF_LOG_DEBUG("LightVG", "Do operator: looking up XObject '%s'", xobj_name.c_str());
 
           // Resolve through the form/tiling resources stack first (so tile
           // patterns and Form XObjects see their own XObject dicts), then
