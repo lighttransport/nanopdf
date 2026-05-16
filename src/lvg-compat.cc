@@ -1156,6 +1156,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
               }
             }
           }
+          lui_canvas_destroy(&tc);
         }
       }
     } else {
@@ -1609,11 +1610,24 @@ void Scene::draw_on(lui_canvas_t* canvas) {
   if (soft_mask_) {
     auto mask = soft_mask_;
     soft_mask_.reset();
-    // Use canvas clip as the loose bbox — identity-lerping untouched pixels
-    // is a no-op, and computing the tight scene bbox iterates every child.
-    lui_rect_t clip = lui_canvas_get_clip(canvas);
-    draw_with_soft_mask(canvas, *mask, clip.x, clip.y,
-                        clip.x + clip.width, clip.y + clip.height,
+    // Tight scene bbox (union of child paint bounds). Falls back to the
+    // canvas clip if the scene has no children with non-degenerate bounds.
+    float bx, by, bw, bh;
+    compute_bbox(&bx, &by, &bw, &bh);
+    int x0, y0, x1, y1;
+    if (bw > 0.0f && bh > 0.0f) {
+      x0 = static_cast<int>(std::floor(bx));
+      y0 = static_cast<int>(std::floor(by));
+      x1 = static_cast<int>(std::ceil(bx + bw));
+      y1 = static_cast<int>(std::ceil(by + bh));
+    } else {
+      lui_rect_t clip = lui_canvas_get_clip(canvas);
+      x0 = clip.x;
+      y0 = clip.y;
+      x1 = clip.x + clip.width;
+      y1 = clip.y + clip.height;
+    }
+    draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
                         [this](lui_canvas_t* c) { draw_on(c); });
     soft_mask_ = mask;
     return;
