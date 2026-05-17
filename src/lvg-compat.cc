@@ -1526,21 +1526,23 @@ void Picture::draw_on(lui_canvas_t* canvas) {
   }
 
   // Axis-aligned scale + translate? Use fast path through lui_canvas.
+  // Note: lui_canvas_draw_image doesn't support mirroring, so negative
+  // scale (PDF horizontal/vertical text flip) must take the slow path.
   if (std::fabs(transform_.e12) < 1e-4f &&
-      std::fabs(transform_.e21) < 1e-4f) {
+      std::fabs(transform_.e21) < 1e-4f &&
+      transform_.e11 > 0.0f &&
+      transform_.e22 > 0.0f) {
     lui_surface_t src = lui_surface_wrap(pixels_.data(),
                                          static_cast<int>(width_),
                                          static_cast<int>(height_),
                                          static_cast<int>(width_));
     float sx = transform_.e11;
     float sy = transform_.e22;
-    int dst_w = static_cast<int>(std::round(std::fabs(sx) * width_));
-    int dst_h = static_cast<int>(std::round(std::fabs(sy) * height_));
+    int dst_w = static_cast<int>(std::round(sx * width_));
+    int dst_h = static_cast<int>(std::round(sy * height_));
     if (dst_w <= 0 || dst_h <= 0) return;
     int dst_x = static_cast<int>(std::round(transform_.e13));
     int dst_y = static_cast<int>(std::round(transform_.e23));
-    if (sx < 0) dst_x -= dst_w;
-    if (sy < 0) dst_y -= dst_h;
     lui_canvas_draw_image(canvas, dst_x, dst_y, dst_w, dst_h, &src, nullptr,
                           LUI_IMAGE_FILTER_BILINEAR);
     return;

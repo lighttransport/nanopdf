@@ -1587,6 +1587,12 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
     cos_tm_outer = state_.text_matrix.a / tm_scale_outer;
     sin_tm_outer = state_.text_matrix.b / tm_scale_outer;
   }
+  // The starting (x, y) has already been transformed through the CTM, but
+  // glyph advance below uses cos_tm/sin_tm in canvas space. If the CTM
+  // contains a mirror (negative determinant on the diagonal), the advance
+  // direction needs to flip so glyphs march in the visually-correct order.
+  if (state_.transform.a < 0.0f) cos_tm_outer = -cos_tm_outer;
+  if (state_.transform.d < 0.0f) sin_tm_outer = -sin_tm_outer;
 
   // Check for Type 3 font (user-defined glyphs)
   auto* type3_font = as_type3_font(current_font_);
@@ -5697,16 +5703,24 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
     return false;
   }
 
-  // Position: glyph origin (x, y) + bitmap offset
-  float px = x + entry->xoff;
-  float py = y + entry->yoff;
+  // Position: glyph origin (x, y) + bitmap offset.
+  // Honour the effective text-rendering matrix sign so horizontal/vertical
+  // flips actually mirror the bitmap. PDF mirrors can come from either the
+  // text matrix (Tm) or the CTM (cm). Bitmap path is only taken when the
+  // text matrix is axis-aligned, so the effective x/y direction signs
+  // come from CTM.a * tm.a and CTM.d * tm.d (cross terms tm.b/tm.c are
+  // ~0 here).
+  float eff_a = state_.transform.a * state_.text_matrix.a;
+  float eff_d = state_.transform.d * state_.text_matrix.d;
+  bool mirror_x = (eff_a < 0.0f);
+  bool mirror_y = (eff_d < 0.0f);
   lvg::Matrix m;
-  m.e11 = 1.0f;
+  m.e11 = mirror_x ? -1.0f : 1.0f;
   m.e12 = 0.0f;
-  m.e13 = px;
+  m.e13 = mirror_x ? (x - entry->xoff) : (x + entry->xoff);
   m.e21 = 0.0f;
-  m.e22 = 1.0f;
-  m.e23 = py;
+  m.e22 = mirror_y ? -1.0f : 1.0f;
+  m.e23 = mirror_y ? (y - entry->yoff) : (y + entry->yoff);
   m.e31 = 0.0f;
   m.e32 = 0.0f;
   m.e33 = 1.0f;
