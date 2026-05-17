@@ -19,8 +19,11 @@ namespace {
 
 #ifdef NANOPDF_PROJECT_DIR
 static const std::string kDataDir = std::string(NANOPDF_PROJECT_DIR) + "/data/";
+static const std::string kVisualFixtureDir =
+    std::string(NANOPDF_PROJECT_DIR) + "/tests/fixtures/visual/";
 #else
 static const std::string kDataDir = "../data/";
+static const std::string kVisualFixtureDir = "../tests/fixtures/visual/";
 #endif
 
 std::vector<uint8_t> load_file(const std::string& path) {
@@ -35,6 +38,9 @@ std::vector<uint8_t> load_file(const std::string& path) {
 bool open_pdf(const std::string& rel_path, std::vector<uint8_t>& data,
               Pdf& pdf) {
   data = load_file(kDataDir + rel_path);
+  if (data.empty()) {
+    data = load_file(kVisualFixtureDir + rel_path);
+  }
   if (data.empty()) return false;
   if (!parse_from_memory(data.data(), data.size(), &pdf)) return false;
   if (!pdf.load_document_structure()) return false;

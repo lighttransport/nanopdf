@@ -20,7 +20,8 @@ except ImportError:
     print("Error: reportlab not installed. Run: pip install reportlab")
     sys.exit(1)
 
-OUTDIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTDIR = os.path.join(PROJECT_DIR, "tests", "fixtures", "visual")
 
 
 def make_cmyk_pdf():

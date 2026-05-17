@@ -6,7 +6,7 @@
 set -e
 
 SERVER="../../../build/nanopdf-mcp"
-TEST_PDF="../../../data/blank.pdf"
+TEST_PDF="../../../tests/fixtures/visual/blank.pdf"
 
 if [ ! -f "$SERVER" ]; then
     echo "Error: MCP server not found at $SERVER"

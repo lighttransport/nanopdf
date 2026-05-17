@@ -15,12 +15,15 @@ using namespace nanopdf;
 
 namespace {
 
-// Path to the project root data/ directory, set via CMake define.
+// Paths to project fixture directories, set via CMake define.
 #ifdef NANOPDF_PROJECT_DIR
 static const std::string kDataDir = std::string(NANOPDF_PROJECT_DIR) + "/data/";
+static const std::string kVisualFixtureDir =
+    std::string(NANOPDF_PROJECT_DIR) + "/tests/fixtures/visual/";
 #else
 // Fallback: assume build directory is one level below project root.
 static const std::string kDataDir = "../data/";
+static const std::string kVisualFixtureDir = "../tests/fixtures/visual/";
 #endif
 
 std::vector<uint8_t> load_file(const std::string& path) {
@@ -28,6 +31,12 @@ std::vector<uint8_t> load_file(const std::string& path) {
   if (!f) return {};
   return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
                                std::istreambuf_iterator<char>());
+}
+
+std::vector<uint8_t> load_fixture_pdf(const std::string& rel_path) {
+  auto data = load_file(kDataDir + rel_path);
+  if (!data.empty()) return data;
+  return load_file(kVisualFixtureDir + rel_path);
 }
 
 }  // namespace
@@ -39,7 +48,7 @@ std::vector<uint8_t> load_file(const std::string& path) {
 TEST_SUITE("ParseRealPDFs") {
 
 TEST_CASE("Parse blank.pdf succeeds with valid structure") {
-  auto data = load_file(kDataDir + "blank.pdf");
+  auto data = load_fixture_pdf("blank.pdf");
   SKIP_IF(data.empty(), "blank.pdf not found");
 
   Pdf pdf;
@@ -58,7 +67,7 @@ TEST_CASE("Parse blank.pdf succeeds with valid structure") {
 }
 
 TEST_CASE("blank.pdf document structure loads with pages") {
-  auto data = load_file(kDataDir + "blank.pdf");
+  auto data = load_fixture_pdf("blank.pdf");
   SKIP_IF(data.empty(), "blank.pdf not found");
 
   Pdf pdf;
@@ -85,7 +94,7 @@ TEST_CASE("blank.pdf document structure loads with pages") {
 }
 
 TEST_CASE("Parse test_cmyk.pdf succeeds with at least 1 page") {
-  auto data = load_file(kDataDir + "test_cmyk.pdf");
+  auto data = load_fixture_pdf("test_cmyk.pdf");
   SKIP_IF(data.empty(), "test_cmyk.pdf not found");
 
   Pdf pdf;
@@ -96,7 +105,7 @@ TEST_CASE("Parse test_cmyk.pdf succeeds with at least 1 page") {
 }
 
 TEST_CASE("Parse test_curves.pdf succeeds and loads document structure") {
-  auto data = load_file(kDataDir + "test_curves.pdf");
+  auto data = load_fixture_pdf("test_curves.pdf");
   SKIP_IF(data.empty(), "test_curves.pdf not found");
 
   Pdf pdf;
@@ -108,7 +117,7 @@ TEST_CASE("Parse test_curves.pdf succeeds and loads document structure") {
 }
 
 TEST_CASE("Parse test_blendmodes.pdf without crashing") {
-  auto data = load_file(kDataDir + "test_blendmodes.pdf");
+  auto data = load_fixture_pdf("test_blendmodes.pdf");
   SKIP_IF(data.empty(), "test_blendmodes.pdf not found");
 
   Pdf pdf;
@@ -117,7 +126,7 @@ TEST_CASE("Parse test_blendmodes.pdf without crashing") {
 }
 
 TEST_CASE("Parse test_linestyles.pdf without crashing") {
-  auto data = load_file(kDataDir + "test_linestyles.pdf");
+  auto data = load_fixture_pdf("test_linestyles.pdf");
   SKIP_IF(data.empty(), "test_linestyles.pdf not found");
 
   Pdf pdf;
@@ -126,7 +135,7 @@ TEST_CASE("Parse test_linestyles.pdf without crashing") {
 }
 
 TEST_CASE("Parse test_softmask.pdf without crashing") {
-  auto data = load_file(kDataDir + "test_softmask.pdf");
+  auto data = load_fixture_pdf("test_softmask.pdf");
   SKIP_IF(data.empty(), "test_softmask.pdf not found");
 
   Pdf pdf;
@@ -135,7 +144,7 @@ TEST_CASE("Parse test_softmask.pdf without crashing") {
 }
 
 TEST_CASE("Parse test_transforms.pdf without crashing") {
-  auto data = load_file(kDataDir + "test_transforms.pdf");
+  auto data = load_fixture_pdf("test_transforms.pdf");
   SKIP_IF(data.empty(), "test_transforms.pdf not found");
 
   Pdf pdf;
@@ -144,7 +153,7 @@ TEST_CASE("Parse test_transforms.pdf without crashing") {
 }
 
 TEST_CASE("Parse test_winding.pdf without crashing") {
-  auto data = load_file(kDataDir + "test_winding.pdf");
+  auto data = load_fixture_pdf("test_winding.pdf");
   SKIP_IF(data.empty(), "test_winding.pdf not found");
 
   Pdf pdf;
@@ -159,7 +168,7 @@ TEST_CASE("Parse standardencoding PDFs without crashing") {
   };
 
   for (const char* rel : se_files) {
-    auto data = load_file(kDataDir + rel);
+    auto data = load_fixture_pdf(rel);
     if (data.empty()) {
       std::cout << "[nanotest] SKIP: " << rel << " not found\n";
       continue;
@@ -180,7 +189,7 @@ TEST_CASE("Parse standardencoding PDFs without crashing") {
 }
 
 TEST_CASE("All tracked test PDFs parse successfully") {
-  // Every PDF tracked in git under data/ should parse without error.
+  // Every small PDF fixture tracked in git should parse without error.
   const char* tracked_pdfs[] = {
       "blank.pdf",
       "test_blendmodes.pdf",
@@ -197,7 +206,7 @@ TEST_CASE("All tracked test PDFs parse successfully") {
   int parsed = 0;
   int skipped = 0;
   for (const char* rel : tracked_pdfs) {
-    auto data = load_file(kDataDir + rel);
+    auto data = load_fixture_pdf(rel);
     if (data.empty()) {
       ++skipped;
       continue;
@@ -214,7 +223,7 @@ TEST_CASE("All tracked test PDFs parse successfully") {
 }
 
 TEST_CASE("parse_pdf returns ParseResult with success details") {
-  auto data = load_file(kDataDir + "blank.pdf");
+  auto data = load_fixture_pdf("blank.pdf");
   SKIP_IF(data.empty(), "blank.pdf not found");
 
   Pdf pdf;
@@ -225,7 +234,7 @@ TEST_CASE("parse_pdf returns ParseResult with success details") {
 }
 
 TEST_CASE("ParseOptions auto_repair=true works on valid PDFs") {
-  auto data = load_file(kDataDir + "blank.pdf");
+  auto data = load_fixture_pdf("blank.pdf");
   SKIP_IF(data.empty(), "blank.pdf not found");
 
   ParseOptions opts;
@@ -239,7 +248,7 @@ TEST_CASE("ParseOptions auto_repair=true works on valid PDFs") {
 }
 
 TEST_CASE("ParseOptions recover_stream_length=true on valid PDFs") {
-  auto data = load_file(kDataDir + "test_curves.pdf");
+  auto data = load_fixture_pdf("test_curves.pdf");
   SKIP_IF(data.empty(), "test_curves.pdf not found");
 
   ParseOptions opts;
@@ -274,7 +283,7 @@ TEST_CASE("Multiple pages accessible on multi-page PDF") {
   };
 
   for (const char* rel : candidates) {
-    auto data = load_file(kDataDir + rel);
+    auto data = load_fixture_pdf(rel);
     if (data.empty()) continue;
 
     Pdf pdf;

@@ -54,13 +54,9 @@ tests/
 ├── integration/              # End-to-end tests with real PDFs
 ├── fixtures/                 # Shared test utilities
 │   ├── test_helpers.hh       # Common helper functions
-│   └── test_helpers.cc       # Helper implementations
-└── data/                     # Test data (PDFs, fonts, etc.)
-    ├── pdfs/
-    │   ├── minimal/          # Minimal test PDFs
-    │   ├── encrypted/        # Encrypted test PDFs
-    │   └── real_world/       # Real-world PDF samples
-    └── fonts/                # Test font files
+│   ├── test_helpers.cc       # Helper implementations
+│   └── visual/               # Committed visual regression PDF fixtures
+└── data/                     # Optional downloaded corpora and local test data
 ```
 
 ## Test Framework: nanotest

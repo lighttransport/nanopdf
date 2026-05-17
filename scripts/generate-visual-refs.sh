@@ -24,8 +24,8 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 
-# List of test PDFs (all single-page). Legacy visual samples live in data/;
-# focused renderer regression fixtures live in tests/fixtures/visual/.
+# List of test PDFs (all single-page). Focused renderer regression fixtures
+# live in tests/fixtures/visual; data/ remains a fallback for legacy/local runs.
 PDF_FILES=(
   blank.pdf
   test_blendmodes.pdf
@@ -35,8 +35,8 @@ PDF_FILES=(
   test_softmask.pdf
   test_transforms.pdf
   test_winding.pdf
-  # test_cmyk.pdf and the older graphics/clip/dash/pattern/gradient/
-  # textmode fixtures are intentionally omitted from the default suite until
+  # test_cmyk.pdf is omitted pending a color-management baseline. The older
+  # graphics/clip/dash/pattern/gradient/textmode fixtures remain omitted until
   # their PDFs and reference policy are restored together.
 )
 

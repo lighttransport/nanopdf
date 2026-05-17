@@ -78,7 +78,8 @@ TEST_CASE("Validate blank.pdf against Arlington model") {
     ArlingtonModel model;
     REQUIRE(model.load(arlington_dir));
 
-    std::string pdf_path = std::string(NANOPDF_PROJECT_DIR) + "/data/blank.pdf";
+    std::string pdf_path =
+        std::string(NANOPDF_PROJECT_DIR) + "/tests/fixtures/visual/blank.pdf";
     SKIP_IF(!file_exists(pdf_path), "blank.pdf not found");
 
     std::vector<uint8_t> pdf_data;
