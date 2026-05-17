@@ -159,7 +159,7 @@ private:
     float char_spacing{0.0f};        // Tc - character spacing
     float word_spacing{0.0f};        // Tw - word spacing
     float horiz_scaling{100.0f};     // Tz - horizontal scaling (percentage)
-    int text_rise{0};                // Ts - text rise (baseline shift)
+    float text_rise{0.0f};           // Ts - text rise (baseline shift)
     int text_render_mode{0};         // Tr - text rendering mode (0-7)
 
     // Text clipping path (accumulated during text block for modes 4-7)
@@ -292,7 +292,8 @@ private:
   // Draw an image XObject
   // fill_r/g/b: current non-stroking color, used to paint image mask pixels
   bool draw_image(const ImageXObject& image, float x, float y, float width, float height,
-                  uint8_t fill_r = 0, uint8_t fill_g = 0, uint8_t fill_b = 0);
+                  uint8_t fill_r = 0, uint8_t fill_g = 0, uint8_t fill_b = 0,
+                  const GraphicsState::Matrix* image_ctm = nullptr);
 
   // Draw a shading (gradient)
   bool draw_shading(const std::string& shading_name);
@@ -315,13 +316,6 @@ private:
 
   // Render a transparency group XObject to create a soft mask
   bool render_soft_mask_group(const Value& group_xobject, int mask_type);
-
-  // Apply soft mask to current rendering (if active)
-  void apply_soft_mask_to_context();
-
-  // Per-pixel soft mask compositing on a rendered buffer
-  void apply_soft_mask_to_pixels(uint8_t* pixels, uint32_t width,
-                                  uint32_t height);
 
   void begin_progress(const RenderProgressCallback& callback,
                       size_t total_objects,
@@ -384,12 +378,19 @@ private:
   // Helper to lookup a resource, checking Form resources first, then page resources
   const Value* lookup_resource(const std::string& resource_type, const std::string& name) const;
 
+  bool apply_extgstate(const std::string& name);
+  bool apply_extgstate_dict(const Dictionary& gs_dict);
+
   // Owns Values that lookup_resource() had to resolve from REFERENCE entries.
   // Returned pointers reference entries inside these owned dicts, so the
   // storage must outlive the caller's use of the pointer. Uses deque so
   // emplace_back never invalidates existing addresses. Cleared at the start
   // of each render_page().
   mutable std::deque<Value> lookup_resolved_owned_;
+
+  // Fonts parsed from nested resource dictionaries that are not present in
+  // Page::fonts. Cleared at the start of each render_page().
+  std::deque<std::unique_ptr<BaseFont>> lookup_font_owned_;
 
   // Shared snapshot of the active soft mask. Built lazily in
   // apply_soft_mask_opacity() so each masked paint shares one allocation.

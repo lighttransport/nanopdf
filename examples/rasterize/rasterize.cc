@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: Apache 2.0
 // Copyright 2024 - Present, Light Transport Entertainment Inc.
 //
-// PDF to PNG rasterizer using nanopdf
+// PDF rasterizer using nanopdf
 //
 // Backends:
 //   lightvg  — lightui VG software rasterizer (default, no external deps)
 //   thorvg   — ThorVG (requires nanopdf built with -DNANOPDF_USE_THORVG=ON)
 //
-// Usage: rasterize <input.pdf> <output.png> [options]
+// Usage: rasterize <input.pdf> <output> [options]
 //
 // Options:
-//   --backend <name>   Renderer: lightvg (default) or thorvg
+//   --backend <name>   Renderer: lightvg (default), thorvg, or list
 //   -p, --page <n>     Page number to render (default: 1)
 //   --pages <spec>     Page selection (e.g. 1-3,7,10-12)
-//   -w, --width <n>    Output width in pixels (default: 800)
-//   -h, --height <n>   Output height in pixels (default: 600)
+//   -w, --width <n>    Output width in pixels (preserves aspect if height omitted)
+//   -h, --height <n>   Output height in pixels (preserves aspect if width omitted)
 //   -s, --scale <f>    Scale factor (overrides width/height)
 //   --dpi <n>          DPI for rendering (default: 150, same as pdftoppm)
 //   -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)
 //   -g, --grayscale    Convert output to grayscale
+//   --format <name>    Output format: png, jpg, bmp, or tga
+//   --jpeg-quality <n> JPEG quality 1-100 (default: 90)
+//   --png-compression <n> PNG compression level 0-9 (default: 6)
 //   --all              Render all pages (creates multiple PNG files)
 //   --verbose          Verbose output
 //   --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace
@@ -39,11 +42,7 @@
 #include "../../src/nanopdf.hh"
 #include "../../src/nanopdf-log.hh"
 
-// For saving processed images
-extern "C" {
-  int stbi_write_png(const char* filename, int w, int h, int comp,
-                     const void* data, int stride_in_bytes);
-}
+#include "../../src/third_party/stb_image_write.h"
 
 struct RasterizeOptions {
   std::string input_file;
@@ -62,6 +61,10 @@ struct RasterizeOptions {
   bool height_set = false;
   int rotation = 0;    // 0, 90, 180, 270 degrees
   bool grayscale = false;
+  nanopdf::RenderOptions::Format output_format = nanopdf::RenderOptions::Format::PNG;
+  int jpeg_quality = 90;
+  int png_compression = 6;
+  bool list_backends = false;
   bool render_all_pages = false;
   bool verbose = false;
   int log_level = 3;  // Default: Info
@@ -69,20 +72,23 @@ struct RasterizeOptions {
 };
 
 void print_usage(const char* program_name) {
-  std::cout << "PDF to PNG Rasterizer using nanopdf\n";
+  std::cout << "PDF Rasterizer using nanopdf\n";
   std::cout << "\n";
-  std::cout << "Usage: " << program_name << " <input.pdf> <output.png> [options]\n";
+  std::cout << "Usage: " << program_name << " <input.pdf> <output> [options]\n";
   std::cout << "\n";
   std::cout << "Options:\n";
-  std::cout << "  --backend <name>   Renderer: lightvg (default) or thorvg\n";
+  std::cout << "  --backend <name>   Renderer: lightvg (default), thorvg, or list\n";
   std::cout << "  -p, --page <n>     Page number to render (default: 1)\n";
   std::cout << "  --pages <spec>     Page selection (e.g. 1-3,7,10-12)\n";
-  std::cout << "  -w, --width <n>    Output width in pixels (default: 800)\n";
-  std::cout << "  -h, --height <n>   Output height in pixels (default: 600)\n";
+  std::cout << "  -w, --width <n>    Output width in pixels (preserves aspect if height omitted)\n";
+  std::cout << "  -h, --height <n>   Output height in pixels (preserves aspect if width omitted)\n";
   std::cout << "  -s, --scale <f>    Scale factor (overrides width/height)\n";
   std::cout << "  --dpi <n>          DPI for rendering (default: 150, same as pdftoppm)\n";
   std::cout << "  -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)\n";
   std::cout << "  -g, --grayscale    Convert output to grayscale\n";
+  std::cout << "  --format <name>    Output format: png, jpg, bmp, or tga (default: png)\n";
+  std::cout << "  --jpeg-quality <n> JPEG quality 1-100 (default: 90)\n";
+  std::cout << "  --png-compression <n> PNG compression level 0-9 (default: 6)\n";
   std::cout << "  --all              Render all pages (creates multiple PNG files)\n";
   std::cout << "  --verbose          Verbose output\n";
   std::cout << "  --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace\n";
@@ -95,6 +101,46 @@ void print_usage(const char* program_name) {
   std::cout << "  " << program_name << " document.pdf output.png --all --dpi 150\n";
   std::cout << "  " << program_name << " document.pdf output.png -s 2.0\n";
   std::cout << "  " << program_name << " document.pdf output.png -r 90 --grayscale\n";
+  std::cout << "  " << program_name << " document.pdf output.jpg --format jpg --jpeg-quality 85\n";
+}
+
+void print_available_backends() {
+  std::cout << "Available backends:\n";
+  std::cout << "  lightvg: "
+            << (nanopdf::backend_available(nanopdf::BackendKind::LightVG)
+                    ? "enabled" : "not compiled")
+            << "\n";
+  std::cout << "  thorvg:  "
+            << (nanopdf::backend_available(nanopdf::BackendKind::ThorVG)
+                    ? "enabled" : "not compiled")
+            << "\n";
+}
+
+static bool parse_output_format(const std::string& name,
+                                nanopdf::RenderOptions::Format& out) {
+  std::string lower;
+  lower.reserve(name.size());
+  for (char c : name) {
+    lower.push_back(static_cast<char>(
+        std::tolower(static_cast<unsigned char>(c))));
+  }
+  if (lower == "png") {
+    out = nanopdf::RenderOptions::Format::PNG;
+    return true;
+  }
+  if (lower == "jpg" || lower == "jpeg") {
+    out = nanopdf::RenderOptions::Format::JPEG;
+    return true;
+  }
+  if (lower == "bmp") {
+    out = nanopdf::RenderOptions::Format::BMP;
+    return true;
+  }
+  if (lower == "tga") {
+    out = nanopdf::RenderOptions::Format::TGA;
+    return true;
+  }
+  return false;
 }
 
 bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
@@ -158,6 +204,24 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
       }
     } else if (arg == "-g" || arg == "--grayscale") {
       options.grayscale = true;
+    } else if (arg == "--format" && i + 1 < argc) {
+      std::string format_name = argv[++i];
+      if (!parse_output_format(format_name, options.output_format)) {
+        std::cerr << "Error: Format must be png, jpg, jpeg, bmp, or tga\n";
+        return false;
+      }
+    } else if (arg == "--jpeg-quality" && i + 1 < argc) {
+      options.jpeg_quality = std::atoi(argv[++i]);
+      if (options.jpeg_quality < 1 || options.jpeg_quality > 100) {
+        std::cerr << "Error: JPEG quality must be 1-100\n";
+        return false;
+      }
+    } else if (arg == "--png-compression" && i + 1 < argc) {
+      options.png_compression = std::atoi(argv[++i]);
+      if (options.png_compression < 0 || options.png_compression > 9) {
+        std::cerr << "Error: PNG compression level must be 0-9\n";
+        return false;
+      }
     } else if (arg == "--all") {
       options.render_all_pages = true;
     } else if (arg == "--verbose") {
@@ -170,9 +234,13 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
       }
     } else if (arg == "--backend" && i + 1 < argc) {
       std::string name = argv[++i];
+      if (name == "list") {
+        options.list_backends = true;
+        continue;
+      }
       if (!nanopdf::parse_backend_kind(name, &options.backend)) {
         std::cerr << "Error: Unknown backend: " << name
-                  << " (expected: lightvg, thorvg)\n";
+                  << " (expected: lightvg, thorvg, list)\n";
         return false;
       }
     } else if (arg == "--help") {
@@ -375,6 +443,39 @@ std::vector<uint8_t> rotate_pixels(const std::vector<uint8_t>& src,
   return dst;
 }
 
+bool save_rgba_pixels(const std::string& filename,
+                      const std::vector<uint8_t>& pixels,
+                      int width, int height,
+                      const RasterizeOptions& options) {
+  if (width <= 0 || height <= 0 || pixels.empty()) return false;
+
+  switch (options.output_format) {
+    case nanopdf::RenderOptions::Format::PNG:
+      stbi_write_png_compression_level = options.png_compression;
+      return stbi_write_png(filename.c_str(), width, height, 4,
+                            pixels.data(), width * 4) != 0;
+    case nanopdf::RenderOptions::Format::JPEG: {
+      std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
+      for (int i = 0; i < width * height; ++i) {
+        size_t rgb_idx = static_cast<size_t>(i) * 3;
+        size_t rgba_idx = static_cast<size_t>(i) * 4;
+        rgb[rgb_idx + 0] = pixels[rgba_idx + 0];
+        rgb[rgb_idx + 1] = pixels[rgba_idx + 1];
+        rgb[rgb_idx + 2] = pixels[rgba_idx + 2];
+      }
+      return stbi_write_jpg(filename.c_str(), width, height, 3,
+                            rgb.data(), options.jpeg_quality) != 0;
+    }
+    case nanopdf::RenderOptions::Format::BMP:
+      return stbi_write_bmp(filename.c_str(), width, height, 4,
+                            pixels.data()) != 0;
+    case nanopdf::RenderOptions::Format::TGA:
+      return stbi_write_tga(filename.c_str(), width, height, 4,
+                            pixels.data()) != 0;
+  }
+  return false;
+}
+
 bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_num,
                 const RasterizeOptions& options, const std::string& output_file) {
   // Get page dimensions from media_box [left, bottom, right, top]
@@ -406,7 +507,7 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     } else if (options.height_set && !options.width_set) {
       output_width = static_cast<int>(output_height * aspect_ratio);
     }
-    // If both are set, honor them verbatim (may distort aspect).
+    // If both are set, honor the canvas size verbatim.
   } else {
     float dpi_scale = options.dpi / 72.0f;
     output_width = static_cast<int>(page_width * dpi_scale);
@@ -491,27 +592,30 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
                             options.rotation, final_width, final_height);
     }
 
-    // Save processed image using stb_image_write
-    if (stbi_write_png(output_file.c_str(), final_width, final_height, 4,
-                       pixels.data(), final_width * 4)) {
+    if (save_rgba_pixels(output_file, pixels, final_width, final_height, options)) {
       if (options.verbose) {
         std::cout << "  Saved to: " << output_file << "\n";
       }
       return true;
     } else {
-      std::cerr << "Error: Failed to save PNG file: " << output_file << "\n";
+      std::cerr << "Error: Failed to save output file: " << output_file << "\n";
       return false;
     }
   }
 
-  // No post-processing needed, save directly
-  if (backend->save_to_png(output_file)) {
+  nanopdf::RenderOptions save_options;
+  save_options.format = options.output_format;
+  save_options.jpeg_quality = options.jpeg_quality;
+  save_options.png_compression = options.png_compression;
+
+  // No post-processing needed, save directly through the selected backend.
+  if (backend->save_to_file(output_file, save_options)) {
     if (options.verbose) {
       std::cout << "  Saved to: " << output_file << "\n";
     }
     return true;
   } else {
-    std::cerr << "Error: Failed to save PNG file: " << output_file << "\n";
+    std::cerr << "Error: Failed to save output file: " << output_file << "\n";
     return false;
   }
 }
@@ -519,10 +623,27 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
 int main(int argc, char* argv[]) {
   RasterizeOptions options;
 
+  if (argc == 2) {
+    std::string arg = argv[1];
+    if (arg == "--help" || arg == "-?") {
+      print_usage(argv[0]);
+      return 0;
+    }
+  }
+  if (argc == 3 && std::string(argv[1]) == "--backend" &&
+      std::string(argv[2]) == "list") {
+    print_available_backends();
+    return 0;
+  }
+
   // Parse command line arguments
   if (!parse_arguments(argc, argv, options)) {
     print_usage(argv[0]);
     return 1;
+  }
+  if (options.list_backends) {
+    print_available_backends();
+    return 0;
   }
 
   // Set log level from command line option

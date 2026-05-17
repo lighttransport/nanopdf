@@ -374,25 +374,16 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Define test cases with per-test tolerance
+  // Define test cases with per-test tolerance. Keep this list in sync with
+  // scripts/generate-visual-refs.sh and committed/generated local fixtures so
+  // default CI runs do not pass with silent coverage skips.
   std::vector<TestCase> tests = {
     {"blank.pdf",          2,  1.0},
-    {"test_graphics.pdf",  5,  5.0},
-    {"test_clip.pdf",      5,  5.0},
-    {"test_dash.pdf",      5,  6.0},
-    {"test_pattern.pdf",   5,  5.0},
-    {"test_image.pdf",     8, 10.0},
-    {"test_gradient.pdf",  8,  5.0},
-    {"test_radial.pdf",    8,  5.0},
-    {"test_multistop.pdf", 8,  5.0},
-    {"test_textmode.pdf",  8, 10.0},
-    {"test_textmode2.pdf", 8, 20.0},
-    // Phase 2 shape tests
-    {"test_cmyk.pdf",       8, 10.0},
     {"test_linestyles.pdf", 5,  8.0},
     {"test_curves.pdf",     5,  5.0},
     {"test_winding.pdf",    5,  5.0},
     {"test_transforms.pdf", 5,  5.0},
+    {"test_image_transform.pdf", 8, 10.0},
     {"test_blendmodes.pdf", 8, 15.0},
     {"test_softmask.pdf",   8, 10.0},
   };
@@ -565,7 +556,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  return (failed > 0) ? 1 : 0;
+  return (failed > 0 || skipped > 0) ? 1 : 0;
 
 #endif  // TEST_VISUAL_BACKEND_*
 }

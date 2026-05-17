@@ -20,12 +20,10 @@
 //   and replays each paint onto the underlying `lui_canvas_t` immediately.
 // * Cubic Beziers are flattened to polygon vertices for `lui_canvas_*` fills
 //   and strokes; flattening uses adaptive subdivision capped at depth 6.
-// * Vector clip (`Shape::clip`) is approximated with the clipper's axis-
-//   aligned bounding box (`lui_canvas_set_clip` only accepts a rect). This
-//   is lossy for arbitrary clip paths but keeps content inside the right
-//   region.
-// * Polygon gradient fills are not natively supported by lui_canvas; they
-//   degrade to a solid colour sampled from the gradient's mid-stop.
+// * Vector clip uses a rect fast path when possible, otherwise the clipper
+//   path is rasterized to an alpha mask and intersected with the canvas clip.
+// * Polygon gradient fills and gradient strokes are sampled per pixel when
+//   lui_canvas has no native primitive for the requested operation.
 
 #pragma once
 
@@ -152,9 +150,9 @@ class Paint {
     return Result::Success;
   }
 
-  // Approximate clip via the clipper's bounding box. ThorVG-style vector
-  // clip is not supported by lui_canvas. The clipper is owned by this paint
-  // after this call.
+  // Clip this paint with a Shape. Axis-aligned rect clips use the canvas clip;
+  // arbitrary clips are rasterized to a temporary alpha mask. The clipper is
+  // owned by this paint after this call.
   Result clip(Shape* clipper);
 
   // Pre-multiplied opacity (0-255).
@@ -185,7 +183,7 @@ class Paint {
   BlendMethod blend_mode_{BlendMethod::Normal};
   uint8_t     opacity_{255};
 
-  // Clipper (axis-aligned bbox applied on draw_on).
+  // Optional clipper applied on draw_on.
   Shape* clipper_{nullptr};
 
   // Optional soft mask. When non-null, draw_on dispatches through
@@ -226,8 +224,8 @@ class Shape : public Paint {
     return Result::Success;
   }
   Result strokeFill(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
-  // Gradient strokeFill: takes ownership. Degraded to mid-stop sample on
-  // draw (lui_canvas has no gradient-stroke primitive).
+  // Gradient strokeFill: takes ownership. Sampled per pixel on draw when
+  // lui_canvas has no gradient-stroke primitive.
   Result strokeFill(LinearGradient* g);
   Result strokeFill(RadialGradient* g);
   Result strokeCap(StrokeCap c) {
@@ -278,6 +276,7 @@ class Shape : public Paint {
 
   friend class Scene;
   friend class SwCanvas;
+  friend class Picture;
 };
 
 // ---------------------------------------------------------------------------
@@ -289,11 +288,15 @@ class Picture : public Paint {
   ~Picture() override;
 
   // Loads a buffer of ARGB/ABGR pixels. Picture takes a copy (we own it).
-  Result load(uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs,
+  Result load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs,
               bool premultiplied = false);
 
   Result transform(const Matrix& m);
   Result translate(float x, float y);
+  Result interpolate(bool enabled) {
+    interpolate_ = enabled;
+    return Result::Success;
+  }
 
   Kind kind() const override { return kPicture; }
   void draw_on(lui_canvas_t* canvas) override;
@@ -304,15 +307,17 @@ class Picture : public Paint {
  private:
   Picture() = default;
 
-  // Slow path: per-pixel inverse-transform sample for rotated/sheared
-  // pictures. Only invoked when the transform has non-zero off-diagonal
-  // terms.
+  void draw_pixels(lui_canvas_t* canvas);
+
+  // Slow path: per-pixel inverse-transform sample for rotated/sheared,
+  // mirrored, blended, or opacity-adjusted pictures.
   void draw_transformed(lui_canvas_t* canvas);
 
   std::vector<uint32_t> pixels_;  // ARGB-packed for lui_surface
   uint32_t width_{0};
   uint32_t height_{0};
   Matrix   transform_{1, 0, 0, 0, 1, 0, 0, 0, 1};
+  bool     interpolate_{false};
 };
 
 // ---------------------------------------------------------------------------

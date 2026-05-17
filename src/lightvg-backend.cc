@@ -1576,6 +1576,11 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
   if (!scene_) {
     return false;
   }
+  if (state_.fill_opacity < 1.0f) {
+    float opacity = std::max(0.0f, std::min(1.0f, state_.fill_opacity));
+    a = static_cast<uint8_t>(a * opacity + 0.5f);
+  }
+  const float hscale = state_.horiz_scaling / 100.0f;
 
   // Compute text direction from text matrix for rotated text positioning
   // For normal text [8,0,0,8], cos_tm=1, sin_tm=0 (advance right)
@@ -1614,8 +1619,8 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
         // No glyph - draw tofu box placeholder and advance
         draw_missing_glyph_placeholder(cursor_x, cursor_y, size, r, g, b, a);
         float adv = size * 0.6f;
-        cursor_x += adv * cos_tm_outer;
-        cursor_y -= adv * sin_tm_outer;
+        cursor_x += (adv * hscale) * cos_tm_outer;
+        cursor_y -= (adv * hscale) * sin_tm_outer;
         continue;
       }
 
@@ -1630,8 +1635,8 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
         advance = static_cast<float>(type3_font->widths[char_code] * fm_a * size);
       }
 
-      cursor_x += advance * cos_tm_outer;
-      cursor_y -= advance * sin_tm_outer;
+      cursor_x += (advance * hscale) * cos_tm_outer;
+      cursor_y -= (advance * hscale) * sin_tm_outer;
     }
     return true;
   }
@@ -1819,8 +1824,8 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
           } else {
             adv = type0_font->default_width / 1000.0f * size + tc_canvas;
           }
-          cursor_x += adv * cos_tm;
-          cursor_y -= adv * sin_tm;  // canvas y = -(PDF y), so subtract sin
+          cursor_x += (adv * hscale) * cos_tm;
+          cursor_y -= (adv * hscale) * sin_tm;  // canvas y = -(PDF y), so subtract sin
 
           // Do not apply font kerning here: PDF content streams already encode
           // text positioning via Tj/TJ adjustments and text state tracking.
@@ -1883,8 +1888,8 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
         adv = advance_width * em_scale;
       }
       adv += tc_canvas2 + tw_canvas;
-      cursor_x += adv * cos_tm;
-      cursor_y -= adv * sin_tm;
+      cursor_x += (adv * hscale) * cos_tm;
+      cursor_y -= (adv * hscale) * sin_tm;
 
       // Do not apply font kerning here: PDF text placement is already explicit.
 
@@ -1894,7 +1899,8 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
     // Fallback: draw per-character tofu box placeholders for text
     float char_width = size * 0.5f;
     for (size_t i = 0; i < text.length(); ++i) {
-      draw_missing_glyph_placeholder(x + i * char_width * 1.2f, y, size, r, g, b, a);
+      draw_missing_glyph_placeholder(x + i * char_width * 1.2f * hscale,
+                                     y, size, r, g, b, a);
     }
   }
 
@@ -2942,7 +2948,8 @@ static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
                                    std::vector<double>& outputs);
 
 bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height,
-                               uint8_t fill_r, uint8_t fill_g, uint8_t fill_b) {
+                               uint8_t fill_r, uint8_t fill_g, uint8_t fill_b,
+                               const GraphicsState::Matrix* image_ctm) {
   NANOPDF_LOG_DEBUG("LightVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
                     image.width, image.height, x, y, width, height, image.data.size());
 
@@ -2952,7 +2959,7 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     return false;
   }
 
-  // Convert image data to ARGB8888 format for ThorVG
+  // Convert image data to ARGB8888 format for LightVG
   std::vector<uint32_t> argb_data;
   int img_width = image.width;
   int img_height = image.height;
@@ -3294,45 +3301,57 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     }
   }
 
-  // Create ThorVG Picture from raw data
+  // Create LightVG Picture from raw data. lvg::Picture::load() copies the
+  // buffer, so the temporary vector can stay stack-owned.
   auto picture = lvg::Picture::gen();
   if (!picture) {
     return false;
   }
 
-  // Load raw pixel data
-  // Note: ThorVG expects the data to persist, so we copy it
-  auto* data_copy = new uint32_t[argb_data.size()];
-  std::copy(argb_data.begin(), argb_data.end(), data_copy);
-
-  auto result = picture->load(data_copy, img_width, img_height, lvg::ColorSpace::ARGB8888, true);
+  auto result = picture->load(argb_data.data(), img_width, img_height,
+                              lvg::ColorSpace::ARGB8888, true);
   if (result != lvg::Result::Success) {
-    delete[] data_copy;
+    picture->unref();
     return false;
   }
+  picture->interpolate(image.interpolate);
 
-  // Apply transformation to position and scale the image
-  // PDF coordinate: (x, y) is bottom-left, we need to flip Y for screen coordinates
-  float scale_x = width / img_width;
-  float scale_y = height / img_height;
-
-  // Convert PDF coordinates to canvas coordinates
-  // In PDF, y=0 is at bottom. In screen coords, y=0 is at top.
-  // PDF (x, y) with height h maps to canvas (x*scale, (page_h - y - h)*scale)
-  float canvas_x = x * state_.scale;
-  float canvas_y = (state_.page_height - y - height) * state_.scale;
-
-  NANOPDF_LOG_DEBUG("LightVG", "draw_image transform: page_h=%.1f, scale=%.3f, canvas=(%.1f,%.1f)",
-                    state_.page_height, state_.scale, canvas_x, canvas_y);
-
-  // Apply transformation using matrix for non-uniform scaling
+  // Apply transformation using matrix for non-uniform scaling.
+  // PDF images map their unit square through the current CTM. Source pixel
+  // row 0 is the top of that square, so source v maps to PDF y=(1 - v/h).
   lvg::Matrix m;
-  m.e11 = scale_x * state_.scale;
-  m.e12 = 0.0f;
-  m.e13 = canvas_x;
-  m.e21 = 0.0f;
-  m.e22 = scale_y * state_.scale;
-  m.e23 = canvas_y;
+  if (image_ctm) {
+    float inv_w = 1.0f / static_cast<float>(img_width);
+    float inv_h = 1.0f / static_cast<float>(img_height);
+    m.e11 = image_ctm->a * inv_w * state_.scale;
+    m.e12 = -image_ctm->c * inv_h * state_.scale;
+    m.e13 = (image_ctm->c + image_ctm->e) * state_.scale;
+    m.e21 = -image_ctm->b * inv_w * state_.scale;
+    m.e22 = image_ctm->d * inv_h * state_.scale;
+    m.e23 = (state_.page_height - image_ctm->d - image_ctm->f) * state_.scale;
+    NANOPDF_LOG_DEBUG("LightVG",
+                      "draw_image CTM: [%.3f %.3f %.3f %.3f %.3f %.3f] -> "
+                      "matrix=[%.3f %.3f %.3f; %.3f %.3f %.3f]",
+                      image_ctm->a, image_ctm->b, image_ctm->c, image_ctm->d,
+                      image_ctm->e, image_ctm->f, m.e11, m.e12, m.e13,
+                      m.e21, m.e22, m.e23);
+  } else {
+    // PDF coordinate: (x, y) is bottom-left, we need to flip Y for screen coordinates.
+    float scale_x = width / img_width;
+    float scale_y = height / img_height;
+    float canvas_x = x * state_.scale;
+    float canvas_y = (state_.page_height - y - height) * state_.scale;
+
+    NANOPDF_LOG_DEBUG("LightVG", "draw_image transform: page_h=%.1f, scale=%.3f, canvas=(%.1f,%.1f)",
+                      state_.page_height, state_.scale, canvas_x, canvas_y);
+
+    m.e11 = scale_x * state_.scale;
+    m.e12 = 0.0f;
+    m.e13 = canvas_x;
+    m.e21 = 0.0f;
+    m.e22 = scale_y * state_.scale;
+    m.e23 = canvas_y;
+  }
   m.e31 = 0.0f;
   m.e32 = 0.0f;
   m.e33 = 1.0f;
@@ -3341,6 +3360,21 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   // Apply blend mode
   if (state_.blend_mode != 0) {
     picture->blend(static_cast<lvg::BlendMethod>(state_.blend_mode));
+  }
+  if (state_.fill_opacity < 1.0f) {
+    float opacity = std::max(0.0f, std::min(1.0f, state_.fill_opacity));
+    picture->opacity(static_cast<uint8_t>(opacity * 255.0f + 0.5f));
+  }
+  if (state_.has_clip && !state_.clip_commands.empty()) {
+    auto clipper = lvg::Shape::gen();
+    if (clipper) {
+      append_shape_geometry(clipper, state_.clip_commands, state_.clip_points);
+      clipper->fillRule(state_.clip_even_odd ? lvg::FillRule::EvenOdd
+                                             : lvg::FillRule::NonZero);
+      if (picture->clip(clipper) != lvg::Result::Success) {
+        clipper->unref();
+      }
+    }
   }
 
   // Push to scene
@@ -3658,39 +3692,180 @@ const Value* LightVGBackend::lookup_resource(const std::string& resource_type,
   return nullptr;
 }
 
+static lvg::BlendMethod blend_method_from_pdf_name(const std::string& name) {
+  if (name == "Multiply") return lvg::BlendMethod::Multiply;
+  if (name == "Screen") return lvg::BlendMethod::Screen;
+  if (name == "Overlay") return lvg::BlendMethod::Overlay;
+  if (name == "Darken") return lvg::BlendMethod::Darken;
+  if (name == "Lighten") return lvg::BlendMethod::Lighten;
+  if (name == "ColorDodge") return lvg::BlendMethod::ColorDodge;
+  if (name == "ColorBurn") return lvg::BlendMethod::ColorBurn;
+  if (name == "HardLight") return lvg::BlendMethod::HardLight;
+  if (name == "SoftLight") return lvg::BlendMethod::SoftLight;
+  if (name == "Difference") return lvg::BlendMethod::Difference;
+  if (name == "Exclusion") return lvg::BlendMethod::Exclusion;
+  if (name == "Hue") return lvg::BlendMethod::Hue;
+  if (name == "Saturation") return lvg::BlendMethod::Saturation;
+  if (name == "Color") return lvg::BlendMethod::Color;
+  if (name == "Luminosity") return lvg::BlendMethod::Luminosity;
+  return lvg::BlendMethod::Normal;
+}
+
+bool LightVGBackend::apply_extgstate(const std::string& name) {
+  if (!current_pdf_) return false;
+  std::string gs_name = name;
+  if (!gs_name.empty() && gs_name[0] == '/') {
+    gs_name = gs_name.substr(1);
+  }
+  const Value* gs_value = lookup_resource("ExtGState", gs_name);
+  if (!gs_value) return false;
+
+  Value resolved_value = *gs_value;
+  if (resolved_value.type == Value::REFERENCE) {
+    auto resolved = resolve_reference(*current_pdf_,
+                                      resolved_value.ref_object_number,
+                                      resolved_value.ref_generation_number);
+    if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
+      return false;
+    }
+    resolved_value = std::move(resolved.value);
+  }
+  if (resolved_value.type != Value::DICTIONARY) return false;
+  return apply_extgstate_dict(resolved_value.dict);
+}
+
+bool LightVGBackend::apply_extgstate_dict(const Dictionary& gs_dict) {
+  auto number = [&](const char* key, float* out) {
+    auto it = gs_dict.find(key);
+    if (it != gs_dict.end() && it->second.type == Value::NUMBER) {
+      *out = static_cast<float>(it->second.number);
+      return true;
+    }
+    return false;
+  };
+  auto boolean = [&](const char* key, bool* out) {
+    auto it = gs_dict.find(key);
+    if (it != gs_dict.end() && it->second.type == Value::BOOLEAN) {
+      *out = it->second.boolean;
+      return true;
+    }
+    return false;
+  };
+
+  number("ca", &state_.fill_opacity);
+  state_.fill_opacity = clamp14(state_.fill_opacity, 0.0f, 1.0f);
+
+  number("CA", &state_.stroke_opacity);
+  state_.stroke_opacity = clamp14(state_.stroke_opacity, 0.0f, 1.0f);
+
+  auto bm_it = gs_dict.find("BM");
+  if (bm_it != gs_dict.end()) {
+    std::string bm_name;
+    if (bm_it->second.type == Value::NAME) {
+      bm_name = bm_it->second.name;
+    } else if (bm_it->second.type == Value::ARRAY) {
+      for (const Value& item : bm_it->second.array) {
+        if (item.type == Value::NAME) {
+          bm_name = item.name;
+          break;
+        }
+      }
+    }
+    state_.blend_mode = static_cast<int>(blend_method_from_pdf_name(bm_name));
+  }
+
+  number("LW", &state_.stroke_width);
+
+  float tmp = 0.0f;
+  if (number("LC", &tmp)) state_.line_cap = static_cast<int>(tmp);
+  if (number("LJ", &tmp)) state_.line_join = static_cast<int>(tmp);
+  number("ML", &state_.miter_limit);
+
+  boolean("AIS", &state_.alpha_is_shape);
+  boolean("TK", &state_.text_knockout);
+  boolean("OP", &state_.overprint_stroke);
+  boolean("op", &state_.overprint_fill);
+  if (number("OPM", &tmp)) state_.overprint_mode = static_cast<int>(tmp);
+  number("FL", &state_.flatness);
+  boolean("SA", &state_.stroke_adjustment);
+
+  auto ri_it = gs_dict.find("RI");
+  if (ri_it != gs_dict.end() && ri_it->second.type == Value::NAME) {
+    state_.rendering_intent = ri_it->second.name;
+  }
+
+  auto dash_it = gs_dict.find("D");
+  if (dash_it != gs_dict.end() && dash_it->second.type == Value::ARRAY &&
+      dash_it->second.array.size() >= 2) {
+    const Value& dash_array = dash_it->second.array[0];
+    const Value& dash_phase = dash_it->second.array[1];
+    if (dash_array.type == Value::ARRAY) {
+      state_.dash_pattern.clear();
+      for (const Value& v : dash_array.array) {
+        if (v.type == Value::NUMBER) {
+          state_.dash_pattern.push_back(static_cast<float>(v.number));
+        }
+      }
+    }
+    if (dash_phase.type == Value::NUMBER) {
+      state_.dash_phase = static_cast<float>(dash_phase.number);
+    }
+  }
+
+  auto smask_it = gs_dict.find("SMask");
+  if (smask_it != gs_dict.end()) {
+    const Value& smask = smask_it->second;
+    if (smask.type == Value::NAME && smask.name == "None") {
+      state_.has_soft_mask = false;
+      state_.soft_mask_type = 0;
+      state_.soft_mask_data.clear();
+      state_.soft_mask_width = 0;
+      state_.soft_mask_height = 0;
+      current_soft_mask_.reset();
+    } else if (smask.type == Value::DICTIONARY || smask.type == Value::REFERENCE) {
+      Dictionary smask_dict;
+      if (smask.type == Value::DICTIONARY) {
+        smask_dict = smask.dict;
+      } else if (current_pdf_) {
+        auto resolved = resolve_reference(*current_pdf_,
+                                          smask.ref_object_number,
+                                          smask.ref_generation_number);
+        if (resolved.success && resolved.value.type == Value::DICTIONARY) {
+          smask_dict = std::move(resolved.value.dict);
+        }
+      }
+      if (!smask_dict.empty()) {
+        int mask_type = 1;
+        auto s_it = smask_dict.find("S");
+        if (s_it != smask_dict.end() && s_it->second.type == Value::NAME &&
+            s_it->second.name == "Luminosity") {
+          mask_type = 2;
+        }
+        auto g_it = smask_dict.find("G");
+        if (g_it != smask_dict.end()) {
+          state_.has_soft_mask = true;
+          state_.soft_mask_type = mask_type;
+          if (render_soft_mask_group(g_it->second, mask_type)) {
+            current_soft_mask_.reset();
+          } else {
+            state_.has_soft_mask = false;
+          }
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
 bool LightVGBackend::draw_shading(const std::string& shading_name) {
   if (!scene_ || !current_pdf_ || !current_page_) {
     return false;
   }
 
-  // Look up shading in page resources
-  auto shading_dict_it = current_page_->resources.find("Shading");
-  if (shading_dict_it == current_page_->resources.end()) {
-    return false;
-  }
-
-  // Resolve shading dictionary if it's a reference
-  Value shading_dict_value = shading_dict_it->second;
-  if (shading_dict_value.type == Value::REFERENCE) {
-    auto resolved = resolve_reference(*current_pdf_, shading_dict_value.ref_object_number,
-                                      shading_dict_value.ref_generation_number);
-    if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
-      return false;
-    }
-    shading_dict_value = resolved.value;
-  }
-
-  if (shading_dict_value.type != Value::DICTIONARY) {
-    return false;
-  }
-
-  // Find the specific shading by name
-  auto shading_it = shading_dict_value.dict.find(shading_name);
-  if (shading_it == shading_dict_value.dict.end()) {
-    return false;
-  }
-
-  const Value& shading_value = shading_it->second;
+  const Value* shading_value_ptr = lookup_resource("Shading", shading_name);
+  if (!shading_value_ptr) return false;
+  const Value& shading_value = *shading_value_ptr;
 
   // Resolve reference if needed
   Value resolved_shading = shading_value;
@@ -3822,13 +3997,11 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
     std::vector<uint32_t> pixels;
     if (rasterize_function_shading(*current_pdf_, *shading, raster_w, raster_h,
                                     state_.scale, state_.page_height, pixels)) {
-      // Create ThorVG Picture from rasterized bitmap
+      // Create LightVG Picture from rasterized bitmap. Picture copies the
+      // input pixels during load().
       auto picture = lvg::Picture::gen();
       if (picture) {
-        auto* data_copy = new uint32_t[pixels.size()];
-        std::copy(pixels.begin(), pixels.end(), data_copy);
-
-        auto result = picture->load(data_copy, raster_w, raster_h,
+        auto result = picture->load(pixels.data(), raster_w, raster_h,
                                      lvg::ColorSpace::ARGB8888, true);
         if (result == lvg::Result::Success) {
           // Position the picture at the shape location
@@ -3843,7 +4016,7 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
           shape->unref();  // Don't need the shape anymore
           return true;
         } else {
-          delete[] data_copy;
+          picture->unref();
         }
       }
     }
@@ -4002,7 +4175,7 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
 #endif
     }
 
-    // Convert bitmap to ThorVG Picture
+    // Convert bitmap to LightVG Picture
     auto picture = lvg::Picture::gen();
     if (!picture) {
       shape->unref();
@@ -4155,7 +4328,7 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
       have_prev = true;
     }
 
-    // Convert bitmap to ThorVG Picture
+    // Convert bitmap to LightVG Picture
     auto picture = lvg::Picture::gen();
     if (!picture) {
       shape->unref();
@@ -4278,6 +4451,7 @@ bool LightVGBackend::parse_inline_image(const std::string& content, size_t& pos)
   int width = 0, height = 0, bpc = 8;
   std::string cs = "G";  // Default grayscale
   std::string filter;
+  bool interpolate = false;
 
   // W or Width
   auto it = dict.find("W");
@@ -4303,6 +4477,14 @@ bool LightVGBackend::parse_inline_image(const std::string& content, size_t& pos)
   it = dict.find("F");
   if (it == dict.end()) it = dict.find("Filter");
   if (it != dict.end()) filter = it->second;
+
+  // I or Interpolate
+  it = dict.find("I");
+  if (it == dict.end()) it = dict.find("Interpolate");
+  if (it != dict.end()) {
+    interpolate = (it->second == "true" || it->second == "True" ||
+                   it->second == "1");
+  }
 
   if (width <= 0 || height <= 0) {
     // Skip to EI and return
@@ -4434,6 +4616,7 @@ bool LightVGBackend::parse_inline_image(const std::string& content, size_t& pos)
   image.height = height;
   image.bits_per_component = bpc;
   image.data = decoded_data;
+  image.interpolate = interpolate;
 
   if (cs == "RGB" || cs == "DeviceRGB") {
     image.color_space.type = ColorSpaceType::DeviceRGB;
@@ -4443,20 +4626,10 @@ bool LightVGBackend::parse_inline_image(const std::string& content, size_t& pos)
     image.color_space.type = ColorSpaceType::DeviceGray;
   }
 
-  // Draw the image using CTM
-  float img_x = state_.transform.e * state_.scale;
-  float img_y = state_.transform.f;
-  float img_width = state_.transform.a * state_.scale;
-  float img_height = state_.transform.d * state_.scale;
-
-  if (img_height < 0) {
-    img_y += img_height;
-    img_height = -img_height;
-  }
-  img_y = (state_.page_height - img_y) * state_.scale - img_height;
-
-  draw_image(image, img_x, img_y, img_width, img_height,
-                          state_.fill_r, state_.fill_g, state_.fill_b);
+  draw_image(image, state_.transform.e, state_.transform.f,
+             state_.transform.a, state_.transform.d,
+             state_.fill_r, state_.fill_g, state_.fill_b,
+             &state_.transform);
 
   return true;
 }
@@ -4466,39 +4639,15 @@ bool LightVGBackend::apply_pattern_fill(lvg::Shape* shape, const std::string& pa
     return false;
   }
 
-  // Look up pattern from page resources
-  auto pattern_dict_it = current_page_->resources.find("Pattern");
-  if (pattern_dict_it == current_page_->resources.end()) {
-    NANOPDF_LOG_TRACE("LightVG", "No Pattern resources in page");
-    return false;
-  }
-
-  // Get the pattern dictionary
-  Dictionary pattern_resources;
-  if (pattern_dict_it->second.type == Value::DICTIONARY) {
-    pattern_resources = pattern_dict_it->second.dict;
-  } else if (pattern_dict_it->second.type == Value::REFERENCE) {
-    auto resolved = resolve_reference(*current_pdf_,
-                                      pattern_dict_it->second.ref_object_number,
-                                      pattern_dict_it->second.ref_generation_number);
-    if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
-      return false;
-    }
-    pattern_resources = resolved.value.dict;
-  } else {
-    return false;
-  }
-
-  // Look up the specific pattern
-  auto pattern_it = pattern_resources.find(pattern_name);
-  if (pattern_it == pattern_resources.end()) {
+  const Value* pattern_value = lookup_resource("Pattern", pattern_name);
+  if (!pattern_value) {
     NANOPDF_LOG_DEBUG("LightVG", "Pattern '%s' not found", pattern_name.c_str());
     return false;
   }
 
   // The Value overload handles REFERENCE/DICTIONARY/STREAM triage and, for
   // Tiling patterns, decodes the stream body into pattern->tiling->content_stream.
-  auto pattern = parse_pattern(*current_pdf_, pattern_it->second, 0, 0);
+  auto pattern = parse_pattern(*current_pdf_, *pattern_value, 0, 0);
   if (!pattern) {
     NANOPDF_LOG_DEBUG("LightVG", "Failed to parse pattern '%s'", pattern_name.c_str());
     return false;
@@ -4849,7 +4998,7 @@ bool LightVGBackend::apply_tiling_pattern(lvg::Shape* shape, const TilingPattern
 
     // Rotated / sheared pattern matrix: tiles are placed along the (a,b)
     // and (c,d) pattern axes rather than along screen axes. We emit one
-    // ThorVG Picture per tile instance, each with its own rotation transform,
+    // LightVG Picture per tile instance, each with its own rotation transform,
     // and let the caller-applied clip trim off tiles that spill outside the
     // fill shape. This branch preserves proper tile alignment for patterns
     // with non-zero skew (b or c); the flat-bitmap path below cannot.
@@ -5024,7 +5173,7 @@ bool LightVGBackend::apply_tiling_pattern(lvg::Shape* shape, const TilingPattern
       }
     }
 
-    // Create ThorVG Picture from tiled bitmap
+    // Create LightVG Picture from tiled bitmap
     auto picture = lvg::Picture::gen();
     if (picture) {
       auto result = picture->load(tiled_pixels.data(), tiled_w, tiled_h,
@@ -5677,7 +5826,7 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   // Create ARGB8888 bitmap with glyph color + alpha from bitmap
   int gw = entry->width;
   int gh = entry->height;
-  auto* argb = new uint32_t[gw * gh];
+  std::vector<uint32_t> argb(static_cast<size_t>(gw) * gh);
   for (int i = 0; i < gw * gh; i++) {
     // Apply gamma correction (gamma=1.4) to tighten AA fringe:
     // pushes intermediate alpha values toward 0, reducing dark halo
@@ -5685,21 +5834,21 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
     float corrected = std::pow(normalized, 1.4f);
     uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
     // ARGB8888: A in high byte, straight alpha
-    argb[i] = (static_cast<uint32_t>(alpha) << 24) |
-              (static_cast<uint32_t>(r) << 16) |
-              (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+    argb[static_cast<size_t>(i)] =
+        (static_cast<uint32_t>(alpha) << 24) |
+        (static_cast<uint32_t>(r) << 16) |
+        (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
   }
 
-  // Create ThorVG Picture and position it
+  // Create LightVG Picture and position it. Picture copies the input pixels.
   auto picture = lvg::Picture::gen();
   if (!picture) {
-    delete[] argb;
     return false;
   }
 
-  if (picture->load(argb, gw, gh, lvg::ColorSpace::ARGB8888S, true) !=
+  if (picture->load(argb.data(), gw, gh, lvg::ColorSpace::ARGB8888S, true) !=
       lvg::Result::Success) {
-    delete[] argb;
+    picture->unref();
     return false;
   }
 
@@ -5907,6 +6056,8 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   // Reset per-page resource resolution storage so it doesn't grow unbounded
   // across multi-page renders.
   lookup_resolved_owned_.clear();
+  lookup_font_owned_.clear();
+  current_soft_mask_.reset();
 
   // Get page dimensions
   float page_width = 612.0f;
@@ -6102,6 +6253,8 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
 
   // Reset per-page resource resolution storage so it doesn't grow unbounded.
   lookup_resolved_owned_.clear();
+  lookup_font_owned_.clear();
+  current_soft_mask_.reset();
 
   if (!initialized_) {
     result.error = "Backend not initialized";
@@ -7035,6 +7188,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         if (!state_stack.empty()) {
           state_ = state_stack.back();
           state_stack.pop_back();
+          current_soft_mask_.reset();
         }
         if (!font_state_stack.empty()) {
           current_font_name_ = font_state_stack.back().first;
@@ -7044,197 +7198,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       }
       // Graphics state dictionary (gs operator)
       else if (token == "gs") {
-        if (operands.size() >= 1 && current_pdf_ && current_page_) {
-          std::string gs_name = operands[0];
-          if (!gs_name.empty() && gs_name[0] == '/') {
-            gs_name = gs_name.substr(1);
-          }
-          // Look up ExtGState from page resources
-          auto extgstate_it = current_page_->resources.find("ExtGState");
-          if (extgstate_it != current_page_->resources.end()) {
-            Dictionary extgstate_dict;
-            if (extgstate_it->second.type == Value::DICTIONARY) {
-              extgstate_dict = extgstate_it->second.dict;
-            } else if (extgstate_it->second.type == Value::REFERENCE) {
-              auto resolved = resolve_reference(*current_pdf_,
-                                                extgstate_it->second.ref_object_number,
-                                                extgstate_it->second.ref_generation_number);
-              if (resolved.success && resolved.value.type == Value::DICTIONARY) {
-                extgstate_dict = resolved.value.dict;
-              }
-            }
-            // Find the specific graphics state
-            auto gs_it = extgstate_dict.find(gs_name);
-            if (gs_it != extgstate_dict.end()) {
-              Dictionary gs_dict;
-              if (gs_it->second.type == Value::DICTIONARY) {
-                gs_dict = gs_it->second.dict;
-              } else if (gs_it->second.type == Value::REFERENCE) {
-                auto resolved = resolve_reference(*current_pdf_,
-                                                  gs_it->second.ref_object_number,
-                                                  gs_it->second.ref_generation_number);
-                if (resolved.success && resolved.value.type == Value::DICTIONARY) {
-                  gs_dict = resolved.value.dict;
-                }
-              }
-              // Apply graphics state parameters
-              // ca - non-stroking alpha (fill)
-              auto ca_it = gs_dict.find("ca");
-              if (ca_it != gs_dict.end() && ca_it->second.type == Value::NUMBER) {
-                state_.fill_opacity = static_cast<float>(ca_it->second.number);
-              }
-              // CA - stroking alpha
-              auto CA_it = gs_dict.find("CA");
-              if (CA_it != gs_dict.end() && CA_it->second.type == Value::NUMBER) {
-                state_.stroke_opacity = static_cast<float>(CA_it->second.number);
-              }
-              // BM - blend mode
-              auto bm_it = gs_dict.find("BM");
-              if (bm_it != gs_dict.end()) {
-                std::string bm_name;
-                if (bm_it->second.type == Value::NAME) {
-                  bm_name = bm_it->second.name;
-                } else if (bm_it->second.type == Value::ARRAY && !bm_it->second.array.empty()) {
-                  if (bm_it->second.array[0].type == Value::NAME) {
-                    bm_name = bm_it->second.array[0].name;
-                  }
-                }
-                // Map PDF blend mode to ThorVG BlendMethod enum
-                if (bm_name == "Normal" || bm_name == "Compatible") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Normal);
-                } else if (bm_name == "Multiply") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Multiply);
-                } else if (bm_name == "Screen") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Screen);
-                } else if (bm_name == "Overlay") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Overlay);
-                } else if (bm_name == "Darken") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Darken);
-                } else if (bm_name == "Lighten") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Lighten);
-                } else if (bm_name == "ColorDodge") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::ColorDodge);
-                } else if (bm_name == "ColorBurn") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::ColorBurn);
-                } else if (bm_name == "HardLight") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::HardLight);
-                } else if (bm_name == "SoftLight") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::SoftLight);
-                } else if (bm_name == "Difference") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Difference);
-                } else if (bm_name == "Exclusion") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Exclusion);
-                } else if (bm_name == "Hue") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Hue);
-                } else if (bm_name == "Saturation") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Saturation);
-                } else if (bm_name == "Color") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Color);
-                } else if (bm_name == "Luminosity") {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Luminosity);
-                } else {
-                  state_.blend_mode = static_cast<int>(lvg::BlendMethod::Normal);
-                }
-              }
-              // LW - line width
-              auto lw_it = gs_dict.find("LW");
-              if (lw_it != gs_dict.end() && lw_it->second.type == Value::NUMBER) {
-                state_.stroke_width = static_cast<float>(lw_it->second.number);
-              }
-              // LC - line cap
-              auto lc_it = gs_dict.find("LC");
-              if (lc_it != gs_dict.end() && lc_it->second.type == Value::NUMBER) {
-                state_.line_cap = static_cast<int>(lc_it->second.number);
-              }
-              // LJ - line join
-              auto lj_it = gs_dict.find("LJ");
-              if (lj_it != gs_dict.end() && lj_it->second.type == Value::NUMBER) {
-                state_.line_join = static_cast<int>(lj_it->second.number);
-              }
-              // ML - miter limit
-              auto ml_it = gs_dict.find("ML");
-              if (ml_it != gs_dict.end() && ml_it->second.type == Value::NUMBER) {
-                state_.miter_limit = static_cast<float>(ml_it->second.number);
-              }
-              // AIS - alpha is shape
-              auto ais_it = gs_dict.find("AIS");
-              if (ais_it != gs_dict.end() && ais_it->second.type == Value::BOOLEAN) {
-                state_.alpha_is_shape = ais_it->second.boolean;
-              }
-              // TK - text knockout
-              auto tk_it = gs_dict.find("TK");
-              if (tk_it != gs_dict.end() && tk_it->second.type == Value::BOOLEAN) {
-                state_.text_knockout = tk_it->second.boolean;
-              }
-              // OP - overprint for stroking
-              auto op_stroke_it = gs_dict.find("OP");
-              if (op_stroke_it != gs_dict.end() && op_stroke_it->second.type == Value::BOOLEAN) {
-                state_.overprint_stroke = op_stroke_it->second.boolean;
-              }
-              // op - overprint for non-stroking (fill)
-              auto op_fill_it = gs_dict.find("op");
-              if (op_fill_it != gs_dict.end() && op_fill_it->second.type == Value::BOOLEAN) {
-                state_.overprint_fill = op_fill_it->second.boolean;
-              }
-              // OPM - overprint mode
-              auto opm_it = gs_dict.find("OPM");
-              if (opm_it != gs_dict.end() && opm_it->second.type == Value::NUMBER) {
-                state_.overprint_mode = static_cast<int>(opm_it->second.number);
-              }
-              // FL - flatness tolerance
-              auto fl_it = gs_dict.find("FL");
-              if (fl_it != gs_dict.end() && fl_it->second.type == Value::NUMBER) {
-                state_.flatness = static_cast<float>(fl_it->second.number);
-              }
-              // SA - stroke adjustment
-              auto sa_it = gs_dict.find("SA");
-              if (sa_it != gs_dict.end() && sa_it->second.type == Value::BOOLEAN) {
-                state_.stroke_adjustment = sa_it->second.boolean;
-              }
-              // SMask - soft mask
-              auto smask_it = gs_dict.find("SMask");
-              if (smask_it != gs_dict.end()) {
-                if (smask_it->second.type == Value::NAME && smask_it->second.name == "None") {
-                  // Clear soft mask
-                  state_.has_soft_mask = false;
-                  state_.soft_mask_type = 0;
-                  state_.soft_mask_data.clear();
-                } else if (smask_it->second.type == Value::DICTIONARY ||
-                           smask_it->second.type == Value::REFERENCE) {
-                  // Parse soft mask dictionary
-                  Dictionary smask_dict;
-                  if (smask_it->second.type == Value::DICTIONARY) {
-                    smask_dict = smask_it->second.dict;
-                  } else {
-                    auto resolved = resolve_reference(*current_pdf_,
-                                                      smask_it->second.ref_object_number,
-                                                      smask_it->second.ref_generation_number);
-                    if (resolved.success && resolved.value.type == Value::DICTIONARY) {
-                      smask_dict = resolved.value.dict;
-                    }
-                  }
-                  if (!smask_dict.empty()) {
-                    state_.has_soft_mask = true;
-                    // Get soft mask type (S entry)
-                    auto s_it = smask_dict.find("S");
-                    if (s_it != smask_dict.end() && s_it->second.type == Value::NAME) {
-                      if (s_it->second.name == "Alpha") {
-                        state_.soft_mask_type = 1;
-                      } else if (s_it->second.name == "Luminosity") {
-                        state_.soft_mask_type = 2;
-                      }
-                    }
-                    // Get and render the G (transparency group) XObject
-                    auto g_it = smask_dict.find("G");
-                    if (g_it != smask_dict.end()) {
-                      render_soft_mask_group(g_it->second, state_.soft_mask_type);
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+        if (!operands.empty()) apply_extgstate(operands[0]);
       }
       // Transformation matrix operators
       else if (token == "cm") {  // Concatenate matrix
@@ -7335,7 +7299,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       } else if (token == "Ts") {  // Set text rise
         if (operands.size() >= 1) {
-          state_.text_rise = static_cast<int>(nanopdf::stof_or(operands[0]));
+          state_.text_rise = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "Tr") {  // Set text rendering mode
         // 0 = Fill, 1 = Stroke, 2 = Fill+Stroke, 3 = Invisible
@@ -7353,7 +7317,8 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
           state_.font_size = nanopdf::stof_or(operands[operands.size() - 1]);
 
-          // Try to load the font from page resources
+          // Try to load the font from page resources first, then from the
+          // active Form/pattern resource stack.
           current_font_name_ = font_name;
           current_font_ = nullptr;
           if (current_pdf_ && current_page_) {
@@ -7362,9 +7327,34 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
               current_font_ = font_it->second.get();
               load_font(*current_pdf_, font_name, current_font_);
             } else {
-              // Font not in page dictionary — attempt fallback using name hint
-              NANOPDF_LOG_DEBUG("LightVG", "Font '%s' not in page resources, trying fallback", font_name.c_str());
-              load_fallback_font_with_hint(font_name, nullptr);
+              const Value* font_value = lookup_resource("Font", font_name);
+              Value resolved_font;
+              if (font_value) {
+                resolved_font = *font_value;
+                if (resolved_font.type == Value::REFERENCE) {
+                  auto resolved = resolve_reference(*current_pdf_,
+                                                    resolved_font.ref_object_number,
+                                                    resolved_font.ref_generation_number);
+                  if (resolved.success) resolved_font = std::move(resolved.value);
+                }
+              }
+              if (resolved_font.type == Value::DICTIONARY) {
+                auto parsed_font = Pdf::parse_font(*current_pdf_, resolved_font);
+                if (parsed_font) {
+                  std::string cache_name =
+                      font_name + "#resource" +
+                      std::to_string(lookup_font_owned_.size());
+                  lookup_font_owned_.push_back(std::move(parsed_font));
+                  current_font_name_ = cache_name;
+                  current_font_ = lookup_font_owned_.back().get();
+                  load_font(*current_pdf_, current_font_name_, current_font_);
+                }
+              }
+              if (!current_font_) {
+                // Font not in available resources — attempt fallback using name hint
+                NANOPDF_LOG_DEBUG("LightVG", "Font '%s' not in resources, trying fallback", font_name.c_str());
+                load_fallback_font_with_hint(font_name, nullptr);
+              }
             }
           }
         }
@@ -7388,8 +7378,10 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
 
           // Get text position from text matrix and apply CTM
-          float text_x = state_.text_matrix.e;
-          float text_y = state_.text_matrix.f;
+          float text_x = state_.text_matrix.e +
+                         state_.text_rise * state_.text_matrix.c;
+          float text_y = state_.text_matrix.f +
+                         state_.text_rise * state_.text_matrix.d;
           state_.transform.transform(text_x, text_y);
 
           // Transform from PDF coordinates to canvas coordinates
@@ -7428,6 +7420,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             // Horizontal: advance along x axis (a/b components of text matrix)
             float text_advance =
                 calculate_text_advance_draw_model(text, state_.font_size);
+            text_advance *= state_.horiz_scaling / 100.0f;
             state_.text_matrix.e += text_advance * state_.text_matrix.a;
             state_.text_matrix.f += text_advance * state_.text_matrix.b;
           }
@@ -7464,8 +7457,10 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                 }
               }
               if (!text.empty()) {
-                float text_x = state_.text_matrix.e;
-                float text_y = state_.text_matrix.f;
+                float text_x = state_.text_matrix.e +
+                               state_.text_rise * state_.text_matrix.c;
+                float text_y = state_.text_matrix.f +
+                               state_.text_rise * state_.text_matrix.d;
                 state_.transform.transform(text_x, text_y);
                 float canvas_x = text_x * state_.scale;
                 float canvas_y = (state_.page_height - text_y) * state_.scale;
@@ -7490,6 +7485,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                 } else {
                   float text_advance =
                       calculate_text_advance_draw_model(text, state_.font_size);
+                  text_advance *= state_.horiz_scaling / 100.0f;
                   state_.text_matrix.e += text_advance * state_.text_matrix.a;
                   state_.text_matrix.f += text_advance * state_.text_matrix.b;
                 }
@@ -7506,7 +7502,8 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                   state_.text_matrix.f += ty * state_.text_matrix.d;
                 } else {
                   // Horizontal: numeric adjustment displaces along x axis
-                  float tx = -adjustment * state_.font_size / 1000.0f;
+                  float tx = -adjustment * state_.font_size / 1000.0f *
+                             (state_.horiz_scaling / 100.0f);
                   state_.text_matrix.e += tx * state_.text_matrix.a;
                   state_.text_matrix.f += tx * state_.text_matrix.b;
                 }
@@ -7545,8 +7542,10 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
 
           // Get text position from text matrix and apply CTM
-          float text_x = state_.text_matrix.e;
-          float text_y = state_.text_matrix.f;
+          float text_x = state_.text_matrix.e +
+                         state_.text_rise * state_.text_matrix.c;
+          float text_y = state_.text_matrix.f +
+                         state_.text_rise * state_.text_matrix.d;
           state_.transform.transform(text_x, text_y);
           float canvas_x = text_x * state_.scale;
           float canvas_y = (state_.page_height - text_y) * state_.scale;
@@ -7578,89 +7577,11 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           } else {
             float text_advance =
                 calculate_text_advance_draw_model(text, state_.font_size);
+            text_advance *= state_.horiz_scaling / 100.0f;
             state_.text_matrix.e += text_advance * state_.text_matrix.a;
             state_.text_matrix.f += text_advance * state_.text_matrix.b;
           }
           advance_progress();
-        }
-      }
-      // Extended graphics state operator
-      else if (token == "gs") {  // Set graphics state from dictionary
-        if (operands.size() >= 1 && current_pdf_ && current_page_) {
-          std::string gs_name = operands[0];
-          if (!gs_name.empty() && gs_name[0] == '/') {
-            gs_name = gs_name.substr(1);
-          }
-
-          // Look up ExtGState in page resources
-          auto ext_it = current_page_->resources.find("ExtGState");
-          if (ext_it != current_page_->resources.end()) {
-            Value ext_dict = ext_it->second;
-            // Resolve reference if needed
-            if (ext_dict.type == Value::REFERENCE) {
-              ResolvedObject resolved = resolve_reference(*current_pdf_,
-                  ext_dict.ref_object_number, ext_dict.ref_generation_number);
-              if (resolved.success) {
-                ext_dict = resolved.value;
-              }
-            }
-
-            if (ext_dict.type == Value::DICTIONARY) {
-              auto gs_it = ext_dict.dict.find(gs_name);
-              if (gs_it != ext_dict.dict.end()) {
-                Value gs_dict = gs_it->second;
-                // Resolve reference if needed
-                if (gs_dict.type == Value::REFERENCE) {
-                  ResolvedObject resolved = resolve_reference(*current_pdf_,
-                      gs_dict.ref_object_number, gs_dict.ref_generation_number);
-                  if (resolved.success) {
-                    gs_dict = resolved.value;
-                  }
-                }
-
-                if (gs_dict.type == Value::DICTIONARY) {
-                  // Read opacity values (ca = fill alpha, CA = stroke alpha)
-                  auto ca_it = gs_dict.dict.find("ca");  // Fill opacity
-                  if (ca_it != gs_dict.dict.end() && ca_it->second.type == Value::NUMBER) {
-                    state_.fill_opacity = static_cast<float>(ca_it->second.number);
-                    if (state_.fill_opacity < 0.0f) state_.fill_opacity = 0.0f;
-                    if (state_.fill_opacity > 1.0f) state_.fill_opacity = 1.0f;
-                  }
-
-                  auto CA_it = gs_dict.dict.find("CA");  // Stroke opacity
-                  if (CA_it != gs_dict.dict.end() && CA_it->second.type == Value::NUMBER) {
-                    state_.stroke_opacity = static_cast<float>(CA_it->second.number);
-                    if (state_.stroke_opacity < 0.0f) state_.stroke_opacity = 0.0f;
-                    if (state_.stroke_opacity > 1.0f) state_.stroke_opacity = 1.0f;
-                  }
-
-                  // Read line width if specified
-                  auto lw_it = gs_dict.dict.find("LW");
-                  if (lw_it != gs_dict.dict.end() && lw_it->second.type == Value::NUMBER) {
-                    state_.stroke_width = static_cast<float>(lw_it->second.number);
-                  }
-
-                  // Read line cap if specified
-                  auto lc_it = gs_dict.dict.find("LC");
-                  if (lc_it != gs_dict.dict.end() && lc_it->second.type == Value::NUMBER) {
-                    state_.line_cap = static_cast<int>(lc_it->second.number);
-                  }
-
-                  // Read line join if specified
-                  auto lj_it = gs_dict.dict.find("LJ");
-                  if (lj_it != gs_dict.dict.end() && lj_it->second.type == Value::NUMBER) {
-                    state_.line_join = static_cast<int>(lj_it->second.number);
-                  }
-
-                  // Read miter limit if specified
-                  auto ml_it = gs_dict.dict.find("ML");
-                  if (ml_it != gs_dict.dict.end() && ml_it->second.type == Value::NUMBER) {
-                    state_.miter_limit = static_cast<float>(ml_it->second.number);
-                  }
-                }
-              }
-            }
-          }
         }
       }
       // Inline image (BI ... ID data EI)
@@ -7705,16 +7626,10 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                   subtype_it->second.type == Value::NAME) {
                 if (subtype_it->second.name == "Image") {
                   ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
-                  float img_x = state_.transform.e;
-                  float img_y = state_.transform.f;
-                  float img_width = state_.transform.a;
-                  float img_height = state_.transform.d;
-                  if (img_height < 0) {
-                    img_y += img_height;
-                    img_height = -img_height;
-                  }
-                  draw_image(image, img_x, img_y, img_width, img_height,
-                             state_.fill_r, state_.fill_g, state_.fill_b);
+                  draw_image(image, state_.transform.e, state_.transform.f,
+                             state_.transform.a, state_.transform.d,
+                             state_.fill_r, state_.fill_g, state_.fill_b,
+                             &state_.transform);
                   rendered_xobject = true;
                 } else if (subtype_it->second.name == "Form") {
                   auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
@@ -7968,79 +7883,6 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   state_.soft_mask_height = soft_mask_height;
 
   return true;
-}
-
-void LightVGBackend::apply_soft_mask_to_context() {
-  if (!state_.has_soft_mask || state_.soft_mask_data.empty()) {
-    return;
-  }
-
-  // Adjust fill/stroke opacity based on the soft mask.
-  // For spatially-varying masks, we sample the mask at the center of the
-  // current clip region as an approximation. A full per-pixel implementation
-  // would require rendering each masked element to an offscreen buffer and
-  // compositing per-pixel, which is planned for a future version.
-
-  if (state_.soft_mask_width > 0 && state_.soft_mask_height > 0) {
-    // Sample a region of the mask corresponding to the current drawing area.
-    // Use the center region (middle 50%) for a weighted average that better
-    // represents the visible mask effect than a global average.
-    uint32_t x0 = state_.soft_mask_width / 4;
-    uint32_t x1 = state_.soft_mask_width * 3 / 4;
-    uint32_t y0 = state_.soft_mask_height / 4;
-    uint32_t y1 = state_.soft_mask_height * 3 / 4;
-    if (x1 <= x0) x1 = x0 + 1;
-    if (y1 <= y0) y1 = y0 + 1;
-
-    uint64_t sum = 0;
-    uint64_t count = 0;
-    for (uint32_t y = y0; y < y1 && y < state_.soft_mask_height; ++y) {
-      for (uint32_t x = x0; x < x1 && x < state_.soft_mask_width; ++x) {
-        sum += state_.soft_mask_data[y * state_.soft_mask_width + x];
-        ++count;
-      }
-    }
-
-    float avg_alpha = (count > 0) ?
-        static_cast<float>(sum) / (count * 255.0f) : 1.0f;
-
-    state_.fill_opacity *= avg_alpha;
-    state_.stroke_opacity *= avg_alpha;
-  }
-}
-
-void LightVGBackend::apply_soft_mask_to_pixels(
-    uint8_t* pixels, uint32_t width, uint32_t height) {
-  if (!state_.has_soft_mask || state_.soft_mask_data.empty()) return;
-  if (state_.soft_mask_width == 0 || state_.soft_mask_height == 0) return;
-
-  // Per-pixel soft mask compositing: multiply alpha channel of each pixel
-  // by the corresponding mask value. Handles dimension mismatches by
-  // nearest-neighbor sampling.
-  for (uint32_t y = 0; y < height; ++y) {
-    // Map to mask coordinates
-    uint32_t my = y * state_.soft_mask_height / height;
-    if (my >= state_.soft_mask_height) my = state_.soft_mask_height - 1;
-
-    for (uint32_t x = 0; x < width; ++x) {
-      uint32_t mx = x * state_.soft_mask_width / width;
-      if (mx >= state_.soft_mask_width) mx = state_.soft_mask_width - 1;
-
-      uint8_t mask_val = state_.soft_mask_data[my * state_.soft_mask_width + mx];
-
-      // Pixel format is ARGB8888 (ThorVG native)
-      size_t idx = (y * width + x) * 4;
-      // Multiply alpha by mask value
-      uint8_t a = pixels[idx + 3];
-      pixels[idx + 3] = static_cast<uint8_t>((a * mask_val + 127) / 255);
-      // Also premultiply RGB if alpha changed
-      if (mask_val < 255) {
-        pixels[idx + 0] = static_cast<uint8_t>((pixels[idx + 0] * mask_val + 127) / 255);
-        pixels[idx + 1] = static_cast<uint8_t>((pixels[idx + 1] * mask_val + 127) / 255);
-        pixels[idx + 2] = static_cast<uint8_t>((pixels[idx + 2] * mask_val + 127) / 255);
-      }
-    }
-  }
 }
 
 }  // namespace nanopdf

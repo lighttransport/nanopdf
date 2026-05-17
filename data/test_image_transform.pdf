@@ -1,0 +1,68 @@
+%PDF-1.4
+% nanopdf visual fixture: transformed image XObjects
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 240]
+   /Resources << /ProcSet [ /PDF /ImageC ] /XObject << /Im1 5 0 R >> >>
+   /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 218 >>
+stream
+q
+0.96 0.96 0.96 rg
+0 0 320 240 re f
+Q
+q
+0.75 0.75 0.75 RG
+1 w
+10 10 300 220 re S
+Q
+q
+60 0 0 60 20 155 cm
+/Im1 Do
+Q
+q
+0 70 -70 0 145 155 cm
+/Im1 Do
+Q
+q
+70 20 20 55 170 135 cm
+/Im1 Do
+Q
+q
+-60 0 0 60 300 35 cm
+/Im1 Do
+Q
+endstream
+endobj
+5 0 obj
+<< /Type /XObject /Subtype /Image /Width 4 /Height 4
+   /ColorSpace /DeviceRGB /BitsPerComponent 8
+   /Filter /ASCIIHexDecode /Length 114 >>
+stream
+FF0000 00FF00 0000FF FFFF00
+00FFFF FF00FF FFFFFF 000000
+FF8000 8000FF 808080 80FF80
+800000 008000 000080 C0C0C0
+>
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000062 00000 n 
+0000000111 00000 n 
+0000000168 00000 n 
+0000000330 00000 n 
+0000000598 00000 n 
+trailer
+<< /Root 1 0 R /Size 6 >>
+startxref
+885
+%%EOF

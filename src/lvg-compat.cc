@@ -1154,7 +1154,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
     mask = rasterize_path_to_mask(clipper_->cmds_, clipper_->pts_,
                                   clip_bbox.x, clip_bbox.y,
                                   clip_bbox.width, clip_bbox.height,
-                                  FillRule::NonZero);
+                                  clipper_->fill_rule_);
   }
 
   // -- Detect axis-aligned rect for the fast paths.
@@ -1184,14 +1184,14 @@ void Shape::draw_on(lui_canvas_t* canvas) {
         if (opacity_ < 255) fa = static_cast<uint8_t>((fa * opacity_) / 255);
         if (fa > 0) {
           uint32_t color = pack_argb(fill_r_, fill_g_, fill_b_, fa);
-          if (blend_mode_ != BlendMethod::Normal &&
-              blend_mode_supported(blend_mode_)) {
+          if (blend_mode_ == BlendMethod::Normal) {
+            lui_canvas_fill_rect(canvas, ix, iy, iw, ih, color);
+            fill_handled = true;
+          } else if (blend_mode_supported(blend_mode_)) {
             lui_canvas_fill_rect_blended(canvas, ix, iy, iw, ih, color,
                                          to_lui_blend(blend_mode_));
-          } else {
-            lui_canvas_fill_rect(canvas, ix, iy, iw, ih, color);
+            fill_handled = true;
           }
-          fill_handled = true;
         }
       }
     }
@@ -1431,7 +1431,7 @@ Picture::~Picture() {
   if (clipper_) delete clipper_;
 }
 
-Result Picture::load(uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs,
+Result Picture::load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs,
                      bool premultiplied) {
   if (!data || w == 0 || h == 0) return Result::InvalidArguments;
   width_  = w;
@@ -1525,13 +1525,123 @@ void Picture::draw_on(lui_canvas_t* canvas) {
     return;
   }
 
+  lui_rect_t saved_clip = lui_canvas_get_clip(canvas);
+  int clip_mode = 0;
+  lui_rect_t clip_bbox{0, 0, 0, 0};
+
+  if (clipper_) {
+    float crx, cry, crw, crh;
+    if (detect_axis_aligned_rect(clipper_->cmds_, clipper_->pts_, crx, cry,
+                                 crw, crh)) {
+      int x0 = std::max(static_cast<int>(std::floor(crx)), saved_clip.x);
+      int y0 = std::max(static_cast<int>(std::floor(cry)), saved_clip.y);
+      int x1 = std::min(static_cast<int>(std::ceil(crx + crw)),
+                        saved_clip.x + saved_clip.width);
+      int y1 = std::min(static_cast<int>(std::ceil(cry + crh)),
+                        saved_clip.y + saved_clip.height);
+      clip_bbox.x = x0;
+      clip_bbox.y = y0;
+      clip_bbox.width = std::max(0, x1 - x0);
+      clip_bbox.height = std::max(0, y1 - y0);
+      if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
+      lui_canvas_set_clip(canvas, &clip_bbox);
+      clip_mode = 1;
+    } else {
+      float cx, cy, cw, ch;
+      clipper_->compute_bbox(&cx, &cy, &cw, &ch);
+      int x0 = std::max(static_cast<int>(std::floor(cx)), saved_clip.x);
+      int y0 = std::max(static_cast<int>(std::floor(cy)), saved_clip.y);
+      int x1 = std::min(static_cast<int>(std::ceil(cx + cw)),
+                        saved_clip.x + saved_clip.width);
+      int y1 = std::min(static_cast<int>(std::ceil(cy + ch)),
+                        saved_clip.y + saved_clip.height);
+      clip_bbox.x = x0;
+      clip_bbox.y = y0;
+      clip_bbox.width = std::max(0, x1 - x0);
+      clip_bbox.height = std::max(0, y1 - y0);
+      if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
+      lui_canvas_set_clip(canvas, &clip_bbox);
+      clip_mode = 2;
+    }
+  }
+
+  std::vector<uint32_t> snapshot;
+  std::vector<uint8_t> mask;
+  if (clip_mode == 2) {
+    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    if (dst && dst->pixels) {
+      snapshot.resize(static_cast<size_t>(clip_bbox.width) * clip_bbox.height);
+      for (int y = 0; y < clip_bbox.height; ++y) {
+        const uint32_t* row =
+            dst->pixels + (clip_bbox.y + y) * dst->stride + clip_bbox.x;
+        std::memcpy(snapshot.data() + static_cast<size_t>(y) * clip_bbox.width,
+                    row, static_cast<size_t>(clip_bbox.width) * sizeof(uint32_t));
+      }
+    }
+    mask = rasterize_path_to_mask(clipper_->cmds_, clipper_->pts_,
+                                  clip_bbox.x, clip_bbox.y,
+                                  clip_bbox.width, clip_bbox.height,
+                                  clipper_->fill_rule_);
+  }
+
+  draw_pixels(canvas);
+
+  if (clip_mode == 2 && !mask.empty() && !snapshot.empty()) {
+    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    if (dst && dst->pixels) {
+      for (int y = 0; y < clip_bbox.height; ++y) {
+        uint32_t* dst_row =
+            dst->pixels + (clip_bbox.y + y) * dst->stride + clip_bbox.x;
+        const uint32_t* snap_row =
+            snapshot.data() + static_cast<size_t>(y) * clip_bbox.width;
+        const uint8_t* mask_row =
+            mask.data() + static_cast<size_t>(y) * clip_bbox.width;
+        for (int x = 0; x < clip_bbox.width; ++x) {
+          uint8_t m = mask_row[x];
+          if (m == 255) continue;
+          if (m == 0) {
+            dst_row[x] = snap_row[x];
+            continue;
+          }
+          uint32_t snap = snap_row[x];
+          uint32_t curr = dst_row[x];
+          uint16_t inv = static_cast<uint16_t>(255 - m);
+          uint8_t sa = static_cast<uint8_t>((snap >> 24) & 0xff);
+          uint8_t sr = static_cast<uint8_t>((snap >> 16) & 0xff);
+          uint8_t sg = static_cast<uint8_t>((snap >> 8) & 0xff);
+          uint8_t sb = static_cast<uint8_t>(snap & 0xff);
+          uint8_t ca = static_cast<uint8_t>((curr >> 24) & 0xff);
+          uint8_t cr = static_cast<uint8_t>((curr >> 16) & 0xff);
+          uint8_t cg = static_cast<uint8_t>((curr >> 8) & 0xff);
+          uint8_t cb = static_cast<uint8_t>(curr & 0xff);
+          uint8_t oa = static_cast<uint8_t>((ca * m + sa * inv) / 255);
+          uint8_t orr = static_cast<uint8_t>((cr * m + sr * inv) / 255);
+          uint8_t og = static_cast<uint8_t>((cg * m + sg * inv) / 255);
+          uint8_t ob = static_cast<uint8_t>((cb * m + sb * inv) / 255);
+          dst_row[x] = pack_argb(orr, og, ob, oa);
+        }
+      }
+    }
+  }
+
+  if (clip_mode != 0) {
+    lui_canvas_set_clip(canvas, &saved_clip);
+  }
+}
+
+void Picture::draw_pixels(lui_canvas_t* canvas) {
+  if (!canvas || pixels_.empty() || width_ == 0 || height_ == 0) return;
+
   // Axis-aligned scale + translate? Use fast path through lui_canvas.
   // Note: lui_canvas_draw_image doesn't support mirroring, so negative
-  // scale (PDF horizontal/vertical text flip) must take the slow path.
+  // scale (PDF horizontal/vertical text flip), opacity, and custom blend
+  // modes must take the per-pixel path.
   if (std::fabs(transform_.e12) < 1e-4f &&
       std::fabs(transform_.e21) < 1e-4f &&
       transform_.e11 > 0.0f &&
-      transform_.e22 > 0.0f) {
+      transform_.e22 > 0.0f &&
+      opacity_ == 255 &&
+      blend_mode_ == BlendMethod::Normal) {
     lui_surface_t src = lui_surface_wrap(pixels_.data(),
                                          static_cast<int>(width_),
                                          static_cast<int>(height_),
@@ -1543,8 +1653,10 @@ void Picture::draw_on(lui_canvas_t* canvas) {
     if (dst_w <= 0 || dst_h <= 0) return;
     int dst_x = static_cast<int>(std::round(transform_.e13));
     int dst_y = static_cast<int>(std::round(transform_.e23));
+    lui_image_filter_t filter =
+        interpolate_ ? LUI_IMAGE_FILTER_BILINEAR : LUI_IMAGE_FILTER_NEAREST;
     lui_canvas_draw_image(canvas, dst_x, dst_y, dst_w, dst_h, &src, nullptr,
-                          LUI_IMAGE_FILTER_BILINEAR);
+                          filter);
     return;
   }
 
@@ -1599,52 +1711,55 @@ void Picture::draw_transformed(lui_canvas_t* canvas) {
       float v = i21 * ox + i22 * oy;
       if (u < 0.0f || u >= sw || v < 0.0f || v >= sh) continue;
 
-      int u0 = static_cast<int>(std::floor(u));
-      int v0 = static_cast<int>(std::floor(v));
-      float fu = u - u0;
-      float fv = v - v0;
-      int u1 = std::min(u0 + 1, sw_int - 1);
-      int v1 = std::min(v0 + 1, sh_int - 1);
-      if (u0 < 0) u0 = 0;
-      if (v0 < 0) v0 = 0;
-
       auto idx = [&](int x, int y) {
         return static_cast<size_t>(y) * sw_int + x;
       };
-      uint32_t p00 = pixels_[idx(u0, v0)];
-      uint32_t p10 = pixels_[idx(u1, v0)];
-      uint32_t p01 = pixels_[idx(u0, v1)];
-      uint32_t p11 = pixels_[idx(u1, v1)];
 
-      auto comp = [&](int shift) -> uint8_t {
-        float c00 = static_cast<float>((p00 >> shift) & 0xff);
-        float c10 = static_cast<float>((p10 >> shift) & 0xff);
-        float c01 = static_cast<float>((p01 >> shift) & 0xff);
-        float c11 = static_cast<float>((p11 >> shift) & 0xff);
-        float c0 = c00 * (1.0f - fu) + c10 * fu;
-        float c1 = c01 * (1.0f - fu) + c11 * fu;
-        float c  = c0 * (1.0f - fv) + c1 * fv;
-        return static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, c + 0.5f)));
-      };
+      uint32_t sample = 0;
+      if (interpolate_) {
+        int u0 = static_cast<int>(std::floor(u));
+        int v0 = static_cast<int>(std::floor(v));
+        float fu = u - u0;
+        float fv = v - v0;
+        int u1 = std::min(u0 + 1, sw_int - 1);
+        int v1 = std::min(v0 + 1, sh_int - 1);
+        if (u0 < 0) u0 = 0;
+        if (v0 < 0) v0 = 0;
 
-      uint8_t sa = comp(24);
+        uint32_t p00 = pixels_[idx(u0, v0)];
+        uint32_t p10 = pixels_[idx(u1, v0)];
+        uint32_t p01 = pixels_[idx(u0, v1)];
+        uint32_t p11 = pixels_[idx(u1, v1)];
+
+        auto comp = [&](int shift) -> uint8_t {
+          float c00 = static_cast<float>((p00 >> shift) & 0xff);
+          float c10 = static_cast<float>((p10 >> shift) & 0xff);
+          float c01 = static_cast<float>((p01 >> shift) & 0xff);
+          float c11 = static_cast<float>((p11 >> shift) & 0xff);
+          float c0 = c00 * (1.0f - fu) + c10 * fu;
+          float c1 = c01 * (1.0f - fu) + c11 * fu;
+          float c  = c0 * (1.0f - fv) + c1 * fv;
+          return static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, c + 0.5f)));
+        };
+        sample = pack_argb(comp(16), comp(8), comp(0), comp(24));
+      } else {
+        int sx = std::min(sw_int - 1, std::max(0, static_cast<int>(std::floor(u))));
+        int sy = std::min(sh_int - 1, std::max(0, static_cast<int>(std::floor(v))));
+        sample = pixels_[idx(sx, sy)];
+      }
+
+      uint8_t sa = static_cast<uint8_t>((sample >> 24) & 0xff);
       if (sa == 0) continue;
-      uint8_t sr = comp(16);
-      uint8_t sg = comp(8);
-      uint8_t sb = comp(0);
+      if (opacity_ < 255) {
+        sa = static_cast<uint8_t>((static_cast<uint16_t>(sa) * opacity_ + 127) / 255);
+        if (sa == 0) continue;
+      }
+      uint8_t sr = static_cast<uint8_t>((sample >> 16) & 0xff);
+      uint8_t sg = static_cast<uint8_t>((sample >> 8) & 0xff);
+      uint8_t sb = static_cast<uint8_t>(sample & 0xff);
 
-      // SRC_OVER composite onto dst pixel.
-      uint32_t cur = dst_row[px];
-      uint8_t da = static_cast<uint8_t>((cur >> 24) & 0xff);
-      uint8_t dr = static_cast<uint8_t>((cur >> 16) & 0xff);
-      uint8_t dg = static_cast<uint8_t>((cur >> 8) & 0xff);
-      uint8_t db = static_cast<uint8_t>(cur & 0xff);
-      uint16_t inv_sa = static_cast<uint16_t>(255 - sa);
-      uint8_t oa = static_cast<uint8_t>(sa + (da * inv_sa) / 255);
-      uint8_t orr = static_cast<uint8_t>((sr * sa + dr * inv_sa) / 255);
-      uint8_t og = static_cast<uint8_t>((sg * sa + dg * inv_sa) / 255);
-      uint8_t ob = static_cast<uint8_t>((sb * sa + db * inv_sa) / 255);
-      dst_row[px] = pack_argb(orr, og, ob, oa);
+      uint32_t src = pack_argb(sr, sg, sb, sa);
+      dst_row[px] = composite_pixel(dst_row[px], src, blend_mode_);
     }
   }
 }

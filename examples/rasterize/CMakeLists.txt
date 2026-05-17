@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 
 project(nanopdf_rasterize_example)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find nanopdf library (assumes it's built in the parent build directory)
@@ -23,8 +23,9 @@ if(USE_LIGHTVG)
                       ${NANOPDF_ROOT}/src/third_party/lightui_vg/src)
 endif()
 
-# Find ThorVG if enabled
-option(USE_THORVG "Enable ThorVG backend" ON)
+# Find ThorVG if enabled. LightVG is the default rasterize backend; ThorVG is
+# only needed when explicitly selecting --backend thorvg.
+option(USE_THORVG "Enable optional ThorVG backend" OFF)
 if(USE_THORVG)
   # First check if ThorVG is in the dist/ directory
   set(THORVG_DIST_DIR ${NANOPDF_ROOT}/dist)
@@ -75,7 +76,7 @@ if(USE_THORVG)
       set(THORVG_LIBRARIES ${THORVG_LIBRARY})
       message(STATUS "Found ThorVG: ${THORVG_LIBRARY}")
     else()
-      message(WARNING "ThorVG not found. Rasterize example will not work without ThorVG.")
+      message(STATUS "ThorVG not found. The optional --backend thorvg path will be unavailable.")
     endif()
   endif()
 
@@ -160,6 +161,10 @@ if(THORVG_FOUND)
   endif()
 endif()
 
+if(NOT USE_LIGHTVG AND NOT THORVG_FOUND)
+  message(FATAL_ERROR "No raster backend enabled. Enable USE_LIGHTVG or provide ThorVG.")
+endif()
+
 # Link with zlib (required by nanopdf)
 find_package(ZLIB REQUIRED)
 target_link_libraries(rasterize ZLIB::ZLIB)
@@ -209,7 +214,7 @@ if(UNIX AND NOT APPLE)
   target_link_libraries(rasterize pthread)
 endif()
 
-# OpenMP for ThorVG parallel processing
+# OpenMP for optional backend parallel processing
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(rasterize OpenMP::OpenMP_CXX)

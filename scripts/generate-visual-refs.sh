@@ -27,24 +27,15 @@ mkdir -p "${OUTPUT_DIR}"
 PDF_FILES=(
   blank.pdf
   test_blendmodes.pdf
-  test_clip.pdf
   test_curves.pdf
-  test_dash.pdf
-  test_gradient.pdf
-  test_graphics.pdf
-  test_image.pdf
+  test_image_transform.pdf
   test_linestyles.pdf
-  test_multistop.pdf
-  test_pattern.pdf
-  test_radial.pdf
   test_softmask.pdf
-  test_textmode.pdf
-  test_textmode2.pdf
   test_transforms.pdf
   test_winding.pdf
-  # test_cmyk.pdf — refs intentionally omitted; CMYK ICC support is
-  # incomplete in both backends and produces large pixel diffs. Re-enable
-  # once colour management catches up.
+  # test_cmyk.pdf and the older graphics/clip/dash/pattern/gradient/
+  # textmode fixtures are intentionally omitted from the default suite until
+  # their PDFs and reference policy are restored together.
 )
 
 count=0

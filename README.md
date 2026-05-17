@@ -87,6 +87,7 @@ the bundled miniz library).
 ### Rendering Backends
 - Canvas export (HTML5 Canvas commands)
 - SVG export (paths, text, gradients, patterns)
+- LightVG software rasterization backend (default)
 - ThorVG vector graphics backend (optional)
 - Blend2D rasterization backend (optional)
 - Render progress callbacks for dense pages (1% steps once the object threshold is reached)
@@ -117,6 +118,7 @@ cmake --build build
 | `NANOPDF_USE_CCACHE` | `ON` | Use ccache for faster incremental builds |
 | `NANOPDF_USE_NANOSTL` | `OFF` | Use bundled nanostl instead of system STL |
 | `NANOPDF_USE_STB_TRUETYPE` | `ON` | Include stb_truetype for TrueType font parsing |
+| `NANOPDF_USE_LIGHTVG` | `ON` | Build the default LightVG software raster backend |
 | `NANOPDF_USE_THORVG` | `OFF` | Build the ThorVG raster backend |
 | `NANOPDF_USE_BLEND2D` | `OFF` | Build the Blend2D raster backend |
 | `NANOPDF_BUILD_TESTS` | `ON` | Build test executables |
