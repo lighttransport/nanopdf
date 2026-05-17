@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DATA_DIR="${PROJECT_DIR}/data"
+VISUAL_FIXTURE_DIR="${PROJECT_DIR}/tests/fixtures/visual"
 OUTPUT_DIR="${1:-${DATA_DIR}/visual_refs}"
 DPI=150
 
@@ -23,7 +24,8 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 
-# List of test PDFs (all single-page)
+# List of test PDFs (all single-page). Legacy visual samples live in data/;
+# focused renderer regression fixtures live in tests/fixtures/visual/.
 PDF_FILES=(
   blank.pdf
   test_blendmodes.pdf
@@ -41,6 +43,9 @@ PDF_FILES=(
 count=0
 for pdf in "${PDF_FILES[@]}"; do
   pdf_path="${DATA_DIR}/${pdf}"
+  if [ ! -f "${pdf_path}" ]; then
+    pdf_path="${VISUAL_FIXTURE_DIR}/${pdf}"
+  fi
   if [ ! -f "${pdf_path}" ]; then
     echo "SKIP: ${pdf} (not found)"
     continue

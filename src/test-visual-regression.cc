@@ -66,6 +66,7 @@ std::string source_dir() { return ".."; }
 #endif
 
 std::string data_dir() { return source_dir() + "/data"; }
+std::string visual_fixture_dir() { return source_dir() + "/tests/fixtures/visual"; }
 std::string ref_dir() { return data_dir() + "/visual_refs"; }
 
 // Test case definition
@@ -89,6 +90,17 @@ const float kDPI = 150.0f;
 bool file_exists(const std::string& path) {
   struct stat st;
   return stat(path.c_str(), &st) == 0;
+}
+
+std::string resolve_pdf_path(const std::string& pdf_name) {
+  if (pdf_name.find('/') != std::string::npos && file_exists(pdf_name)) {
+    return pdf_name;
+  }
+  std::string data_path = data_dir() + "/" + pdf_name;
+  if (file_exists(data_path)) return data_path;
+  std::string fixture_path = visual_fixture_dir() + "/" + pdf_name;
+  if (file_exists(fixture_path)) return fixture_path;
+  return data_path;
 }
 
 bool ensure_directory(const std::string& path) {
@@ -416,7 +428,7 @@ int main(int argc, char** argv) {
   int skipped = 0;
 
   for (const auto& tc : tests) {
-    std::string pdf_path = data_dir() + "/" + tc.pdf_name;
+    std::string pdf_path = resolve_pdf_path(tc.pdf_name);
     std::string stem = tc.pdf_name.substr(0, tc.pdf_name.size() - 4);
     std::string ref_path = ref_dir() + "/" + stem + "-page1-150dpi.png";
 

@@ -46,6 +46,7 @@ Thumbs.db
 # Test/temp data
 *.pdf
 !data/*.pdf
+!tests/fixtures/visual/*.pdf
 canvas_output.*
 svg_output.*
 data/ccitt/
