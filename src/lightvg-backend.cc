@@ -1938,6 +1938,65 @@ static bool load_font_file(const std::string& path, std::vector<uint8_t>& data) 
   return true;
 }
 
+// Try to derive a styled (Bold / Italic / BoldItalic) variant path from a
+// "regular" fallback path. The on-disk naming conventions vary by family —
+// DejaVu uses -Bold / -Oblique, Liberation uses -Bold / -Italic, FreeFont
+// uses BoldItalic with no separator, Noto matches DejaVu, etc. We probe
+// several common patterns; the caller load_font_file() returns false for
+// any path that doesn't exist on disk.
+static std::vector<std::string> derive_styled_paths(const std::string& regular,
+                                                    bool want_bold,
+                                                    bool want_italic) {
+  std::vector<std::string> out;
+  if (!want_bold && !want_italic) {
+    out.push_back(regular);
+    return out;
+  }
+
+  size_t slash = regular.find_last_of("/\\");
+  size_t name_start = (slash == std::string::npos) ? 0 : slash + 1;
+  size_t dot = regular.find_last_of('.');
+  if (dot == std::string::npos || dot < name_start) {
+    out.push_back(regular);
+    return out;
+  }
+  std::string dir  = regular.substr(0, name_start);
+  std::string stem = regular.substr(name_start, dot - name_start);
+  std::string ext  = regular.substr(dot);
+
+  // Drop a trailing "-Regular" / "Regular" so substitution doesn't double up.
+  for (const char* suf : {"-Regular", "Regular"}) {
+    size_t slen = std::strlen(suf);
+    if (stem.size() > slen && stem.compare(stem.size() - slen, slen, suf) == 0) {
+      stem.erase(stem.size() - slen);
+      break;
+    }
+  }
+
+  // Candidate suffixes, ordered by preference (best match first).
+  std::vector<const char*> suffixes;
+  if (want_bold && want_italic) {
+    suffixes = {"-BoldOblique", "-BoldItalic", "BoldOblique", "BoldItalic"};
+  } else if (want_bold) {
+    suffixes = {"-Bold", "Bold"};
+  } else /* want_italic */ {
+    suffixes = {"-Oblique", "-Italic", "Oblique", "Italic"};
+  }
+
+  for (const char* suf : suffixes) {
+    out.push_back(dir + stem + suf + ext);
+  }
+  // If bold-italic fails, degrade to bold-only.
+  if (want_bold && want_italic) {
+    for (const char* suf : {"-Bold", "Bold"}) {
+      out.push_back(dir + stem + suf + ext);
+    }
+  }
+  // Always include the regular path as a final fallback.
+  out.push_back(regular);
+  return out;
+}
+
 // Helper to determine font category from name
 // Helper to determine font category from name
 // Returns: 0=sans-serif, 1=monospace, 2=serif, 3=symbol, 4=CJK
@@ -2314,16 +2373,28 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   }
 #endif
 
-  // Try fonts in the matching category first
+  // Weight/italic hint from the PDF font name (e.g. "Helvetica-Bold" → 700,
+  // "Times-Italic" → italic). Used below to prefer styled file variants.
+  auto fb_ws = parse_font_weight_style(hint_name);
+  bool fb_want_bold   = fb_ws.first >= 600;
+  bool fb_want_italic = fb_ws.second;
+
+  // Try fonts in the matching category first. For each regular path, probe
+  // styled variants (Bold / Italic / BoldItalic) on disk before the regular.
   for (const char** path = font_list; *path; ++path) {
-    FontCache cache;
-    if (load_font_file(*path, cache.font_data)) {
-      int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
-        cache.initialized = true;
-        font_cache_[font_name] = std::move(cache);
-        NANOPDF_LOG_DEBUG("LightVG", "Using fallback font: %s for '%s' (cat=%d)", *path, font_name.c_str(), category);
-        return true;
+    auto candidates = derive_styled_paths(*path, fb_want_bold, fb_want_italic);
+    for (const std::string& cand : candidates) {
+      FontCache cache;
+      if (load_font_file(cand, cache.font_data)) {
+        int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+          cache.initialized = true;
+          font_cache_[font_name] = std::move(cache);
+          NANOPDF_LOG_DEBUG("LightVG", "Using fallback font: %s for '%s' (cat=%d, weight=%d%s)",
+                            cand.c_str(), font_name.c_str(), category,
+                            fb_ws.first, fb_want_italic ? ",italic" : "");
+          return true;
+        }
       }
     }
   }
@@ -2331,14 +2402,19 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   // If category-specific fonts not found, try sans-serif as ultimate fallback
   if (category != 0) {
     for (const char** path = sans_fonts; *path; ++path) {
-      FontCache cache;
-      if (load_font_file(*path, cache.font_data)) {
-        int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
-          cache.initialized = true;
-          font_cache_[font_name] = std::move(cache);
-          NANOPDF_LOG_DEBUG("LightVG", "Using fallback font: %s for '%s' (fallback)", *path, font_name.c_str());
-          return true;
+      auto candidates = derive_styled_paths(*path, fb_want_bold, fb_want_italic);
+      for (const std::string& cand : candidates) {
+        FontCache cache;
+        if (load_font_file(cand, cache.font_data)) {
+          int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+          if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+            cache.initialized = true;
+            font_cache_[font_name] = std::move(cache);
+            NANOPDF_LOG_DEBUG("LightVG", "Using fallback font: %s for '%s' (fallback, weight=%d%s)",
+                              cand.c_str(), font_name.c_str(),
+                              fb_ws.first, fb_want_italic ? ",italic" : "");
+            return true;
+          }
         }
       }
     }
