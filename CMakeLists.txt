@@ -796,6 +796,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     ${PROJECT_SOURCE_DIR}/src/c
     ${PROJECT_SOURCE_DIR}/tests)
   set_property(TARGET nanopdf_c_api_smoke PROPERTY C_STANDARD 11)
+  add_sanitizers(nanopdf_c_api_smoke)
   add_test(NAME nanopdf_c_api_smoke COMMAND nanopdf_c_api_smoke)
   set_tests_properties(nanopdf_c_api_smoke PROPERTIES LABELS "unit")
 endif()
