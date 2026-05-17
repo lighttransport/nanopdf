@@ -516,6 +516,99 @@ void contours_bbox(const std::vector<Contour>& contours, float& minx,
   }
 }
 
+// Slice a contour into sub-polylines according to a PDF-style dash pattern
+// (alternating on/off lengths in canvas units) and starting `phase` offset.
+// Sub-polylines preserve cap/join style when re-drawn through styled_polyline.
+// Returns the original contour unchanged when the pattern is empty or has
+// zero total length.
+std::vector<Contour> apply_dash(const Contour& contour,
+                                const std::vector<float>& pattern,
+                                float phase) {
+  std::vector<Contour> out;
+  if (contour.pts.size() < 2) {
+    if (!contour.pts.empty()) out.push_back(contour);
+    return out;
+  }
+  float cycle = 0.0f;
+  for (float v : pattern) cycle += v;
+  if (pattern.empty() || cycle <= 1e-6f) {
+    out.push_back(contour);
+    return out;
+  }
+
+  // Normalise phase into [0, cycle).
+  float pos = std::fmod(phase, cycle);
+  if (pos < 0.0f) pos += cycle;
+
+  // Locate the pattern entry the phase lands in and how much of it is left.
+  size_t pat_idx = 0;
+  bool is_on = true;  // PDF dash array always starts with an "on" entry
+  float acc = 0.0f;
+  while (pat_idx < pattern.size() && acc + pattern[pat_idx] <= pos) {
+    acc += pattern[pat_idx];
+    ++pat_idx;
+    is_on = !is_on;
+  }
+  if (pat_idx >= pattern.size()) {
+    // Shouldn't happen after normalisation; bail to solid.
+    out.push_back(contour);
+    return out;
+  }
+  float remaining_in_dash = pattern[pat_idx] - (pos - acc);
+
+  Contour current;
+  if (is_on) current.pts.push_back(contour.pts[0]);
+
+  auto advance_pattern = [&]() {
+    pat_idx = (pat_idx + 1) % pattern.size();
+    is_on = !is_on;
+    remaining_in_dash = pattern[pat_idx];
+  };
+
+  auto flush_current = [&]() {
+    if (current.pts.size() >= 2) out.push_back(std::move(current));
+    current = Contour{};
+  };
+
+  for (size_t i = 0; i + 1 < contour.pts.size(); ++i) {
+    const lui_pointf_t& p0 = contour.pts[i];
+    const lui_pointf_t& p1 = contour.pts[i + 1];
+    float dx = p1.x - p0.x;
+    float dy = p1.y - p0.y;
+    float seg_len = std::sqrt(dx * dx + dy * dy);
+    if (seg_len < 1e-6f) continue;
+    float ux = dx / seg_len;
+    float uy = dy / seg_len;
+    float seg_remaining = seg_len;
+    float seg_consumed = 0.0f;
+
+    while (seg_remaining > 1e-6f) {
+      float take = std::min(seg_remaining, remaining_in_dash);
+      seg_consumed += take;
+      lui_pointf_t pt{p0.x + ux * seg_consumed, p0.y + uy * seg_consumed};
+
+      if (is_on) {
+        current.pts.push_back(pt);
+      }
+
+      remaining_in_dash -= take;
+      seg_remaining     -= take;
+
+      if (remaining_in_dash <= 1e-6f) {
+        if (is_on) flush_current();
+        else current.pts.clear();
+        advance_pattern();
+        if (is_on && seg_remaining > 1e-6f) {
+          current.pts.push_back(pt);
+        }
+      }
+    }
+  }
+
+  if (is_on) flush_current();
+  return out;
+}
+
 // Rasterize a sequence of contours to an 8-bit alpha mask of `bbox_w` × `bbox_h`.
 // Contours are translated so (bbox_x, bbox_y) becomes (0, 0) before rasterizing.
 std::vector<uint8_t> rasterize_contours_to_mask(
@@ -1205,6 +1298,16 @@ void Shape::draw_on(lui_canvas_t* canvas) {
               p.x -= static_cast<float>(x0);
               p.y -= static_cast<float>(y0);
             }
+            if (!stroke_dash_.empty()) {
+              auto subs = apply_dash(c, stroke_dash_, stroke_dash_phase_);
+              for (const Contour& sc : subs) {
+                if (sc.pts.size() < 2) continue;
+                lui_canvas_draw_styled_polyline(
+                    &tc, sc.pts.data(), static_cast<int>(sc.pts.size()),
+                    0xFFFFFFFFu, sw, /*closed=*/false, to_cap, to_join);
+              }
+              continue;
+            }
             bool closed = false;
             if (c.pts.size() >= 3) {
               const lui_pointf_t& f = c.pts.front();
@@ -1250,6 +1353,18 @@ void Shape::draw_on(lui_canvas_t* canvas) {
         uint32_t color = pack_argb(sr, sg, sb, sa);
         for (const Contour& c : contours) {
           if (c.pts.size() < 2) continue;
+          // Dashed stroke: slice contour by the dash pattern, then draw each
+          // "on" sub-polyline. Dashing always breaks contour closure.
+          if (!stroke_dash_.empty()) {
+            auto subs = apply_dash(c, stroke_dash_, stroke_dash_phase_);
+            for (const Contour& sc : subs) {
+              if (sc.pts.size() < 2) continue;
+              lui_canvas_draw_styled_polyline(
+                  canvas, sc.pts.data(), static_cast<int>(sc.pts.size()),
+                  color, sw, /*closed=*/false, to_cap, to_join);
+            }
+            continue;
+          }
           bool closed = false;
           if (c.pts.size() >= 3) {
             const lui_pointf_t& f = c.pts.front();
