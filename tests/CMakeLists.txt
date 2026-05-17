@@ -91,6 +91,7 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/document/test_pdfa_validation.cc
     unit/graphics/test_color_transform.cc
     unit/backends/test_render_progress.cc
+    unit/backends/test_focal_radial_gradient.cc
     unit/filters/test_tiff_decode.cc
     unit/forms/test_form_manipulation.cc
 )

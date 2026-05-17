@@ -244,6 +244,10 @@ bool build_lui_gradient(Paint* grad, lui_canvas_gradient_t& out,
   }
   if (grad->kind() == Paint::kRadial) {
     auto* rg = static_cast<RadialGradient*>(grad);
+    // lui_canvas's radial gradient is concentric only (centre + radius).
+    // Focal-point radials must go through the per-pixel sample_gradient_at
+    // path; signal that here by declining the fast-path build.
+    if (rg->has_focal()) return false;
     int count = std::min<int>(rg->stop_count(), LUI_CANVAS_GRADIENT_MAX_STOPS);
     if (count == 0) return false;
     out.type = LUI_CANVAS_GRADIENT_RADIAL;
@@ -590,6 +594,9 @@ void fill_polygon_with_source(lui_canvas_t* canvas,
   }
 }
 
+}  // namespace (close the file-local anonymous namespace so the next
+   // function matches its lvg:: declaration in the header)
+
 // Sample an lvg gradient at (canvas_x, canvas_y). Returns 0xAARRGGBB.
 uint32_t sample_gradient_at(const Paint* grad, float x, float y,
                             uint8_t opacity_mul) {
@@ -609,10 +616,59 @@ uint32_t sample_gradient_at(const Paint* grad, float x, float y,
     lg->sample(t, r, g, b, a);
   } else if (grad->kind() == Paint::kRadial) {
     const auto* rg = static_cast<const RadialGradient*>(grad);
-    float dx = x - rg->cx();
-    float dy = y - rg->cy();
-    float d  = std::sqrt(dx * dx + dy * dy);
-    float t  = rg->r() > 1e-8f ? d / rg->r() : 1.0f;
+    float t;
+    if (!rg->has_focal()) {
+      // Concentric radial: t = distance from centre / radius.
+      float dx = x - rg->cx();
+      float dy = y - rg->cy();
+      float d  = std::sqrt(dx * dx + dy * dy);
+      t = rg->r() > 1e-8f ? d / rg->r() : 1.0f;
+    } else {
+      // PDF Shading Type 3 / SVG focal radial: the gradient is a family of
+      // circles interpolated between focal (fx,fy,fr) at t=0 and centre
+      // (cx,cy,r) at t=1. We solve for the t whose circle contains P,
+      // picking the larger valid root (later in the gradient progression):
+      //   Centre(t) = F + t*(C-F),  Radius(t) = Fr + t*(r-Fr)
+      //   |P - Centre(t)|^2 = Radius(t)^2
+      // → A*t^2 - 2*B*t + C = 0 with
+      //   A = |D|^2 - Dr^2, B = PF·D + Fr*Dr, C = |PF|^2 - Fr^2
+      float pfx = x - rg->fx();
+      float pfy = y - rg->fy();
+      float dx  = rg->cx() - rg->fx();
+      float dy  = rg->cy() - rg->fy();
+      float dr  = rg->r()  - rg->fr();
+      float A = dx * dx + dy * dy - dr * dr;
+      float B = pfx * dx + pfy * dy + rg->fr() * dr;
+      float C = pfx * pfx + pfy * pfy - rg->fr() * rg->fr();
+      if (std::fabs(A) < 1e-12f) {
+        // Degenerate: focal and outer circles have equal radius; quadratic
+        // collapses to -2*B*t + C = 0.
+        t = std::fabs(B) > 1e-12f ? C / (2.0f * B) : 1.0f;
+      } else {
+        float disc = B * B - A * C;
+        if (disc < 0.0f) {
+          // P is outside the two-circle family. Pad to the gradient end.
+          t = 1.0f;
+        } else {
+          float sq = std::sqrt(disc);
+          // For A > 0 (typical: outer is larger than focal in expansion
+          // direction), the larger root is the one we want. For A < 0, the
+          // family is "shrinking" and signs flip; the heuristic of picking
+          // the root with non-negative interpolated radius and larger t
+          // covers both cases.
+          float t1 = (B + sq) / A;
+          float t2 = (B - sq) / A;
+          float r1 = rg->fr() + t1 * dr;
+          float r2 = rg->fr() + t2 * dr;
+          bool r1_ok = (r1 >= 0.0f);
+          bool r2_ok = (r2 >= 0.0f);
+          if (r1_ok && r2_ok) t = std::max(t1, t2);
+          else if (r1_ok)     t = t1;
+          else if (r2_ok)     t = t2;
+          else                t = 1.0f;
+        }
+      }
+    }
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
     rg->sample(t, r, g, b, a);
@@ -620,6 +676,8 @@ uint32_t sample_gradient_at(const Paint* grad, float x, float y,
   if (opacity_mul < 255) a = static_cast<uint8_t>((a * opacity_mul) / 255);
   return pack_argb(r, g, b, a);
 }
+
+namespace {  // reopen for the remaining file-local helpers
 
 // Rasterize an arbitrary path to an 8-bit alpha mask of `bbox_w` × `bbox_h`.
 // Path is translated so (bbox_x, bbox_y) becomes (0, 0) before rasterizing.
@@ -1526,11 +1584,14 @@ void LinearGradient::sample(float t, uint8_t& r, uint8_t& g, uint8_t& b,
 
 RadialGradient* RadialGradient::gen() { return new RadialGradient(); }
 
-Result RadialGradient::radial(float cx, float cy, float r, float /*fx*/,
-                              float /*fy*/, float /*fr*/) {
+Result RadialGradient::radial(float cx, float cy, float r, float fx,
+                              float fy, float fr) {
   cx_ = cx;
   cy_ = cy;
   r_  = r;
+  fx_ = fx;
+  fy_ = fy;
+  fr_ = fr;
   return Result::Success;
 }
 

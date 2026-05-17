@@ -31,6 +31,7 @@
 
 #ifdef NANOPDF_USE_LIGHTVG
 
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <memory>
@@ -378,6 +379,17 @@ class RadialGradient : public Paint {
   float cx() const { return cx_; }
   float cy() const { return cy_; }
   float r() const { return r_; }
+  float fx() const { return fx_; }
+  float fy() const { return fy_; }
+  float fr() const { return fr_; }
+  // PDF Shading Type 3 uses a focal circle (fx,fy,fr) distinct from the
+  // outer circle (cx,cy,r). When the focal coincides with the centre and
+  // its radius is zero we fall back to the simple d/r parameterisation.
+  bool has_focal() const {
+    constexpr float eps = 1e-4f;
+    return std::fabs(fx_ - cx_) > eps || std::fabs(fy_ - cy_) > eps ||
+           std::fabs(fr_)       > eps;
+  }
   bool empty() const { return stops_.empty(); }
 
   int stop_count() const { return static_cast<int>(stops_.size()); }
@@ -390,6 +402,7 @@ class RadialGradient : public Paint {
   std::vector<Fill::ColorStop> stops_;
   FillSpread spread_{FillSpread::Pad};
   float cx_{0}, cy_{0}, r_{0};
+  float fx_{0}, fy_{0}, fr_{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -455,6 +468,13 @@ class Initializer {
   static Result init(int /*threads*/) { return Result::Success; }
   static Result term() { return Result::Success; }
 };
+
+// Sample a Linear/RadialGradient at canvas position (x, y). Returns 0xAARRGGBB
+// in straight-alpha form, with the gradient's alpha multiplied by opacity_mul.
+// Exposed for unit tests; also used internally by fill_polygon_with_source
+// and the gradient-stroke compositor.
+uint32_t sample_gradient_at(const Paint* grad, float x, float y,
+                            uint8_t opacity_mul = 255);
 
 }  // namespace lvg
 
