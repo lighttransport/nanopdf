@@ -427,6 +427,32 @@ uint32_t composite_pixel(uint32_t dst, uint32_t src, BlendMethod m) {
   uint8_t dg = static_cast<uint8_t>((dst >> 8) & 0xff);
   uint8_t db = static_cast<uint8_t>(dst & 0xff);
 
+  // Fast path: pure SRC_OVER (the common case). The W3C formula collapses
+  // when B(Cb, Cs) = Cs, so co = Cs and we can skip the per-channel
+  // blend_separable call entirely.
+  if (m == BlendMethod::Normal) {
+    if (sa == 255 || da == 0) {
+      return (static_cast<uint32_t>(sa) << 24) |
+             (static_cast<uint32_t>(sr) << 16) |
+             (static_cast<uint32_t>(sg) << 8)  |
+              static_cast<uint32_t>(sb);
+    }
+    uint16_t inv_sa = static_cast<uint16_t>(255 - sa);
+    uint8_t a_out = static_cast<uint8_t>(sa + (da * inv_sa) / 255);
+    if (a_out == 0) return 0;
+    uint32_t num_r = sa * 255u * sr + inv_sa * da * dr;
+    uint32_t num_g = sa * 255u * sg + inv_sa * da * dg;
+    uint32_t num_b = sa * 255u * sb + inv_sa * da * db;
+    uint32_t denom = 255u * a_out;
+    uint8_t o_r = static_cast<uint8_t>(num_r / denom);
+    uint8_t o_g = static_cast<uint8_t>(num_g / denom);
+    uint8_t o_b = static_cast<uint8_t>(num_b / denom);
+    return (static_cast<uint32_t>(a_out) << 24) |
+           (static_cast<uint32_t>(o_r) << 16) |
+           (static_cast<uint32_t>(o_g) << 8)  |
+            static_cast<uint32_t>(o_b);
+  }
+
   // Per W3C compositing: co = (1 - αb) × Cs + αb × B(Cb, Cs), then SRC_OVER.
   uint8_t Br, Bg, Bb;
   if (is_nonseparable_blend(m)) {
