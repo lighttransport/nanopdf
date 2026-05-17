@@ -2,9 +2,9 @@ name: Visual Regression
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - '*'
+  workflow_dispatch:
 
 jobs:
   visual-regression:
