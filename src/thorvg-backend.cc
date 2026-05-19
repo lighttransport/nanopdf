@@ -1194,9 +1194,21 @@ static void convert_icc_to_srgb(
       // Unknown RGB profile - try to use full ICC profile parsing
       color::IccProfileInfo full_profile;
       if (!color_space.icc_profile_data.empty()) {
-        full_profile = color::parse_icc_profile(
-            color_space.icc_profile_data.data(),
-            color_space.icc_profile_data.size());
+        uint64_t icc_hash = 0xcbf29ce484222325ULL;
+        for (uint8_t b : color_space.icc_profile_data) {
+          icc_hash ^= b;
+          icc_hash *= 0x1000000000000043ULL;
+        }
+
+        if (!SharedIccCache::instance().find(icc_hash, full_profile)) {
+          full_profile = color::parse_icc_profile(
+              color_space.icc_profile_data.data(),
+              color_space.icc_profile_data.size());
+
+          if (full_profile.valid) {
+            SharedIccCache::instance().store(icc_hash, full_profile);
+          }
+        }
       }
 
       if (full_profile.valid && full_profile.is_matrix_profile) {
@@ -2015,6 +2027,25 @@ bool ThorVGBackend::load_fallback_font(const std::string& font_name) {
 }
 
 bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, const BaseFont* font) {
+  // Check shared fallback cache first to avoid repeated filesystem probes
+  std::string cached_path;
+  if (SharedFontFallbackCache::instance().find(font_name, cached_path)) {
+    if (cached_path.empty()) {
+      return false;  // Previously searched and not found
+    }
+    // Use cached path directly
+    FontCache cache;
+    if (load_font_file(cached_path, cache.font_data)) {
+      int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+        cache.initialized = true;
+        font_cache_[font_name] = std::move(cache);
+        return true;
+      }
+    }
+    // Cached file no longer exists or is invalid - fall through to search
+  }
+
   // Use actual font name (e.g. "Helvetica") for category detection instead of
   // the PDF resource name (e.g. "F0") which carries no useful type information.
   const std::string& hint_name =
@@ -2275,6 +2306,7 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
+          SharedFontFallbackCache::instance().store(font_name, cand);
           NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s' (cat=%d, weight=%d%s)",
                             cand.c_str(), font_name.c_str(), category,
                             fb_ws.first, fb_want_italic ? ",italic" : "");
@@ -2295,6 +2327,7 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
           if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
             cache.initialized = true;
             font_cache_[font_name] = std::move(cache);
+            SharedFontFallbackCache::instance().store(font_name, cand);
             NANOPDF_LOG_DEBUG("ThorVG", "Using fallback font: %s for '%s' (fallback, weight=%d%s)",
                               cand.c_str(), font_name.c_str(),
                               fb_ws.first, fb_want_italic ? ",italic" : "");
@@ -2305,6 +2338,8 @@ bool ThorVGBackend::load_fallback_font_with_hint(const std::string& font_name, c
     }
   }
 
+  // Mark as not found to avoid re-searching
+  SharedFontFallbackCache::instance().store(font_name, "");
   NANOPDF_LOG_WARN("ThorVG", "Font '%s' - no fallback font found", font_name.c_str());
   return false;
 }
@@ -2931,8 +2966,6 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   }
   // Handle Separation color space (single spot color)
   else if (cs_type == ColorSpaceType::Separation) {
-    // Separation has a single tint value that maps to alternate color space
-    const auto& colorant = image.color_space.colorant_names;
     const auto& tint_func = image.color_space.tint_function;
 
     // Determine alternate color space components
@@ -2946,41 +2979,52 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
       }
     }
 
-    for (int i = 0; i < img_width * img_height && i < static_cast<int>(image.data.size()); i++) {
-      // Get tint value (0-1 range from 8-bit data)
-      double tint = image.data[i] / 255.0;
+    // Build or retrieve the 256-entry tint LUT
+    uint32_t func_obj = (tint_func.type == Value::REFERENCE) ? tint_func.ref_object_number : 0;
+    TintLutKey lut_key{func_obj, static_cast<uint32_t>(alt_components)};
+    const uint32_t* lut_data = nullptr;
+    TintLutEntry lut_entry;
 
-      // Evaluate tint function if present
-      std::vector<double> outputs;
-      uint8_t r = 0, g = 0, b = 0;
+    auto cache_it = tint_lut_cache_.find(lut_key);
+    if (cache_it != tint_lut_cache_.end()) {
+      lut_data = cache_it->second.lut.data();
+    } else {
+      // Build LUT by evaluating function for each 8-bit input
+      for (int t = 0; t < 256; ++t) {
+        double tint = t / 255.0;
+        std::vector<double> outputs;
+        uint8_t r = 0, g = 0, b = 0;
 
-      if (tint_func.type != Value::UNDEFINED && current_pdf_ &&
-          evaluate_pdf_function(*current_pdf_, tint_func, {tint}, outputs) &&
-          !outputs.empty()) {
-        // Convert alternate color to RGB
-        if (alt_components == 1) {
-          // Gray
-          uint8_t gray = static_cast<uint8_t>(outputs[0] * 255);
+        if (tint_func.type != Value::UNDEFINED && current_pdf_ &&
+            evaluate_pdf_function(*current_pdf_, tint_func, {tint}, outputs) &&
+            !outputs.empty()) {
+          if (alt_components == 1) {
+            uint8_t gray = static_cast<uint8_t>(outputs[0] * 255);
+            r = g = b = gray;
+          } else if (alt_components == 3 && outputs.size() >= 3) {
+            r = static_cast<uint8_t>(outputs[0] * 255);
+            g = static_cast<uint8_t>(outputs[1] * 255);
+            b = static_cast<uint8_t>(outputs[2] * 255);
+          } else if (alt_components == 4 && outputs.size() >= 4) {
+            cmyk_to_rgb(static_cast<float>(outputs[0]),
+                        static_cast<float>(outputs[1]),
+                        static_cast<float>(outputs[2]),
+                        static_cast<float>(outputs[3]), r, g, b);
+          }
+        } else {
+          uint8_t gray = static_cast<uint8_t>((1.0 - tint) * 255);
           r = g = b = gray;
-        } else if (alt_components == 3 && outputs.size() >= 3) {
-          // RGB
-          r = static_cast<uint8_t>(outputs[0] * 255);
-          g = static_cast<uint8_t>(outputs[1] * 255);
-          b = static_cast<uint8_t>(outputs[2] * 255);
-        } else if (alt_components == 4 && outputs.size() >= 4) {
-          // CMYK to RGB
-          cmyk_to_rgb(static_cast<float>(outputs[0]),
-                      static_cast<float>(outputs[1]),
-                      static_cast<float>(outputs[2]),
-                      static_cast<float>(outputs[3]), r, g, b);
         }
-      } else {
-        // Fallback: treat as grayscale tint
-        uint8_t gray = static_cast<uint8_t>((1.0 - tint) * 255);
-        r = g = b = gray;
+        lut_entry.lut[t] = (0xFF << 24) | (r << 16) | (g << 8) | b;
       }
+      tint_lut_cache_[lut_key] = std::move(lut_entry);
+      lut_data = tint_lut_cache_[lut_key].lut.data();
+    }
 
-      argb_data[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+    // Fast pixel loop: simple LUT lookup
+    int pixel_count = std::min(img_width * img_height, static_cast<int>(image.data.size()));
+    for (int i = 0; i < pixel_count; ++i) {
+      argb_data[i] = lut_data[image.data[i]];
     }
   }
   // Handle DeviceN color space (multiple spot colors)
@@ -3225,9 +3269,20 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
 }
 
 // Helper function to extract color stops from a PDF function
-// Returns color stops for gradient fills
+// Returns color stops for gradient fills. Uses cache when available.
 static std::vector<tvg::Fill::ColorStop> extract_color_stops_from_function(
-    const Pdf& pdf, const Value& function) {
+    const Pdf& pdf, const Value& function,
+    std::unordered_map<uint32_t, ThorVGColorStopCacheEntry>* cache = nullptr) {
+
+  // Check cache first
+  if (cache && function.type == Value::REFERENCE) {
+    uint32_t func_obj = function.ref_object_number;
+    auto it = cache->find(func_obj);
+    if (it != cache->end()) {
+      return it->second.stops;
+    }
+  }
+
   std::vector<tvg::Fill::ColorStop> stops;
 
   if (function.type != Value::DICTIONARY) {
@@ -3375,12 +3430,18 @@ static std::vector<tvg::Fill::ColorStop> extract_color_stops_from_function(
     }
   }
   else {
-    // Unsupported function type - default gradient
-    stops.push_back({0.0f, 0, 0, 0, 255});
-    stops.push_back({1.0f, 255, 255, 255, 255});
-  }
+  // Unsupported function type - default gradient
+  stops.push_back({0.0f, 0, 0, 0, 255});
+  stops.push_back({1.0f, 255, 255, 255, 255});
+}
 
-  return stops;
+// Store in cache
+if (cache && function.type == Value::REFERENCE) {
+  uint32_t func_obj = function.ref_object_number;
+  (*cache)[func_obj].stops = stops;
+}
+
+return stops;
 }
 
 // PDF function evaluator - evaluates a PDF function at given input values
@@ -3625,7 +3686,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     gradient->linear(x0, y0, x1, y1);
 
     // Extract color stops from function (supports Type 2 and Type 3 functions)
-    auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function);
+    auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
     gradient->colorStops(colorStops.data(), colorStops.size());
 
     // Set spread mode based on extend flags
@@ -3657,7 +3718,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     gradient->radial(x1, y1, r1, x0, y0, r0);
 
     // Extract color stops from function (supports Type 2 and Type 3 functions)
-    auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function);
+    auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
     gradient->colorStops(colorStops.data(), colorStops.size());
 
     if (shading->extend.size() >= 2 && (shading->extend[0] || shading->extend[1])) {
@@ -3691,9 +3752,49 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     if (raster_w <= 0) raster_w = 256;
     if (raster_h <= 0) raster_h = 256;
 
+    // Check render cache first
+    uint32_t shading_obj = (shading_value.type == Value::REFERENCE) ? shading_value.ref_object_number : 0;
+    std::string cache_key = "shading_func:" + std::to_string(shading_obj) + ":" +
+                            std::to_string(raster_w) + "x" + std::to_string(raster_h);
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached)) {
+      // Use cached bitmap
+      auto picture = tvg::Picture::gen();
+      if (picture) {
+        auto* data_copy = new uint32_t[cached.data.size() / sizeof(uint32_t)];
+        std::copy(reinterpret_cast<const uint32_t*>(cached.data.data()),
+                  reinterpret_cast<const uint32_t*>(cached.data.data()) + cached.data.size() / sizeof(uint32_t),
+                  data_copy);
+        auto result = picture->load(data_copy, raster_w, raster_h,
+                                     tvg::ColorSpace::ARGB8888, true);
+        if (result == tvg::Result::Success) {
+          tvg::Matrix m;
+          m.e11 = 1.0f; m.e12 = 0.0f; m.e13 = x;
+          m.e21 = 0.0f; m.e22 = 1.0f; m.e23 = y;
+          m.e31 = 0.0f; m.e32 = 0.0f; m.e33 = 1.0f;
+          picture->transform(m);
+          apply_soft_mask_opacity(picture);
+          scene_->add(picture);
+          shape->unref();
+          return true;
+        } else {
+          delete[] data_copy;
+        }
+      }
+    }
+
     std::vector<uint32_t> pixels;
     if (rasterize_function_shading(*current_pdf_, *shading, raster_w, raster_h,
                                     state_.scale, state_.page_height, pixels)) {
+      // Store in render cache
+      RenderCacheEntry entry;
+      entry.width = raster_w;
+      entry.height = raster_h;
+      entry.data.resize(pixels.size() * sizeof(uint32_t));
+      std::copy(pixels.begin(), pixels.end(),
+                reinterpret_cast<uint32_t*>(entry.data.data()));
+      RenderCache::instance().store(cache_key, std::move(entry));
+
       // Create ThorVG Picture from rasterized bitmap
       auto picture = tvg::Picture::gen();
       if (picture) {
@@ -3741,7 +3842,7 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
     }
 
     gradient->linear(x0, y0, x1, y1);
-    auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function);
+    auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
     gradient->colorStops(colorStops.data(), colorStops.size());
     shape->fill(gradient);
   }
@@ -3778,6 +3879,26 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #endif
       shape->unref();
       return false;
+    }
+
+    // Check render cache first
+    uint32_t shading_obj = (shading_value.type == Value::REFERENCE) ? shading_value.ref_object_number : 0;
+    std::string cache_key = "shading_mesh:" + std::to_string(shading_obj) + ":" +
+                            std::to_string(static_cast<int>(shading->type)) + ":" +
+                            std::to_string(bmp_width) + "x" + std::to_string(bmp_height);
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached)) {
+      auto picture = tvg::Picture::gen();
+      if (picture) {
+        if (picture->load(reinterpret_cast<uint32_t*>(cached.data.data()),
+                          bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) == tvg::Result::Success) {
+          picture->translate(x, y);
+          apply_soft_mask_opacity(picture);
+          scene_->add(picture);
+          shape->unref();
+          return true;
+        }
+      }
     }
 
     std::vector<uint32_t> bitmap(bmp_width * bmp_height, 0x00000000);  // Transparent
@@ -3892,6 +4013,15 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
       rgba_data[i] = (a << 24) | (b << 16) | (g << 8) | r;
     }
 
+    // Store in render cache
+    RenderCacheEntry entry;
+    entry.width = bmp_width;
+    entry.height = bmp_height;
+    entry.data.resize(rgba_data.size() * sizeof(uint32_t));
+    std::copy(rgba_data.begin(), rgba_data.end(),
+              reinterpret_cast<uint32_t*>(entry.data.data()));
+    RenderCache::instance().store(cache_key, std::move(entry));
+
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
                       bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) != tvg::Result::Success) {
@@ -3939,6 +4069,26 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
 #endif
       shape->unref();
       return false;
+    }
+
+    // Check render cache first
+    uint32_t shading_obj = (shading_value.type == Value::REFERENCE) ? shading_value.ref_object_number : 0;
+    std::string cache_key = "shading_patch:" + std::to_string(shading_obj) + ":" +
+                            std::to_string(static_cast<int>(shading->type)) + ":" +
+                            std::to_string(bmp_width) + "x" + std::to_string(bmp_height);
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached)) {
+      auto picture = tvg::Picture::gen();
+      if (picture) {
+        if (picture->load(reinterpret_cast<uint32_t*>(cached.data.data()),
+                          bmp_width, bmp_height, tvg::ColorSpace::ARGB8888S, true) == tvg::Result::Success) {
+          picture->translate(x, y);
+          apply_soft_mask_opacity(picture);
+          scene_->add(picture);
+          shape->unref();
+          return true;
+        }
+      }
     }
 
     std::vector<uint32_t> bitmap(bmp_width * bmp_height, 0x00000000);  // Transparent
@@ -4044,6 +4194,15 @@ bool ThorVGBackend::draw_shading(const std::string& shading_name) {
       uint32_t b = (bgra >> 16) & 0xFF;
       rgba_data[i] = (a << 24) | (b << 16) | (g << 8) | r;
     }
+
+    // Store in render cache
+    RenderCacheEntry entry;
+    entry.width = bmp_width;
+    entry.height = bmp_height;
+    entry.data.resize(rgba_data.size() * sizeof(uint32_t));
+    std::copy(rgba_data.begin(), rgba_data.end(),
+              reinterpret_cast<uint32_t*>(entry.data.data()));
+    RenderCache::instance().store(cache_key, std::move(entry));
 
     // Load pixel data (ARGB8888S = un-premultiplied ARGB)
     if (picture->load(reinterpret_cast<uint32_t*>(rgba_data.data()),
@@ -4421,7 +4580,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
       gradient->linear(x0, y0, x1, y1);
 
       // Extract color stops
-      auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function);
+      auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
       gradient->colorStops(colorStops.data(), colorStops.size());
 
       if (shading->extend.size() >= 2 && (shading->extend[0] || shading->extend[1])) {
@@ -4480,7 +4639,7 @@ bool ThorVGBackend::apply_pattern_fill(tvg::Shape* shape, const std::string& pat
 
       gradient->radial(x1, y1, r1, x0, y0, r0);
 
-      auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function);
+      auto colorStops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
       gradient->colorStops(colorStops.data(), colorStops.size());
 
       if (shading->extend.size() >= 2 && (shading->extend[0] || shading->extend[1])) {
@@ -5118,41 +5277,77 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     }
   }
 
-  // Resolve glyph via ttf_parse when available; keep stbtt as a last-ditch
-  // fallback for fonts that ttf_parse rejects at init time.
+  // Resolve glyph index first (fast cmap lookup) so we can short-circuit
+  // .notdef and check the outline cache before parsing sfnt tables.
   uint16_t gid = 0;
-  ttf_outline_t outline{};
-  bool have_ttf_outline = false;
   if (font->has_ttf_parse) {
     gid = ttf_cmap_lookup(&font->ttf, static_cast<uint32_t>(codepoint));
-    if (gid != 0 && ttf_glyph_outline(&font->ttf, gid, &outline) == 0) {
-      have_ttf_outline = true;
-    }
+  } else {
+    gid = static_cast<uint16_t>(stbtt_FindGlyphIndex(&font->font_info, codepoint));
   }
 
-  stbtt_vertex* vertices = nullptr;
-  int num_verts = 0;
-  if (!have_ttf_outline) {
-    // stbtt_GetCodepointShape returns the font's .notdef glyph when the
-    // codepoint is not in the cmap — many fonts draw .notdef as a visible
-    // tofu-box-with-X, which is misleading here. Check the glyph index
-    // explicitly and render our own placeholder when missing.
-    int stbtt_gid = stbtt_FindGlyphIndex(&font->font_info, codepoint);
-    if (stbtt_gid == 0) {
+  // Handle missing glyph early
+  if (gid == 0) {
     if (codepoint == 0x20 || codepoint == 0x09 || codepoint == 0x0A ||
         codepoint == 0x0D || codepoint == 0x00A0) {
-      return true;  // whitespace glyph with no visible outline
+      return true;
     }
     if (draw_bullet_fallback()) return true;
     if (draw_checkmark_fallback()) return true;
     draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
-    num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
+
+  // --- Glyph outline vector cache ---
+  // Caches deeply parsed ttf_outline_t data so that rotated / stroked / clipped
+  // text reuses the outline without re-parsing sfnt tables (ttf_glyph_outline).
+  GlyphOutlineKey cache_key{current_font_name_, static_cast<int>(gid)};
+  auto cache_it = glyph_outline_cache_.find(cache_key);
+  bool outline_from_cache = (cache_it != glyph_outline_cache_.end());
+
+  ttf_outline_t outline{};
+  bool have_ttf_outline = false;
+  stbtt_vertex* vertices = nullptr;
+  int num_verts = 0;
+
+  if (outline_from_cache) {
+    // Wire a temporary ttf_outline_t pointing into the cached vectors.
+    const auto& cached = cache_it->second;
+    outline.points = const_cast<ttf_point_t*>(cached.points.data());
+    outline.contour_ends = const_cast<int*>(cached.contour_ends.data());
+    outline.num_points = static_cast<int>(cached.points.size());
+    outline.num_contours = static_cast<int>(cached.contour_ends.size());
+    outline.x_min = cached.x_min;
+    outline.y_min = cached.y_min;
+    outline.x_max = cached.x_max;
+    outline.y_max = cached.y_max;
+    have_ttf_outline = true;
+  } else if (font->has_ttf_parse &&
+             ttf_glyph_outline(&font->ttf, gid, &outline) == 0) {
+    have_ttf_outline = true;
+
+    // Deep-copy into cache
+    GlyphOutlineEntry entry;
+    entry.points.assign(outline.points, outline.points + outline.num_points);
+    entry.contour_ends.assign(outline.contour_ends,
+                              outline.contour_ends + outline.num_contours);
+    entry.x_min = outline.x_min;
+    entry.y_min = outline.y_min;
+    entry.x_max = outline.x_max;
+    entry.y_max = outline.y_max;
+    if (glyph_outline_cache_.size() >= kMaxGlyphOutlineCacheEntries) {
+      glyph_outline_cache_.erase(glyph_outline_cache_.begin());
+    }
+    glyph_outline_cache_[cache_key] = std::move(entry);
+  }
+
+  if (!have_ttf_outline) {
+    // stbtt fallback — only reached when ttf_parse couldn't load the font.
+    num_verts = stbtt_GetGlyphShape(&font->font_info, gid, &vertices);
     if (num_verts == 0 || !vertices) {
       if (codepoint == 0x20 || codepoint == 0x09 || codepoint == 0x0A ||
           codepoint == 0x0D || codepoint == 0x00A0) {
-        return true;  // whitespace glyph with no visible outline
+        return true;
       }
       if (draw_bullet_fallback()) return true;
       if (draw_checkmark_fallback()) return true;
@@ -5181,8 +5376,11 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
 
   auto shape = tvg::Shape::gen();
   if (!shape) {
-    if (have_ttf_outline) ttf_outline_free(&outline);
-    else stbtt_FreeShape(&font->font_info, vertices);
+    if (have_ttf_outline && !outline_from_cache) {
+      ttf_outline_free(&outline);
+    } else if (!have_ttf_outline && vertices) {
+      stbtt_FreeShape(&font->font_info, vertices);
+    }
     return false;
   }
 
@@ -5266,8 +5464,11 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   shape->close();
   if (add_to_clip) state_.text_clip_commands.push_back(tvg::PathCommand::Close);
 
-  if (have_ttf_outline) ttf_outline_free(&outline);
-  else stbtt_FreeShape(&font->font_info, vertices);
+  if (have_ttf_outline && !outline_from_cache) {
+    ttf_outline_free(&outline);
+  } else if (!have_ttf_outline && vertices) {
+    stbtt_FreeShape(&font->font_info, vertices);
+  }
 
   // Mode 7: clip only - don't render visible shape
   if (render_mode == 7 || invisible) {
@@ -5332,16 +5533,45 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
     }
   }
 
-  // Primary path: ttf_parse outline. Fall back to stbtt only when ttf rejected the font.
+  // --- Glyph outline vector cache ---
+  GlyphOutlineKey cache_key{current_font_name_, glyph_index};
+  auto cache_it = glyph_outline_cache_.find(cache_key);
+  bool outline_from_cache = (cache_it != glyph_outline_cache_.end());
+
   ttf_outline_t outline{};
   bool have_ttf_outline = false;
-  if (font->has_ttf_parse &&
-      ttf_glyph_outline(&font->ttf, static_cast<uint16_t>(glyph_index), &outline) == 0) {
-    have_ttf_outline = true;
-  }
-
   stbtt_vertex* vertices = nullptr;
   int num_verts = 0;
+
+  if (outline_from_cache) {
+    const auto& cached = cache_it->second;
+    outline.points = const_cast<ttf_point_t*>(cached.points.data());
+    outline.contour_ends = const_cast<int*>(cached.contour_ends.data());
+    outline.num_points = static_cast<int>(cached.points.size());
+    outline.num_contours = static_cast<int>(cached.contour_ends.size());
+    outline.x_min = cached.x_min;
+    outline.y_min = cached.y_min;
+    outline.x_max = cached.x_max;
+    outline.y_max = cached.y_max;
+    have_ttf_outline = true;
+  } else if (font->has_ttf_parse &&
+             ttf_glyph_outline(&font->ttf, static_cast<uint16_t>(glyph_index), &outline) == 0) {
+    have_ttf_outline = true;
+
+    GlyphOutlineEntry entry;
+    entry.points.assign(outline.points, outline.points + outline.num_points);
+    entry.contour_ends.assign(outline.contour_ends,
+                              outline.contour_ends + outline.num_contours);
+    entry.x_min = outline.x_min;
+    entry.y_min = outline.y_min;
+    entry.x_max = outline.x_max;
+    entry.y_max = outline.y_max;
+    if (glyph_outline_cache_.size() >= kMaxGlyphOutlineCacheEntries) {
+      glyph_outline_cache_.erase(glyph_outline_cache_.begin());
+    }
+    glyph_outline_cache_[cache_key] = std::move(entry);
+  }
+
   if (!have_ttf_outline) {
     num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
     if (num_verts == 0 || !vertices) {
@@ -5367,8 +5597,11 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
 
   auto shape = tvg::Shape::gen();
   if (!shape) {
-    if (have_ttf_outline) ttf_outline_free(&outline);
-    else stbtt_FreeShape(&font->font_info, vertices);
+    if (have_ttf_outline && !outline_from_cache) {
+      ttf_outline_free(&outline);
+    } else if (!have_ttf_outline && vertices) {
+      stbtt_FreeShape(&font->font_info, vertices);
+    }
     return false;
   }
 
@@ -5445,8 +5678,11 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
   shape->close();
   if (add_to_clip) state_.text_clip_commands.push_back(tvg::PathCommand::Close);
 
-  if (have_ttf_outline) ttf_outline_free(&outline);
-  else stbtt_FreeShape(&font->font_info, vertices);
+  if (have_ttf_outline && !outline_from_cache) {
+    ttf_outline_free(&outline);
+  } else if (!have_ttf_outline && vertices) {
+    stbtt_FreeShape(&font->font_info, vertices);
+  }
 
   if (render_mode == 7 || invisible) {
     return true;

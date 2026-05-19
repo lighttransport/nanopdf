@@ -6,6 +6,7 @@
 #ifdef NANOPDF_USE_LIGHTVG
 
 #include "lvg-compat.hh"
+#include <array>
 #include <deque>
 #include <memory>
 #include <vector>
@@ -37,6 +38,11 @@ using namespace nanostl;
 #include "render-backend.hh"
 
 namespace nanopdf {
+
+// Color stop cache entry - declared outside class for use in static functions.
+struct LightVGColorStopCacheEntry {
+  std::vector<lvg::Fill::ColorStop> stops;
+};
 
 // Backwards-compat aliases: legacy callers use these names, the actual
 // type lives in render-backend.hh now.
@@ -459,6 +465,29 @@ private:
   // Reusable ARGB buffer for glyph rendering. Avoids per-glyph allocation
   // in draw_glyph_bitmap_by_index when the render cache misses.
   std::vector<uint32_t> glyph_argb_buf_;
+
+  // Separation tint function LUT cache (256-entry precomputed ARGB LUT).
+  struct TintLutKey {
+    uint32_t func_obj_num;
+    uint32_t alt_cs;
+    bool operator==(const TintLutKey& o) const {
+      return func_obj_num == o.func_obj_num && alt_cs == o.alt_cs;
+    }
+  };
+  struct TintLutKeyHash {
+    size_t operator()(const TintLutKey& k) const {
+      size_t h = std::hash<uint32_t>{}(k.func_obj_num);
+      h ^= std::hash<uint32_t>{}(k.alt_cs) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  struct TintLutEntry {
+    std::array<uint32_t, 256> lut;
+  };
+  std::unordered_map<TintLutKey, TintLutEntry, TintLutKeyHash> tint_lut_cache_;
+
+  // Color stop cache for gradient shadings.
+  std::unordered_map<uint32_t, LightVGColorStopCacheEntry> color_stop_cache_;
 };
 
 }  // namespace nanopdf

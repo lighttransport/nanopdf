@@ -6,10 +6,12 @@
 #ifdef NANOPDF_USE_BLEND2D
 
 #include <blend2d.h>
+#include <array>
 #include <memory>
 #include <vector>
 #include <string>
 #include <map>
+#include <unordered_map>
 
 // stb_truetype for glyph outline extraction
 #include "stb_truetype.h"
@@ -28,6 +30,11 @@ using namespace nanostl;
 #include "nanopdf.hh"
 
 namespace nanopdf {
+
+// Color stop cache entry - declared outside class for use in static functions.
+struct Blend2DColorStopCacheEntry {
+  std::vector<std::pair<float, BLRgba32>> stops;
+};
 
 struct Blend2DRenderResult {
   bool success{false};
@@ -366,6 +373,55 @@ private:
 
   // Reusable ARGB buffer for glyph rendering.
   std::vector<uint32_t> glyph_argb_buf_;
+
+  // Cached glyph outline data (unscaled stbtt vertices) to avoid repeated
+  // stbtt_GetCodepointShape / stbtt_GetGlyphShape calls.  Keyed by
+  // (font_name, glyph_index).  Each entry stores a flat array of vertex
+  // records: {type, x, y, cx, cy, cx1, cy1} per vertex.
+  struct GlyphOutlineKey {
+    std::string font_name;
+    int glyph_id;
+    bool operator==(const GlyphOutlineKey& o) const {
+      return font_name == o.font_name && glyph_id == o.glyph_id;
+    }
+  };
+  struct GlyphOutlineKeyHash {
+    size_t operator()(const GlyphOutlineKey& k) const {
+      size_t h = std::hash<std::string>{}(k.font_name);
+      h ^= std::hash<int>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  struct GlyphOutlineData {
+    // Flat array: for each vertex, 7 floats: {type, x, y, cx, cy, cx1, cy1}
+    std::vector<float> verts;
+  };
+  std::unordered_map<GlyphOutlineKey, GlyphOutlineData, GlyphOutlineKeyHash>
+      glyph_outline_cache_;
+  static constexpr size_t kMaxGlyphOutlineCacheEntries = 2048;
+
+  // Separation tint function LUT cache (256-entry precomputed ARGB LUT).
+  struct TintLutKey {
+    uint32_t func_obj_num;
+    uint32_t alt_cs;
+    bool operator==(const TintLutKey& o) const {
+      return func_obj_num == o.func_obj_num && alt_cs == o.alt_cs;
+    }
+  };
+  struct TintLutKeyHash {
+    size_t operator()(const TintLutKey& k) const {
+      size_t h = std::hash<uint32_t>{}(k.func_obj_num);
+      h ^= std::hash<uint32_t>{}(k.alt_cs) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  struct TintLutEntry {
+    std::array<uint32_t, 256> lut;
+  };
+  std::unordered_map<TintLutKey, TintLutEntry, TintLutKeyHash> tint_lut_cache_;
+
+  // Color stop cache for gradient shadings.
+  std::unordered_map<uint32_t, Blend2DColorStopCacheEntry> color_stop_cache_;
 };
 
 }  // namespace nanopdf

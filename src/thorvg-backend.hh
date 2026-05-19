@@ -6,6 +6,7 @@
 #ifdef NANOPDF_USE_THORVG
 
 #include <thorvg.h>
+#include <array>
 #include <deque>
 #include <memory>
 #include <vector>
@@ -37,6 +38,11 @@ using namespace nanostl;
 #include "render-backend.hh"
 
 namespace nanopdf {
+
+// Color stop cache entry - declared outside class for use in static functions.
+struct ThorVGColorStopCacheEntry {
+  std::vector<tvg::Fill::ColorStop> stops;
+};
 
 // Backwards-compat aliases: legacy callers use these names, the actual
 // type lives in render-backend.hh now.
@@ -258,6 +264,30 @@ private:
     float xoff{0.0f}, yoff{0.0f};  // offset from glyph origin (float for 2x precision)
   };
 
+  // Glyph outline vector cache key: font_name + glyph_id
+  struct GlyphOutlineKey {
+    std::string font_name;
+    int glyph_id;
+    bool operator==(const GlyphOutlineKey& o) const {
+      return font_name == o.font_name && glyph_id == o.glyph_id;
+    }
+  };
+
+  struct GlyphOutlineKeyHash {
+    size_t operator()(const GlyphOutlineKey& k) const {
+      size_t h = std::hash<std::string>{}(k.font_name);
+      h ^= std::hash<int>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+
+  // Stores a deep-copied ttf_outline_t for the glyph outline cache.
+  struct GlyphOutlineEntry {
+    std::vector<ttf_point_t> points;
+    std::vector<int> contour_ends;
+    int16_t x_min{0}, y_min{0}, x_max{0}, y_max{0};
+  };
+
   // Draw an outlined "tofu" box placeholder for a missing glyph
   bool draw_missing_glyph_placeholder(float x, float y, float size,
                                       uint8_t r, uint8_t g, uint8_t b, uint8_t a);
@@ -374,6 +404,13 @@ private:
       glyph_bitmap_cache_;
   static constexpr size_t kMaxGlyphCacheEntries = 4096;
 
+  // Glyph outline vector cache for ttf_parse outlines.
+  // Caches deeply parsed ttf_outline_t data so that rotated / stroked / clipped
+  // text reuses the outline without re-parsing sfnt tables.
+  std::unordered_map<GlyphOutlineKey, GlyphOutlineEntry, GlyphOutlineKeyHash>
+      glyph_outline_cache_;
+  static constexpr size_t kMaxGlyphOutlineCacheEntries = 2048;
+
   // Current font for text rendering
   std::string current_font_name_;
   const BaseFont* current_font_{nullptr};  // Pointer to current font for encoding lookup
@@ -409,6 +446,32 @@ private:
 
   // Reusable ARGB buffer for glyph rendering.
   std::vector<uint32_t> glyph_argb_buf_;
+
+  // Separation/DeviceN tint function LUT cache.
+  // For Separation images, precomputes a 256-entry LUT mapping each 8-bit
+  // tint value to its ARGB output, avoiding per-pixel function evaluation.
+  // Keyed by the tint function's object number (0 = no reference, uses fallback).
+  struct TintLutKey {
+    uint32_t func_obj_num;
+    uint32_t alt_cs;  // alternate color space type (1=gray, 3=rgb, 4=cmyk)
+    bool operator==(const TintLutKey& o) const {
+      return func_obj_num == o.func_obj_num && alt_cs == o.alt_cs;
+    }
+  };
+  struct TintLutKeyHash {
+    size_t operator()(const TintLutKey& k) const {
+      size_t h = std::hash<uint32_t>{}(k.func_obj_num);
+      h ^= std::hash<uint32_t>{}(k.alt_cs) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  struct TintLutEntry {
+    std::array<uint32_t, 256> lut;  // ARGB values for each 8-bit input
+  };
+  std::unordered_map<TintLutKey, TintLutEntry, TintLutKeyHash> tint_lut_cache_;
+
+  // Color stop cache for gradient shadings.
+  std::unordered_map<uint32_t, ThorVGColorStopCacheEntry> color_stop_cache_;
 };
 
 }  // namespace nanopdf

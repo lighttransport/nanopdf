@@ -1445,6 +1445,23 @@ bool Blend2DBackend::load_fallback_font(const std::string& font_name) {
 }
 
 bool Blend2DBackend::load_fallback_font_with_hint(const std::string& font_name, const BaseFont* font) {
+  // Check shared fallback cache first to avoid repeated filesystem probes
+  std::string cached_path;
+  if (SharedFontFallbackCache::instance().find(font_name, cached_path)) {
+    if (cached_path.empty()) {
+      return false;
+    }
+    FontCache cache;
+    if (load_font_file(cached_path, cache.font_data)) {
+      int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+        cache.initialized = true;
+        font_cache_[font_name] = std::move(cache);
+        return true;
+      }
+    }
+  }
+
   // Determine font category for better substitution
   int category = get_font_category(font_name);
 
@@ -1646,7 +1663,7 @@ bool Blend2DBackend::load_fallback_font_with_hint(const std::string& font_name, 
 
       if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
         cache.initialized = true;
-        // printf("[Blend2D] Using fallback font: %s for '%s' (cat=%d)\n", path.c_str(), font_name.c_str(), category);
+        SharedFontFallbackCache::instance().store(font_name, path);
         return true;
       }
     }
@@ -1667,13 +1684,14 @@ bool Blend2DBackend::load_fallback_font_with_hint(const std::string& font_name, 
 
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), 0)) {
           cache.initialized = true;
-          // printf("[Blend2D] Using fallback font: %s for '%s' (fallback cat=%d)\n", path.c_str(), font_name.c_str(), category);
+          SharedFontFallbackCache::instance().store(font_name, path);
           return true;
         }
       }
     }
   }
 
+  SharedFontFallbackCache::instance().store(font_name, "");
   return false;
 }
 
@@ -1808,88 +1826,96 @@ bool Blend2DBackend::draw_glyph(int codepoint, float x, float y, float size,
 
   FontCache* font = get_font(current_font_name_);
   if (!font) {
-    // Fallback to tofu box placeholder
     draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
+  }
+
+  // Check outline cache first.
+  GlyphOutlineKey key{current_font_name_, codepoint};
+  const GlyphOutlineData* cached = nullptr;
+  auto cache_it = glyph_outline_cache_.find(key);
+  if (cache_it != glyph_outline_cache_.end()) {
+    cached = &cache_it->second;
   }
 
   stbtt_vertex* vertices = nullptr;
-  int num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
-
-  if (num_verts == 0 || !vertices) {
-    // Glyph not found in font - draw tofu box placeholder
-    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
-    return true;
+  int num_verts = 0;
+  if (!cached) {
+    num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
+    if (num_verts == 0 || !vertices) {
+      draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
+      return true;
+    }
+    // Store in cache for future use.
+    if (glyph_outline_cache_.size() >= kMaxGlyphOutlineCacheEntries) {
+      glyph_outline_cache_.erase(glyph_outline_cache_.begin());
+    }
+    auto& entry = glyph_outline_cache_[key];
+    entry.verts.resize(static_cast<size_t>(num_verts) * 7);
+    for (int i = 0; i < num_verts; ++i) {
+      entry.verts[i * 7 + 0] = static_cast<float>(vertices[i].type);
+      entry.verts[i * 7 + 1] = static_cast<float>(vertices[i].x);
+      entry.verts[i * 7 + 2] = static_cast<float>(vertices[i].y);
+      entry.verts[i * 7 + 3] = static_cast<float>(vertices[i].cx);
+      entry.verts[i * 7 + 4] = static_cast<float>(vertices[i].cy);
+      entry.verts[i * 7 + 5] = static_cast<float>(vertices[i].cx1);
+      entry.verts[i * 7 + 6] = static_cast<float>(vertices[i].cy1);
+    }
+    cached = &entry;
   }
 
   float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+  const std::vector<float>& v = cached->verts;
+  size_t nv = v.size() / 7;
 
   BLPath path;
-  float curr_x = x, curr_y = y;
-
-  for (int i = 0; i < num_verts; i++) {
-    stbtt_vertex* v = &vertices[i];
-    float vx = x + v->x * scale;
-    float vy = y - v->y * scale;
-
-    switch (v->type) {
+  for (size_t i = 0; i < nv; ++i) {
+    int type = static_cast<int>(v[i * 7 + 0]);
+    float vx = x + v[i * 7 + 1] * scale;
+    float vy = y - v[i * 7 + 2] * scale;
+    switch (type) {
       case STBTT_vmove:
         path.move_to(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       case STBTT_vline:
         path.line_to(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       case STBTT_vcurve: {
-        float cx = x + v->cx * scale;
-        float cy = y - v->cy * scale;
+        float cx = x + v[i * 7 + 3] * scale;
+        float cy = y - v[i * 7 + 4] * scale;
         path.quad_to(cx, cy, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       }
       case STBTT_vcubic: {
-        float cx1 = x + v->cx * scale;
-        float cy1 = y - v->cy * scale;
-        float cx2 = x + v->cx1 * scale;
-        float cy2 = y - v->cy1 * scale;
+        float cx1 = x + v[i * 7 + 5] * scale;
+        float cy1 = y - v[i * 7 + 6] * scale;
+        float cx2 = x + v[i * 7 + 3] * scale;
+        float cy2 = y - v[i * 7 + 4] * scale;
         path.cubic_to(cx1, cy1, cx2, cy2, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       }
     }
   }
-
   path.close();
 
-  // Apply text rendering mode
+  if (vertices) stbtt_FreeShape(&font->font_info, vertices);
+
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
   bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
   bool invisible = (render_mode == 3 || render_mode == 7);
 
-  stbtt_FreeShape(&font->font_info, vertices);
-
-  // Accumulate glyph path into text clip path for modes 4-7
   if (add_to_clip) {
     state_.text_clip_active = true;
     state_.text_clip_path.add_path(path);
   }
-
-  if (invisible) {
-    return true;
-  }
+  if (invisible) return true;
 
   if (do_fill) {
     ctx_.set_fill_style(BLRgba32(r, g, b, a));
     ctx_.fill_path(path);
   }
-
   if (do_stroke) {
     float stroke_width = state_.stroke_width * state_.scale;
     if (stroke_width < 0.5f) stroke_width = 0.5f;
@@ -1898,95 +1924,103 @@ bool Blend2DBackend::draw_glyph(int codepoint, float x, float y, float size,
     ctx_.set_stroke_style(BLRgba32(state_.stroke_r, state_.stroke_g, state_.stroke_b, stroke_alpha));
     ctx_.stroke_path(path);
   }
-
   return true;
 }
 
 bool Blend2DBackend::draw_glyph_by_index(int glyph_index, float x, float y, float size,
-                                          uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+                                           uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   if (!initialized_) return false;
 
   FontCache* font = get_font(current_font_name_);
   if (!font) {
-    // Fallback to tofu box placeholder
     draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
+  }
+
+  // Check outline cache first.
+  GlyphOutlineKey key{current_font_name_, glyph_index};
+  const GlyphOutlineData* cached = nullptr;
+  auto cache_it = glyph_outline_cache_.find(key);
+  if (cache_it != glyph_outline_cache_.end()) {
+    cached = &cache_it->second;
   }
 
   stbtt_vertex* vertices = nullptr;
-  int num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
-
-  if (num_verts == 0 || !vertices) {
-    // Glyph not found - draw tofu box placeholder
-    draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
-    return true;
+  int num_verts = 0;
+  if (!cached) {
+    num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
+    if (num_verts == 0 || !vertices) {
+      draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
+      return true;
+    }
+    // Store in cache for future use.
+    if (glyph_outline_cache_.size() >= kMaxGlyphOutlineCacheEntries) {
+      glyph_outline_cache_.erase(glyph_outline_cache_.begin());
+    }
+    auto& entry = glyph_outline_cache_[key];
+    entry.verts.resize(static_cast<size_t>(num_verts) * 7);
+    for (int i = 0; i < num_verts; ++i) {
+      entry.verts[i * 7 + 0] = static_cast<float>(vertices[i].type);
+      entry.verts[i * 7 + 1] = static_cast<float>(vertices[i].x);
+      entry.verts[i * 7 + 2] = static_cast<float>(vertices[i].y);
+      entry.verts[i * 7 + 3] = static_cast<float>(vertices[i].cx);
+      entry.verts[i * 7 + 4] = static_cast<float>(vertices[i].cy);
+      entry.verts[i * 7 + 5] = static_cast<float>(vertices[i].cx1);
+      entry.verts[i * 7 + 6] = static_cast<float>(vertices[i].cy1);
+    }
+    cached = &entry;
   }
 
   float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+  const std::vector<float>& v = cached->verts;
+  size_t nv = v.size() / 7;
 
   BLPath path;
-  float curr_x = x, curr_y = y;
-
-  for (int i = 0; i < num_verts; i++) {
-    stbtt_vertex* v = &vertices[i];
-    float vx = x + v->x * scale;
-    float vy = y - v->y * scale;
-
-    switch (v->type) {
+  for (size_t i = 0; i < nv; ++i) {
+    int type = static_cast<int>(v[i * 7 + 0]);
+    float vx = x + v[i * 7 + 1] * scale;
+    float vy = y - v[i * 7 + 2] * scale;
+    switch (type) {
       case STBTT_vmove:
         path.move_to(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       case STBTT_vline:
         path.line_to(vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       case STBTT_vcurve: {
-        float cx = x + v->cx * scale;
-        float cy = y - v->cy * scale;
+        float cx = x + v[i * 7 + 3] * scale;
+        float cy = y - v[i * 7 + 4] * scale;
         path.quad_to(cx, cy, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       }
       case STBTT_vcubic: {
-        float cx1 = x + v->cx * scale;
-        float cy1 = y - v->cy * scale;
-        float cx2 = x + v->cx1 * scale;
-        float cy2 = y - v->cy1 * scale;
+        float cx1 = x + v[i * 7 + 5] * scale;
+        float cy1 = y - v[i * 7 + 6] * scale;
+        float cx2 = x + v[i * 7 + 3] * scale;
+        float cy2 = y - v[i * 7 + 4] * scale;
         path.cubic_to(cx1, cy1, cx2, cy2, vx, vy);
-        curr_x = vx;
-        curr_y = vy;
         break;
       }
     }
   }
-
   path.close();
 
-  // Apply text rendering mode
+  if (vertices) stbtt_FreeShape(&font->font_info, vertices);
+
   int render_mode = state_.text_render_mode;
   bool do_fill = (render_mode == 0 || render_mode == 2 || render_mode == 4 || render_mode == 6);
   bool do_stroke = (render_mode == 1 || render_mode == 2 || render_mode == 5 || render_mode == 6);
   bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
   bool invisible = (render_mode == 3 || render_mode == 7);
 
-  stbtt_FreeShape(&font->font_info, vertices);
-
-  // Accumulate glyph path into text clip path for modes 4-7
   if (add_to_clip) {
     state_.text_clip_active = true;
     state_.text_clip_path.add_path(path);
   }
 
-  // Restore clipping to full canvas before drawing text
   ctx_.restore_clipping();
 
-  if (invisible) {
-    return true;
-  }
+  if (invisible) return true;
 
   if (do_fill) {
     ctx_.set_comp_op(BL_COMP_OP_SRC_OVER);
@@ -2520,22 +2554,24 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
       }
     }
 
-    for (int row = 0; row < img_height; row++) {
-      for (int col = 0; col < img_width; col++) {
-        int pixel = row * img_width + col;
-        size_t dst_idx = row * img_data.stride + col * 4;
+    // Build or retrieve the 256-entry tint LUT
+    uint32_t func_obj = (tint_func.type == Value::REFERENCE) ? tint_func.ref_object_number : 0;
+    TintLutKey lut_key{func_obj, static_cast<uint32_t>(alt_components)};
+    const uint32_t* lut_data = nullptr;
+    TintLutEntry lut_entry;
 
-        // Get tint value (0-1 range from 8-bit data)
-        double tint = (pixel < static_cast<int>(image.data.size())) ? image.data[pixel] / 255.0 : 0.0;
-
-        // Evaluate tint function if present
+    auto cache_it = tint_lut_cache_.find(lut_key);
+    if (cache_it != tint_lut_cache_.end()) {
+      lut_data = cache_it->second.lut.data();
+    } else {
+      for (int t = 0; t < 256; ++t) {
+        double tint = t / 255.0;
         std::vector<double> outputs;
         uint8_t r = 0, g = 0, b = 0;
 
         if (tint_func.type != Value::UNDEFINED && current_pdf_ &&
             evaluate_pdf_function(*current_pdf_, tint_func, {tint}, outputs) &&
             !outputs.empty()) {
-          // Convert alternate color to RGB
           if (alt_components == 1) {
             uint8_t gray = static_cast<uint8_t>(outputs[0] * 255);
             r = g = b = gray;
@@ -2553,15 +2589,26 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
             b = static_cast<uint8_t>(255 * (1.0f - y) * (1.0f - k));
           }
         } else {
-          // Fallback: treat as grayscale tint
           uint8_t gray = static_cast<uint8_t>((1.0 - tint) * 255);
           r = g = b = gray;
         }
+        lut_entry.lut[t] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+      }
+      tint_lut_cache_[lut_key] = std::move(lut_entry);
+      lut_data = tint_lut_cache_[lut_key].lut.data();
+    }
 
+    // Fast pixel loop: LUT lookup
+    for (int row = 0; row < img_height; row++) {
+      for (int col = 0; col < img_width; col++) {
+        int pixel = row * img_width + col;
+        size_t dst_idx = row * img_data.stride + col * 4;
+        uint8_t tint_byte = (pixel < static_cast<int>(image.data.size())) ? image.data[pixel] : 0;
+        uint32_t argb = lut_data[tint_byte];
         // PRGB32 is BGRA
-        dst[dst_idx + 0] = b;
-        dst[dst_idx + 1] = g;
-        dst[dst_idx + 2] = r;
+        dst[dst_idx + 0] = static_cast<uint8_t>(argb >> 8);
+        dst[dst_idx + 1] = static_cast<uint8_t>(argb >> 16);
+        dst[dst_idx + 2] = static_cast<uint8_t>(argb >> 24);
         dst[dst_idx + 3] = 255;
       }
     }
@@ -2916,9 +2963,20 @@ Dictionary Blend2DBackend::lookup_resource_type_dict(const std::string& resource
 }
 
 // Extract color stops from a PDF function (Type 2 or Type 3 stitching)
-// Returns vector of (offset, BLRgba32) pairs suitable for BLGradient::add_stop()
+// Returns vector of (offset, BLRgba32) pairs suitable for BLGradient::add_stop().
+// Uses cache when available.
 static std::vector<std::pair<float, BLRgba32>> extract_color_stops_from_function(
-    const Pdf& pdf, const Value& function) {
+    const Pdf& pdf, const Value& function,
+    std::unordered_map<uint32_t, Blend2DColorStopCacheEntry>* cache = nullptr) {
+
+  if (cache && function.type == Value::REFERENCE) {
+    uint32_t func_obj = function.ref_object_number;
+    auto it = cache->find(func_obj);
+    if (it != cache->end()) {
+      return it->second.stops;
+    }
+  }
+
   std::vector<std::pair<float, BLRgba32>> stops;
 
   if (function.type != Value::DICTIONARY) {
@@ -3050,12 +3108,18 @@ static std::vector<std::pair<float, BLRgba32>> extract_color_stops_from_function
     }
   }
   else {
-    // Unsupported function type - default gradient
-    stops.push_back({0.0f, BLRgba32(0, 0, 0, 255)});
-    stops.push_back({1.0f, BLRgba32(255, 255, 255, 255)});
-  }
+  // Unsupported function type - default gradient
+  stops.push_back({0.0f, BLRgba32(0, 0, 0, 255)});
+  stops.push_back({1.0f, BLRgba32(255, 255, 255, 255)});
+}
 
-  return stops;
+// Store in cache
+if (cache && function.type == Value::REFERENCE) {
+  uint32_t func_obj = function.ref_object_number;
+  (*cache)[func_obj].stops = stops;
+}
+
+return stops;
 }
 
 // ============================================================
@@ -3475,7 +3539,7 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     BLGradient gradient(BLLinearGradientValues(x0, y0, x1, y1));
 
     // Extract color stops from function (supports Type 2 and Type 3 stitching)
-    auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+    auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
     for (auto& s : color_stops) {
       gradient.add_stop(s.first, s.second);
     }
@@ -3497,7 +3561,7 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     BLGradient gradient(BLRadialGradientValues(x1, y1, x0, y0, r1, r0));
 
     // Extract color stops from function (supports Type 2 and Type 3 stitching)
-    auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+    auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
     for (auto& s : color_stops) {
       gradient.add_stop(s.first, s.second);
     }
@@ -3527,9 +3591,31 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     if (raster_w <= 0) raster_w = 256;
     if (raster_h <= 0) raster_h = 256;
 
+    // Check render cache first
+    uint32_t shading_obj = (shading_value.type == Value::REFERENCE) ? shading_value.ref_object_number : 0;
+    std::string cache_key = "shading_func:" + std::to_string(shading_obj) + ":" +
+                            std::to_string(raster_w) + "x" + std::to_string(raster_h);
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached)) {
+      BLImage shading_img;
+      shading_img.create_from_data(raster_w, raster_h, BL_FORMAT_PRGB32,
+                                    cached.data.data(), raster_w * 4);
+      ctx_.blit_image(BLPoint(x, y), shading_img);
+      return true;
+    }
+
     std::vector<uint32_t> pixels;
     if (rasterize_function_shading(*current_pdf_, *shading, raster_w, raster_h,
                                     state_.scale, state_.page_height, pixels)) {
+      // Store in render cache
+      RenderCacheEntry entry;
+      entry.width = raster_w;
+      entry.height = raster_h;
+      entry.data.resize(pixels.size() * sizeof(uint32_t));
+      std::copy(pixels.begin(), pixels.end(),
+                reinterpret_cast<uint32_t*>(entry.data.data()));
+      RenderCache::instance().store(cache_key, std::move(entry));
+
       // Create BLImage from rasterized pixels
       BLImage shading_img;
       shading_img.create_from_data(raster_w, raster_h, BL_FORMAT_PRGB32,
@@ -3565,6 +3651,20 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     int bmp_height = static_cast<int>(h);
     if (bmp_width <= 0 || bmp_height <= 0 || bmp_width > 4096 || bmp_height > 4096) {
       return false;
+    }
+
+    // Check render cache first
+    uint32_t shading_obj = (shading_value.type == Value::REFERENCE) ? shading_value.ref_object_number : 0;
+    std::string cache_key = "shading_mesh:" + std::to_string(shading_obj) + ":" +
+                            std::to_string(static_cast<int>(shading->type)) + ":" +
+                            std::to_string(bmp_width) + "x" + std::to_string(bmp_height);
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached)) {
+      BLImage shading_img;
+      shading_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
+                                    cached.data.data(), bmp_width * 4);
+      ctx_.blit_image(BLPoint(x, y), shading_img);
+      return true;
     }
 
     std::vector<uint32_t> bitmap(bmp_width * bmp_height, 0x00000000);
@@ -3645,6 +3745,15 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     }
 
     // Create BLImage from bitmap and blit
+    // Store in render cache first
+    RenderCacheEntry entry;
+    entry.width = bmp_width;
+    entry.height = bmp_height;
+    entry.data.resize(bitmap.size() * sizeof(uint32_t));
+    std::copy(bitmap.begin(), bitmap.end(),
+              reinterpret_cast<uint32_t*>(entry.data.data()));
+    RenderCache::instance().store(cache_key, std::move(entry));
+
     BLImage mesh_img;
     mesh_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
                                bitmap.data(), bmp_width * 4);
@@ -3677,6 +3786,20 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     int bmp_height = static_cast<int>(h);
     if (bmp_width <= 0 || bmp_height <= 0 || bmp_width > 4096 || bmp_height > 4096) {
       return false;
+    }
+
+    // Check render cache first
+    uint32_t shading_obj = (shading_value.type == Value::REFERENCE) ? shading_value.ref_object_number : 0;
+    std::string cache_key = "shading_patch:" + std::to_string(shading_obj) + ":" +
+                            std::to_string(static_cast<int>(shading->type)) + ":" +
+                            std::to_string(bmp_width) + "x" + std::to_string(bmp_height);
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached)) {
+      BLImage shading_img;
+      shading_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
+                                    cached.data.data(), bmp_width * 4);
+      ctx_.blit_image(BLPoint(x, y), shading_img);
+      return true;
     }
 
     std::vector<uint32_t> bitmap(bmp_width * bmp_height, 0x00000000);
@@ -3755,6 +3878,15 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     }
 
     // Create BLImage from bitmap and blit
+    // Store in render cache first
+    RenderCacheEntry entry;
+    entry.width = bmp_width;
+    entry.height = bmp_height;
+    entry.data.resize(bitmap.size() * sizeof(uint32_t));
+    std::copy(bitmap.begin(), bitmap.end(),
+              reinterpret_cast<uint32_t*>(entry.data.data()));
+    RenderCache::instance().store(cache_key, std::move(entry));
+
     BLImage mesh_img;
     mesh_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
                                bitmap.data(), bmp_width * 4);
@@ -5450,7 +5582,7 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
       BLGradient gradient(BLLinearGradientValues(x0, y0, x1, y1));
 
       // Extract color stops from function (supports Type 2 and Type 3 stitching)
-      auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+      auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
       for (auto& s : color_stops) {
         gradient.add_stop(s.first, s.second);
       }
@@ -5504,7 +5636,7 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
       BLGradient gradient(BLRadialGradientValues(x1, y1, x0, y0, r1, r0));
 
       // Extract color stops from function (supports Type 2 and Type 3 stitching)
-      auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function);
+      auto color_stops = extract_color_stops_from_function(*current_pdf_, shading->function, &color_stop_cache_);
       for (auto& s : color_stops) {
         gradient.add_stop(s.first, s.second);
       }
