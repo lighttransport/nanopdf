@@ -16,6 +16,7 @@
 #include "font-provider.hh"
 #include "font-unicode-map.hh"
 #include "shared-font-cache.hh"
+#include "render-cache.hh"
 #include "pdf-function.hh"
 #include "string-parse.hh"
 
@@ -34,6 +35,16 @@
 extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
+
+static uint64_t fnv1a64(const void* data, size_t len) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  uint64_t h = 14695981039346656037ULL;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
 
 struct ThorVGRect {
   float x{0.0f};
@@ -2806,7 +2817,6 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
   }
 
   // Convert image data to ARGB8888 format for ThorVG
-  std::vector<uint32_t> argb_data;
   int img_width = image.width;
   int img_height = image.height;
 
@@ -2814,7 +2824,13 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
     return false;
   }
 
-  argb_data.resize(img_width * img_height);
+  // Fast path: cached ARGB from render cache.
+  std::vector<uint32_t> argb_data;
+  if (image.color_space.type == ColorSpaceType::CacheARGB) {
+    argb_data.resize(static_cast<size_t>(img_width) * img_height);
+    memcpy(argb_data.data(), image.data.data(), argb_data.size() * sizeof(uint32_t));
+  } else {
+    argb_data.resize(img_width * img_height);
 
   // Determine number of components based on color space
   int num_components = 3;  // Default RGB
@@ -3146,6 +3162,10 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
       }
     }
   }
+  }  // else (non-cached ARGB path)
+
+  // Save ARGB for render cache if needed.
+  last_image_argb_ = argb_data;
 
   // Create ThorVG Picture from raw data
   auto picture = tvg::Picture::gen();
@@ -7573,17 +7593,55 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
               if (subtype_it != xobj_value.stream.dict.end() &&
                   subtype_it->second.type == Value::NAME) {
                 if (subtype_it->second.name == "Image") {
-                  ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
-                  float img_x = state_.transform.e;
-                  float img_y = state_.transform.f;
-                  float img_width = state_.transform.a;
-                  float img_height = state_.transform.d;
-                  if (img_height < 0) {
-                    img_y += img_height;
-                    img_height = -img_height;
+                  // Cache key: same (obj_num, obj_gen) always produces
+                  // the same decoded + color-converted pixels.
+                  std::string img_cache_key = "img:" + std::to_string(xobj_num) + ":" +
+                                              std::to_string(xobj_gen);
+                  RenderCacheEntry img_cached;
+                  if (xobj_num != 0 &&
+                      RenderCache::instance().find(img_cache_key, img_cached) &&
+                      img_cached.width > 0 && img_cached.height > 0) {
+                    // Cache hit: use pre-converted ARGB pixels directly.
+                    ImageXObject image;
+                    image.width = static_cast<int>(img_cached.width);
+                    image.height = static_cast<int>(img_cached.height);
+                    image.data.resize(img_cached.data.size());
+                    memcpy(image.data.data(), img_cached.data.data(),
+                           img_cached.data.size());
+                    image.color_space.type = ColorSpaceType::CacheARGB;
+                    float img_x = state_.transform.e;
+                    float img_y = state_.transform.f;
+                    float img_w = state_.transform.a;
+                    float img_h = state_.transform.d;
+                    if (img_h < 0) { img_y += img_h; img_h = -img_h; }
+                    draw_image(image, img_x, img_y, img_w, img_h,
+                               state_.fill_r, state_.fill_g, state_.fill_b);
+                  } else {
+                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
+                    float img_x = state_.transform.e;
+                    float img_y = state_.transform.f;
+                    float img_width = state_.transform.a;
+                    float img_height = state_.transform.d;
+                    if (img_height < 0) {
+                      img_y += img_height;
+                      img_height = -img_height;
+                    }
+                    draw_image(image, img_x, img_y, img_width, img_height,
+                               state_.fill_r, state_.fill_g, state_.fill_b);
+                    // Cache the result ARGB for future use.
+                    if (xobj_num != 0 && !last_image_argb_.empty()) {
+                      size_t n = static_cast<size_t>(image.width) *
+                                 static_cast<size_t>(image.height);
+                      RenderCacheEntry entry;
+                      entry.width = static_cast<uint32_t>(image.width);
+                      entry.height = static_cast<uint32_t>(image.height);
+                      entry.data.resize(n * sizeof(uint32_t));
+                      memcpy(entry.data.data(), last_image_argb_.data(),
+                             n * sizeof(uint32_t));
+                      RenderCache::instance().store(img_cache_key, std::move(entry));
+                      last_image_argb_.clear();
+                    }
                   }
-                  draw_image(image, img_x, img_y, img_width, img_height,
-                             state_.fill_r, state_.fill_g, state_.fill_b);
                   rendered_xobject = true;
                 } else if (subtype_it->second.name == "Form") {
                   auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);

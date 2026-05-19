@@ -390,6 +390,14 @@ private:
   // emplace_back never invalidates existing addresses. Cleared at the start
   // of each render_page().
   mutable std::deque<Value> lookup_resolved_owned_;
+
+  // After draw_image() completes, holds the ARGB pixel buffer so the caller
+  // can store it in the render cache. Only filled when the image came from a
+  // named XObject (obj_num != 0). Cleared once consumed.
+  std::vector<uint32_t> last_image_argb_;
+
+  // Reusable ARGB buffer for glyph rendering.
+  std::vector<uint32_t> glyph_argb_buf_;
 };
 
 }  // namespace nanopdf

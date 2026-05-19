@@ -444,6 +444,10 @@ private:
   // can store it in the render cache. Only filled when the image came from a
   // named XObject (obj_num != 0). Cleared once consumed.
   std::vector<uint32_t> last_image_argb_;
+
+  // Reusable ARGB buffer for glyph rendering. Avoids per-glyph allocation
+  // in draw_glyph_bitmap_by_index when the render cache misses.
+  std::vector<uint32_t> glyph_argb_buf_;
 };
 
 }  // namespace nanopdf

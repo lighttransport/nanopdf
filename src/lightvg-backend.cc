@@ -4894,7 +4894,11 @@ bool LightVGBackend::apply_tiling_pattern(lvg::Shape* shape, const TilingPattern
     uint64_t content_hash = fnv1a64(tiling->content_stream.data(),
                                     tiling->content_stream.size());
     int paint_type_int = static_cast<int>(tiling->paint_type);
-    std::string cache_key = "tile:" + std::to_string(content_hash) + ":" +
+    // Include pattern pointer so different TilingPattern objects with identical
+    // content but different resources get separate cache entries.
+    uintptr_t ptr_key = reinterpret_cast<uintptr_t>(tiling);
+    std::string cache_key = "tile:" + std::to_string(ptr_key) + ":" +
+                            std::to_string(content_hash) + ":" +
                             std::to_string(tile_px_w) + "x" +
                             std::to_string(tile_px_h) + ":" +
                             std::to_string(paint_type_int);
@@ -6133,10 +6137,10 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   // Create ARGB8888 bitmap with glyph color + alpha from bitmap
   int gw = entry->width;
   int gh = entry->height;
+  size_t npixels = static_cast<size_t>(gw) * gh;
 
   // Try render cache for pre-colored ARGB — skips per-pixel fill on hit.
   std::string glyph_cache_key;
-  std::vector<uint32_t> argb;
   bool glyph_cached = false;
   glyph_cache_key = "glyph:" + current_font_name_ + ":" +
                     std::to_string(glyph_index) + ":" +
@@ -6151,13 +6155,14 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
     if (RenderCache::instance().find(glyph_cache_key, gce) &&
         gce.width == static_cast<uint32_t>(gw) &&
         gce.height == static_cast<uint32_t>(gh)) {
-      argb.resize(static_cast<size_t>(gw) * gh);
-      memcpy(argb.data(), gce.data.data(), argb.size() * sizeof(uint32_t));
+      glyph_argb_buf_.resize(npixels);
+      memcpy(glyph_argb_buf_.data(), gce.data.data(), npixels * sizeof(uint32_t));
       glyph_cached = true;
     }
   }
   if (!glyph_cached) {
-    argb.resize(static_cast<size_t>(gw) * gh);
+    // Reuse pre-allocated buffer to avoid per-glyph heap allocation.
+    glyph_argb_buf_.resize(npixels);
     if (entry->is_lcd) {
     // LCD subpixel: per-channel alpha (3 bytes/pixel, gamma-corrected)
     for (int i = 0; i < gw * gh; i++) {
@@ -6170,7 +6175,7 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
           (pc[2] / 255.0f) * a + 0.5f);
       uint8_t max_a = std::max({alpha_r, alpha_g, alpha_b});
       // Pre-multiplied ARGB: alpha = max per-channel, RGB modulated
-      argb[static_cast<size_t>(i)] =
+      glyph_argb_buf_[static_cast<size_t>(i)] =
           (static_cast<uint32_t>(max_a) << 24) |
           (static_cast<uint32_t>(r) * alpha_r / 255 << 16) |
           (static_cast<uint32_t>(g) * alpha_g / 255 << 8) |
@@ -6182,7 +6187,7 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
       float normalized = entry->bitmap[i] / 255.0f;
       float corrected = std::pow(normalized, 1.4f);
       uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
-      argb[static_cast<size_t>(i)] =
+      glyph_argb_buf_[static_cast<size_t>(i)] =
           (static_cast<uint32_t>(alpha) << 24) |
           (static_cast<uint32_t>(r) << 16) |
           (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
@@ -6190,12 +6195,12 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   }
 
     // Store colored ARGB in render cache for future same-color hits.
-    size_t argb_bytes = argb.size() * sizeof(uint32_t);
+    size_t argb_bytes = glyph_argb_buf_.size() * sizeof(uint32_t);
     RenderCacheEntry gce_out;
     gce_out.width = static_cast<uint32_t>(gw);
     gce_out.height = static_cast<uint32_t>(gh);
     gce_out.data.resize(argb_bytes);
-    memcpy(gce_out.data.data(), argb.data(), argb_bytes);
+    memcpy(gce_out.data.data(), glyph_argb_buf_.data(), argb_bytes);
     RenderCache::instance().store(glyph_cache_key, std::move(gce_out));
   }
 
@@ -6205,7 +6210,7 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
     return false;
   }
 
-  if (picture->load(argb.data(), gw, gh, lvg::ColorSpace::ARGB8888S, true) !=
+  if (picture->load(glyph_argb_buf_.data(), gw, gh, lvg::ColorSpace::ARGB8888S, true) !=
       lvg::Result::Success) {
     picture->unref();
     return false;
