@@ -5510,9 +5510,9 @@ bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   if (cache_it != glyph_bitmap_cache_.end()) {
     entry = &cache_it->second;
   } else {
-    // Evict if cache is full
+    // Evict a single entry when full (much better than clearing all)
     if (glyph_bitmap_cache_.size() >= kMaxGlyphCacheEntries) {
-      glyph_bitmap_cache_.clear();
+      glyph_bitmap_cache_.erase(glyph_bitmap_cache_.begin());
     }
 
     // Render glyph bitmap with 2x oversampling for better edge quality.
@@ -5618,29 +5618,61 @@ bool ThorVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   // Create ARGB8888 bitmap with glyph color + alpha from bitmap
   int gw = entry->width;
   int gh = entry->height;
-  auto* argb = new uint32_t[gw * gh];
-  for (int i = 0; i < gw * gh; i++) {
-    // Apply gamma correction (gamma=1.4) to tighten AA fringe:
-    // pushes intermediate alpha values toward 0, reducing dark halo
-    float normalized = entry->bitmap[i] / 255.0f;
-    float corrected = std::pow(normalized, 1.4f);
-    uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
-    // ARGB8888: A in high byte, straight alpha
-    argb[i] = (static_cast<uint32_t>(alpha) << 24) |
-              (static_cast<uint32_t>(r) << 16) |
-              (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+  size_t npixels = static_cast<size_t>(gw) * gh;
+
+  // Try render cache for pre-colored ARGB — skips per-pixel fill on hit.
+  std::string glyph_cache_key;
+  bool glyph_cached = false;
+  glyph_cache_key = "glyph:" + current_font_name_ + ":" +
+                    std::to_string(glyph_index) + ":" +
+                    std::to_string(size_q) + ":0:" +
+                    std::to_string(r) + ":" +
+                    std::to_string(g) + ":" +
+                    std::to_string(b) + ":" +
+                    std::to_string(a);
+  {
+    RenderCacheEntry gce;
+    if (RenderCache::instance().find(glyph_cache_key, gce) &&
+        gce.width == static_cast<uint32_t>(gw) &&
+        gce.height == static_cast<uint32_t>(gh)) {
+      glyph_argb_buf_.resize(npixels);
+      memcpy(glyph_argb_buf_.data(), gce.data.data(), npixels * sizeof(uint32_t));
+      glyph_cached = true;
+    }
+  }
+  if (!glyph_cached) {
+    // Reuse pre-allocated buffer to avoid per-glyph heap allocation.
+    glyph_argb_buf_.resize(npixels);
+    for (int i = 0; i < gw * gh; i++) {
+      // Apply gamma correction (gamma=1.4) to tighten AA fringe:
+      // pushes intermediate alpha values toward 0, reducing dark halo
+      float normalized = entry->bitmap[i] / 255.0f;
+      float corrected = std::pow(normalized, 1.4f);
+      uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
+      // ARGB8888: A in high byte, straight alpha
+      glyph_argb_buf_[i] = (static_cast<uint32_t>(alpha) << 24) |
+                           (static_cast<uint32_t>(r) << 16) |
+                           (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+    }
+
+    // Store colored ARGB in render cache for future same-color hits.
+    size_t argb_bytes = glyph_argb_buf_.size() * sizeof(uint32_t);
+    RenderCacheEntry gce_out;
+    gce_out.width = static_cast<uint32_t>(gw);
+    gce_out.height = static_cast<uint32_t>(gh);
+    gce_out.data.resize(argb_bytes);
+    memcpy(gce_out.data.data(), glyph_argb_buf_.data(), argb_bytes);
+    RenderCache::instance().store(glyph_cache_key, std::move(gce_out));
   }
 
   // Create ThorVG Picture and position it
   auto picture = tvg::Picture::gen();
   if (!picture) {
-    delete[] argb;
     return false;
   }
 
-  if (picture->load(argb, gw, gh, tvg::ColorSpace::ARGB8888S, true) !=
+  if (picture->load(glyph_argb_buf_.data(), gw, gh, tvg::ColorSpace::ARGB8888S, true) !=
       tvg::Result::Success) {
-    delete[] argb;
     return false;
   }
 
@@ -7768,10 +7800,12 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
 
   // Get the XObject stream
   Value xobject_value = group_xobject;
+  uint32_t xobj_num = 0;
+  uint16_t xobj_gen = 0;
   if (xobject_value.type == Value::REFERENCE) {
-    auto resolved = resolve_reference(*current_pdf_,
-                                      xobject_value.ref_object_number,
-                                      xobject_value.ref_generation_number);
+    xobj_num = xobject_value.ref_object_number;
+    xobj_gen = xobject_value.ref_generation_number;
+    auto resolved = resolve_reference(*current_pdf_, xobj_num, xobj_gen);
     if (!resolved.success) return false;
     xobject_value = resolved.value;
   }
@@ -7803,6 +7837,32 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
 
   if (mask_width == 0) mask_width = width_;
   if (mask_height == 0) mask_height = height_;
+
+  // Try render cache for pre-rendered soft mask data.
+  std::string smask_cache_key;
+  bool smask_cached = false;
+  if (xobj_num != 0) {
+    smask_cache_key = "smask:" + std::to_string(xobj_num) + ":" +
+                      std::to_string(xobj_gen) + ":" +
+                      std::to_string(mask_type) + ":" +
+                      std::to_string(mask_width) + "x" +
+                      std::to_string(mask_height);
+    RenderCacheEntry smask_cached_entry;
+    if (RenderCache::instance().find(smask_cache_key, smask_cached_entry) &&
+        smask_cached_entry.width == mask_width &&
+        smask_cached_entry.height == mask_height) {
+      state_.soft_mask_width = mask_width;
+      state_.soft_mask_height = mask_height;
+      state_.soft_mask_data.resize(mask_width * mask_height);
+      memcpy(state_.soft_mask_data.data(), smask_cached_entry.data.data(),
+             smask_cached_entry.data.size());
+      smask_cached = true;
+    }
+  }
+
+  if (smask_cached) {
+    return true;
+  }
 
   // Decode the XObject stream content
   auto decoded = decode_stream(*current_pdf_, xobject_value);
@@ -7925,6 +7985,15 @@ bool ThorVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_
   state_.soft_mask_data = std::move(soft_mask_data);
   state_.soft_mask_width = soft_mask_width;
   state_.soft_mask_height = soft_mask_height;
+
+  // Store rendered soft mask in render cache for reuse across pages.
+  if (xobj_num != 0 && !state_.soft_mask_data.empty()) {
+    RenderCacheEntry smask_entry;
+    smask_entry.width = soft_mask_width;
+    smask_entry.height = soft_mask_height;
+    smask_entry.data = state_.soft_mask_data;
+    RenderCache::instance().store(smask_cache_key, std::move(smask_entry));
+  }
 
   return true;
 }
