@@ -180,6 +180,148 @@ static size_t count_render_objects_impl(std::string_view content) {
   return count;
 }
 
+// Computes extra progress weight for XObject Do operators beyond the
+// baseline count of 1.  Returns 0 when the XObject is not found or is an
+// unknown subtype.
+//   Image: weight = max(1, w*h/10000) - 1
+//   Form:  weight = form_operator_count - 1
+static size_t compute_xobject_extra_weight(const std::string& xobj_name,
+                                            const Pdf& pdf,
+                                            const Dictionary& resources) {
+  auto xobj_it = resources.find("XObject");
+  if (xobj_it == resources.end()) return 0;
+  const Value& xobj_dict = xobj_it->second;
+  if (xobj_dict.type != Value::DICTIONARY) return 0;
+
+  auto name_it = xobj_dict.dict.find(xobj_name);
+  if (name_it == xobj_dict.dict.end()) return 0;
+
+  Value entry = name_it->second;
+  uint32_t obj_num = 0;
+  uint16_t obj_gen = 0;
+  if (entry.type == Value::REFERENCE) {
+    obj_num = entry.ref_object_number;
+    obj_gen = entry.ref_generation_number;
+    auto res = resolve_reference(pdf, obj_num, obj_gen);
+    if (!res.success) return 0;
+    entry = std::move(res.value);
+  }
+  if (entry.type != Value::STREAM) return 0;
+
+  auto sub_it = entry.stream.dict.find("Subtype");
+  if (sub_it == entry.stream.dict.end() ||
+      sub_it->second.type != Value::NAME)
+    return 0;
+
+  if (sub_it->second.name == "Image") {
+    int w = 0, h = 0;
+    auto w_it = entry.stream.dict.find("Width");
+    auto h_it = entry.stream.dict.find("Height");
+    if (w_it != entry.stream.dict.end() &&
+        w_it->second.type == Value::NUMBER)
+      w = static_cast<int>(w_it->second.number);
+    if (h_it != entry.stream.dict.end() &&
+        h_it->second.type == Value::NUMBER)
+      h = static_cast<int>(h_it->second.number);
+    if (w <= 0 || h <= 0) return 0;
+    size_t weight =
+        std::max<size_t>(1, (static_cast<size_t>(w) * h) / 10000);
+    return weight - 1;  // Do already counted as 1
+  }
+
+  if (sub_it->second.name == "Form") {
+    auto dec = decode_stream(pdf, entry, obj_num, obj_gen);
+    if (!dec.success || dec.data.empty()) return 0;
+    size_t n = count_render_objects_impl(std::string_view(
+        reinterpret_cast<const char*>(dec.data.data()), dec.data.size()));
+    return n - 1;  // Do already counted as 1
+  }
+
+  return 0;
+}
+
+// Scans content for "NAME Do" patterns and accumulates extra progress
+// weight from Image/Form XObjects.  Uses page-level resources.
+static size_t scan_do_extra_weight(std::string_view content,
+                                    const Pdf& pdf,
+                                    const Dictionary& resources) {
+  size_t extra = 0;
+  size_t pos = 0;
+  std::string last_token;
+
+  while (pos < content.size()) {
+    while (pos < content.size() &&
+           std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+    if (pos >= content.size()) break;
+
+    if (content[pos] == '%') {
+      while (pos < content.size() && content[pos] != '\n' &&
+             content[pos] != '\r') {
+        pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '(') {
+      int depth = 1;
+      pos++;
+      while (pos < content.size() && depth > 0) {
+        if (content[pos] == '\\' && (pos + 1) < content.size()) {
+          pos += 2;
+        } else if (content[pos] == '(') {
+          depth++;
+          pos++;
+        } else if (content[pos] == ')') {
+          depth--;
+          pos++;
+        } else {
+          pos++;
+        }
+      }
+      continue;
+    }
+
+    if (content[pos] == '<') {
+      if ((pos + 1) < content.size() && content[pos + 1] == '<') {
+        pos += 2;
+      } else {
+        pos++;
+        while (pos < content.size() && content[pos] != '>') pos++;
+        if (pos < content.size()) pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '[' || content[pos] == ']' ||
+        content[pos] == '{' || content[pos] == '}') {
+      pos++;
+      continue;
+    }
+
+    size_t start = pos;
+    while (pos < content.size() &&
+           !is_pdf_content_delimiter(content[pos])) {
+      pos++;
+    }
+    if (start == pos) {
+      pos++;
+      continue;
+    }
+
+    std::string_view token(content.data() + start, pos - start);
+    if (token == "Do") {
+      if (!last_token.empty() && last_token[0] == '/') {
+        extra += compute_xobject_extra_weight(last_token.substr(1),
+                                               pdf, resources);
+      }
+    }
+    last_token.assign(token.data(), token.size());
+  }
+  return extra;
+}
+
 // glyph_name_to_unicode is now in font-unicode-map.hh (shared, sorted-array+bsearch)
 
 // WinAnsiEncoding to Unicode mapping table
@@ -1161,6 +1303,11 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
     }
 
     total_render_objects += count_render_objects(decoded_result.data);
+    total_render_objects += scan_do_extra_weight(
+        std::string_view(
+            reinterpret_cast<const char*>(decoded_result.data.data()),
+            decoded_result.data.size()),
+        pdf, page.resources);
     decoded_contents.push_back(std::move(decoded_result.data));
   }
 
@@ -3819,6 +3966,11 @@ Blend2DRenderResult Blend2DBackend::render_page(const Pdf& pdf, const Page& page
     }
 
     total_render_objects += count_render_objects(decoded_result.data);
+    total_render_objects += scan_do_extra_weight(
+        std::string_view(
+            reinterpret_cast<const char*>(decoded_result.data.data()),
+            decoded_result.data.size()),
+        pdf, page.resources);
     decoded_contents.push_back(std::move(decoded_result.data));
   }
 
@@ -4849,10 +5001,9 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                         }
                       }
 
-                      bool progress_enabled = progress_.enabled;
-                      progress_.enabled = false;
+                      // Parse and render Form content — sub-operators advance progress
+                      // naturally, so no progress guard or form-level advance.
                       parse_pdf_content(decoded.data);
-                      progress_.enabled = progress_enabled;
                       rendered_xobject = true;
 
                       // Restore BBox clipping
@@ -4873,7 +5024,23 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             }
           }
           if (rendered_xobject) {
-            advance_progress();
+            // Image: advance by pixel-area weight (pre-counted in scan_do_extra_weight).
+            // Form: sub-operators advance progress naturally, no extra advance here.
+            if (subtype_it->second.name == "Image") {
+              int w = 0, h = 0;
+              auto w_it = xobj_value.stream.dict.find("Width");
+              auto h_it = xobj_value.stream.dict.find("Height");
+              if (w_it != xobj_value.stream.dict.end() &&
+                  w_it->second.type == Value::NUMBER)
+                w = static_cast<int>(w_it->second.number);
+              if (h_it != xobj_value.stream.dict.end() &&
+                  h_it->second.type == Value::NUMBER)
+                h = static_cast<int>(h_it->second.number);
+              size_t img_weight = std::max<size_t>(1,
+                  (static_cast<size_t>(w) * h) / 10000);
+              advance_progress(img_weight);
+            }
+            // Form: no advance_progress() — sub-operators advance naturally.
           }
         }
       }
