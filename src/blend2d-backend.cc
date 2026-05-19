@@ -5555,6 +5555,33 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
     if (img_width > 512) img_width = 512;
     if (img_height > 512) img_height = 512;
 
+    // Try render cache for pre-rendered tile.
+    uint64_t content_hash = fnv1a64(tiling.content_stream.data(),
+                                    tiling.content_stream.size());
+    int paint_type_int = static_cast<int>(tiling.paint_type);
+    uintptr_t ptr_key = reinterpret_cast<uintptr_t>(pattern->tiling.get());
+    std::string tile_cache_key = "tile:" + std::to_string(ptr_key) + ":" +
+                                 std::to_string(content_hash) + ":" +
+                                 std::to_string(img_width) + "x" +
+                                 std::to_string(img_height) + ":" +
+                                 std::to_string(paint_type_int);
+
+    BLImage rendered_tile;
+    RenderCacheEntry tile_cached;
+    bool tile_cached_found = false;
+    if (RenderCache::instance().find(tile_cache_key, tile_cached) &&
+        tile_cached.width == img_width &&
+        tile_cached.height == img_height) {
+      // Cache hit — reconstruct BLImage from cached bytes.
+      rendered_tile.create(img_width, img_height, BL_FORMAT_PRGB32);
+      BLImageData tile_data;
+      rendered_tile.get_data(&tile_data);
+      memcpy(tile_data.pixel_data, tile_cached.data.data(),
+             tile_cached.data.size());
+      tile_cached_found = true;
+    }
+
+    if (!tile_cached_found) {
     // Create tile image and context
     BLImage tile_image(img_width, img_height, BL_FORMAT_PRGB32);
     BLContext tile_ctx(tile_image);
@@ -5612,7 +5639,7 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
 
     // Retrieve rendered tile
     ctx_.end();
-    BLImage rendered_tile = std::move(image_);
+    rendered_tile = std::move(image_);
 
     // Restore original state
     image_ = std::move(saved_image);
@@ -5620,6 +5647,19 @@ bool Blend2DBackend::apply_pattern_fill(BLPath& path, const std::string& pattern
     width_ = saved_width;
     height_ = saved_height;
     state_ = saved_state;
+
+    // Store rendered tile in render cache for reuse across pages/shapes.
+    {
+      BLImageData cache_data;
+      rendered_tile.get_data(&cache_data);
+      RenderCacheEntry entry;
+      entry.width = img_width;
+      entry.height = img_height;
+      entry.data.resize(img_width * img_height * 4);
+      memcpy(entry.data.data(), cache_data.pixel_data, entry.data.size());
+      RenderCache::instance().store(tile_cache_key, std::move(entry));
+    }
+    }  // end if (!tile_cached_found)
 
     // For uncolored tiles: convert rendered content to alpha mask and apply current fill color
     if (tiling.paint_type == TilingPaintType::UncoloredTiles) {
