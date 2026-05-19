@@ -6,6 +6,7 @@
 #include "blend2d-backend.hh"
 #include "font-unicode-map.hh"
 #include "shared-font-cache.hh"
+#include "render-cache.hh"
 #include "nanopdf-log.hh"
 #include "string-parse.hh"
 
@@ -31,6 +32,16 @@
 extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
+
+static uint64_t fnv1a64(const void* data, size_t len) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  uint64_t h = 14695981039346656037ULL;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
 
 static bool is_pdf_content_delimiter(char c) {
   return std::isspace(static_cast<unsigned char>(c)) || c == '/' || c == '[' ||
@@ -2195,7 +2206,7 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
   int img_width = image.width;
   int img_height = image.height;
 
-  // Create Blend2D image from decoded data
+  // Create Blend2D image
   BLImage img;
   img.create(img_width, img_height, BL_FORMAT_PRGB32);
 
@@ -2203,7 +2214,31 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
   img.get_data(&img_data);
 
   uint8_t* dst = static_cast<uint8_t*>(img_data.pixel_data);
-  const uint8_t* src = image.data.data();
+
+  // Fast path: cached ARGB from render cache.
+  std::vector<uint32_t> argb_data;
+  if (image.color_space.type == ColorSpaceType::CacheARGB) {
+    argb_data.resize(static_cast<size_t>(img_width) * img_height);
+    memcpy(argb_data.data(), image.data.data(), argb_data.size() * sizeof(uint32_t));
+    // Convert cached ARGB to BGRA for Blend2D
+    for (int row = 0; row < img_height; row++) {
+      for (int col = 0; col < img_width; col++) {
+        size_t src_idx = static_cast<size_t>(row) * img_width + col;
+        size_t dst_idx = row * img_data.stride + col * 4;
+        uint32_t argb = argb_data[src_idx];
+        uint8_t a = (argb >> 24) & 0xFF;
+        uint8_t r = (argb >> 16) & 0xFF;
+        uint8_t g = (argb >> 8) & 0xFF;
+        uint8_t b = argb & 0xFF;
+        dst[dst_idx + 0] = b;
+        dst[dst_idx + 1] = g;
+        dst[dst_idx + 2] = r;
+        dst[dst_idx + 3] = a;
+      }
+    }
+  } else {
+    argb_data.resize(img_width * img_height);
+    const uint8_t* src = image.data.data();
 
   // Handle image mask (1-bit stencil data)
   if (image.image_mask) {
@@ -2506,7 +2541,25 @@ bool Blend2DBackend::draw_image(const ImageXObject& image, float x, float y, flo
         }
       }
     }
-  }
+
+    // Populate argb_data from BGRA for render cache.
+    for (int row = 0; row < img_height; row++) {
+      for (int col = 0; col < img_width; col++) {
+        size_t dst_idx = row * img_data.stride + col * 4;
+        size_t src_idx = static_cast<size_t>(row) * img_width + col;
+        uint8_t b = dst[dst_idx + 0];
+        uint8_t g = dst[dst_idx + 1];
+        uint8_t r = dst[dst_idx + 2];
+        uint8_t a = dst[dst_idx + 3];
+        argb_data[src_idx] = (static_cast<uint32_t>(a) << 24) |
+                             (static_cast<uint32_t>(r) << 16) |
+                             (static_cast<uint32_t>(g) << 8) | b;
+      }
+    }
+  }  // else (non-cached ARGB path)
+
+  // Save ARGB for render cache if needed.
+  last_image_argb_ = std::move(argb_data);
 
   // Draw image scaled to fit
   ctx_.save();
@@ -4666,19 +4719,58 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                 if (subtype_it != xobj_value.stream.dict.end() &&
                     subtype_it->second.type == Value::NAME) {
                   if (subtype_it->second.name == "Image") {
-                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value,
-                        xobj_obj_num, xobj_gen_num);
-                    float img_x = state_.transform.e * state_.scale;
-                    float img_y = state_.transform.f;
-                    float img_width = state_.transform.a * state_.scale;
-                    float img_height = state_.transform.d * state_.scale;
-                    if (img_height < 0) {
-                      img_y += img_height;
-                      img_height = -img_height;
+                    // Cache key: same (obj_num, obj_gen) always produces
+                    // the same decoded + color-converted pixels.
+                    std::string img_cache_key = "img:" + std::to_string(xobj_obj_num) + ":" +
+                                                std::to_string(xobj_gen_num);
+                    RenderCacheEntry img_cached;
+                    if (xobj_obj_num != 0 &&
+                        RenderCache::instance().find(img_cache_key, img_cached) &&
+                        img_cached.width > 0 && img_cached.height > 0) {
+                      // Cache hit: use pre-converted ARGB pixels directly.
+                      ImageXObject image;
+                      image.width = static_cast<int>(img_cached.width);
+                      image.height = static_cast<int>(img_cached.height);
+                      image.data.resize(img_cached.data.size());
+                      memcpy(image.data.data(), img_cached.data.data(),
+                             img_cached.data.size());
+                      image.color_space.type = ColorSpaceType::CacheARGB;
+                      float img_x = state_.transform.e * state_.scale;
+                      float img_y = state_.transform.f;
+                      float img_w = state_.transform.a * state_.scale;
+                      float img_h = state_.transform.d * state_.scale;
+                      if (img_h < 0) { img_y += img_h; img_h = -img_h; }
+                      img_y = (state_.page_height - img_y) * state_.scale - img_h;
+                      draw_image(image, img_x, img_y, img_w, img_h,
+                          state_.fill_r, state_.fill_g, state_.fill_b);
+                    } else {
+                      ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value,
+                          xobj_obj_num, xobj_gen_num);
+                      float img_x = state_.transform.e * state_.scale;
+                      float img_y = state_.transform.f;
+                      float img_width = state_.transform.a * state_.scale;
+                      float img_height = state_.transform.d * state_.scale;
+                      if (img_height < 0) {
+                        img_y += img_height;
+                        img_height = -img_height;
+                      }
+                      img_y = (state_.page_height - img_y) * state_.scale - img_height;
+                      draw_image(image, img_x, img_y, img_width, img_height,
+                          state_.fill_r, state_.fill_g, state_.fill_b);
+                      // Cache the result ARGB for future use.
+                      if (xobj_obj_num != 0 && !last_image_argb_.empty()) {
+                        size_t n = static_cast<size_t>(image.width) *
+                                   static_cast<size_t>(image.height);
+                        RenderCacheEntry entry;
+                        entry.width = static_cast<uint32_t>(image.width);
+                        entry.height = static_cast<uint32_t>(image.height);
+                        entry.data.resize(n * sizeof(uint32_t));
+                        memcpy(entry.data.data(), last_image_argb_.data(),
+                               n * sizeof(uint32_t));
+                        RenderCache::instance().store(img_cache_key, std::move(entry));
+                        last_image_argb_.clear();
+                      }
                     }
-                    img_y = (state_.page_height - img_y) * state_.scale - img_height;
-                    draw_image(image, img_x, img_y, img_width, img_height,
-                        state_.fill_r, state_.fill_g, state_.fill_b);
                     rendered_xobject = true;
                   } else if (subtype_it->second.name == "Form") {
                     // Form XObject - decode and parse its content stream

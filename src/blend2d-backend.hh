@@ -347,6 +347,14 @@ private:
   // Helper to lookup a resource type sub-dictionary (e.g., "Shading", "ExtGState"),
   // checking form_resources_stack_ first (top-down), then falling back to page resources.
   Dictionary lookup_resource_type_dict(const std::string& resource_type) const;
+
+  // After draw_image() completes, holds the ARGB pixel buffer so the caller
+  // can store it in the render cache. Only filled when the image came from a
+  // named XObject (obj_num != 0). Cleared once consumed.
+  std::vector<uint32_t> last_image_argb_;
+
+  // Reusable ARGB buffer for glyph rendering.
+  std::vector<uint32_t> glyph_argb_buf_;
 };
 
 }  // namespace nanopdf
