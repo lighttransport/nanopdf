@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "third_party/ttf_parse.h"
+
 #include <array>
 #include <cstdint>
 #include <map>
@@ -52,10 +54,30 @@ struct Type1FontData {
   int std_hw{0};  // StdHW
   int std_vw{0};  // StdVW
 
-  // CharStrings (glyph name -> encoded charstring data)
+  // CharStrings (glyph name -> decrypted charstring data)
   // Only populated if parse_charstrings is true
   std::map<std::string, std::vector<uint8_t>> char_strings;
+
+  // Subrs (local subroutines, from Private dict)
+  std::vector<std::vector<uint8_t>> subrs;
+
+  // Number of lenIV random prefix bytes (default 4)
+  int lenIV{4};
 };
+
+// Interpret a Type1 CharString for the given glyph name.
+// Returns 0 on success, -1 on failure.
+// Caller must free *out with ttf_outline_free().
+int t1_glyph_outline(const Type1FontData& t1,
+                     const std::string& glyph_name,
+                     ttf_outline_t* out);
+
+// Adobe Type 1 binary decryption (RFC 5531 / Type 1 Font Format).
+// buffer/len is modified in-place. key is the starting key (55665 for eexec).
+void t1_binary_decrypt(uint8_t* buffer, uint32_t len, uint16_t key);
+
+// Adobe Type 1 binary encryption (in-place).
+void t1_binary_encrypt(uint8_t* buffer, uint32_t len, uint16_t key);
 
 // Type1 font parser
 class Type1Parser {

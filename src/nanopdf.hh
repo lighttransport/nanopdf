@@ -164,7 +164,8 @@ enum class ColorSpaceType {
   Indexed,
   Pattern,
   Separation,
-  DeviceN
+  DeviceN,
+  CacheARGB
 };
 
 // Color space structure
@@ -356,10 +357,16 @@ struct CMap {
       return it->second;
     }
 
-    // Check range mappings
-    for (const auto& range : range_mappings) {
-      if (code >= range.first.first && code <= range.first.second) {
-        return range.second + (code - range.first.first);
+    // Binary search over sorted range_mappings
+    // std::map sorts by (start, end) via default pair ordering
+    auto bound = range_mappings.lower_bound({code, 0});
+    if (bound != range_mappings.end() && bound->first.first == code) {
+      return bound->second;
+    }
+    if (bound != range_mappings.begin()) {
+      --bound;
+      if (code >= bound->first.first && code <= bound->first.second) {
+        return bound->second + (code - bound->first.first);
       }
     }
 
@@ -776,6 +783,10 @@ struct Type0Font : public BaseFont {
     double v_y{880.0};     // Vertical origin Y (relative to horizontal origin)
   };
   std::map<uint32_t, VerticalMetrics> cid_vertical_metrics;
+
+  // Pre-computed flags to avoid runtime string matching in render loop
+  bool is_two_byte_cid{false};  // true for Identity-H/V, UniJIS*, UniGB*, etc.
+  bool is_vertical{false};      // true for CMap names ending in "-V"
 
   // Whether the font has vertical metrics defined
   bool has_vertical_metrics{false};

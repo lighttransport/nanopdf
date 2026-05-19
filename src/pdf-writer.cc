@@ -1781,6 +1781,89 @@ void PageBuilder::circle(double cx, double cy, double r) {
   close_path();
 }
 
+void PageBuilder::ellipse(double cx, double cy, double rx, double ry) {
+  const double k = 0.5522847498;
+  double kx = k * rx, ky = k * ry;
+  move_to(cx + rx, cy);
+  curve_to(cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
+  curve_to(cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
+  curve_to(cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
+  curve_to(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
+  close_path();
+}
+
+void PageBuilder::arc(double cx, double cy, double rx, double ry,
+                      double start_angle, double end_angle) {
+  const double k = 0.5522847498;
+  const double d2r = M_PI / 180.0;
+  double start = start_angle * d2r;
+  double end = end_angle * d2r;
+  if (start == end) return;
+  if (end < start) end += 2.0 * M_PI;
+  double span = end - start;
+  if (span >= 2.0 * M_PI) {
+    ellipse(cx, cy, rx, ry);
+    return;
+  }
+  int segments = static_cast<int>(std::ceil(span / (M_PI * 0.5)));
+  double step = span / segments;
+  double a = start;
+  double x0 = cx + rx * std::cos(a);
+  double y0 = cy + ry * std::sin(a);
+  move_to(x0, y0);
+  for (int i = 0; i < segments; ++i) {
+    double a1 = a + step;
+    double cosa = std::cos(a);
+    double sina = std::sin(a);
+    double cosa1 = std::cos(a1);
+    double sina1 = std::sin(a1);
+    double dx = rx * (cosa1 - cosa);
+    double dy = ry * (sina1 - sina);
+    double x1 = cx + rx * cosa;
+    double y1 = cy + ry * sina;
+    double x2 = cx + rx * cosa1;
+    double y2 = cy + ry * sina1;
+    double len = std::sqrt(dx * dx + dy * dy);
+    double alpha = k * len / std::sqrt(rx * rx + ry * ry);
+    alpha = std::min(alpha, k);
+    double tx = -ry * cosa;
+    double ty = rx * sina;
+    double nlen = std::sqrt(tx * tx + ty * ty);
+    if (nlen > 0) {
+      tx /= nlen;
+      ty /= nlen;
+    } else {
+      double ang = a + step * 0.5;
+      tx = -ry * std::cos(ang);
+      ty = rx * std::sin(ang);
+      nlen = std::sqrt(tx * tx + ty * ty);
+      if (nlen > 0) { tx /= nlen; ty /= nlen; }
+    }
+    double cp1x = x1 + alpha * rx * tx;
+    double cp1y = y1 + alpha * ry * ty;
+    double cp2x = x2 + alpha * rx * tx;
+    double cp2y = y2 + alpha * ry * ty;
+    curve_to(cp1x, cp1y, cp2x, cp2y, x2, y2);
+    a = a1;
+  }
+}
+
+void PageBuilder::rounded_rect(double x, double y, double w, double h, double r) {
+  r = std::min(r, std::min(w, h) * 0.5);
+  const double k = 0.5522847498;
+  double k_r = k * r;
+  move_to(x + r, y);
+  line_to(x + w - r, y);
+  curve_to(x + w - r + k_r, y, x + w, y + r - k_r, x + w, y + r);
+  line_to(x + w, y + h - r);
+  curve_to(x + w, y + h - r + k_r, x + w - r + k_r, y + h, x + w - r, y + h);
+  line_to(x + r, y + h);
+  curve_to(x + r - k_r, y + h, x, y + h - r + k_r, x, y + h - r);
+  line_to(x, y + r);
+  curve_to(x, y + r - k_r, x + r - k_r, y, x + r, y);
+  close_path();
+}
+
 void PageBuilder::draw_image(const std::string& name, double x, double y,
                              double w, double h) {
   save_state();

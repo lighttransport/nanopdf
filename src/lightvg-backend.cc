@@ -15,6 +15,8 @@
 #include "cff-wrapper.hh"
 #include "font-provider.hh"
 #include "font-unicode-map.hh"
+#include "shared-font-cache.hh"
+#include "render-cache.hh"
 #include "pdf-function.hh"
 #include "string-parse.hh"
 
@@ -33,6 +35,16 @@
 extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
+
+static uint64_t fnv1a64(const void* data, size_t len) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  uint64_t h = 14695981039346656037ULL;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
 
 struct LightVGRect {
   float x{0.0f};
@@ -337,6 +349,148 @@ static size_t count_render_objects_impl(std::string_view content) {
   }
 
   return count;
+}
+
+// Computes extra progress weight for XObject Do operators beyond the
+// baseline count of 1.  Returns 0 when the XObject is not found or is an
+// unknown subtype.
+//   Image: weight = max(1, w*h/10000) - 1
+//   Form:  weight = form_operator_count - 1
+static size_t compute_xobject_extra_weight(const std::string& xobj_name,
+                                            const Pdf& pdf,
+                                            const Dictionary& resources) {
+  auto xobj_it = resources.find("XObject");
+  if (xobj_it == resources.end()) return 0;
+  const Value& xobj_dict = xobj_it->second;
+  if (xobj_dict.type != Value::DICTIONARY) return 0;
+
+  auto name_it = xobj_dict.dict.find(xobj_name);
+  if (name_it == xobj_dict.dict.end()) return 0;
+
+  Value entry = name_it->second;
+  uint32_t obj_num = 0;
+  uint16_t obj_gen = 0;
+  if (entry.type == Value::REFERENCE) {
+    obj_num = entry.ref_object_number;
+    obj_gen = entry.ref_generation_number;
+    auto res = resolve_reference(pdf, obj_num, obj_gen);
+    if (!res.success) return 0;
+    entry = std::move(res.value);
+  }
+  if (entry.type != Value::STREAM) return 0;
+
+  auto sub_it = entry.stream.dict.find("Subtype");
+  if (sub_it == entry.stream.dict.end() ||
+      sub_it->second.type != Value::NAME)
+    return 0;
+
+  if (sub_it->second.name == "Image") {
+    int w = 0, h = 0;
+    auto w_it = entry.stream.dict.find("Width");
+    auto h_it = entry.stream.dict.find("Height");
+    if (w_it != entry.stream.dict.end() &&
+        w_it->second.type == Value::NUMBER)
+      w = static_cast<int>(w_it->second.number);
+    if (h_it != entry.stream.dict.end() &&
+        h_it->second.type == Value::NUMBER)
+      h = static_cast<int>(h_it->second.number);
+    if (w <= 0 || h <= 0) return 0;
+    size_t weight =
+        std::max<size_t>(1, (static_cast<size_t>(w) * h) / 10000);
+    return weight - 1;  // Do already counted as 1
+  }
+
+  if (sub_it->second.name == "Form") {
+    auto dec = decode_stream(pdf, entry, obj_num, obj_gen);
+    if (!dec.success || dec.data.empty()) return 0;
+    size_t n = count_render_objects_impl(std::string_view(
+        reinterpret_cast<const char*>(dec.data.data()), dec.data.size()));
+    return n - 1;  // Do already counted as 1
+  }
+
+  return 0;
+}
+
+// Scans content for "NAME Do" patterns and accumulates extra progress
+// weight from Image/Form XObjects.  Uses page-level resources.
+static size_t scan_do_extra_weight(std::string_view content,
+                                    const Pdf& pdf,
+                                    const Dictionary& resources) {
+  size_t extra = 0;
+  size_t pos = 0;
+  std::string last_token;
+
+  while (pos < content.size()) {
+    while (pos < content.size() &&
+           std::isspace(static_cast<unsigned char>(content[pos]))) {
+      pos++;
+    }
+    if (pos >= content.size()) break;
+
+    if (content[pos] == '%') {
+      while (pos < content.size() && content[pos] != '\n' &&
+             content[pos] != '\r') {
+        pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '(') {
+      int depth = 1;
+      pos++;
+      while (pos < content.size() && depth > 0) {
+        if (content[pos] == '\\' && (pos + 1) < content.size()) {
+          pos += 2;
+        } else if (content[pos] == '(') {
+          depth++;
+          pos++;
+        } else if (content[pos] == ')') {
+          depth--;
+          pos++;
+        } else {
+          pos++;
+        }
+      }
+      continue;
+    }
+
+    if (content[pos] == '<') {
+      if ((pos + 1) < content.size() && content[pos + 1] == '<') {
+        pos += 2;
+      } else {
+        pos++;
+        while (pos < content.size() && content[pos] != '>') pos++;
+        if (pos < content.size()) pos++;
+      }
+      continue;
+    }
+
+    if (content[pos] == '[' || content[pos] == ']' ||
+        content[pos] == '{' || content[pos] == '}') {
+      pos++;
+      continue;
+    }
+
+    size_t start = pos;
+    while (pos < content.size() &&
+           !is_pdf_content_delimiter(content[pos])) {
+      pos++;
+    }
+    if (start == pos) {
+      pos++;
+      continue;
+    }
+
+    std::string_view token(content.data() + start, pos - start);
+    if (token == "Do") {
+      if (!last_token.empty() && last_token[0] == '/') {
+        extra += compute_xobject_extra_weight(last_token.substr(1),
+                                               pdf, resources);
+      }
+    }
+    last_token.assign(token.data(), token.size());
+  }
+  return extra;
 }
 
 static bool is_rectangular_path(const std::vector<lvg::PathCommand>& commands,
@@ -711,105 +865,7 @@ static uint32_t adobe_japan1_cid_to_unicode(uint32_t cid) {
 }
 
 // Common Adobe glyph name to Unicode mapping
-static uint32_t glyph_name_to_unicode(const std::string& name) {
-  // Most common glyph names - add more as needed
-  static const std::map<std::string, uint32_t> glyph_map = {
-    {"space", 0x0020}, {"exclam", 0x0021}, {"quotedbl", 0x0022},
-    {"numbersign", 0x0023}, {"dollar", 0x0024}, {"percent", 0x0025},
-    {"ampersand", 0x0026}, {"quotesingle", 0x0027}, {"parenleft", 0x0028},
-    {"parenright", 0x0029}, {"asterisk", 0x002A}, {"plus", 0x002B},
-    {"comma", 0x002C}, {"hyphen", 0x002D}, {"period", 0x002E},
-    {"slash", 0x002F}, {"zero", 0x0030}, {"one", 0x0031},
-    {"two", 0x0032}, {"three", 0x0033}, {"four", 0x0034},
-    {"five", 0x0035}, {"six", 0x0036}, {"seven", 0x0037},
-    {"eight", 0x0038}, {"nine", 0x0039}, {"colon", 0x003A},
-    {"semicolon", 0x003B}, {"less", 0x003C}, {"equal", 0x003D},
-    {"greater", 0x003E}, {"question", 0x003F}, {"at", 0x0040},
-    {"A", 0x0041}, {"B", 0x0042}, {"C", 0x0043}, {"D", 0x0044},
-    {"E", 0x0045}, {"F", 0x0046}, {"G", 0x0047}, {"H", 0x0048},
-    {"I", 0x0049}, {"J", 0x004A}, {"K", 0x004B}, {"L", 0x004C},
-    {"M", 0x004D}, {"N", 0x004E}, {"O", 0x004F}, {"P", 0x0050},
-    {"Q", 0x0051}, {"R", 0x0052}, {"S", 0x0053}, {"T", 0x0054},
-    {"U", 0x0055}, {"V", 0x0056}, {"W", 0x0057}, {"X", 0x0058},
-    {"Y", 0x0059}, {"Z", 0x005A}, {"bracketleft", 0x005B},
-    {"backslash", 0x005C}, {"bracketright", 0x005D}, {"asciicircum", 0x005E},
-    {"underscore", 0x005F}, {"grave", 0x0060},
-    {"a", 0x0061}, {"b", 0x0062}, {"c", 0x0063}, {"d", 0x0064},
-    {"e", 0x0065}, {"f", 0x0066}, {"g", 0x0067}, {"h", 0x0068},
-    {"i", 0x0069}, {"j", 0x006A}, {"k", 0x006B}, {"l", 0x006C},
-    {"m", 0x006D}, {"n", 0x006E}, {"o", 0x006F}, {"p", 0x0070},
-    {"q", 0x0071}, {"r", 0x0072}, {"s", 0x0073}, {"t", 0x0074},
-    {"u", 0x0075}, {"v", 0x0076}, {"w", 0x0077}, {"x", 0x0078},
-    {"y", 0x0079}, {"z", 0x007A}, {"braceleft", 0x007B},
-    {"bar", 0x007C}, {"braceright", 0x007D}, {"asciitilde", 0x007E},
-    // Extended Latin
-    {"exclamdown", 0x00A1}, {"cent", 0x00A2}, {"sterling", 0x00A3},
-    {"currency", 0x00A4}, {"yen", 0x00A5}, {"brokenbar", 0x00A6},
-    {"section", 0x00A7}, {"dieresis", 0x00A8}, {"copyright", 0x00A9},
-    {"ordfeminine", 0x00AA}, {"guillemotleft", 0x00AB},
-    {"logicalnot", 0x00AC}, {"registered", 0x00AE}, {"macron", 0x00AF},
-    {"degree", 0x00B0}, {"plusminus", 0x00B1}, {"twosuperior", 0x00B2},
-    {"threesuperior", 0x00B3}, {"acute", 0x00B4}, {"mu", 0x00B5},
-    {"paragraph", 0x00B6}, {"periodcentered", 0x00B7}, {"cedilla", 0x00B8},
-    {"onesuperior", 0x00B9}, {"ordmasculine", 0x00BA},
-    {"guillemotright", 0x00BB}, {"onequarter", 0x00BC},
-    {"onehalf", 0x00BD}, {"threequarters", 0x00BE}, {"questiondown", 0x00BF},
-    // Ligatures and special
-    {"fi", 0xFB01}, {"fl", 0xFB02}, {"ff", 0xFB00}, {"ffi", 0xFB03}, {"ffl", 0xFB04},
-    {"endash", 0x2013}, {"emdash", 0x2014},
-    {"quoteleft", 0x2018}, {"quoteright", 0x2019},
-    {"quotedblleft", 0x201C}, {"quotedblright", 0x201D},
-    {"bullet", 0x2022}, {"ellipsis", 0x2026},
-    {"dagger", 0x2020}, {"daggerdbl", 0x2021},
-    {"perthousand", 0x2030}, {"trademark", 0x2122},
-    // Accented letters
-    {"Agrave", 0x00C0}, {"Aacute", 0x00C1}, {"Acircumflex", 0x00C2},
-    {"Atilde", 0x00C3}, {"Adieresis", 0x00C4}, {"Aring", 0x00C5},
-    {"AE", 0x00C6}, {"Ccedilla", 0x00C7}, {"Egrave", 0x00C8},
-    {"Eacute", 0x00C9}, {"Ecircumflex", 0x00CA}, {"Edieresis", 0x00CB},
-    {"Igrave", 0x00CC}, {"Iacute", 0x00CD}, {"Icircumflex", 0x00CE},
-    {"Idieresis", 0x00CF}, {"Eth", 0x00D0}, {"Ntilde", 0x00D1},
-    {"Ograve", 0x00D2}, {"Oacute", 0x00D3}, {"Ocircumflex", 0x00D4},
-    {"Otilde", 0x00D5}, {"Odieresis", 0x00D6}, {"multiply", 0x00D7},
-    {"Oslash", 0x00D8}, {"Ugrave", 0x00D9}, {"Uacute", 0x00DA},
-    {"Ucircumflex", 0x00DB}, {"Udieresis", 0x00DC}, {"Yacute", 0x00DD},
-    {"Thorn", 0x00DE}, {"germandbls", 0x00DF},
-    {"agrave", 0x00E0}, {"aacute", 0x00E1}, {"acircumflex", 0x00E2},
-    {"atilde", 0x00E3}, {"adieresis", 0x00E4}, {"aring", 0x00E5},
-    {"ae", 0x00E6}, {"ccedilla", 0x00E7}, {"egrave", 0x00E8},
-    {"eacute", 0x00E9}, {"ecircumflex", 0x00EA}, {"edieresis", 0x00EB},
-    {"igrave", 0x00EC}, {"iacute", 0x00ED}, {"icircumflex", 0x00EE},
-    {"idieresis", 0x00EF}, {"eth", 0x00F0}, {"ntilde", 0x00F1},
-    {"ograve", 0x00F2}, {"oacute", 0x00F3}, {"ocircumflex", 0x00F4},
-    {"otilde", 0x00F5}, {"odieresis", 0x00F6}, {"divide", 0x00F7},
-    {"oslash", 0x00F8}, {"ugrave", 0x00F9}, {"uacute", 0x00FA},
-    {"ucircumflex", 0x00FB}, {"udieresis", 0x00FC}, {"yacute", 0x00FD},
-    {"thorn", 0x00FE}, {"ydieresis", 0x00FF},
-    // More special characters
-    {"Euro", 0x20AC}, {"florin", 0x0192},
-    {"OE", 0x0152}, {"oe", 0x0153},
-    {"Scaron", 0x0160}, {"scaron", 0x0161},
-    {"Ydieresis", 0x0178}, {"Zcaron", 0x017D}, {"zcaron", 0x017E},
-    {"circumflex", 0x02C6}, {"tilde", 0x02DC},
-    {"dotlessi", 0x0131}, {"Lslash", 0x0141}, {"lslash", 0x0142},
-    // Math and symbols
-    {"minus", 0x2212}, {"fraction", 0x2044},
-    {"guilsinglleft", 0x2039}, {"guilsinglright", 0x203A},
-  };
-
-  auto it = glyph_map.find(name);
-  if (it != glyph_map.end()) {
-    return it->second;
-  }
-
-  // Try uniXXXX format (e.g., "uni0041" = 'A')
-  if (name.length() == 7 && name.substr(0, 3) == "uni") {
-    uint32_t cp = 0;
-    if (parse_hex_uint(name.substr(3), &cp)) return cp;
-  }
-
-  return 0;  // Not found
-}
+// glyph_name_to_unicode is now in font-unicode-map.hh (shared, sorted-array+bsearch)
 
 // ========================================================================
 // Mesh Shading Support - Based on PDFium implementation
@@ -1327,10 +1383,11 @@ static void convert_icc_to_srgb(
 }
 
 // Map character code to Unicode based on font encoding
+// Uses shared glyph_name_to_unicode from font-unicode-map.hh
 static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
   return map_char_to_unicode_generic(
       char_code, font, kWinAnsiEncoding, kMacRomanEncoding,
-      [](const std::string& name) { return glyph_name_to_unicode(name); },
+      glyph_name_to_unicode,
       [](uint32_t cid) { return adobe_japan1_cid_to_unicode(cid); });
 }
 
@@ -1653,34 +1710,10 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
     float cos_tm = cos_tm_outer;
     float sin_tm = sin_tm_outer;
 
-    // Check if this is a Type0/CID font that uses two-byte encoding
+    // Use pre-computed flags from Type0Font (set during PDF parse)
     auto* type0_font = as_type0_font(current_font_);
-    bool is_two_byte_cid = false;
-    bool is_vertical = false;
-    if (type0_font) {
-      // Determine if the CMap uses two-byte encoding based on CMap name
-      // Common two-byte CMaps: Identity-H, Identity-V, UniJIS-*, UniGB-*, UniKS-*, UniCNS-*
-      const std::string& cmap_name = type0_font->encoding_cmap.name;
-      if (cmap_name.find("Identity") != std::string::npos ||
-          cmap_name.find("UTF16") != std::string::npos ||
-          cmap_name.find("UCS2") != std::string::npos ||
-          cmap_name.find("UniJIS") != std::string::npos ||
-          cmap_name.find("UniGB") != std::string::npos ||
-          cmap_name.find("UniKS") != std::string::npos ||
-          cmap_name.find("UniCNS") != std::string::npos ||
-          // Also check registry/ordering for CJK fonts
-          type0_font->ordering == "Japan1" ||
-          type0_font->ordering == "GB1" ||
-          type0_font->ordering == "CNS1" ||
-          type0_font->ordering == "Korea1") {
-        is_two_byte_cid = true;
-      }
-      // CMap names ending in -V indicate vertical writing mode
-      if (cmap_name.size() >= 2 &&
-          cmap_name.substr(cmap_name.size() - 2) == "-V") {
-        is_vertical = true;
-      }
-    }
+    bool is_two_byte_cid = type0_font ? type0_font->is_two_byte_cid : false;
+    bool is_vertical = type0_font ? type0_font->is_vertical : false;
 
     // For vertical mode, track cursor_y separately
     float cursor_y = y;
@@ -2441,6 +2474,34 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     return font_cache_[font_name].initialized;
   }
 
+  // Shared font cache: avoid re-loading and re-decoding font data when the
+  // same Pdf font is loaded by a different backend or a second page pass.
+  {
+    SharedFontEntry shared;
+    if (SharedFontCache::instance().find(&pdf, font_name, shared)) {
+      FontCache cache;
+      cache.font_data = std::move(shared.font_data);
+      cache.is_embedded = shared.is_embedded;
+      cache.cid_to_gid = std::move(shared.cid_to_gid);
+
+      int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+      bool stbtt_ok = stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset);
+
+      if (shared.has_ttf_parse &&
+          ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
+        cache.has_ttf_parse = true;
+      }
+
+      if (!stbtt_ok && !cache.has_ttf_parse) {
+        return load_fallback_font_with_hint(font_name, font);
+      }
+
+      cache.initialized = true;
+      font_cache_[font_name] = std::move(cache);
+      return true;
+    }
+  }
+
   // Check if font has embedded data.
   // For Type0 fonts, the FontDescriptor is in the descendant CIDFont,
   // not on the Type0 font itself.
@@ -2532,6 +2593,15 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
   cache.is_embedded = true;
   cache.cid_to_gid = std::move(cff_cid_to_gid);
   NANOPDF_LOG_INFO("LightVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), cache.font_data.size());
+
+  // Share with other backends / page passes.
+  SharedFontCache::instance().store(&pdf, font_name, {
+    cache.font_data,  // copy
+    true,             // is_embedded
+    cache.has_ttf_parse,
+    cache.cid_to_gid  // copy
+  });
+
   font_cache_[font_name] = std::move(cache);
   return true;
 }
@@ -2548,22 +2618,7 @@ float LightVGBackend::calculate_text_width(const std::string& text, float font_s
   // First try to use PDF font width information if available
   auto* type0_font = as_type0_font(current_font_);
   if (type0_font) {
-    // Determine if the CMap uses two-byte encoding
-    bool is_two_byte_cid = false;
-    const std::string& cmap_name = type0_font->encoding_cmap.name;
-    if (cmap_name.find("Identity") != std::string::npos ||
-        cmap_name.find("UTF16") != std::string::npos ||
-        cmap_name.find("UCS2") != std::string::npos ||
-        cmap_name.find("UniJIS") != std::string::npos ||
-        cmap_name.find("UniGB") != std::string::npos ||
-        cmap_name.find("UniKS") != std::string::npos ||
-        cmap_name.find("UniCNS") != std::string::npos ||
-        type0_font->ordering == "Japan1" ||
-        type0_font->ordering == "GB1" ||
-        type0_font->ordering == "CNS1" ||
-        type0_font->ordering == "Korea1") {
-      is_two_byte_cid = true;
-    }
+    bool is_two_byte_cid = type0_font->is_two_byte_cid;
 
     float width = 0.0f;
     int num_chars = 0;
@@ -2717,24 +2772,7 @@ float LightVGBackend::calculate_text_advance_draw_model(const std::string& text,
 
   auto* type0_font = as_type0_font(current_font_);
   if (type0_font) {
-    bool is_two_byte_cid = false;
-    const std::string& cmap_name = type0_font->encoding_cmap.name;
-    if (cmap_name.find("Identity") != std::string::npos ||
-        cmap_name.find("UTF16") != std::string::npos ||
-        cmap_name.find("UCS2") != std::string::npos ||
-        cmap_name.find("UniJIS") != std::string::npos ||
-        cmap_name.find("UniGB") != std::string::npos ||
-        cmap_name.find("UniKS") != std::string::npos ||
-        cmap_name.find("UniCNS") != std::string::npos ||
-        type0_font->ordering == "Japan1" ||
-        type0_font->ordering == "GB1" ||
-        type0_font->ordering == "CNS1" ||
-        type0_font->ordering == "Korea1") {
-      is_two_byte_cid = true;
-    }
-    bool is_vertical = (cmap_name.size() >= 2 &&
-                        cmap_name.substr(cmap_name.size() - 2) == "-V");
-    if (is_vertical) {
+    if (type0_font->is_vertical) {
       return calculate_vertical_advance(text, font_size);
     }
 
@@ -2742,7 +2780,7 @@ float LightVGBackend::calculate_text_advance_draw_model(const std::string& text,
     for (size_t i = 0; i < text.length();) {
       uint32_t char_code;
       size_t bytes_consumed = 1;
-      if (is_two_byte_cid && i + 1 < text.length()) {
+      if (type0_font->is_two_byte_cid && i + 1 < text.length()) {
         uint8_t high_byte = static_cast<unsigned char>(text[i]);
         uint8_t low_byte = static_cast<unsigned char>(text[i + 1]);
         char_code = (static_cast<uint32_t>(high_byte) << 8) | low_byte;
@@ -2821,30 +2859,14 @@ float LightVGBackend::calculate_vertical_advance(const std::string& text, float 
   auto* type0_font = as_type0_font(current_font_);
   if (!type0_font) return text.length() * font_size;  // fallback
 
-  // Determine if the CMap uses two-byte encoding (same logic as calculate_text_width)
-  bool is_two_byte_cid = false;
-  const std::string& cmap_name = type0_font->encoding_cmap.name;
-  if (cmap_name.find("Identity") != std::string::npos ||
-      cmap_name.find("UTF16") != std::string::npos ||
-      cmap_name.find("UCS2") != std::string::npos ||
-      cmap_name.find("UniJIS") != std::string::npos ||
-      cmap_name.find("UniGB") != std::string::npos ||
-      cmap_name.find("UniKS") != std::string::npos ||
-      cmap_name.find("UniCNS") != std::string::npos ||
-      type0_font->ordering == "Japan1" ||
-      type0_font->ordering == "GB1" ||
-      type0_font->ordering == "CNS1" ||
-      type0_font->ordering == "Korea1") {
-    is_two_byte_cid = true;
-  }
-
+  // Use pre-computed flag from Type0Font
   float advance = 0.0f;
   int num_chars = 0;
   for (size_t i = 0; i < text.length(); ) {
     uint32_t char_code;
     size_t bytes_consumed = 1;
 
-    if (is_two_byte_cid && i + 1 < text.length()) {
+    if (type0_font->is_two_byte_cid && i + 1 < text.length()) {
       uint8_t high_byte = static_cast<unsigned char>(text[i]);
       uint8_t low_byte = static_cast<unsigned char>(text[i + 1]);
       char_code = (static_cast<uint32_t>(high_byte) << 8) | low_byte;
@@ -2968,7 +2990,13 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     return false;
   }
 
-  argb_data.resize(img_width * img_height);
+  // Fast path: cached ARGB from render cache.
+  if (image.color_space.type == ColorSpaceType::CacheARGB) {
+    // data layout: argb_data as uint32_t packed into uint8_t vector
+    argb_data.resize(static_cast<size_t>(img_width) * img_height);
+    memcpy(argb_data.data(), image.data.data(), argb_data.size() * sizeof(uint32_t));
+  } else {
+    argb_data.resize(img_width * img_height);
 
   // Determine number of components based on color space
   int num_components = 3;  // Default RGB
@@ -3300,6 +3328,10 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
       }
     }
   }
+  }  // else (non-cached ARGB path)
+
+  // Save ARGB for render cache if needed.
+  last_image_argb_ = argb_data;
 
   // Create LightVG Picture from raw data. lvg::Picture::load() copies the
   // buffer, so the temporary vector can stay stack-owned.
@@ -4857,97 +4889,127 @@ bool LightVGBackend::apply_tiling_pattern(lvg::Shape* shape, const TilingPattern
     if (tile_px_w < 1) tile_px_w = 1;
     if (tile_px_h < 1) tile_px_h = 1;
 
-    // Create temporary canvas for rendering the tile
-    std::vector<uint32_t> tile_buffer(tile_px_w * tile_px_h, 0);
+    // Try render cache first — same (content, dimensions, paint_type) produces
+    // identical tile pixels regardless of which page or fill shape uses it.
+    uint64_t content_hash = fnv1a64(tiling->content_stream.data(),
+                                    tiling->content_stream.size());
+    int paint_type_int = static_cast<int>(tiling->paint_type);
+    std::string cache_key = "tile:" + std::to_string(content_hash) + ":" +
+                            std::to_string(tile_px_w) + "x" +
+                            std::to_string(tile_px_h) + ":" +
+                            std::to_string(paint_type_int);
 
-    // Initialize with transparent (for colored) or white (for uncolored)
-    if (tiling->paint_type == TilingPaintType::ColoredTiles) {
-      // Transparent background for colored patterns (ARGB = 0x00000000)
-      std::fill(tile_buffer.begin(), tile_buffer.end(), 0);
+    std::vector<uint32_t> rendered_tile;
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached) &&
+        cached.width == static_cast<uint32_t>(tile_px_w) &&
+        cached.height == static_cast<uint32_t>(tile_px_h)) {
+      // Cache hit — reconstruct pixel buffer from cached bytes.
+      size_t n = static_cast<size_t>(tile_px_w) * static_cast<size_t>(tile_px_h);
+      rendered_tile.resize(n);
+      memcpy(rendered_tile.data(), cached.data.data(), n * sizeof(uint32_t));
     } else {
-      // For uncolored, we'll apply color after rendering (ARGB = 0xFFFFFFFF = white)
-      std::fill(tile_buffer.begin(), tile_buffer.end(), 0xFFFFFFFF);
-    }
+      // Cache miss — render the tile sub-scene.
+      std::vector<uint32_t> tile_buffer(tile_px_w * tile_px_h, 0);
 
-    lvg::SwCanvas* tile_canvas = lvg::SwCanvas::gen();
-    if (!tile_canvas) {
-      goto fallback;
-    }
+      // Initialize with transparent (for colored) or white (for uncolored)
+      if (tiling->paint_type == TilingPaintType::ColoredTiles) {
+        std::fill(tile_buffer.begin(), tile_buffer.end(), 0);
+      } else {
+        std::fill(tile_buffer.begin(), tile_buffer.end(), 0xFFFFFFFF);
+      }
 
-    if (tile_canvas->target(tile_buffer.data(),
-                            tile_px_w, tile_px_w, tile_px_h,
-                            lvg::ColorSpace::ABGR8888) != lvg::Result::Success) {
+      lvg::SwCanvas* tile_canvas = lvg::SwCanvas::gen();
+      if (!tile_canvas) {
+        goto fallback;
+      }
+
+      if (tile_canvas->target(tile_buffer.data(),
+                              tile_px_w, tile_px_w, tile_px_h,
+                              lvg::ColorSpace::ABGR8888) != lvg::Result::Success) {
+        delete tile_canvas;
+        goto fallback;
+      }
+
+      lvg::Scene* tile_scene = lvg::Scene::gen();
+      if (!tile_scene) {
+        delete tile_canvas;
+        goto fallback;
+      }
+
+      // Save current state
+      lvg::SwCanvas* saved_canvas = canvas_;
+      lvg::Scene* saved_scene = scene_;
+      std::vector<uint32_t> saved_buffer = std::move(buffer_);
+      uint32_t saved_width = width_;
+      uint32_t saved_height = height_;
+      GraphicsState saved_state = state_;
+
+      // Switch to tile canvas
+      canvas_ = tile_canvas;
+      scene_ = tile_scene;
+      buffer_ = std::move(tile_buffer);
+      width_ = tile_px_w;
+      height_ = tile_px_h;
+
+      // Reset graphics state for tile rendering. Use the geometric mean of
+      // per-axis scales so the pattern cell maps to the tile buffer without
+      // having to handle per-axis scaling in the inner content renderer.
+      state_ = GraphicsState();
+      state_.page_width = tile_width;
+      state_.page_height = tile_height;
+      // Tile canvas scale matches the internal (oversampled) resolution so that
+      // pattern content drawn inside has proper detail. When placed on the main
+      // canvas the tile is downsampled via Picture transform.
+      state_.scale = std::sqrt(internal_scale_x * internal_scale_y);
+
+      // Push pattern resources if available
+      if (!tiling->resources.empty()) {
+        form_resources_stack_.push_back(tiling->resources);
+      }
+
+      // Parse and render the tile content
+      bool progress_enabled = progress_.enabled;
+      progress_.enabled = false;
+      parse_pdf_content(tiling->content_stream);
+      progress_.enabled = progress_enabled;
+
+      // Pop pattern resources
+      if (!tiling->resources.empty() && !form_resources_stack_.empty()) {
+        form_resources_stack_.pop_back();
+      }
+
+      // Finalize tile rendering
+      if (tile_canvas->add(tile_scene) == lvg::Result::Success) {
+        tile_canvas->draw(true);
+        tile_canvas->sync();
+      }
+
+      // Get the rendered tile pixels
+      rendered_tile = std::move(buffer_);
+
+      // Clean up tile canvas
       delete tile_canvas;
-      goto fallback;
+
+      // Restore original state
+      canvas_ = saved_canvas;
+      scene_ = saved_scene;
+      buffer_ = std::move(saved_buffer);
+      width_ = saved_width;
+      height_ = saved_height;
+      state_ = saved_state;
+
+      // Store rendered tile in render cache for reuse across pages/shapes.
+      if (!rendered_tile.empty()) {
+        size_t px = static_cast<size_t>(tile_px_w) * static_cast<size_t>(tile_px_h);
+        RenderCacheEntry entry;
+        entry.width = static_cast<uint32_t>(tile_px_w);
+        entry.height = static_cast<uint32_t>(tile_px_h);
+        entry.data.resize(px * sizeof(uint32_t));
+        memcpy(entry.data.data(), rendered_tile.data(), px * sizeof(uint32_t));
+        RenderCache::instance().store(cache_key, std::move(entry));
+      }
     }
-
-    lvg::Scene* tile_scene = lvg::Scene::gen();
-    if (!tile_scene) {
-      delete tile_canvas;
-      goto fallback;
-    }
-
-    // Save current state
-    lvg::SwCanvas* saved_canvas = canvas_;
-    lvg::Scene* saved_scene = scene_;
-    std::vector<uint32_t> saved_buffer = std::move(buffer_);
-    uint32_t saved_width = width_;
-    uint32_t saved_height = height_;
-    GraphicsState saved_state = state_;
-
-    // Switch to tile canvas
-    canvas_ = tile_canvas;
-    scene_ = tile_scene;
-    buffer_ = std::move(tile_buffer);
-    width_ = tile_px_w;
-    height_ = tile_px_h;
-
-    // Reset graphics state for tile rendering. Use the geometric mean of
-    // per-axis scales so the pattern cell maps to the tile buffer without
-    // having to handle per-axis scaling in the inner content renderer.
-    state_ = GraphicsState();
-    state_.page_width = tile_width;
-    state_.page_height = tile_height;
-    // Tile canvas scale matches the internal (oversampled) resolution so that
-    // pattern content drawn inside has proper detail. When placed on the main
-    // canvas the tile is downsampled via Picture transform.
-    state_.scale = std::sqrt(internal_scale_x * internal_scale_y);
-
-    // Push pattern resources if available
-    if (!tiling->resources.empty()) {
-      form_resources_stack_.push_back(tiling->resources);
-    }
-
-    // Parse and render the tile content
-    bool progress_enabled = progress_.enabled;
-    progress_.enabled = false;
-    parse_pdf_content(tiling->content_stream);
-    progress_.enabled = progress_enabled;
-
-    // Pop pattern resources
-    if (!tiling->resources.empty() && !form_resources_stack_.empty()) {
-      form_resources_stack_.pop_back();
-    }
-
-    // Finalize tile rendering
-    if (tile_canvas->add(tile_scene) == lvg::Result::Success) {
-      tile_canvas->draw(true);
-      tile_canvas->sync();
-    }
-
-    // Get the rendered tile pixels
-    std::vector<uint32_t> rendered_tile = std::move(buffer_);
-
-    // Clean up tile canvas
-    delete tile_canvas;
-
-    // Restore original state
-    canvas_ = saved_canvas;
-    scene_ = saved_scene;
-    buffer_ = std::move(saved_buffer);
-    width_ = saved_width;
-    height_ = saved_height;
-    state_ = saved_state;
 
     // Now create a tiled bitmap covering the target area
     // Get shape bounds
@@ -4976,8 +5038,9 @@ bool LightVGBackend::apply_tiling_pattern(lvg::Shape* shape, const TilingPattern
     tiles_y = clamp14(tiles_y, 1, 500);
 
     // Compose at internal resolution; final Picture transform rescales.
-    int tiled_w = static_cast<int>(tiles_x * step_ix);
-    int tiled_h = static_cast<int>(tiles_y * step_iy);
+    // Use ceil so fractional steps don't clip the last tile.
+    int tiled_w = static_cast<int>(std::ceil(tiles_x * step_ix));
+    int tiled_h = static_cast<int>(std::ceil(tiles_y * step_iy));
     if (tiled_w < 1) tiled_w = 1;
     if (tiled_h < 1) tiled_h = 1;
 
@@ -5137,39 +5200,75 @@ bool LightVGBackend::apply_tiling_pattern(lvg::Shape* shape, const TilingPattern
     // Tile the pattern (axis-aligned fast path). Offsets use the internal
     // (oversampled) step so tile content preserves sub-pixel detail; a final
     // scale transform downsamples during Picture placement.
-    for (int ty = 0; ty < tiles_y; ++ty) {
-      for (int tx = 0; tx < tiles_x; ++tx) {
-        int offset_x = static_cast<int>(tx * step_ix);
-        int offset_y = static_cast<int>(ty * step_iy);
-
-        for (int py = 0; py < tile_px_h && offset_y + py < tiled_h; ++py) {
-          for (int px = 0; px < tile_px_w && offset_x + px < tiled_w; ++px) {
-            // ThorVG's tile render ends up vertically inverted relative to
-            // page space when consumed as a bitmap picture; flip rows to
-            // preserve the source PDF pattern orientation.
-            size_t src_idx = static_cast<size_t>(tile_px_h - 1 - py) * tile_px_w + px;
-            size_t dst_idx = (offset_y + py) * tiled_w + (offset_x + px);
-
-            // Extract BGRA components from ABGR8888 format pixel
-            uint32_t pixel = rendered_tile[src_idx];
-            uint8_t b_val = static_cast<uint8_t>(pixel & 0xFF);
-            uint8_t g_val = static_cast<uint8_t>((pixel >> 8) & 0xFF);
-            uint8_t r_val = static_cast<uint8_t>((pixel >> 16) & 0xFF);
-            uint8_t a_val = static_cast<uint8_t>((pixel >> 24) & 0xFF);
-
-            if (tiling->paint_type == TilingPaintType::UncoloredTiles) {
-              // For uncolored patterns, use the alpha as a mask and apply current color
-              // Invert: white background with black pattern content
-              uint8_t intensity = static_cast<uint8_t>((255 - ((r_val + g_val + b_val) / 3)));
-              a_val = static_cast<uint8_t>((intensity * pattern_a) / 255);
-              r_val = pattern_r;
-              g_val = pattern_g;
-              b_val = pattern_b;
-            }
-
-            tiled_pixels[dst_idx] = (a_val << 24) | (r_val << 16) | (g_val << 8) | b_val;
-          }
+    //
+    // Accumulate tile positions as floats and fill any sub-pixel gaps between
+    // adjacent tiles by replicating the edge pixel, eliminating visible seams.
+    {
+      float oy_f = 0.0f;
+      auto process_tile_pixel = [&](uint32_t raw_pixel, uint8_t& r, uint8_t& g,
+                                      uint8_t& b, uint8_t& a) {
+        r = static_cast<uint8_t>((raw_pixel >> 16) & 0xFF);
+        g = static_cast<uint8_t>((raw_pixel >> 8) & 0xFF);
+        b = static_cast<uint8_t>(raw_pixel & 0xFF);
+        a = static_cast<uint8_t>((raw_pixel >> 24) & 0xFF);
+        if (tiling->paint_type == TilingPaintType::UncoloredTiles) {
+          uint8_t intensity = static_cast<uint8_t>((255 - ((r + g + b) / 3)));
+          a = static_cast<uint8_t>((intensity * pattern_a) / 255);
+          r = pattern_r; g = pattern_g; b = pattern_b;
         }
+      };
+
+      for (int ty = 0; ty < tiles_y; ++ty) {
+        int oy = static_cast<int>(oy_f);
+        float ox_f = 0.0f;
+        for (int tx = 0; tx < tiles_x; ++tx) {
+          int ox = static_cast<int>(ox_f);
+
+          // Copy tile pixels into the tiled bitmap.
+          for (int py = 0; py < tile_px_h && oy + py < tiled_h; ++py) {
+            for (int px = 0; px < tile_px_w && ox + px < tiled_w; ++px) {
+              // Tile render is vertically inverted relative to page space;
+              // flip rows to preserve the source PDF pattern orientation.
+              size_t src_idx =
+                  static_cast<size_t>(tile_px_h - 1 - py) * tile_px_w + px;
+              size_t dst_idx =
+                  static_cast<size_t>(oy + py) * tiled_w + (ox + px);
+
+              uint32_t pixel = rendered_tile[src_idx];
+              uint8_t rv, gv, bv, av;
+              process_tile_pixel(pixel, rv, gv, bv, av);
+              tiled_pixels[dst_idx] =
+                  (static_cast<uint32_t>(av) << 24) |
+                  (static_cast<uint32_t>(rv) << 16) |
+                  (static_cast<uint32_t>(gv) << 8) | bv;
+            }
+          }
+
+          // Fill sub-pixel gap to next tile by replicating the edge column.
+          float next_ox_f = ox_f + step_ix;
+          int next_ox = static_cast<int>(next_ox_f);
+          int gap_start = ox + tile_px_w;
+          if (next_ox > gap_start) {
+            int fill_end = (next_ox < tiled_w) ? next_ox : tiled_w;
+            for (int gx = gap_start; gx < fill_end; ++gx) {
+              for (int gy = 0; gy < tile_px_h && oy + gy < tiled_h; ++gy) {
+                size_t src_idx =
+                    static_cast<size_t>(tile_px_h - 1 - gy) * tile_px_w +
+                    (tile_px_w - 1);
+                size_t dst_idx = static_cast<size_t>(oy + gy) * tiled_w + gx;
+                uint8_t rv, gv, bv, av;
+                process_tile_pixel(rendered_tile[src_idx], rv, gv, bv, av);
+                tiled_pixels[dst_idx] =
+                    (static_cast<uint32_t>(av) << 24) |
+                    (static_cast<uint32_t>(rv) << 16) |
+                    (static_cast<uint32_t>(gv) << 8) | bv;
+              }
+            }
+          }
+
+          ox_f = next_ox_f;
+        }
+        oy_f += step_iy;
       }
     }
 
@@ -5260,6 +5359,75 @@ bool LightVGBackend::draw_missing_glyph_placeholder(float x, float y, float size
   return true;
 }
 
+// Try to render a missing glyph from fallback system fonts (e.g. for Unicode
+// codepoints that the PDF-embedded font does not cover). Iterates over font
+// categories registered in the FontProvider singleton, loads the first match,
+// and delegates to draw_glyph().
+bool LightVGBackend::try_draw_glyph_fallback(int codepoint, float x, float y,
+                                             float size,
+                                             uint8_t r, uint8_t g,
+                                             uint8_t b, uint8_t a) {
+  // Fallback font names by priority (well-known system / embedded fonts).
+  // The first font in font_cache_ that has the codepoint wins.
+  static const char* kFallbackNames[] = {
+      "NotoSerifJP", "NotoSansJP",      // CJK (embedded if NANOPDF_EMBED_CJK_FONTS)
+      "NotoSerif",   "NotoSans",         // Serif / Sans
+      "Arimo",       "Tinos",            // Embedded fallbacks
+      "Cousine",                          // Monospace
+      "DejaVu Sans", "DejaVu Serif",
+      "Liberation Sans", "Liberation Serif",
+      "FreeSerif",   "FreeSans",
+  };
+
+  std::string saved_font = current_font_name_;
+
+  for (const char* fb_name : kFallbackNames) {
+    // Skip if this is the same as the current font
+    if (fb_name == saved_font) continue;
+
+    // Already cached? Check if it has the glyph.
+    FontCache* fc = get_font(fb_name);
+    if (fc) {
+      int gid = 0;
+      if (fc->has_ttf_parse) {
+        gid = ttf_cmap_lookup(&fc->ttf, static_cast<uint32_t>(codepoint));
+      }
+      if (gid == 0 && fc->initialized) {
+        gid = stbtt_FindGlyphIndex(&fc->font_info, codepoint);
+      }
+      if (gid != 0) {
+        current_font_name_ = fb_name;
+        bool ok = draw_glyph(codepoint, x, y, size, r, g, b, a);
+        current_font_name_ = saved_font;
+        if (ok) return true;
+        continue;
+      }
+    } else {
+      // Not cached — try to load as a fallback font.
+      if (!load_fallback_font(fb_name)) continue;
+      fc = get_font(fb_name);
+      if (!fc) continue;
+
+      int gid = 0;
+      if (fc->has_ttf_parse) {
+        gid = ttf_cmap_lookup(&fc->ttf, static_cast<uint32_t>(codepoint));
+      }
+      if (gid == 0 && fc->initialized) {
+        gid = stbtt_FindGlyphIndex(&fc->font_info, codepoint);
+      }
+      if (gid != 0) {
+        current_font_name_ = fb_name;
+        bool ok = draw_glyph(codepoint, x, y, size, r, g, b, a);
+        current_font_name_ = saved_font;
+        if (ok) return true;
+      }
+    }
+  }
+
+  current_font_name_ = saved_font;
+  return false;
+}
+
 bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
                                uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   if (!scene_) {
@@ -5326,44 +5494,84 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     }
   }
 
-  // Resolve glyph via ttf_parse when available; keep stbtt as a last-ditch
-  // fallback for fonts that ttf_parse rejects at init time.
+  // Resolve glyph index.  We get it first (fast cmap lookup) so we can
+  // short-circuit .notdef and check the outline cache before parsing.
   uint16_t gid = 0;
-  ttf_outline_t outline{};
-  bool have_ttf_outline = false;
   if (font->has_ttf_parse) {
     gid = ttf_cmap_lookup(&font->ttf, static_cast<uint32_t>(codepoint));
-    if (gid != 0 && ttf_glyph_outline(&font->ttf, gid, &outline) == 0) {
-      have_ttf_outline = true;
-    }
+  } else {
+    gid = static_cast<uint16_t>(stbtt_FindGlyphIndex(&font->font_info, codepoint));
   }
 
-  stbtt_vertex* vertices = nullptr;
-  int num_verts = 0;
-  if (!have_ttf_outline) {
-    // stbtt_GetCodepointShape returns the font's .notdef glyph when the
-    // codepoint is not in the cmap — many fonts draw .notdef as a visible
-    // tofu-box-with-X, which is misleading here. Check the glyph index
-    // explicitly and render our own placeholder when missing.
-    int stbtt_gid = stbtt_FindGlyphIndex(&font->font_info, codepoint);
-    if (stbtt_gid == 0) {
+  // Handle missing glyph early
+  if (gid == 0) {
     if (codepoint == 0x20 || codepoint == 0x09 || codepoint == 0x0A ||
         codepoint == 0x0D || codepoint == 0x00A0) {
-      return true;  // whitespace glyph with no visible outline
+      return true;
     }
     if (draw_bullet_fallback()) return true;
     if (draw_checkmark_fallback()) return true;
+    if (try_draw_glyph_fallback(codepoint, x, y, size, r, g, b, a)) return true;
     draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
-    num_verts = stbtt_GetCodepointShape(&font->font_info, codepoint, &vertices);
+
+  // --- Glyph outline vector cache ---
+  // Caches deeply parsed ttf_outline_t data so that rotated / stroked / clipped
+  // text reuses the outline without re-parsing sfnt tables (ttf_glyph_outline).
+  GlyphOutlineKey cache_key{current_font_name_, static_cast<int>(gid)};
+  auto cache_it = glyph_outline_cache_.find(cache_key);
+  bool outline_from_cache = (cache_it != glyph_outline_cache_.end());
+
+  ttf_outline_t outline{};
+  bool have_ttf_outline = false;
+  stbtt_vertex* vertices = nullptr;
+  int num_verts = 0;
+
+  if (outline_from_cache) {
+    // Wire a temporary ttf_outline_t pointing into the cached vectors.
+    const auto& cached = cache_it->second;
+    outline.points = const_cast<ttf_point_t*>(cached.points.data());
+    outline.contour_ends = const_cast<int*>(cached.contour_ends.data());
+    outline.num_points = static_cast<int>(cached.points.size());
+    outline.num_contours = static_cast<int>(cached.contour_ends.size());
+    outline.x_min = cached.x_min;
+    outline.y_min = cached.y_min;
+    outline.x_max = cached.x_max;
+    outline.y_max = cached.y_max;
+    have_ttf_outline = true;
+  } else if (font->has_ttf_parse &&
+             ttf_glyph_outline(&font->ttf, gid, &outline) == 0) {
+    have_ttf_outline = true;
+
+    // Deep-copy into cache
+    GlyphOutlineEntry entry;
+    entry.points.assign(outline.points, outline.points + outline.num_points);
+    entry.contour_ends.assign(outline.contour_ends,
+                              outline.contour_ends + outline.num_contours);
+    entry.x_min = outline.x_min;
+    entry.y_min = outline.y_min;
+    entry.x_max = outline.x_max;
+    entry.y_max = outline.y_max;
+    if (glyph_outline_cache_.size() >= kMaxGlyphOutlineCacheEntries) {
+      glyph_outline_cache_.erase(glyph_outline_cache_.begin());
+    }
+    glyph_outline_cache_[cache_key] = std::move(entry);
+  }
+
+  if (!have_ttf_outline) {
+    // stbtt_GetGlyphShape returns the font's .notdef glyph when the
+    // codepoint is not in the cmap — we already checked gid==0 above,
+    // so this path only runs when ttf_parse is unavailable.
+    num_verts = stbtt_GetGlyphShape(&font->font_info, gid, &vertices);
     if (num_verts == 0 || !vertices) {
       if (codepoint == 0x20 || codepoint == 0x09 || codepoint == 0x0A ||
           codepoint == 0x0D || codepoint == 0x00A0) {
-        return true;  // whitespace glyph with no visible outline
+        return true;
       }
       if (draw_bullet_fallback()) return true;
       if (draw_checkmark_fallback()) return true;
+      if (try_draw_glyph_fallback(codepoint, x, y, size, r, g, b, a)) return true;
       draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
       return true;
     }
@@ -5389,8 +5597,11 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
 
   auto shape = lvg::Shape::gen();
   if (!shape) {
-    if (have_ttf_outline) ttf_outline_free(&outline);
-    else stbtt_FreeShape(&font->font_info, vertices);
+    if (have_ttf_outline && !outline_from_cache) {
+      ttf_outline_free(&outline);
+    } else if (!have_ttf_outline && vertices) {
+      stbtt_FreeShape(&font->font_info, vertices);
+    }
     return false;
   }
 
@@ -5474,8 +5685,11 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   shape->close();
   if (add_to_clip) state_.text_clip_commands.push_back(lvg::PathCommand::Close);
 
-  if (have_ttf_outline) ttf_outline_free(&outline);
-  else stbtt_FreeShape(&font->font_info, vertices);
+  if (have_ttf_outline && !outline_from_cache) {
+    ttf_outline_free(&outline);
+  } else if (!have_ttf_outline && vertices) {
+    stbtt_FreeShape(&font->font_info, vertices);
+  }
 
   // Mode 7: clip only - don't render visible shape
   if (render_mode == 7 || invisible) {
@@ -5540,16 +5754,46 @@ bool LightVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
     }
   }
 
-  // Primary path: ttf_parse outline. Fall back to stbtt only when ttf rejected the font.
+  // --- Glyph outline vector cache ---
+  GlyphOutlineKey cache_key{current_font_name_, glyph_index};
+  auto cache_it = glyph_outline_cache_.find(cache_key);
+  bool outline_from_cache = (cache_it != glyph_outline_cache_.end());
+
   ttf_outline_t outline{};
   bool have_ttf_outline = false;
-  if (font->has_ttf_parse &&
-      ttf_glyph_outline(&font->ttf, static_cast<uint16_t>(glyph_index), &outline) == 0) {
-    have_ttf_outline = true;
-  }
-
   stbtt_vertex* vertices = nullptr;
   int num_verts = 0;
+
+  if (outline_from_cache) {
+    const auto& cached = cache_it->second;
+    outline.points = const_cast<ttf_point_t*>(cached.points.data());
+    outline.contour_ends = const_cast<int*>(cached.contour_ends.data());
+    outline.num_points = static_cast<int>(cached.points.size());
+    outline.num_contours = static_cast<int>(cached.contour_ends.size());
+    outline.x_min = cached.x_min;
+    outline.y_min = cached.y_min;
+    outline.x_max = cached.x_max;
+    outline.y_max = cached.y_max;
+    have_ttf_outline = true;
+  } else if (font->has_ttf_parse &&
+             ttf_glyph_outline(&font->ttf, static_cast<uint16_t>(glyph_index),
+                               &outline) == 0) {
+    have_ttf_outline = true;
+
+    GlyphOutlineEntry entry;
+    entry.points.assign(outline.points, outline.points + outline.num_points);
+    entry.contour_ends.assign(outline.contour_ends,
+                              outline.contour_ends + outline.num_contours);
+    entry.x_min = outline.x_min;
+    entry.y_min = outline.y_min;
+    entry.x_max = outline.x_max;
+    entry.y_max = outline.y_max;
+    if (glyph_outline_cache_.size() >= kMaxGlyphOutlineCacheEntries) {
+      glyph_outline_cache_.erase(glyph_outline_cache_.begin());
+    }
+    glyph_outline_cache_[cache_key] = std::move(entry);
+  }
+
   if (!have_ttf_outline) {
     num_verts = stbtt_GetGlyphShape(&font->font_info, glyph_index, &vertices);
     if (num_verts == 0 || !vertices) {
@@ -5575,8 +5819,11 @@ bool LightVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
 
   auto shape = lvg::Shape::gen();
   if (!shape) {
-    if (have_ttf_outline) ttf_outline_free(&outline);
-    else stbtt_FreeShape(&font->font_info, vertices);
+    if (have_ttf_outline && !outline_from_cache) {
+      ttf_outline_free(&outline);
+    } else if (!have_ttf_outline && vertices) {
+      stbtt_FreeShape(&font->font_info, vertices);
+    }
     return false;
   }
 
@@ -5653,8 +5900,11 @@ bool LightVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
   shape->close();
   if (add_to_clip) state_.text_clip_commands.push_back(lvg::PathCommand::Close);
 
-  if (have_ttf_outline) ttf_outline_free(&outline);
-  else stbtt_FreeShape(&font->font_info, vertices);
+  if (have_ttf_outline && !outline_from_cache) {
+    ttf_outline_free(&outline);
+  } else if (!have_ttf_outline && vertices) {
+    stbtt_FreeShape(&font->font_info, vertices);
+  }
 
   if (render_mode == 7 || invisible) {
     return true;
@@ -5710,7 +5960,7 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
 
   // Quantize size for cache lookup (quarter-pixel granularity)
   uint16_t size_q = static_cast<uint16_t>(size * 4.0f + 0.5f);
-  GlyphBitmapKey key{current_font_name_, glyph_index, size_q};
+  GlyphBitmapKey key{current_font_name_, glyph_index, size_q, enable_lcd_};
 
   const GlyphBitmapEntry* entry = nullptr;
   auto cache_it = glyph_bitmap_cache_.find(key);
@@ -5718,14 +5968,14 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   if (cache_it != glyph_bitmap_cache_.end()) {
     entry = &cache_it->second;
   } else {
-    // Evict if cache is full
+    // Evict a single entry when full (much better than clearing all 4096)
     if (glyph_bitmap_cache_.size() >= kMaxGlyphCacheEntries) {
-      glyph_bitmap_cache_.clear();
+      glyph_bitmap_cache_.erase(glyph_bitmap_cache_.begin());
     }
 
-    // Render glyph bitmap with 2x oversampling for better edge quality.
-    // Primary path uses ttf_parse + rasterize; stbtt is a fallback.
-    static const float kOversample = 2.0f;
+    // Oversample factor: 3x for LCD subpixel (3-wide samples per output
+    // pixel), 2x for standard grayscale AA.
+    float oversample = enable_lcd_ ? 3.0f : 2.0f;
     auto& e = glyph_bitmap_cache_[key];
     bool produced = false;
 
@@ -5733,43 +5983,72 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
       ttf_outline_t outline{};
       if (ttf_glyph_outline(&font->ttf, static_cast<uint16_t>(glyph_index),
                             &outline) == 0) {
-        float em_scale_2x = (font->ttf.units_per_em > 0)
-            ? ((size * kOversample) / static_cast<float>(font->ttf.units_per_em))
-            : stbtt_ScaleForPixelHeight(&font->font_info, size * kOversample);
+        float em_scale =
+            (font->ttf.units_per_em > 0)
+                ? ((size * oversample) /
+                   static_cast<float>(font->ttf.units_per_em))
+                : stbtt_ScaleForPixelHeight(&font->font_info,
+                                            size * oversample);
         rast_bitmap_t bm{};
-        if (rast_glyph(&outline, em_scale_2x, &bm) == 0 && bm.pixels &&
+        if (rast_glyph(&outline, em_scale, &bm) == 0 && bm.pixels &&
             bm.width > 0 && bm.height > 0) {
-          int w2x = bm.width;
-          int h2x = bm.height;
-          // rasterize.c reports bearing_x = left side bearing in pixels and
-          // bearing_y = distance from baseline up to the top of the bitmap.
-          // Canvas is y-down, so the bitmap's top-left Y offset from the
-          // baseline is -bearing_y.
-          float xoff2x = static_cast<float>(bm.bearing_x);
-          float yoff2x = -static_cast<float>(bm.bearing_y);
+          int w_ss = bm.width;
+          int h_ss = bm.height;
+          float xoff_ss = static_cast<float>(bm.bearing_x);
+          float yoff_ss = -static_cast<float>(bm.bearing_y);
 
-          int w1x = (w2x + 1) / 2;
-          int h1x = (h2x + 1) / 2;
-          e.bitmap.assign(static_cast<size_t>(w1x) * h1x, 0);
-          for (int iy = 0; iy < h1x; ++iy) {
-            for (int ix = 0; ix < w1x; ++ix) {
-              int sum = 0, count = 0;
-              for (int dy = 0; dy < 2; ++dy) {
-                for (int dx = 0; dx < 2; ++dx) {
-                  int sy = iy * 2 + dy, sx = ix * 2 + dx;
-                  if (sy < h2x && sx < w2x) {
-                    sum += bm.pixels[sy * w2x + sx];
-                    ++count;
+          int os = static_cast<int>(oversample);
+          int w1x = (w_ss + os - 1) / os;
+          int h1x = (h_ss + os - 1) / os;
+          if (enable_lcd_) {
+            // LCD: 3×3 oversampled → per-channel alpha.
+            // Each output pixel gets 3 bytes (R/G/B coverage) from the
+            // corresponding 3×3 block's vertical-averaged columns.
+            e.bitmap.resize(static_cast<size_t>(w1x) * h1x * 3, 0);
+            for (int iy = 0; iy < h1x; ++iy)
+              for (int ix = 0; ix < w1x; ++ix) {
+                float cols[3] = {0, 0, 0};
+                int ccnt[3] = {0, 0, 0};
+                for (int dy = 0; dy < 3; ++dy)
+                  for (int dx = 0; dx < 3; ++dx) {
+                    int sy = iy * 3 + dy, sx = ix * 3 + dx;
+                    if (sy < h_ss && sx < w_ss) {
+                      cols[dx] += bm.pixels[sy * w_ss + sx];
+                      ccnt[dx]++;
+                    }
                   }
+                int bi = (iy * w1x + ix) * 3;
+                for (int ch = 0; ch < 3; ++ch) {
+                  float v = cols[ch] / std::max(1, ccnt[ch]);
+                  float corrected = std::pow(v / 255.0f, 1.4f);
+                  e.bitmap[bi + ch] =
+                      static_cast<uint8_t>(corrected * 255.0f + 0.5f);
                 }
               }
-              e.bitmap[iy * w1x + ix] = static_cast<uint8_t>(sum / count);
-            }
+            e.is_lcd = true;
+            e.lcd_scale = 3;
+          } else {
+            // Grayscale AA: box-filter 2x blocks
+            e.bitmap.assign(static_cast<size_t>(w1x) * h1x, 0);
+            for (int iy = 0; iy < h1x; ++iy)
+              for (int ix = 0; ix < w1x; ++ix) {
+                int sum = 0, count = 0;
+                for (int dy = 0; dy < os; ++dy)
+                  for (int dx = 0; dx < os; ++dx) {
+                    int sy = iy * os + dy, sx = ix * os + dx;
+                    if (sy < h_ss && sx < w_ss) {
+                      sum += bm.pixels[sy * w_ss + sx];
+                      ++count;
+                    }
+                  }
+                e.bitmap[iy * w1x + ix] =
+                    static_cast<uint8_t>(sum / count);
+              }
           }
           e.width = w1x;
           e.height = h1x;
-          e.xoff = xoff2x / kOversample;
-          e.yoff = yoff2x / kOversample;
+          e.xoff = xoff_ss / oversample;
+          e.yoff = yoff_ss / oversample;
           free(bm.pixels);
           produced = true;
         } else if (bm.pixels) {
@@ -5780,40 +6059,68 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
     }
 
     if (!produced) {
-      float scale_2x =
-          stbtt_ScaleForPixelHeight(&font->font_info, size * kOversample);
-      int w2x, h2x, xoff2x, yoff2x;
-      unsigned char* bmp2x = stbtt_GetGlyphBitmapSubpixel(
-          &font->font_info, scale_2x, scale_2x, 0, 0, glyph_index, &w2x, &h2x,
-          &xoff2x, &yoff2x);
+      float scale_ss =
+          stbtt_ScaleForPixelHeight(&font->font_info, size * oversample);
+      int w_ss, h_ss, xoff_ss, yoff_ss;
+      unsigned char* bmp_ss = stbtt_GetGlyphBitmapSubpixel(
+          &font->font_info, scale_ss, scale_ss, 0, 0, glyph_index, &w_ss,
+          &h_ss, &xoff_ss, &yoff_ss);
 
-      if (!bmp2x || w2x <= 0 || h2x <= 0) {
+      if (!bmp_ss || w_ss <= 0 || h_ss <= 0) {
         e.width = 0; e.height = 0; e.xoff = 0; e.yoff = 0;
-        if (bmp2x) stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
+        if (bmp_ss) stbtt_FreeBitmap(bmp_ss, font->font_info.userdata);
       } else {
-        int w1x = (w2x + 1) / 2;
-        int h1x = (h2x + 1) / 2;
-        e.bitmap.resize(w1x * h1x);
-        for (int iy = 0; iy < h1x; iy++) {
-          for (int ix = 0; ix < w1x; ix++) {
-            int sum = 0, count = 0;
-            for (int dy = 0; dy < 2; dy++) {
-              for (int dx = 0; dx < 2; dx++) {
-                int sy = iy * 2 + dy, sx = ix * 2 + dx;
-                if (sy < h2x && sx < w2x) {
-                  sum += bmp2x[sy * w2x + sx];
-                  count++;
+        int os = static_cast<int>(oversample);
+        int w1x = (w_ss + os - 1) / os;
+        int h1x = (h_ss + os - 1) / os;
+        if (enable_lcd_) {
+          // LCD: 3×3 → per-channel alpha
+          e.bitmap.resize(static_cast<size_t>(w1x) * h1x * 3, 0);
+          for (int iy = 0; iy < h1x; iy++)
+            for (int ix = 0; ix < w1x; ix++) {
+              float cols[3] = {0, 0, 0};
+              int ccnt[3] = {0, 0, 0};
+              for (int dy = 0; dy < 3; dy++)
+                for (int dx = 0; dx < 3; dx++) {
+                  int sy = iy * 3 + dy, sx = ix * 3 + dx;
+                  if (sy < h_ss && sx < w_ss) {
+                    cols[dx] += bmp_ss[sy * w_ss + sx];
+                    ccnt[dx]++;
+                  }
                 }
+              int bi = (iy * w1x + ix) * 3;
+              for (int ch = 0; ch < 3; ++ch) {
+                float v = cols[ch] / std::max(1, ccnt[ch]);
+                float corrected = std::pow(v / 255.0f, 1.4f);
+                e.bitmap[bi + ch] =
+                    static_cast<uint8_t>(corrected * 255.0f + 0.5f);
               }
             }
-            e.bitmap[iy * w1x + ix] = static_cast<uint8_t>(sum / count);
-          }
+          e.is_lcd = true;
+          e.lcd_scale = 3;
+        } else {
+          // Grayscale AA: box-filter 2x blocks
+          e.bitmap.resize(static_cast<size_t>(w1x) * h1x);
+          for (int iy = 0; iy < h1x; iy++)
+            for (int ix = 0; ix < w1x; ix++) {
+              int sum = 0, count = 0;
+              for (int dy = 0; dy < os; dy++)
+                for (int dx = 0; dx < os; dx++) {
+                  int sy = iy * os + dy, sx = ix * os + dx;
+                  if (sy < h_ss && sx < w_ss) {
+                    sum += bmp_ss[sy * w_ss + sx];
+                    count++;
+                  }
+                }
+              e.bitmap[iy * w1x + ix] =
+                  static_cast<uint8_t>(sum / count);
+            }
         }
         e.width = w1x;
         e.height = h1x;
-        e.xoff = xoff2x / kOversample;
-        e.yoff = yoff2x / kOversample;
-        stbtt_FreeBitmap(bmp2x, font->font_info.userdata);
+        e.xoff = static_cast<float>(xoff_ss) / oversample;
+        e.yoff = static_cast<float>(yoff_ss) / oversample;
+        stbtt_FreeBitmap(bmp_ss, font->font_info.userdata);
       }
     }
     entry = &e;
@@ -5826,18 +6133,70 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   // Create ARGB8888 bitmap with glyph color + alpha from bitmap
   int gw = entry->width;
   int gh = entry->height;
-  std::vector<uint32_t> argb(static_cast<size_t>(gw) * gh);
-  for (int i = 0; i < gw * gh; i++) {
-    // Apply gamma correction (gamma=1.4) to tighten AA fringe:
-    // pushes intermediate alpha values toward 0, reducing dark halo
-    float normalized = entry->bitmap[i] / 255.0f;
-    float corrected = std::pow(normalized, 1.4f);
-    uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
-    // ARGB8888: A in high byte, straight alpha
-    argb[static_cast<size_t>(i)] =
-        (static_cast<uint32_t>(alpha) << 24) |
-        (static_cast<uint32_t>(r) << 16) |
-        (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+
+  // Try render cache for pre-colored ARGB — skips per-pixel fill on hit.
+  std::string glyph_cache_key;
+  std::vector<uint32_t> argb;
+  bool glyph_cached = false;
+  glyph_cache_key = "glyph:" + current_font_name_ + ":" +
+                    std::to_string(glyph_index) + ":" +
+                    std::to_string(size_q) + ":" +
+                    (enable_lcd_ ? "1" : "0") + ":" +
+                    std::to_string(r) + ":" +
+                    std::to_string(g) + ":" +
+                    std::to_string(b) + ":" +
+                    std::to_string(a);
+  {
+    RenderCacheEntry gce;
+    if (RenderCache::instance().find(glyph_cache_key, gce) &&
+        gce.width == static_cast<uint32_t>(gw) &&
+        gce.height == static_cast<uint32_t>(gh)) {
+      argb.resize(static_cast<size_t>(gw) * gh);
+      memcpy(argb.data(), gce.data.data(), argb.size() * sizeof(uint32_t));
+      glyph_cached = true;
+    }
+  }
+  if (!glyph_cached) {
+    argb.resize(static_cast<size_t>(gw) * gh);
+    if (entry->is_lcd) {
+    // LCD subpixel: per-channel alpha (3 bytes/pixel, gamma-corrected)
+    for (int i = 0; i < gw * gh; i++) {
+      const uint8_t* pc = &entry->bitmap[i * 3];
+      uint8_t alpha_r = static_cast<uint8_t>(
+          (pc[0] / 255.0f) * a + 0.5f);
+      uint8_t alpha_g = static_cast<uint8_t>(
+          (pc[1] / 255.0f) * a + 0.5f);
+      uint8_t alpha_b = static_cast<uint8_t>(
+          (pc[2] / 255.0f) * a + 0.5f);
+      uint8_t max_a = std::max({alpha_r, alpha_g, alpha_b});
+      // Pre-multiplied ARGB: alpha = max per-channel, RGB modulated
+      argb[static_cast<size_t>(i)] =
+          (static_cast<uint32_t>(max_a) << 24) |
+          (static_cast<uint32_t>(r) * alpha_r / 255 << 16) |
+          (static_cast<uint32_t>(g) * alpha_g / 255 << 8) |
+          (static_cast<uint32_t>(b) * alpha_b / 255);
+    }
+  } else {
+    // Grayscale AA: single alpha per pixel, straight ARGB
+    for (int i = 0; i < gw * gh; i++) {
+      float normalized = entry->bitmap[i] / 255.0f;
+      float corrected = std::pow(normalized, 1.4f);
+      uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
+      argb[static_cast<size_t>(i)] =
+          (static_cast<uint32_t>(alpha) << 24) |
+          (static_cast<uint32_t>(r) << 16) |
+          (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+    }
+  }
+
+    // Store colored ARGB in render cache for future same-color hits.
+    size_t argb_bytes = argb.size() * sizeof(uint32_t);
+    RenderCacheEntry gce_out;
+    gce_out.width = static_cast<uint32_t>(gw);
+    gce_out.height = static_cast<uint32_t>(gh);
+    gce_out.data.resize(argb_bytes);
+    memcpy(gce_out.data.data(), argb.data(), argb_bytes);
+    RenderCache::instance().store(glyph_cache_key, std::move(gce_out));
   }
 
   // Create LightVG Picture and position it. Picture copies the input pixels.
@@ -6068,8 +6427,9 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
     page_height = static_cast<float>(page.media_box[3] - page.media_box[1]);
   }
 
-  // Store antialias option (ThorVG always applies AA internally)
+  // Store antialias and LCD options
   antialias_ = options.antialias;
+  enable_lcd_ = options.lcd_subpixel;
   if (!antialias_) {
     NANOPDF_LOG_DEBUG("LightVG", "antialias=false requested, but ThorVG's built-in AA cannot be disabled");
   }
@@ -6106,8 +6466,8 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   current_page_ = &page;
   page.ensure_fonts_loaded(pdf);
 
-  // Clear glyph bitmap cache for fresh page
-  glyph_bitmap_cache_.clear();
+  // Preserve glyph bitmap cache across pages — same font/size/glyph
+  // produces identical bitmaps, and the FIFO eviction keeps memory bounded.
 
   std::vector<std::vector<uint8_t>> decoded_contents;
   decoded_contents.reserve(page.contents.size());
@@ -6138,6 +6498,11 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
     }
 
     total_render_objects += count_render_objects(decoded_result.data);
+    total_render_objects += scan_do_extra_weight(
+        std::string_view(
+            reinterpret_cast<const char*>(decoded_result.data.data()),
+            decoded_result.data.size()),
+        pdf, page.resources);
     decoded_contents.push_back(std::move(decoded_result.data));
   }
 
@@ -6286,8 +6651,8 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   // Ensure page fonts are loaded
   page.ensure_fonts_loaded(pdf);
 
-  // Clear glyph bitmap cache for fresh page
-  glyph_bitmap_cache_.clear();
+  // Preserve glyph bitmap cache across pages — same font/size/glyph
+  // produces identical bitmaps, and the FIFO eviction keeps memory bounded.
 
   std::vector<std::vector<uint8_t>> decoded_contents;
   decoded_contents.reserve(page.contents.size());
@@ -6319,6 +6684,11 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
     }
 
     total_render_objects += count_render_objects(decoded_result.data);
+    total_render_objects += scan_do_extra_weight(
+        std::string_view(
+            reinterpret_cast<const char*>(decoded_result.data.data()),
+            decoded_result.data.size()),
+        pdf, page.resources);
     decoded_contents.push_back(std::move(decoded_result.data));
   }
 
@@ -7403,15 +7773,11 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           draw_text(canvas_x, canvas_y, text, scaled_size,
                    state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a);
 
-          // Detect vertical writing mode for text matrix advancement
-          bool is_vertical = false;
-          auto* type0_font = as_type0_font(current_font_);
-          if (type0_font) {
-            const auto& cn = type0_font->encoding_cmap.name;
-            is_vertical = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
-          }
+          // Use pre-computed vertical flag from Type0Font
+          auto* type0_font_v = as_type0_font(current_font_);
+          bool is_vertical_v = type0_font_v ? type0_font_v->is_vertical : false;
 
-          if (is_vertical) {
+          if (is_vertical_v) {
             // Vertical: advance along y axis (c/d components of text matrix)
             float text_advance = calculate_vertical_advance(text, state_.font_size);
             state_.text_matrix.e += (-text_advance) * state_.text_matrix.c;
@@ -7429,13 +7795,9 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       } else if (token == "TJ") {  // Show text with positioning array
         // TJ takes an array of strings and positioning adjustments
         if (state_.in_text_block) {
-          // Detect vertical writing mode once for the entire TJ array
-          bool is_vertical_tj = false;
+          // Use pre-computed vertical flag from Type0Font
           auto* type0_font_tj = as_type0_font(current_font_);
-          if (type0_font_tj) {
-            const auto& cn = type0_font_tj->encoding_cmap.name;
-            is_vertical_tj = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
-          }
+          bool is_vertical_tj = type0_font_tj ? type0_font_tj->is_vertical : false;
 
           for (const auto& item : operands) {
             if (!item.empty() && (item[0] == '(' || item[0] == '<')) {
@@ -7562,13 +7924,9 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           draw_text(canvas_x, canvas_y, text, scaled_size,
                    state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a);
 
-          // Advance text matrix (same as Tj)
-          bool is_vertical_q = false;
+          // Use pre-computed vertical flag from Type0Font
           auto* type0_font_q = as_type0_font(current_font_);
-          if (type0_font_q) {
-            const auto& cn = type0_font_q->encoding_cmap.name;
-            is_vertical_q = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
-          }
+          bool is_vertical_q = type0_font_q ? type0_font_q->is_vertical : false;
 
           if (is_vertical_q) {
             float text_advance = calculate_vertical_advance(text, state_.font_size);
@@ -7625,12 +7983,58 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
               if (subtype_it != xobj_value.stream.dict.end() &&
                   subtype_it->second.type == Value::NAME) {
                 if (subtype_it->second.name == "Image") {
-                  ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
-                  draw_image(image, state_.transform.e, state_.transform.f,
-                             state_.transform.a, state_.transform.d,
-                             state_.fill_r, state_.fill_g, state_.fill_b,
-                             &state_.transform);
+                  // Cache key: same (obj_num, obj_gen) always produces
+                  // the same decoded + color-converted pixels.
+                  std::string img_cache_key = "img:" + std::to_string(xobj_num) + ":" +
+                                              std::to_string(xobj_gen);
+                  RenderCacheEntry img_cached;
+                  int img_w = 0, img_h = 0;
+                  if (xobj_num != 0 &&
+                      RenderCache::instance().find(img_cache_key, img_cached) &&
+                      img_cached.width > 0 && img_cached.height > 0) {
+                    // Cache hit: use pre-converted ARGB pixels directly.
+                    ImageXObject image;
+                    image.width = static_cast<int>(img_cached.width);
+                    image.height = static_cast<int>(img_cached.height);
+                    img_w = image.width;
+                    img_h = image.height;
+                    image.data.resize(img_cached.data.size());
+                    memcpy(image.data.data(), img_cached.data.data(),
+                           img_cached.data.size());
+                    // Mark as cached so draw_image skips conversion.
+                    image.color_space.type = ColorSpaceType::CacheARGB;
+                    draw_image(image, state_.transform.e, state_.transform.f,
+                               state_.transform.a, state_.transform.d,
+                               state_.fill_r, state_.fill_g, state_.fill_b,
+                               &state_.transform);
+                  } else {
+                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
+                    img_w = image.width;
+                    img_h = image.height;
+                    draw_image(image, state_.transform.e, state_.transform.f,
+                               state_.transform.a, state_.transform.d,
+                               state_.fill_r, state_.fill_g, state_.fill_b,
+                               &state_.transform);
+                    // Cache the result ARGB for future use. draw_image stores
+                    // its result in last_image_argb_ when obj_num != 0.
+                    if (xobj_num != 0 && !last_image_argb_.empty()) {
+                      size_t n = static_cast<size_t>(img_w) *
+                                 static_cast<size_t>(img_h);
+                      RenderCacheEntry entry;
+                      entry.width = static_cast<uint32_t>(img_w);
+                      entry.height = static_cast<uint32_t>(img_h);
+                      entry.data.resize(n * sizeof(uint32_t));
+                      memcpy(entry.data.data(), last_image_argb_.data(),
+                             n * sizeof(uint32_t));
+                      RenderCache::instance().store(img_cache_key, std::move(entry));
+                      last_image_argb_.clear();
+                    }
+                  }
                   rendered_xobject = true;
+                  // Advance progress proportional to image work
+                  size_t img_weight = std::max<size_t>(1,
+                      (static_cast<size_t>(img_w) * img_h) / 10000);
+                  advance_progress(img_weight);
                 } else if (subtype_it->second.name == "Form") {
                   auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                   if (decoded.success && !decoded.data.empty()) {
@@ -7665,10 +8069,9 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                       form_matrix.f = static_cast<float>(matrix_it->second.array[5].number);
                       state_.transform = form_matrix * state_.transform;
                     }
-                    bool progress_enabled = progress_.enabled;
-                    progress_.enabled = false;
+                    // Form: sub-operators advance progress naturally,
+                    // so no progress guard or form-level advance.
                     parse_pdf_content(decoded.data);
-                    progress_.enabled = progress_enabled;
                     rendered_xobject = true;
                     if (has_form_resources) form_resources_stack_.pop_back();
                     state_ = saved_state;
@@ -7677,9 +8080,8 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
               }
             }
           }
-          if (rendered_xobject) {
-            advance_progress();
-          }
+          // Progress already advanced inside each XObject subtype handler
+          // (Image advances by pixel-area weight; Form sub-operators advance naturally).
         }
       }
       // Marked content operators (structure only, no-op for rendering)

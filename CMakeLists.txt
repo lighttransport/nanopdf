@@ -179,6 +179,12 @@ set(NANOPDF_SOURCES
 # Always-on render-backend abstraction (factory + parse helpers).
 list(APPEND NANOPDF_SOURCES src/render-backend.cc)
 
+# Shared font cache (cross-backend font data sharing).
+list(APPEND NANOPDF_SOURCES src/shared-font-cache.cc)
+
+# Render cache (LRU-evicted byte-size-bounded cache for glyphs, tiles, images).
+list(APPEND NANOPDF_SOURCES src/render-cache.cc)
+
 if(NANOPDF_USE_LIGHTVG)
   # scene.c depends on lightui/layer.h + dirty.h (UI-side compositor); not
   # needed for raster output, so we skip it. nanopdf only uses lui_canvas

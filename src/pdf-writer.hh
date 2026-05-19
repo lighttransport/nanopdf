@@ -947,6 +947,10 @@ class PageBuilder {
   void rectangle(double x, double y, double w, double h);
   void line(double x1, double y1, double x2, double y2);
   void circle(double cx, double cy, double r);
+  void ellipse(double cx, double cy, double rx, double ry);
+  void arc(double cx, double cy, double rx, double ry,
+           double start_angle, double end_angle);
+  void rounded_rect(double x, double y, double w, double h, double r);
 
   // Image drawing
   void draw_image(const std::string& name, double x, double y, double w, double h);

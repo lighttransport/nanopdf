@@ -43,6 +43,11 @@ struct RenderOptions {
   // Anti-aliasing hint. Backends may apply AA unconditionally.
   bool antialias{true};
 
+  // LCD subpixel anti-aliasing for glyph bitmaps (LightVG only).
+  // Renders glyphs at 3x horizontal resolution and encodes per-channel
+  // coverage in ARGB for subpixel text on non-white backgrounds.
+  bool lcd_subpixel{false};
+
   // Background fill colour (RGBA).
   uint8_t bg_r{255};
   uint8_t bg_g{255};

@@ -15,6 +15,7 @@
 #include "cff-wrapper.hh"
 #include "font-provider.hh"
 #include "font-unicode-map.hh"
+#include "shared-font-cache.hh"
 #include "pdf-function.hh"
 #include "string-parse.hh"
 
@@ -711,105 +712,7 @@ static uint32_t adobe_japan1_cid_to_unicode(uint32_t cid) {
 }
 
 // Common Adobe glyph name to Unicode mapping
-static uint32_t glyph_name_to_unicode(const std::string& name) {
-  // Most common glyph names - add more as needed
-  static const std::map<std::string, uint32_t> glyph_map = {
-    {"space", 0x0020}, {"exclam", 0x0021}, {"quotedbl", 0x0022},
-    {"numbersign", 0x0023}, {"dollar", 0x0024}, {"percent", 0x0025},
-    {"ampersand", 0x0026}, {"quotesingle", 0x0027}, {"parenleft", 0x0028},
-    {"parenright", 0x0029}, {"asterisk", 0x002A}, {"plus", 0x002B},
-    {"comma", 0x002C}, {"hyphen", 0x002D}, {"period", 0x002E},
-    {"slash", 0x002F}, {"zero", 0x0030}, {"one", 0x0031},
-    {"two", 0x0032}, {"three", 0x0033}, {"four", 0x0034},
-    {"five", 0x0035}, {"six", 0x0036}, {"seven", 0x0037},
-    {"eight", 0x0038}, {"nine", 0x0039}, {"colon", 0x003A},
-    {"semicolon", 0x003B}, {"less", 0x003C}, {"equal", 0x003D},
-    {"greater", 0x003E}, {"question", 0x003F}, {"at", 0x0040},
-    {"A", 0x0041}, {"B", 0x0042}, {"C", 0x0043}, {"D", 0x0044},
-    {"E", 0x0045}, {"F", 0x0046}, {"G", 0x0047}, {"H", 0x0048},
-    {"I", 0x0049}, {"J", 0x004A}, {"K", 0x004B}, {"L", 0x004C},
-    {"M", 0x004D}, {"N", 0x004E}, {"O", 0x004F}, {"P", 0x0050},
-    {"Q", 0x0051}, {"R", 0x0052}, {"S", 0x0053}, {"T", 0x0054},
-    {"U", 0x0055}, {"V", 0x0056}, {"W", 0x0057}, {"X", 0x0058},
-    {"Y", 0x0059}, {"Z", 0x005A}, {"bracketleft", 0x005B},
-    {"backslash", 0x005C}, {"bracketright", 0x005D}, {"asciicircum", 0x005E},
-    {"underscore", 0x005F}, {"grave", 0x0060},
-    {"a", 0x0061}, {"b", 0x0062}, {"c", 0x0063}, {"d", 0x0064},
-    {"e", 0x0065}, {"f", 0x0066}, {"g", 0x0067}, {"h", 0x0068},
-    {"i", 0x0069}, {"j", 0x006A}, {"k", 0x006B}, {"l", 0x006C},
-    {"m", 0x006D}, {"n", 0x006E}, {"o", 0x006F}, {"p", 0x0070},
-    {"q", 0x0071}, {"r", 0x0072}, {"s", 0x0073}, {"t", 0x0074},
-    {"u", 0x0075}, {"v", 0x0076}, {"w", 0x0077}, {"x", 0x0078},
-    {"y", 0x0079}, {"z", 0x007A}, {"braceleft", 0x007B},
-    {"bar", 0x007C}, {"braceright", 0x007D}, {"asciitilde", 0x007E},
-    // Extended Latin
-    {"exclamdown", 0x00A1}, {"cent", 0x00A2}, {"sterling", 0x00A3},
-    {"currency", 0x00A4}, {"yen", 0x00A5}, {"brokenbar", 0x00A6},
-    {"section", 0x00A7}, {"dieresis", 0x00A8}, {"copyright", 0x00A9},
-    {"ordfeminine", 0x00AA}, {"guillemotleft", 0x00AB},
-    {"logicalnot", 0x00AC}, {"registered", 0x00AE}, {"macron", 0x00AF},
-    {"degree", 0x00B0}, {"plusminus", 0x00B1}, {"twosuperior", 0x00B2},
-    {"threesuperior", 0x00B3}, {"acute", 0x00B4}, {"mu", 0x00B5},
-    {"paragraph", 0x00B6}, {"periodcentered", 0x00B7}, {"cedilla", 0x00B8},
-    {"onesuperior", 0x00B9}, {"ordmasculine", 0x00BA},
-    {"guillemotright", 0x00BB}, {"onequarter", 0x00BC},
-    {"onehalf", 0x00BD}, {"threequarters", 0x00BE}, {"questiondown", 0x00BF},
-    // Ligatures and special
-    {"fi", 0xFB01}, {"fl", 0xFB02}, {"ff", 0xFB00}, {"ffi", 0xFB03}, {"ffl", 0xFB04},
-    {"endash", 0x2013}, {"emdash", 0x2014},
-    {"quoteleft", 0x2018}, {"quoteright", 0x2019},
-    {"quotedblleft", 0x201C}, {"quotedblright", 0x201D},
-    {"bullet", 0x2022}, {"ellipsis", 0x2026},
-    {"dagger", 0x2020}, {"daggerdbl", 0x2021},
-    {"perthousand", 0x2030}, {"trademark", 0x2122},
-    // Accented letters
-    {"Agrave", 0x00C0}, {"Aacute", 0x00C1}, {"Acircumflex", 0x00C2},
-    {"Atilde", 0x00C3}, {"Adieresis", 0x00C4}, {"Aring", 0x00C5},
-    {"AE", 0x00C6}, {"Ccedilla", 0x00C7}, {"Egrave", 0x00C8},
-    {"Eacute", 0x00C9}, {"Ecircumflex", 0x00CA}, {"Edieresis", 0x00CB},
-    {"Igrave", 0x00CC}, {"Iacute", 0x00CD}, {"Icircumflex", 0x00CE},
-    {"Idieresis", 0x00CF}, {"Eth", 0x00D0}, {"Ntilde", 0x00D1},
-    {"Ograve", 0x00D2}, {"Oacute", 0x00D3}, {"Ocircumflex", 0x00D4},
-    {"Otilde", 0x00D5}, {"Odieresis", 0x00D6}, {"multiply", 0x00D7},
-    {"Oslash", 0x00D8}, {"Ugrave", 0x00D9}, {"Uacute", 0x00DA},
-    {"Ucircumflex", 0x00DB}, {"Udieresis", 0x00DC}, {"Yacute", 0x00DD},
-    {"Thorn", 0x00DE}, {"germandbls", 0x00DF},
-    {"agrave", 0x00E0}, {"aacute", 0x00E1}, {"acircumflex", 0x00E2},
-    {"atilde", 0x00E3}, {"adieresis", 0x00E4}, {"aring", 0x00E5},
-    {"ae", 0x00E6}, {"ccedilla", 0x00E7}, {"egrave", 0x00E8},
-    {"eacute", 0x00E9}, {"ecircumflex", 0x00EA}, {"edieresis", 0x00EB},
-    {"igrave", 0x00EC}, {"iacute", 0x00ED}, {"icircumflex", 0x00EE},
-    {"idieresis", 0x00EF}, {"eth", 0x00F0}, {"ntilde", 0x00F1},
-    {"ograve", 0x00F2}, {"oacute", 0x00F3}, {"ocircumflex", 0x00F4},
-    {"otilde", 0x00F5}, {"odieresis", 0x00F6}, {"divide", 0x00F7},
-    {"oslash", 0x00F8}, {"ugrave", 0x00F9}, {"uacute", 0x00FA},
-    {"ucircumflex", 0x00FB}, {"udieresis", 0x00FC}, {"yacute", 0x00FD},
-    {"thorn", 0x00FE}, {"ydieresis", 0x00FF},
-    // More special characters
-    {"Euro", 0x20AC}, {"florin", 0x0192},
-    {"OE", 0x0152}, {"oe", 0x0153},
-    {"Scaron", 0x0160}, {"scaron", 0x0161},
-    {"Ydieresis", 0x0178}, {"Zcaron", 0x017D}, {"zcaron", 0x017E},
-    {"circumflex", 0x02C6}, {"tilde", 0x02DC},
-    {"dotlessi", 0x0131}, {"Lslash", 0x0141}, {"lslash", 0x0142},
-    // Math and symbols
-    {"minus", 0x2212}, {"fraction", 0x2044},
-    {"guilsinglleft", 0x2039}, {"guilsinglright", 0x203A},
-  };
-
-  auto it = glyph_map.find(name);
-  if (it != glyph_map.end()) {
-    return it->second;
-  }
-
-  // Try uniXXXX format (e.g., "uni0041" = 'A')
-  if (name.length() == 7 && name.substr(0, 3) == "uni") {
-    uint32_t cp = 0;
-    if (parse_hex_uint(name.substr(3), &cp)) return cp;
-  }
-
-  return 0;  // Not found
-}
+// glyph_name_to_unicode is now in font-unicode-map.hh (shared, sorted-array+bsearch)
 
 // ========================================================================
 // Mesh Shading Support - Based on PDFium implementation
@@ -1327,10 +1230,11 @@ static void convert_icc_to_srgb(
 }
 
 // Map character code to Unicode based on font encoding
+// Uses shared glyph_name_to_unicode from font-unicode-map.hh
 static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
   return map_char_to_unicode_generic(
       char_code, font, kWinAnsiEncoding, kMacRomanEncoding,
-      [](const std::string& name) { return glyph_name_to_unicode(name); },
+      glyph_name_to_unicode,
       [](uint32_t cid) { return adobe_japan1_cid_to_unicode(cid); });
 }
 
@@ -1649,32 +1553,8 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
 
     // Check if this is a Type0/CID font that uses two-byte encoding
     auto* type0_font = as_type0_font(current_font_);
-    bool is_two_byte_cid = false;
-    bool is_vertical = false;
-    if (type0_font) {
-      // Determine if the CMap uses two-byte encoding based on CMap name
-      // Common two-byte CMaps: Identity-H, Identity-V, UniJIS-*, UniGB-*, UniKS-*, UniCNS-*
-      const std::string& cmap_name = type0_font->encoding_cmap.name;
-      if (cmap_name.find("Identity") != std::string::npos ||
-          cmap_name.find("UTF16") != std::string::npos ||
-          cmap_name.find("UCS2") != std::string::npos ||
-          cmap_name.find("UniJIS") != std::string::npos ||
-          cmap_name.find("UniGB") != std::string::npos ||
-          cmap_name.find("UniKS") != std::string::npos ||
-          cmap_name.find("UniCNS") != std::string::npos ||
-          // Also check registry/ordering for CJK fonts
-          type0_font->ordering == "Japan1" ||
-          type0_font->ordering == "GB1" ||
-          type0_font->ordering == "CNS1" ||
-          type0_font->ordering == "Korea1") {
-        is_two_byte_cid = true;
-      }
-      // CMap names ending in -V indicate vertical writing mode
-      if (cmap_name.size() >= 2 &&
-          cmap_name.substr(cmap_name.size() - 2) == "-V") {
-        is_vertical = true;
-      }
-    }
+    bool is_two_byte_cid = type0_font ? type0_font->is_two_byte_cid : false;
+    bool is_vertical = type0_font ? type0_font->is_vertical : false;
 
     // For vertical mode, track cursor_y separately
     float cursor_y = y;
@@ -2423,6 +2303,34 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
     return font_cache_[font_name].initialized;
   }
 
+  // Shared font cache: avoid re-loading and re-decoding font data when the
+  // same Pdf font is loaded by a different backend or a second page pass.
+  {
+    SharedFontEntry shared;
+    if (SharedFontCache::instance().find(&pdf, font_name, shared)) {
+      FontCache cache;
+      cache.font_data = std::move(shared.font_data);
+      cache.is_embedded = shared.is_embedded;
+      cache.cid_to_gid = std::move(shared.cid_to_gid);
+
+      int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+      bool stbtt_ok = stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset);
+
+      if (shared.has_ttf_parse &&
+          ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
+        cache.has_ttf_parse = true;
+      }
+
+      if (!stbtt_ok && !cache.has_ttf_parse) {
+        return load_fallback_font_with_hint(font_name, font);
+      }
+
+      cache.initialized = true;
+      font_cache_[font_name] = std::move(cache);
+      return true;
+    }
+  }
+
   // Check if font has embedded data.
   // For Type0 fonts, the FontDescriptor is in the descendant CIDFont,
   // not on the Type0 font itself.
@@ -2514,6 +2422,15 @@ bool ThorVGBackend::load_font(const Pdf& pdf, const std::string& font_name, cons
   cache.is_embedded = true;
   cache.cid_to_gid = std::move(cff_cid_to_gid);
   NANOPDF_LOG_INFO("ThorVG", "Loaded embedded font '%s' (%zu bytes)", font_name.c_str(), cache.font_data.size());
+
+  // Share with other backends / page passes.
+  SharedFontCache::instance().store(&pdf, font_name, {
+    cache.font_data,  // copy
+    true,             // is_embedded
+    cache.has_ttf_parse,
+    cache.cid_to_gid  // copy
+  });
+
   font_cache_[font_name] = std::move(cache);
   return true;
 }
@@ -2530,22 +2447,7 @@ float ThorVGBackend::calculate_text_width(const std::string& text, float font_si
   // First try to use PDF font width information if available
   auto* type0_font = as_type0_font(current_font_);
   if (type0_font) {
-    // Determine if the CMap uses two-byte encoding
-    bool is_two_byte_cid = false;
-    const std::string& cmap_name = type0_font->encoding_cmap.name;
-    if (cmap_name.find("Identity") != std::string::npos ||
-        cmap_name.find("UTF16") != std::string::npos ||
-        cmap_name.find("UCS2") != std::string::npos ||
-        cmap_name.find("UniJIS") != std::string::npos ||
-        cmap_name.find("UniGB") != std::string::npos ||
-        cmap_name.find("UniKS") != std::string::npos ||
-        cmap_name.find("UniCNS") != std::string::npos ||
-        type0_font->ordering == "Japan1" ||
-        type0_font->ordering == "GB1" ||
-        type0_font->ordering == "CNS1" ||
-        type0_font->ordering == "Korea1") {
-      is_two_byte_cid = true;
-    }
+    bool is_two_byte_cid = type0_font->is_two_byte_cid;
 
     float width = 0.0f;
     int num_chars = 0;
@@ -2699,24 +2601,7 @@ float ThorVGBackend::calculate_text_advance_draw_model(const std::string& text,
 
   auto* type0_font = as_type0_font(current_font_);
   if (type0_font) {
-    bool is_two_byte_cid = false;
-    const std::string& cmap_name = type0_font->encoding_cmap.name;
-    if (cmap_name.find("Identity") != std::string::npos ||
-        cmap_name.find("UTF16") != std::string::npos ||
-        cmap_name.find("UCS2") != std::string::npos ||
-        cmap_name.find("UniJIS") != std::string::npos ||
-        cmap_name.find("UniGB") != std::string::npos ||
-        cmap_name.find("UniKS") != std::string::npos ||
-        cmap_name.find("UniCNS") != std::string::npos ||
-        type0_font->ordering == "Japan1" ||
-        type0_font->ordering == "GB1" ||
-        type0_font->ordering == "CNS1" ||
-        type0_font->ordering == "Korea1") {
-      is_two_byte_cid = true;
-    }
-    bool is_vertical = (cmap_name.size() >= 2 &&
-                        cmap_name.substr(cmap_name.size() - 2) == "-V");
-    if (is_vertical) {
+    if (type0_font->is_vertical) {
       return calculate_vertical_advance(text, font_size);
     }
 
@@ -2724,7 +2609,7 @@ float ThorVGBackend::calculate_text_advance_draw_model(const std::string& text,
     for (size_t i = 0; i < text.length();) {
       uint32_t char_code;
       size_t bytes_consumed = 1;
-      if (is_two_byte_cid && i + 1 < text.length()) {
+      if (type0_font->is_two_byte_cid && i + 1 < text.length()) {
         uint8_t high_byte = static_cast<unsigned char>(text[i]);
         uint8_t low_byte = static_cast<unsigned char>(text[i + 1]);
         char_code = (static_cast<uint32_t>(high_byte) << 8) | low_byte;
@@ -2803,22 +2688,7 @@ float ThorVGBackend::calculate_vertical_advance(const std::string& text, float f
   auto* type0_font = as_type0_font(current_font_);
   if (!type0_font) return text.length() * font_size;  // fallback
 
-  // Determine if the CMap uses two-byte encoding (same logic as calculate_text_width)
-  bool is_two_byte_cid = false;
-  const std::string& cmap_name = type0_font->encoding_cmap.name;
-  if (cmap_name.find("Identity") != std::string::npos ||
-      cmap_name.find("UTF16") != std::string::npos ||
-      cmap_name.find("UCS2") != std::string::npos ||
-      cmap_name.find("UniJIS") != std::string::npos ||
-      cmap_name.find("UniGB") != std::string::npos ||
-      cmap_name.find("UniKS") != std::string::npos ||
-      cmap_name.find("UniCNS") != std::string::npos ||
-      type0_font->ordering == "Japan1" ||
-      type0_font->ordering == "GB1" ||
-      type0_font->ordering == "CNS1" ||
-      type0_font->ordering == "Korea1") {
-    is_two_byte_cid = true;
-  }
+  bool is_two_byte_cid = type0_font->is_two_byte_cid;
 
   float advance = 0.0f;
   int num_chars = 0;
@@ -4809,8 +4679,9 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     tiles_y = clamp14(tiles_y, 1, 500);
 
     // Compose at internal resolution; final Picture transform rescales.
-    int tiled_w = static_cast<int>(tiles_x * step_ix);
-    int tiled_h = static_cast<int>(tiles_y * step_iy);
+    // Use ceil so fractional steps don't clip the last tile.
+    int tiled_w = static_cast<int>(std::ceil(tiles_x * step_ix));
+    int tiled_h = static_cast<int>(std::ceil(tiles_y * step_iy));
     if (tiled_w < 1) tiled_w = 1;
     if (tiled_h < 1) tiled_h = 1;
 
@@ -4970,39 +4841,75 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     // Tile the pattern (axis-aligned fast path). Offsets use the internal
     // (oversampled) step so tile content preserves sub-pixel detail; a final
     // scale transform downsamples during Picture placement.
-    for (int ty = 0; ty < tiles_y; ++ty) {
-      for (int tx = 0; tx < tiles_x; ++tx) {
-        int offset_x = static_cast<int>(tx * step_ix);
-        int offset_y = static_cast<int>(ty * step_iy);
-
-        for (int py = 0; py < tile_px_h && offset_y + py < tiled_h; ++py) {
-          for (int px = 0; px < tile_px_w && offset_x + px < tiled_w; ++px) {
-            // ThorVG's tile render ends up vertically inverted relative to
-            // page space when consumed as a bitmap picture; flip rows to
-            // preserve the source PDF pattern orientation.
-            size_t src_idx = static_cast<size_t>(tile_px_h - 1 - py) * tile_px_w + px;
-            size_t dst_idx = (offset_y + py) * tiled_w + (offset_x + px);
-
-            // Extract BGRA components from ABGR8888 format pixel
-            uint32_t pixel = rendered_tile[src_idx];
-            uint8_t b_val = static_cast<uint8_t>(pixel & 0xFF);
-            uint8_t g_val = static_cast<uint8_t>((pixel >> 8) & 0xFF);
-            uint8_t r_val = static_cast<uint8_t>((pixel >> 16) & 0xFF);
-            uint8_t a_val = static_cast<uint8_t>((pixel >> 24) & 0xFF);
-
-            if (tiling->paint_type == TilingPaintType::UncoloredTiles) {
-              // For uncolored patterns, use the alpha as a mask and apply current color
-              // Invert: white background with black pattern content
-              uint8_t intensity = static_cast<uint8_t>((255 - ((r_val + g_val + b_val) / 3)));
-              a_val = static_cast<uint8_t>((intensity * pattern_a) / 255);
-              r_val = pattern_r;
-              g_val = pattern_g;
-              b_val = pattern_b;
-            }
-
-            tiled_pixels[dst_idx] = (a_val << 24) | (r_val << 16) | (g_val << 8) | b_val;
-          }
+    //
+    // Accumulate tile positions as floats and fill any sub-pixel gaps between
+    // adjacent tiles by replicating the edge pixel, eliminating visible seams.
+    {
+      float oy_f = 0.0f;
+      auto process_tile_pixel = [&](uint32_t raw_pixel, uint8_t& r, uint8_t& g,
+                                      uint8_t& b, uint8_t& a) {
+        r = static_cast<uint8_t>((raw_pixel >> 16) & 0xFF);
+        g = static_cast<uint8_t>((raw_pixel >> 8) & 0xFF);
+        b = static_cast<uint8_t>(raw_pixel & 0xFF);
+        a = static_cast<uint8_t>((raw_pixel >> 24) & 0xFF);
+        if (tiling->paint_type == TilingPaintType::UncoloredTiles) {
+          uint8_t intensity = static_cast<uint8_t>((255 - ((r + g + b) / 3)));
+          a = static_cast<uint8_t>((intensity * pattern_a) / 255);
+          r = pattern_r; g = pattern_g; b = pattern_b;
         }
+      };
+
+      for (int ty = 0; ty < tiles_y; ++ty) {
+        int oy = static_cast<int>(oy_f);
+        float ox_f = 0.0f;
+        for (int tx = 0; tx < tiles_x; ++tx) {
+          int ox = static_cast<int>(ox_f);
+
+          // Copy tile pixels into the tiled bitmap.
+          for (int py = 0; py < tile_px_h && oy + py < tiled_h; ++py) {
+            for (int px = 0; px < tile_px_w && ox + px < tiled_w; ++px) {
+              // Tile render is vertically inverted relative to page space;
+              // flip rows to preserve the source PDF pattern orientation.
+              size_t src_idx =
+                  static_cast<size_t>(tile_px_h - 1 - py) * tile_px_w + px;
+              size_t dst_idx =
+                  static_cast<size_t>(oy + py) * tiled_w + (ox + px);
+
+              uint32_t pixel = rendered_tile[src_idx];
+              uint8_t rv, gv, bv, av;
+              process_tile_pixel(pixel, rv, gv, bv, av);
+              tiled_pixels[dst_idx] =
+                  (static_cast<uint32_t>(av) << 24) |
+                  (static_cast<uint32_t>(rv) << 16) |
+                  (static_cast<uint32_t>(gv) << 8) | bv;
+            }
+          }
+
+          // Fill sub-pixel gap to next tile by replicating the edge column.
+          float next_ox_f = ox_f + step_ix;
+          int next_ox = static_cast<int>(next_ox_f);
+          int gap_start = ox + tile_px_w;
+          if (next_ox > gap_start) {
+            int fill_end = (next_ox < tiled_w) ? next_ox : tiled_w;
+            for (int gx = gap_start; gx < fill_end; ++gx) {
+              for (int gy = 0; gy < tile_px_h && oy + gy < tiled_h; ++gy) {
+                size_t src_idx =
+                    static_cast<size_t>(tile_px_h - 1 - gy) * tile_px_w +
+                    (tile_px_w - 1);
+                size_t dst_idx = static_cast<size_t>(oy + gy) * tiled_w + gx;
+                uint8_t rv, gv, bv, av;
+                process_tile_pixel(rendered_tile[src_idx], rv, gv, bv, av);
+                tiled_pixels[dst_idx] =
+                    (static_cast<uint32_t>(av) << 24) |
+                    (static_cast<uint32_t>(rv) << 16) |
+                    (static_cast<uint32_t>(gv) << 8) | bv;
+              }
+            }
+          }
+
+          ox_f = next_ox_f;
+        }
+        oy_f += step_iy;
       }
     }
 
@@ -7309,7 +7216,7 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         }
       } else if (token == "Ts") {  // Set text rise
         if (operands.size() >= 1) {
-          state_.text_rise = static_cast<int>(nanopdf::stof_or(operands[0]));
+          state_.text_rise = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "Tr") {  // Set text rendering mode
         // 0 = Fill, 1 = Stroke, 2 = Fill+Stroke, 3 = Invisible
@@ -7386,12 +7293,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                    state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a);
 
           // Detect vertical writing mode for text matrix advancement
-          bool is_vertical = false;
           auto* type0_font = as_type0_font(current_font_);
-          if (type0_font) {
-            const auto& cn = type0_font->encoding_cmap.name;
-            is_vertical = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
-          }
+          bool is_vertical = type0_font ? type0_font->is_vertical : false;
 
           if (is_vertical) {
             // Vertical: advance along y axis (c/d components of text matrix)
@@ -7411,12 +7314,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
         // TJ takes an array of strings and positioning adjustments
         if (state_.in_text_block) {
           // Detect vertical writing mode once for the entire TJ array
-          bool is_vertical_tj = false;
           auto* type0_font_tj = as_type0_font(current_font_);
-          if (type0_font_tj) {
-            const auto& cn = type0_font_tj->encoding_cmap.name;
-            is_vertical_tj = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
-          }
+          bool is_vertical_tj = type0_font_tj ? type0_font_tj->is_vertical : false;
 
           for (const auto& item : operands) {
             if (!item.empty() && (item[0] == '(' || item[0] == '<')) {
@@ -7538,12 +7437,8 @@ bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) 
                    state_.fill_r, state_.fill_g, state_.fill_b, state_.fill_a);
 
           // Advance text matrix (same as Tj)
-          bool is_vertical_q = false;
           auto* type0_font_q = as_type0_font(current_font_);
-          if (type0_font_q) {
-            const auto& cn = type0_font_q->encoding_cmap.name;
-            is_vertical_q = (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V");
-          }
+          bool is_vertical_q = type0_font_q ? type0_font_q->is_vertical : false;
 
           if (is_vertical_q) {
             float text_advance = calculate_vertical_advance(text, state_.font_size);

@@ -188,7 +188,7 @@ private:
     float char_spacing{0.0f};        // Tc - character spacing
     float word_spacing{0.0f};        // Tw - word spacing
     float horiz_scaling{100.0f};     // Tz - horizontal scaling (percentage)
-    int text_rise{0};                // Ts - text rise (baseline shift)
+    float text_rise{0.0f};           // Ts - text rise (baseline shift)
     int text_render_mode{0};         // Tr - text rendering mode (0-7)
 
     // Transformation matrix [a b c d e f]

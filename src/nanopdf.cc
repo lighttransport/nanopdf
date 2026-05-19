@@ -8612,6 +8612,29 @@ std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& fon
     parse_cmap_value(pdf, encoding_it->second, &font->encoding_cmap);
   }
 
+  // Pre-compute two-byte CID and vertical flags from CMap name
+  {
+    const std::string& cn = font->encoding_cmap.name;
+    if (cn.find("Identity") != std::string::npos ||
+        cn.find("UTF16") != std::string::npos ||
+        cn.find("UCS2") != std::string::npos ||
+        cn.find("UniJIS") != std::string::npos ||
+        cn.find("UniGB") != std::string::npos ||
+        cn.find("UniKS") != std::string::npos ||
+        cn.find("UniCNS") != std::string::npos) {
+      font->is_two_byte_cid = true;
+    }
+    if (cn.size() >= 2 && cn.substr(cn.size() - 2) == "-V") {
+      font->is_vertical = true;
+    }
+    if (!font->is_two_byte_cid) {
+      const std::string& o = font->ordering;
+      if (o == "Japan1" || o == "GB1" || o == "CNS1" || o == "Korea1") {
+        font->is_two_byte_cid = true;
+      }
+    }
+  }
+
   auto tounicode_it = font_dict.find("ToUnicode");
   if (tounicode_it != font_dict.end()) {
     parse_cmap_value(pdf, tounicode_it->second, &font->to_unicode_cmap);

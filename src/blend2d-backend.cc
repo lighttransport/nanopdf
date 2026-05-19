@@ -5,6 +5,7 @@
 
 #include "blend2d-backend.hh"
 #include "font-unicode-map.hh"
+#include "shared-font-cache.hh"
 #include "nanopdf-log.hh"
 #include "string-parse.hh"
 
@@ -168,58 +169,7 @@ static size_t count_render_objects_impl(std::string_view content) {
   return count;
 }
 
-// Helper function to convert glyph name to Unicode codepoint
-static uint32_t glyph_name_to_unicode(const std::string& name) {
-  // Standard glyph names mapping (subset)
-  static const std::map<std::string, uint32_t> glyph_map = {
-    {"space", 0x0020}, {"exclam", 0x0021}, {"quotedbl", 0x0022},
-    {"numbersign", 0x0023}, {"dollar", 0x0024}, {"percent", 0x0025},
-    {"ampersand", 0x0026}, {"quotesingle", 0x0027}, {"parenleft", 0x0028},
-    {"parenright", 0x0029}, {"asterisk", 0x002A}, {"plus", 0x002B},
-    {"comma", 0x002C}, {"hyphen", 0x002D}, {"period", 0x002E},
-    {"slash", 0x002F}, {"zero", 0x0030}, {"one", 0x0031},
-    {"two", 0x0032}, {"three", 0x0033}, {"four", 0x0034},
-    {"five", 0x0035}, {"six", 0x0036}, {"seven", 0x0037},
-    {"eight", 0x0038}, {"nine", 0x0039}, {"colon", 0x003A},
-    {"semicolon", 0x003B}, {"less", 0x003C}, {"equal", 0x003D},
-    {"greater", 0x003E}, {"question", 0x003F}, {"at", 0x0040},
-    // Uppercase letters
-    {"A", 0x0041}, {"B", 0x0042}, {"C", 0x0043}, {"D", 0x0044},
-    {"E", 0x0045}, {"F", 0x0046}, {"G", 0x0047}, {"H", 0x0048},
-    {"I", 0x0049}, {"J", 0x004A}, {"K", 0x004B}, {"L", 0x004C},
-    {"M", 0x004D}, {"N", 0x004E}, {"O", 0x004F}, {"P", 0x0050},
-    {"Q", 0x0051}, {"R", 0x0052}, {"S", 0x0053}, {"T", 0x0054},
-    {"U", 0x0055}, {"V", 0x0056}, {"W", 0x0057}, {"X", 0x0058},
-    {"Y", 0x0059}, {"Z", 0x005A},
-    // Lowercase letters
-    {"a", 0x0061}, {"b", 0x0062}, {"c", 0x0063}, {"d", 0x0064},
-    {"e", 0x0065}, {"f", 0x0066}, {"g", 0x0067}, {"h", 0x0068},
-    {"i", 0x0069}, {"j", 0x006A}, {"k", 0x006B}, {"l", 0x006C},
-    {"m", 0x006D}, {"n", 0x006E}, {"o", 0x006F}, {"p", 0x0070},
-    {"q", 0x0071}, {"r", 0x0072}, {"s", 0x0073}, {"t", 0x0074},
-    {"u", 0x0075}, {"v", 0x0076}, {"w", 0x0077}, {"x", 0x0078},
-    {"y", 0x0079}, {"z", 0x007A},
-  };
-
-  auto it = glyph_map.find(name);
-  if (it != glyph_map.end()) {
-    return it->second;
-  }
-
-  // Try uniXXXX format
-  if (name.length() == 7 && name.substr(0, 3) == "uni") {
-    uint32_t cp = 0;
-    if (parse_hex_uint(name.substr(3), &cp)) return cp;
-    return 0;
-  }
-
-  // Single character name
-  if (name.length() == 1) {
-    return static_cast<uint32_t>(name[0]);
-  }
-
-  return 0;
-}
+// glyph_name_to_unicode is now in font-unicode-map.hh (shared, sorted-array+bsearch)
 
 // WinAnsiEncoding to Unicode mapping table
 static const uint16_t kWinAnsiEncoding[256] = {
@@ -656,7 +606,7 @@ static uint32_t map_char_to_unicode(uint32_t char_code, const BaseFont* font) {
 // Check if font uses two-byte CID encoding. Thin wrapper over the shared
 // helper so existing call sites keep the familiar name.
 static bool is_two_byte_cid_font(const Type0Font* type0_font) {
-  return is_type0_two_byte_cid(type0_font);
+  return type0_font ? type0_font->is_two_byte_cid : false;
 }
 
 // ICC Profile parsing helpers
@@ -1564,6 +1514,25 @@ bool Blend2DBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     return true;
   }
 
+  // Shared font cache: avoid re-loading and re-decoding font data when the
+  // same Pdf font is loaded by a different backend or a second page pass.
+  {
+    SharedFontEntry shared;
+    if (SharedFontCache::instance().find(&pdf, font_name, shared)) {
+      FontCache& cache = font_cache_[font_name];
+      cache.font_data = std::move(shared.font_data);
+      int font_offset = 0;
+      if (cache.font_data.size() > 4) {
+        font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
+        if (font_offset < 0) font_offset = 0;
+      }
+      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+        cache.initialized = true;
+        return true;
+      }
+    }
+  }
+
   // For Type0 fonts, check descendant font's descriptor for embedded font
   const FontDescriptor* desc = nullptr;
   auto* type0_font = as_type0_font(font);
@@ -1623,6 +1592,15 @@ bool Blend2DBackend::load_font(const Pdf& pdf, const std::string& font_name, con
         }
         if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
           cache.initialized = true;
+
+          // Share with other backends / page passes.
+          SharedFontCache::instance().store(&pdf, font_name, {
+            cache.font_data,  // copy
+            true,             // is_embedded (Blend2D doesn't track this, but LightVG/ThorVG do)
+            false,            // has_ttf_parse
+            {}                // cid_to_gid (Blend2D doesn't use this)
+          });
+
           return true;
         }
       }
@@ -3346,7 +3324,7 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
                                     pixels.data(), raster_w * 4);
 
       // Blit to context at the correct position
-      ctx_.blit_image(BLPointI(static_cast<int>(x), static_cast<int>(y)), shading_img);
+      ctx_.blit_image(BLPoint(x, y), shading_img);
       return true;
     }
 
@@ -3459,7 +3437,7 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     mesh_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
                                bitmap.data(), bmp_width * 4);
 
-    ctx_.blit_image(BLPointI(static_cast<int>(x), static_cast<int>(y)), mesh_img);
+    ctx_.blit_image(BLPoint(x, y), mesh_img);
     return true;
   }
   else if (shading->type == ShadingType::CoonsPatchMesh ||
@@ -3569,7 +3547,7 @@ bool Blend2DBackend::draw_shading(const std::string& shading_name) {
     mesh_img.create_from_data(bmp_width, bmp_height, BL_FORMAT_PRGB32,
                                bitmap.data(), bmp_width * 4);
 
-    ctx_.blit_image(BLPointI(static_cast<int>(x), static_cast<int>(y)), mesh_img);
+    ctx_.blit_image(BLPoint(x, y), mesh_img);
     return true;
   }
 
@@ -4557,7 +4535,7 @@ bool Blend2DBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       } else if (token == "Ts") {
         if (operands.size() >= 1) {
-          state_.text_rise = static_cast<int>(nanopdf::stof_or(operands[0]));
+          state_.text_rise = nanopdf::stof_or(operands[0]);
         }
       } else if (token == "Tr") {
         if (operands.size() >= 1) {

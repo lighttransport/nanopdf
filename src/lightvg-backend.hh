@@ -221,14 +221,41 @@ private:
     ttf_font_t ttf{};                 // Zero-init POD; only read when has_ttf_parse is true
   };
 
-  // Glyph bitmap cache key: font_name + glyph_id + quantized_size
+  // Glyph outline cache key: font_name + glyph_id.
+  // Caches decomposed vector outlines so rotated/stroked/clipped text
+  // reuses the outline without re-parsing the sfnt tables.
+  struct GlyphOutlineKey {
+    std::string font_name;
+    int glyph_id;
+    bool operator==(const GlyphOutlineKey& o) const {
+      return font_name == o.font_name && glyph_id == o.glyph_id;
+    }
+  };
+
+  struct GlyphOutlineKeyHash {
+    size_t operator()(const GlyphOutlineKey& k) const {
+      size_t h = std::hash<std::string>{}(k.font_name);
+      h ^= std::hash<int>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+
+  // Stores a deep-copied ttf_outline_t for the glyph outline cache.
+  struct GlyphOutlineEntry {
+    std::vector<ttf_point_t> points;
+    std::vector<int> contour_ends;
+    int16_t x_min{0}, y_min{0}, x_max{0}, y_max{0};
+  };
+
+  // Glyph bitmap cache key: font_name + glyph_id + quantized_size + lcd flag
   struct GlyphBitmapKey {
     std::string font_name;
     int glyph_id;
     uint16_t size_q;  // size * 4, quantized to quarter-pixel
+    bool lcd{false};  // LCD subpixel mode
     bool operator==(const GlyphBitmapKey& o) const {
       return font_name == o.font_name && glyph_id == o.glyph_id &&
-             size_q == o.size_q;
+             size_q == o.size_q && lcd == o.lcd;
     }
   };
 
@@ -237,19 +264,27 @@ private:
       size_t h = std::hash<std::string>{}(k.font_name);
       h ^= std::hash<int>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
       h ^= std::hash<uint16_t>{}(k.size_q) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<bool>{}(k.lcd) + 0x9e3779b9 + (h << 6) + (h >> 2);
       return h;
     }
   };
 
   struct GlyphBitmapEntry {
-    std::vector<uint8_t> bitmap;  // grayscale alpha
+    std::vector<uint8_t> bitmap;  // grayscale alpha (or 3x oversampled for LCD)
     int width{0}, height{0};
     float xoff{0.0f}, yoff{0.0f};  // offset from glyph origin (float for 2x precision)
+    bool is_lcd{false};  // true when bitmap holds 3x oversampled LCD data
+    int lcd_scale{1};    // oversample factor (1 for grayscale, 3 for LCD)
   };
 
   // Draw an outlined "tofu" box placeholder for a missing glyph
   bool draw_missing_glyph_placeholder(float x, float y, float size,
                                       uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+
+  // Try to render a missing glyph using fallback fonts (FontProvider).
+  // Returns true if any fallback font successfully rendered the glyph.
+  bool try_draw_glyph_fallback(int codepoint, float x, float y, float size,
+                               uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
   // Draw a single glyph using stb_truetype outlines (by Unicode codepoint)
   bool draw_glyph(int codepoint, float x, float y, float size,
@@ -346,13 +381,21 @@ private:
   uint32_t width_{0};
   uint32_t height_{0};
   bool antialias_{true};
+  bool enable_lcd_{false};
   bool initialized_{false};
   GraphicsState state_;
 
   // Font cache - maps font names to loaded font data
   std::map<std::string, FontCache> font_cache_;
 
+  // Glyph outline vector cache for rotated/stroked/clipped text.
+  // Avoids re-parsing sfnt tables and re-decomposing outlines per frame.
+  std::unordered_map<GlyphOutlineKey, GlyphOutlineEntry, GlyphOutlineKeyHash>
+      glyph_outline_cache_;
+  static constexpr size_t kMaxGlyphOutlineCacheEntries = 2048;
+
   // Glyph bitmap cache for stb_truetype bitmap rasterizer
+  // Single-entry eviction when full replaces the old full-clear strategy.
   std::unordered_map<GlyphBitmapKey, GlyphBitmapEntry, GlyphBitmapKeyHash>
       glyph_bitmap_cache_;
   static constexpr size_t kMaxGlyphCacheEntries = 4096;
@@ -396,6 +439,11 @@ private:
   // apply_soft_mask_opacity() so each masked paint shares one allocation.
   // Cleared via cache-key mismatch when the underlying soft_mask_data changes.
   std::shared_ptr<const lvg::SoftMaskData> current_soft_mask_;
+
+  // After draw_image() completes, holds the ARGB pixel buffer so the caller
+  // can store it in the render cache. Only filled when the image came from a
+  // named XObject (obj_num != 0). Cleared once consumed.
+  std::vector<uint32_t> last_image_argb_;
 };
 
 }  // namespace nanopdf
