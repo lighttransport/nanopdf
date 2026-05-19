@@ -115,7 +115,18 @@ public:
 
   // Render page with options (handles DPI scaling)
   Blend2DRenderResult render_page(const Pdf& pdf, const Page& page, const RenderOptions& options);
-  
+
+  // Render cache statistics for profiling.
+  struct CacheStats {
+    size_t hits{0};
+    size_t misses{0};
+    size_t evictions{0};
+    size_t entries{0};
+    size_t bytes_used{0};
+    size_t max_size{0};
+  };
+  CacheStats get_cache_stats() const;
+
   // Calculate text width using font metrics (returns width in text space units)
   float calculate_text_width(const std::string& text, float font_size);
 

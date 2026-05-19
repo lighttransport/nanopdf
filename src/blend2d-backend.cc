@@ -1111,6 +1111,18 @@ Blend2DRenderResult Blend2DBackend::get_buffer() {
   return result;
 }
 
+Blend2DBackend::CacheStats Blend2DBackend::get_cache_stats() const {
+  CacheStats stats;
+  auto rc = RenderCache::instance().stats();
+  stats.hits = rc.hits;
+  stats.misses = rc.misses;
+  stats.evictions = rc.evictions;
+  stats.entries = rc.entries;
+  stats.bytes_used = rc.bytes_used;
+  stats.max_size = RenderCache::instance().max_size();
+  return stats;
+}
+
 bool Blend2DBackend::save_to_png(const std::string& filename) {
   RenderOptions options;
   options.format = RenderOptions::Format::PNG;

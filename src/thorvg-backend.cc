@@ -5745,6 +5745,18 @@ ThorVGRenderResult ThorVGBackend::get_buffer() {
   return result;
 }
 
+ThorVGBackend::CacheStats ThorVGBackend::get_cache_stats() const {
+  CacheStats stats;
+  auto rc = RenderCache::instance().stats();
+  stats.hits = rc.hits;
+  stats.misses = rc.misses;
+  stats.evictions = rc.evictions;
+  stats.entries = rc.entries;
+  stats.bytes_used = rc.bytes_used;
+  stats.max_size = RenderCache::instance().max_size();
+  return stats;
+}
+
 bool ThorVGBackend::save_to_png(const std::string& filename) {
   ThorVGRenderOptions options;
   options.format = ThorVGRenderOptions::Format::PNG;

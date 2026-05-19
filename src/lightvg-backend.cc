@@ -6293,6 +6293,18 @@ LightVGRenderResult LightVGBackend::get_buffer() {
   return result;
 }
 
+LightVGBackend::CacheStats LightVGBackend::get_cache_stats() const {
+  CacheStats stats;
+  auto rc = RenderCache::instance().stats();
+  stats.hits = rc.hits;
+  stats.misses = rc.misses;
+  stats.evictions = rc.evictions;
+  stats.entries = rc.entries;
+  stats.bytes_used = rc.bytes_used;
+  stats.max_size = RenderCache::instance().max_size();
+  return stats;
+}
+
 bool LightVGBackend::save_to_png(const std::string& filename) {
   LightVGRenderOptions options;
   options.format = LightVGRenderOptions::Format::PNG;

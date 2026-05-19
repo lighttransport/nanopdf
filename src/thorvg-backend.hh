@@ -94,6 +94,17 @@ public:
   ThorVGRenderResult render_page(const Pdf& pdf, const Page& page,
                                  const ThorVGRenderOptions& options) override;
 
+  // Render cache statistics for profiling.
+  struct CacheStats {
+    size_t hits{0};
+    size_t misses{0};
+    size_t evictions{0};
+    size_t entries{0};
+    size_t bytes_used{0};
+    size_t max_size{0};
+  };
+  CacheStats get_cache_stats() const;
+
 private:
   // Parse PDF content stream and convert to ThorVG shapes
   bool parse_pdf_content(const std::vector<uint8_t>& content_data);
