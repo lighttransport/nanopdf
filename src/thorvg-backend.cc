@@ -4580,97 +4580,129 @@ bool ThorVGBackend::apply_tiling_pattern(tvg::Shape* shape, const TilingPattern*
     if (tile_px_w < 1) tile_px_w = 1;
     if (tile_px_h < 1) tile_px_h = 1;
 
-    // Create temporary canvas for rendering the tile
-    std::vector<uint32_t> tile_buffer(tile_px_w * tile_px_h, 0);
+    // Try render cache first — same (content, dimensions, paint_type) produces
+    // identical tile pixels regardless of which page or fill shape uses it.
+    uint64_t content_hash = fnv1a64(tiling->content_stream.data(),
+                                    tiling->content_stream.size());
+    int paint_type_int = static_cast<int>(tiling->paint_type);
+    uintptr_t ptr_key = reinterpret_cast<uintptr_t>(tiling);
+    std::string cache_key = "tile:" + std::to_string(ptr_key) + ":" +
+                            std::to_string(content_hash) + ":" +
+                            std::to_string(tile_px_w) + "x" +
+                            std::to_string(tile_px_h) + ":" +
+                            std::to_string(paint_type_int);
 
-    // Initialize with transparent (for colored) or white (for uncolored)
-    if (tiling->paint_type == TilingPaintType::ColoredTiles) {
-      // Transparent background for colored patterns (ARGB = 0x00000000)
-      std::fill(tile_buffer.begin(), tile_buffer.end(), 0);
+    std::vector<uint32_t> rendered_tile;
+    RenderCacheEntry cached;
+    if (RenderCache::instance().find(cache_key, cached) &&
+        cached.width == static_cast<uint32_t>(tile_px_w) &&
+        cached.height == static_cast<uint32_t>(tile_px_h)) {
+      // Cache hit — reconstruct pixel buffer from cached bytes.
+      size_t n = static_cast<size_t>(tile_px_w) * static_cast<size_t>(tile_px_h);
+      rendered_tile.resize(n);
+      memcpy(rendered_tile.data(), cached.data.data(), n * sizeof(uint32_t));
     } else {
-      // For uncolored, we'll apply color after rendering (ARGB = 0xFFFFFFFF = white)
-      std::fill(tile_buffer.begin(), tile_buffer.end(), 0xFFFFFFFF);
-    }
+      // Cache miss — render the tile sub-scene.
+      std::vector<uint32_t> tile_buffer(tile_px_w * tile_px_h, 0);
 
-    tvg::SwCanvas* tile_canvas = tvg::SwCanvas::gen();
-    if (!tile_canvas) {
-      goto fallback;
-    }
+      // Initialize with transparent (for colored) or white (for uncolored)
+      if (tiling->paint_type == TilingPaintType::ColoredTiles) {
+        std::fill(tile_buffer.begin(), tile_buffer.end(), 0);
+      } else {
+        std::fill(tile_buffer.begin(), tile_buffer.end(), 0xFFFFFFFF);
+      }
 
-    if (tile_canvas->target(tile_buffer.data(),
-                            tile_px_w, tile_px_w, tile_px_h,
-                            tvg::ColorSpace::ABGR8888) != tvg::Result::Success) {
+      tvg::SwCanvas* tile_canvas = tvg::SwCanvas::gen();
+      if (!tile_canvas) {
+        goto fallback;
+      }
+
+      if (tile_canvas->target(tile_buffer.data(),
+                              tile_px_w, tile_px_w, tile_px_h,
+                              tvg::ColorSpace::ABGR8888) != tvg::Result::Success) {
+        delete tile_canvas;
+        goto fallback;
+      }
+
+      tvg::Scene* tile_scene = tvg::Scene::gen();
+      if (!tile_scene) {
+        delete tile_canvas;
+        goto fallback;
+      }
+
+      // Save current state
+      tvg::SwCanvas* saved_canvas = canvas_;
+      tvg::Scene* saved_scene = scene_;
+      std::vector<uint32_t> saved_buffer = std::move(buffer_);
+      uint32_t saved_width = width_;
+      uint32_t saved_height = height_;
+      GraphicsState saved_state = state_;
+
+      // Switch to tile canvas
+      canvas_ = tile_canvas;
+      scene_ = tile_scene;
+      buffer_ = std::move(tile_buffer);
+      width_ = tile_px_w;
+      height_ = tile_px_h;
+
+      // Reset graphics state for tile rendering. Use the geometric mean of
+      // per-axis scales so the pattern cell maps to the tile buffer without
+      // having to handle per-axis scaling in the inner content renderer.
+      state_ = GraphicsState();
+      state_.page_width = tile_width;
+      state_.page_height = tile_height;
+      // Tile canvas scale matches the internal (oversampled) resolution so that
+      // pattern content drawn inside has proper detail. When placed on the main
+      // canvas the tile is downsampled via Picture transform.
+      state_.scale = std::sqrt(internal_scale_x * internal_scale_y);
+
+      // Push pattern resources if available
+      if (!tiling->resources.empty()) {
+        form_resources_stack_.push_back(tiling->resources);
+      }
+
+      // Parse and render the tile content
+      bool progress_enabled = progress_.enabled;
+      progress_.enabled = false;
+      parse_pdf_content(tiling->content_stream);
+      progress_.enabled = progress_enabled;
+
+      // Pop pattern resources
+      if (!tiling->resources.empty() && !form_resources_stack_.empty()) {
+        form_resources_stack_.pop_back();
+      }
+
+      // Finalize tile rendering
+      if (tile_canvas->add(tile_scene) == tvg::Result::Success) {
+        tile_canvas->draw(true);
+        tile_canvas->sync();
+      }
+
+      // Get the rendered tile pixels
+      rendered_tile = std::move(buffer_);
+
+      // Clean up tile canvas
       delete tile_canvas;
-      goto fallback;
+
+      // Restore original state
+      canvas_ = saved_canvas;
+      scene_ = saved_scene;
+      buffer_ = std::move(saved_buffer);
+      width_ = saved_width;
+      height_ = saved_height;
+      state_ = saved_state;
+
+      // Store rendered tile in render cache for reuse across pages/shapes.
+      if (!rendered_tile.empty()) {
+        size_t px = static_cast<size_t>(tile_px_w) * static_cast<size_t>(tile_px_h);
+        RenderCacheEntry entry;
+        entry.width = static_cast<uint32_t>(tile_px_w);
+        entry.height = static_cast<uint32_t>(tile_px_h);
+        entry.data.resize(px * sizeof(uint32_t));
+        memcpy(entry.data.data(), rendered_tile.data(), px * sizeof(uint32_t));
+        RenderCache::instance().store(cache_key, std::move(entry));
+      }
     }
-
-    tvg::Scene* tile_scene = tvg::Scene::gen();
-    if (!tile_scene) {
-      delete tile_canvas;
-      goto fallback;
-    }
-
-    // Save current state
-    tvg::SwCanvas* saved_canvas = canvas_;
-    tvg::Scene* saved_scene = scene_;
-    std::vector<uint32_t> saved_buffer = std::move(buffer_);
-    uint32_t saved_width = width_;
-    uint32_t saved_height = height_;
-    GraphicsState saved_state = state_;
-
-    // Switch to tile canvas
-    canvas_ = tile_canvas;
-    scene_ = tile_scene;
-    buffer_ = std::move(tile_buffer);
-    width_ = tile_px_w;
-    height_ = tile_px_h;
-
-    // Reset graphics state for tile rendering. Use the geometric mean of
-    // per-axis scales so the pattern cell maps to the tile buffer without
-    // having to handle per-axis scaling in the inner content renderer.
-    state_ = GraphicsState();
-    state_.page_width = tile_width;
-    state_.page_height = tile_height;
-    // Tile canvas scale matches the internal (oversampled) resolution so that
-    // pattern content drawn inside has proper detail. When placed on the main
-    // canvas the tile is downsampled via Picture transform.
-    state_.scale = std::sqrt(internal_scale_x * internal_scale_y);
-
-    // Push pattern resources if available
-    if (!tiling->resources.empty()) {
-      form_resources_stack_.push_back(tiling->resources);
-    }
-
-    // Parse and render the tile content
-    bool progress_enabled = progress_.enabled;
-    progress_.enabled = false;
-    parse_pdf_content(tiling->content_stream);
-    progress_.enabled = progress_enabled;
-
-    // Pop pattern resources
-    if (!tiling->resources.empty() && !form_resources_stack_.empty()) {
-      form_resources_stack_.pop_back();
-    }
-
-    // Finalize tile rendering
-    if (tile_canvas->add(tile_scene) == tvg::Result::Success) {
-      tile_canvas->draw(true);
-      tile_canvas->sync();
-    }
-
-    // Get the rendered tile pixels
-    std::vector<uint32_t> rendered_tile = std::move(buffer_);
-
-    // Clean up tile canvas
-    delete tile_canvas;
-
-    // Restore original state
-    canvas_ = saved_canvas;
-    scene_ = saved_scene;
-    buffer_ = std::move(saved_buffer);
-    width_ = saved_width;
-    height_ = saved_height;
-    state_ = saved_state;
 
     // Now create a tiled bitmap covering the target area
     // Get shape bounds
