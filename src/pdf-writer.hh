@@ -955,6 +955,12 @@ class PageBuilder {
   // Image drawing
   void draw_image(const std::string& name, double x, double y, double w, double h);
 
+  // Raw content / custom resources
+  void append_raw(const std::string& raw_content);
+  void add_resource_ref(const std::string& category,
+                        const std::string& name,
+                        int obj_id);
+
   // Text
   void begin_text();
   void end_text();
@@ -987,6 +993,13 @@ class PageBuilder {
   double current_fill_alpha_ = 1.0;
   double current_stroke_alpha_ = 1.0;
   BlendMode current_blend_mode_ = BlendMode::Normal;
+
+  struct CustomResourceRef {
+    std::string category;
+    std::string name;
+    int obj_id = 0;
+  };
+  std::vector<CustomResourceRef> custom_resources_;
 
   friend class PdfWriter;  // For accessing links_ and highlights_
 };
@@ -1313,6 +1326,9 @@ class PdfWriter {
   void add_text_markup(int page_index, const TextMarkupConfig& config);
 
   // Page management
+  /// Add a page from a pre-built page builder.
+  void add_page(PageSize size, const PageBuilder& builder);
+
   /// Add a page with custom content builder
   void add_page(PageSize size, std::function<void(PageBuilder&)> build_fn);
 
@@ -1424,6 +1440,15 @@ class PdfWriter {
   /// @return WriteResult indicating success or failure
   static WriteResult apply_redactions(const Pdf& source_pdf,
                                        std::vector<uint8_t>& output);
+
+  // Low-level object authoring
+  /// Add a pre-serialized indirect object body. Returns the object number.
+  int add_raw_object(const std::string& serialized_data);
+
+  /// Add a raw stream object. stream_dict must contain the full stream dictionary.
+  /// Returns the object number.
+  int add_raw_stream_object(const std::string& stream_dict,
+                            const std::vector<uint8_t>& stream_data);
 
   // Output
   /// Write PDF to file

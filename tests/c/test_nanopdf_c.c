@@ -3,6 +3,7 @@
 #include "nanopdf_forms.h"
 #include "nanopdf_parse.h"
 #include "nanopdf_text.h"
+#include "nanopdf_write.h"
 #include "../../src/c/nanopdf_crypto.h"
 #include "../../src/c/nanopdf_image_decoder.h"
 #include "../../src/c/nanopdf_jbig2.h"
@@ -118,6 +119,24 @@ static int has_zero_byte(const uint8_t* data, size_t size) {
 
 static int bytes_equal(const uint8_t* a, const uint8_t* b, size_t size) {
   return memcmp(a, b, size) == 0;
+}
+
+static int buffer_contains_text(
+    const uint8_t* data, size_t size, const char* needle) {
+  size_t needle_size = strlen(needle);
+  size_t i = 0;
+
+  if (!data || !needle || needle_size == 0 || needle_size > size) {
+    return 0;
+  }
+
+  for (i = 0; i + needle_size <= size; ++i) {
+    if (memcmp(data + i, needle, needle_size) == 0) {
+      return 1;
+    }
+  }
+
+  return 0;
 }
 
 typedef struct TestBitBuilder {
@@ -7050,6 +7069,149 @@ static void test_nanopdf_c_recover_stream_length(void) {
   free(pdf);
 }
 
+static void test_nanopdf_c_writer_shapes_and_objects(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_object* form_stream = NULL;
+  nanopdf_object* temp = NULL;
+  nanopdf_object* zero = NULL;
+  nanopdf_object* twelve = NULL;
+  nanopdf_object* bbox = NULL;
+  char* font_name = NULL;
+  char* image_name = NULL;
+  char* extracted_text = NULL;
+  nanopdf_object_ref form_ref = {0, 0, 0};
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  char image_ref_token[64];
+  static const uint8_t k_form_stream_data[] = "0 0 1 rg 0 0 12 12 re f\n";
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_title(writer, "C writer smoke") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_author(writer, "nanopdf-c") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_subject(writer, "vector + object authoring") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_standard_font(
+                 writer, NANOPDF_STANDARD_FONT_HELVETICA, &font_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(font_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_image_from_memory(
+                 writer,
+                 k_jpeg_1x1_red,
+                 sizeof(k_jpeg_1x1_red),
+                 NANOPDF_IMAGE_COMPRESSION_AUTO,
+                 &image_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(image_name != NULL);
+
+  TEST_CHECK(nanopdf_object_create_stream(context, &form_stream) == NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_object_create_name(context, "XObject", &temp) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_dict_set(form_stream, "Type", temp) == NANOPDF_STATUS_OK);
+  nanopdf_object_destroy(temp);
+  temp = NULL;
+
+  TEST_CHECK(nanopdf_object_create_name(context, "Form", &temp) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_dict_set(form_stream, "Subtype", temp) == NANOPDF_STATUS_OK);
+  nanopdf_object_destroy(temp);
+  temp = NULL;
+
+  TEST_CHECK(nanopdf_object_create_array(context, &bbox) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_create_number(context, 0.0, &zero) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_create_number(context, 12.0, &twelve) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_array_append(bbox, zero) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_array_append(bbox, zero) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_array_append(bbox, twelve) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_array_append(bbox, twelve) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_object_dict_set(form_stream, "BBox", bbox) == NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_object_stream_set_data(
+                 form_stream,
+                 k_form_stream_data,
+                 sizeof(k_form_stream_data) - 1) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_object(writer, form_stream, &form_ref) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(form_ref.valid == 1);
+  TEST_CHECK(form_ref.object_number > 0);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 200.0, 200.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_line_width(page, 2.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_stroke_color_rgb(page, 1.0, 0.0, 0.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_rectangle(page, 10.0, 10.0, 40.0, 30.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_stroke(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_fill_color_rgb(page, 0.0, 1.0, 0.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_circle(page, 100.0, 100.0, 20.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_fill(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(page, font_name, 14.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 160.0, "Hello C writer") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_image(page, image_name, 140.0, 140.0, 24.0, 24.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_add_resource_ref(page, "XObject", "Fx1", form_ref) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_append_raw_content(
+                 page, "q 1 0 0 1 60 60 cm /Fx1 Do Q\n") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(pdf_size > 0);
+  snprintf(image_ref_token, sizeof(image_ref_token), "/%s ", image_name);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Form"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Image"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Fx1 "));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, image_ref_token));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Title (C writer smoke)"));
+
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_page_count(document) == 1);
+  TEST_CHECK(nanopdf_page_extract_text(document, 0, &extracted_text) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strstr(extracted_text, "Hello C writer") != NULL);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (extracted_text) {
+    nanopdf_free(context, extracted_text);
+  }
+  if (image_name) {
+    nanopdf_free(context, image_name);
+  }
+  if (font_name) {
+    nanopdf_free(context, font_name);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  nanopdf_object_destroy(form_stream);
+  nanopdf_object_destroy(bbox);
+  nanopdf_object_destroy(zero);
+  nanopdf_object_destroy(twelve);
+  nanopdf_object_destroy(temp);
+  nanopdf_writer_destroy(writer);
+  nanopdf_context_destroy(context);
+}
+
 struct TEST_ENTRY TEST_LIST[] = {
     {"nanopdf_c_smoke", test_nanopdf_c_smoke},
     {"nanopdf_c_native_content_variants", test_nanopdf_c_native_content_variants},
@@ -7087,5 +7249,6 @@ struct TEST_ENTRY TEST_LIST[] = {
     {"nanopdf_c_hybrid_xref", test_nanopdf_c_hybrid_xref},
     {"nanopdf_c_auto_repair", test_nanopdf_c_auto_repair},
     {"nanopdf_c_recover_stream_length", test_nanopdf_c_recover_stream_length},
+    {"nanopdf_c_writer_shapes_and_objects", test_nanopdf_c_writer_shapes_and_objects},
     {NULL, NULL},
 };

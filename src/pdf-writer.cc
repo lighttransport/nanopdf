@@ -1872,6 +1872,24 @@ void PageBuilder::draw_image(const std::string& name, double x, double y,
   restore_state();
 }
 
+void PageBuilder::append_raw(const std::string& raw_content) {
+  content_ += raw_content;
+}
+
+void PageBuilder::add_resource_ref(const std::string& category,
+                                   const std::string& name,
+                                   int obj_id) {
+  if (category.empty() || name.empty() || obj_id <= 0) {
+    return;
+  }
+
+  CustomResourceRef resource;
+  resource.category = category;
+  resource.name = name;
+  resource.obj_id = obj_id;
+  custom_resources_.push_back(std::move(resource));
+}
+
 void PageBuilder::begin_text() { emit("BT\n"); }
 
 void PageBuilder::end_text() { emit("ET\n"); }
@@ -2021,6 +2039,12 @@ struct PdfWriter::Impl {
   };
 
   // Pages
+  struct CustomResourceRef {
+    std::string category;
+    std::string name;
+    int obj_id = 0;
+  };
+
   struct PageData {
     PageSize size;
     std::string content;
@@ -2030,6 +2054,7 @@ struct PdfWriter::Impl {
     std::vector<std::string> used_layers;       // Layer (OCG) resources
     std::vector<std::string> used_patterns;     // Pattern (gradient) resources
     std::vector<std::string> used_templates;    // Template (Form XObject) resources
+    std::vector<CustomResourceRef> custom_resources;
     std::vector<int> annotation_refs;  // Annotation object references for this page
     std::vector<LinkAnnotationData> links;  // Link annotations for this page
     std::vector<HighlightAnnotationData> highlights;  // Highlight annotations for this page
@@ -5097,11 +5122,7 @@ void PdfWriter::mark_chars_used(const std::string& font_name,
   }
 }
 
-void PdfWriter::add_page(PageSize size,
-                         std::function<void(PageBuilder&)> build_fn) {
-  PageBuilder builder(this);
-  build_fn(builder);
-
+void PdfWriter::add_page(PageSize size, const PageBuilder& builder) {
   Impl::PageData page;
   page.size = size;
   page.content = builder.content();
@@ -5180,7 +5201,22 @@ void PdfWriter::add_page(PageSize size,
     page.highlights.push_back(ha);
   }
 
+  for (const auto& resource : builder.custom_resources_) {
+    Impl::CustomResourceRef custom_resource;
+    custom_resource.category = resource.category;
+    custom_resource.name = resource.name;
+    custom_resource.obj_id = resource.obj_id;
+    page.custom_resources.push_back(std::move(custom_resource));
+  }
+
   impl_->pages.push_back(std::move(page));
+}
+
+void PdfWriter::add_page(PageSize size,
+                         std::function<void(PageBuilder&)> build_fn) {
+  PageBuilder builder(this);
+  build_fn(builder);
+  add_page(size, builder);
 }
 
 void PdfWriter::add_image_page(const ImageData& img, PageSize size,
@@ -5527,6 +5563,26 @@ int PdfWriter::import_pages_from(const Pdf& source_pdf,
   }
 
   return imported_count;
+}
+
+int PdfWriter::add_raw_object(const std::string& serialized_data) {
+  Impl::ImportedObject object;
+  object.obj_id = impl_->allocate_obj();
+  object.is_stream = false;
+  object.serialized_data = serialized_data.empty() ? "null" : serialized_data;
+  impl_->imported_objects.push_back(std::move(object));
+  return impl_->imported_objects.back().obj_id;
+}
+
+int PdfWriter::add_raw_stream_object(const std::string& stream_dict,
+                                     const std::vector<uint8_t>& stream_data) {
+  Impl::ImportedObject object;
+  object.obj_id = impl_->allocate_obj();
+  object.is_stream = true;
+  object.stream_dict = stream_dict;
+  object.stream_data = stream_data;
+  impl_->imported_objects.push_back(std::move(object));
+  return impl_->imported_objects.back().obj_id;
 }
 
 WriteResult PdfWriter::split_pages(const Pdf& source_pdf,
@@ -6212,8 +6268,25 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     // Resources
     impl_->output << "/Resources <<\n";
 
+    auto has_custom_category = [&](const std::string& category) {
+      return std::any_of(page.custom_resources.begin(),
+                         page.custom_resources.end(),
+                         [&](const Impl::CustomResourceRef& resource) {
+                           return resource.category == category;
+                         });
+    };
+
+    auto write_custom_category_entries = [&](const std::string& category) {
+      for (const auto& resource : page.custom_resources) {
+        if (resource.category != category) continue;
+        impl_->output << "    /" << resource.name << " "
+                      << resource.obj_id << " 0 R\n";
+      }
+    };
+
     // Image XObjects and Templates
-    if (!page.used_images.empty() || !page.used_templates.empty()) {
+    if (!page.used_images.empty() || !page.used_templates.empty() ||
+        has_custom_category("XObject")) {
       impl_->output << "  /XObject <<\n";
       for (const auto& img_name : page.used_images) {
         std::string ref = impl_->get_image_resource(img_name);
@@ -6229,11 +6302,12 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
           }
         }
       }
+      write_custom_category_entries("XObject");
       impl_->output << "  >>\n";
     }
 
     // Fonts
-    if (!page.used_fonts.empty()) {
+    if (!page.used_fonts.empty() || has_custom_category("Font")) {
       impl_->output << "  /Font <<\n";
       for (const auto& font_name : page.used_fonts) {
         std::string ref = impl_->get_font_resource(font_name);
@@ -6241,11 +6315,12 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
           impl_->output << "    /" << font_name << " " << ref << "\n";
         }
       }
+      write_custom_category_entries("Font");
       impl_->output << "  >>\n";
     }
 
     // ExtGState (for transparency)
-    if (!page.used_extgstates.empty()) {
+    if (!page.used_extgstates.empty() || has_custom_category("ExtGState")) {
       impl_->output << "  /ExtGState <<\n";
       for (const auto& gs_name : page.used_extgstates) {
         for (const auto& gs : impl_->extgstates) {
@@ -6255,11 +6330,12 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
           }
         }
       }
+      write_custom_category_entries("ExtGState");
       impl_->output << "  >>\n";
     }
 
     // Patterns (for gradients)
-    if (!page.used_patterns.empty()) {
+    if (!page.used_patterns.empty() || has_custom_category("Pattern")) {
       impl_->output << "  /Pattern <<\n";
       for (const auto& pat_name : page.used_patterns) {
         for (const auto& grad : impl_->gradients) {
@@ -6269,11 +6345,12 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
           }
         }
       }
+      write_custom_category_entries("Pattern");
       impl_->output << "  >>\n";
     }
 
     // Properties (for layers/OCG)
-    if (!page.used_layers.empty()) {
+    if (!page.used_layers.empty() || has_custom_category("Properties")) {
       impl_->output << "  /Properties <<\n";
       for (const auto& layer_name : page.used_layers) {
         for (const auto& layer : impl_->layers) {
@@ -6283,6 +6360,21 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
           }
         }
       }
+      write_custom_category_entries("Properties");
+      impl_->output << "  >>\n";
+    }
+
+    std::set<std::string> standard_categories = {
+        "XObject", "Font", "ExtGState", "Pattern", "Properties"};
+    std::set<std::string> extra_categories;
+    for (const auto& resource : page.custom_resources) {
+      if (!standard_categories.count(resource.category)) {
+        extra_categories.insert(resource.category);
+      }
+    }
+    for (const auto& category : extra_categories) {
+      impl_->output << "  /" << category << " <<\n";
+      write_custom_category_entries(category);
       impl_->output << "  >>\n";
     }
 

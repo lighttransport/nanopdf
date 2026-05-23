@@ -9,12 +9,15 @@ extern "C" {
 #endif
 
 #define NANOPDF_C_VERSION_MAJOR 0u
-#define NANOPDF_C_VERSION_MINOR 1u
+#define NANOPDF_C_VERSION_MINOR 4u
 #define NANOPDF_C_VERSION_PATCH 0u
 
 typedef struct nanopdf_context nanopdf_context;
 typedef struct nanopdf_document nanopdf_document;
 typedef struct nanopdf_text_layout nanopdf_text_layout;
+typedef struct nanopdf_writer nanopdf_writer;
+typedef struct nanopdf_page_builder nanopdf_page_builder;
+typedef struct nanopdf_object nanopdf_object;
 
 typedef enum nanopdf_status {
   NANOPDF_STATUS_OK = 0,
@@ -46,6 +49,30 @@ typedef enum nanopdf_field_type {
   NANOPDF_FIELD_TYPE_CHOICE = 2,
   NANOPDF_FIELD_TYPE_SIGNATURE = 3
 } nanopdf_field_type;
+
+typedef enum nanopdf_standard_font {
+  NANOPDF_STANDARD_FONT_HELVETICA = 0,
+  NANOPDF_STANDARD_FONT_HELVETICA_BOLD = 1,
+  NANOPDF_STANDARD_FONT_HELVETICA_OBLIQUE = 2,
+  NANOPDF_STANDARD_FONT_HELVETICA_BOLD_OBLIQUE = 3,
+  NANOPDF_STANDARD_FONT_TIMES_ROMAN = 4,
+  NANOPDF_STANDARD_FONT_TIMES_BOLD = 5,
+  NANOPDF_STANDARD_FONT_TIMES_ITALIC = 6,
+  NANOPDF_STANDARD_FONT_TIMES_BOLD_ITALIC = 7,
+  NANOPDF_STANDARD_FONT_COURIER = 8,
+  NANOPDF_STANDARD_FONT_COURIER_BOLD = 9,
+  NANOPDF_STANDARD_FONT_COURIER_OBLIQUE = 10,
+  NANOPDF_STANDARD_FONT_COURIER_BOLD_OBLIQUE = 11,
+  NANOPDF_STANDARD_FONT_SYMBOL = 12,
+  NANOPDF_STANDARD_FONT_ZAPF_DINGBATS = 13
+} nanopdf_standard_font;
+
+typedef enum nanopdf_image_compression {
+  NANOPDF_IMAGE_COMPRESSION_AUTO = 0,
+  NANOPDF_IMAGE_COMPRESSION_FLATE = 1,
+  NANOPDF_IMAGE_COMPRESSION_DCT = 2,
+  NANOPDF_IMAGE_COMPRESSION_CCITT_FAX = 3
+} nanopdf_image_compression;
 
 typedef void* (*nanopdf_alloc_fn)(void* user_data, size_t size);
 typedef void* (*nanopdf_realloc_fn)(void* user_data, void* ptr, size_t size);
@@ -110,6 +137,12 @@ typedef struct nanopdf_form_field_info {
   const char* mapping_name;
   uint32_t flags;
 } nanopdf_form_field_info;
+
+typedef struct nanopdf_object_ref {
+  uint32_t object_number;
+  uint16_t generation;
+  uint8_t valid;
+} nanopdf_object_ref;
 
 #ifdef __cplusplus
 }  /* extern "C" */

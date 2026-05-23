@@ -610,6 +610,7 @@ set(NANOPDF_C_API_HEADERS
   src/c/nanopdf_parse.h
   src/c/nanopdf_text.h
   src/c/nanopdf_forms.h
+  src/c/nanopdf_write.h
 )
 
 set(NANOPDF_C_API_SOURCES
@@ -623,6 +624,7 @@ set(NANOPDF_C_API_SOURCES
   src/c/nanopdf_basic_document.c
   src/c/nanopdf_basic_layout.c
   src/c/nanopdf_c_api.c
+  src/c/nanopdf_write.cc
   src/third_party/miniz.c
 )
 
@@ -649,8 +651,12 @@ endif()
 add_library(nanopdf-c STATIC ${NANOPDF_C_API_SOURCES})
 target_include_directories(nanopdf-c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/c
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/c)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/c
+          ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set_property(TARGET nanopdf-c PROPERTY C_STANDARD 11)
+set_property(TARGET nanopdf-c PROPERTY CXX_STANDARD 17)
+set_property(TARGET nanopdf-c PROPERTY CXX_STANDARD_REQUIRED ON)
+target_link_libraries(nanopdf-c PUBLIC ${BUILD_TARGET})
 if(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
   target_compile_definitions(nanopdf-c PRIVATE NANOPDF_C_USE_CPP_IMAGE_BRIDGE=1)
   foreach(_nanopdf_cxx_option IN LISTS NANOPDF_CXX_OPTIONS)
@@ -663,8 +669,18 @@ if(NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
       "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>")
   endif()
   target_compile_definitions(nanopdf-c PRIVATE ${NANOPDF_CXX_DEFINES})
-  set_property(TARGET nanopdf-c PROPERTY CXX_STANDARD 17)
-  set_property(TARGET nanopdf-c PROPERTY CXX_STANDARD_REQUIRED ON)
+endif()
+if(NOT NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
+  foreach(_nanopdf_cxx_option IN LISTS NANOPDF_CXX_OPTIONS)
+    target_compile_options(nanopdf-c PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${_nanopdf_cxx_option}>")
+  endforeach()
+  if(NOT MSVC)
+    target_compile_options(nanopdf-c PRIVATE
+      "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-function>"
+      "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>"
+      "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>")
+  endif()
+  target_compile_definitions(nanopdf-c PRIVATE ${NANOPDF_CXX_DEFINES})
 endif()
 if(NOT NANOPDF_BUILD_WASM)
   add_sanitizers(nanopdf-c)
@@ -802,6 +818,7 @@ if(NANOPDF_BUILD_TESTS AND NOT NANOPDF_BUILD_WASM)
     ${PROJECT_SOURCE_DIR}/src/c
     ${PROJECT_SOURCE_DIR}/tests)
   set_property(TARGET nanopdf_c_api_smoke PROPERTY C_STANDARD 11)
+  set_property(TARGET nanopdf_c_api_smoke PROPERTY LINKER_LANGUAGE CXX)
   add_sanitizers(nanopdf_c_api_smoke)
   add_test(NAME nanopdf_c_api_smoke COMMAND nanopdf_c_api_smoke)
   set_tests_properties(nanopdf_c_api_smoke PROPERTIES LABELS "unit")
