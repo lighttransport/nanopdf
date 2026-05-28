@@ -63,6 +63,9 @@ public:
                              size_t object_threshold = 100,
                              uint32_t percent_step = 1) override;
   void clear_progress_callback() override;
+  void set_render_result_pixels_enabled(bool enabled) override {
+    result_pixels_enabled_ = enabled;
+  }
 
   BackendKind kind() const override { return BackendKind::LightVG; }
 
@@ -427,6 +430,7 @@ private:
   const Page* current_page_{nullptr};
   RenderProgressConfig progress_config_;
   RenderProgressState progress_;
+  bool result_pixels_enabled_{true};
 
   // Form XObject resource stack for nested Form XObjects
   // Each entry contains resources from a Form XObject

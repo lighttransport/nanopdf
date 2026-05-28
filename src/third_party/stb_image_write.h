@@ -448,6 +448,23 @@ static void stbiw__write_pixel(stbi__write_context *s, int rgb_dir, int comp, in
       stbiw__write1(s, d[comp - 1]);
 }
 
+static inline int stbiw__pixel_diff(const unsigned char *a, const unsigned char *b, int comp)
+{
+   switch (comp) {
+      case 4:
+         return (a[0] != b[0]) | (a[1] != b[1]) |
+                (a[2] != b[2]) | (a[3] != b[3]);
+      case 3:
+         return (a[0] != b[0]) | (a[1] != b[1]) | (a[2] != b[2]);
+      case 2:
+         return (a[0] != b[0]) | (a[1] != b[1]);
+      case 1:
+         return a[0] != b[0];
+      default:
+         return memcmp(a, b, comp);
+   }
+}
+
 static void stbiw__write_pixels(stbi__write_context *s, int rgb_dir, int vdir, int x, int y, int comp, void *data, int write_alpha, int scanline_pad, int expand_mono)
 {
    stbiw_uint32 zero = 0;
@@ -567,11 +584,11 @@ static int stbi_write_tga_core(stbi__write_context *s, int x, int y, int comp, v
 
             if (i < x - 1) {
                ++len;
-               diff = memcmp(begin, row + (i + 1) * comp, comp);
+               diff = stbiw__pixel_diff(begin, row + (i + 1) * comp, comp);
                if (diff) {
                   const unsigned char *prev = begin;
                   for (k = i + 2; k < x && len < 128; ++k) {
-                     if (memcmp(prev, row + k * comp, comp)) {
+                     if (stbiw__pixel_diff(prev, row + k * comp, comp)) {
                         prev += comp;
                         ++len;
                      } else {
@@ -581,7 +598,7 @@ static int stbi_write_tga_core(stbi__write_context *s, int x, int y, int comp, v
                   }
                } else {
                   for (k = i + 2; k < x && len < 128; ++k) {
-                     if (!memcmp(begin, row + k * comp, comp)) {
+                     if (!stbiw__pixel_diff(begin, row + k * comp, comp)) {
                         ++len;
                      } else {
                         break;

@@ -84,6 +84,13 @@ class RenderBackend {
   virtual RenderResult render_page(const Pdf& pdf, const Page& page,
                                    const RenderOptions& options) = 0;
 
+  // Backends that keep an internal render target can skip populating
+  // RenderResult::pixels when the caller will save directly through the
+  // backend. The default preserves existing behavior.
+  virtual void set_render_result_pixels_enabled(bool enabled) {
+    (void)enabled;
+  }
+
   virtual void set_progress_callback(RenderProgressCallback callback,
                                      size_t object_threshold = 100,
                                      uint32_t percent_step = 1) = 0;

@@ -557,14 +557,17 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
               << "'...\n";
   }
 
+  const bool direct_backend_save = (options.rotation == 0 && !options.grayscale);
+  backend->set_render_result_pixels_enabled(!direct_backend_save);
   auto result = backend->render_page(pdf, page);
+  backend->set_render_result_pixels_enabled(true);
   if (!result.success) {
     std::cerr << "Error: Failed to render page " << page_num << ": " << result.error << "\n";
     return false;
   }
 
   // Apply post-processing (rotation and/or grayscale) if needed
-  if (options.rotation != 0 || options.grayscale) {
+  if (!direct_backend_save) {
     auto buffer = backend->get_buffer();
     if (buffer.pixels.empty()) {
       std::cerr << "Error: Failed to get render buffer\n";
@@ -669,14 +672,28 @@ int main(int argc, char* argv[]) {
   }
 
   // Read PDF file
-  std::ifstream ifs(options.input_file, std::ios::binary);
+  std::ifstream ifs(options.input_file, std::ios::binary | std::ios::ate);
   if (!ifs) {
     std::cerr << "Error: Failed to open PDF file: " << options.input_file << "\n";
     return 1;
   }
 
-  std::vector<uint8_t> pdf_data((std::istreambuf_iterator<char>(ifs)),
-                                std::istreambuf_iterator<char>());
+  std::streamoff file_size = ifs.tellg();
+  if (file_size < 0) {
+    std::cerr << "Error: Failed to determine PDF file size: " << options.input_file << "\n";
+    return 1;
+  }
+
+  std::vector<uint8_t> pdf_data(static_cast<size_t>(file_size));
+  ifs.seekg(0, std::ios::beg);
+  if (!pdf_data.empty()) {
+    ifs.read(reinterpret_cast<char*>(pdf_data.data()),
+             static_cast<std::streamsize>(pdf_data.size()));
+    if (ifs.gcount() != static_cast<std::streamsize>(pdf_data.size())) {
+      std::cerr << "Error: Failed to read PDF file: " << options.input_file << "\n";
+      return 1;
+    }
+  }
   ifs.close();
 
   if (options.verbose) {

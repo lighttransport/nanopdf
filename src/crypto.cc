@@ -29,6 +29,38 @@ const uint32_t kSHA256RoundConstants[64] = {
     0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
     0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
 
+inline uint8_t aes_xtime(uint8_t x) {
+  return static_cast<uint8_t>((x << 1) ^ ((x & 0x80) ? 0x1b : 0));
+}
+
+inline uint8_t aes_mul9(uint8_t x) {
+  uint8_t x2 = aes_xtime(x);
+  uint8_t x4 = aes_xtime(x2);
+  uint8_t x8 = aes_xtime(x4);
+  return static_cast<uint8_t>(x8 ^ x);
+}
+
+inline uint8_t aes_mul11(uint8_t x) {
+  uint8_t x2 = aes_xtime(x);
+  uint8_t x4 = aes_xtime(x2);
+  uint8_t x8 = aes_xtime(x4);
+  return static_cast<uint8_t>(x8 ^ x2 ^ x);
+}
+
+inline uint8_t aes_mul13(uint8_t x) {
+  uint8_t x2 = aes_xtime(x);
+  uint8_t x4 = aes_xtime(x2);
+  uint8_t x8 = aes_xtime(x4);
+  return static_cast<uint8_t>(x8 ^ x4 ^ x);
+}
+
+inline uint8_t aes_mul14(uint8_t x) {
+  uint8_t x2 = aes_xtime(x);
+  uint8_t x4 = aes_xtime(x2);
+  uint8_t x8 = aes_xtime(x4);
+  return static_cast<uint8_t>(x8 ^ x4 ^ x2);
+}
+
 }  // namespace
 
 // RC4 Implementation
@@ -222,10 +254,10 @@ void AES128::inv_mix_columns(uint8_t* state) {
     for (int j = 0; j < 4; j++) {
       a[j] = state[i * 4 + j];
     }
-    state[i * 4 + 0] = gmul(a[0], 0x0e) ^ gmul(a[1], 0x0b) ^ gmul(a[2], 0x0d) ^ gmul(a[3], 0x09);
-    state[i * 4 + 1] = gmul(a[0], 0x09) ^ gmul(a[1], 0x0e) ^ gmul(a[2], 0x0b) ^ gmul(a[3], 0x0d);
-    state[i * 4 + 2] = gmul(a[0], 0x0d) ^ gmul(a[1], 0x09) ^ gmul(a[2], 0x0e) ^ gmul(a[3], 0x0b);
-    state[i * 4 + 3] = gmul(a[0], 0x0b) ^ gmul(a[1], 0x0d) ^ gmul(a[2], 0x09) ^ gmul(a[3], 0x0e);
+    state[i * 4 + 0] = aes_mul14(a[0]) ^ aes_mul11(a[1]) ^ aes_mul13(a[2]) ^ aes_mul9(a[3]);
+    state[i * 4 + 1] = aes_mul9(a[0]) ^ aes_mul14(a[1]) ^ aes_mul11(a[2]) ^ aes_mul13(a[3]);
+    state[i * 4 + 2] = aes_mul13(a[0]) ^ aes_mul9(a[1]) ^ aes_mul14(a[2]) ^ aes_mul11(a[3]);
+    state[i * 4 + 3] = aes_mul11(a[0]) ^ aes_mul13(a[1]) ^ aes_mul9(a[2]) ^ aes_mul14(a[3]);
   }
 }
 
@@ -1325,10 +1357,10 @@ void AES256::inv_mix_columns(uint8_t* state) {
     for (int j = 0; j < 4; j++) {
       a[j] = state[i * 4 + j];
     }
-    state[i * 4 + 0] = gmul(a[0], 0x0e) ^ gmul(a[1], 0x0b) ^ gmul(a[2], 0x0d) ^ gmul(a[3], 0x09);
-    state[i * 4 + 1] = gmul(a[0], 0x09) ^ gmul(a[1], 0x0e) ^ gmul(a[2], 0x0b) ^ gmul(a[3], 0x0d);
-    state[i * 4 + 2] = gmul(a[0], 0x0d) ^ gmul(a[1], 0x09) ^ gmul(a[2], 0x0e) ^ gmul(a[3], 0x0b);
-    state[i * 4 + 3] = gmul(a[0], 0x0b) ^ gmul(a[1], 0x0d) ^ gmul(a[2], 0x09) ^ gmul(a[3], 0x0e);
+    state[i * 4 + 0] = aes_mul14(a[0]) ^ aes_mul11(a[1]) ^ aes_mul13(a[2]) ^ aes_mul9(a[3]);
+    state[i * 4 + 1] = aes_mul9(a[0]) ^ aes_mul14(a[1]) ^ aes_mul11(a[2]) ^ aes_mul13(a[3]);
+    state[i * 4 + 2] = aes_mul13(a[0]) ^ aes_mul9(a[1]) ^ aes_mul14(a[2]) ^ aes_mul11(a[3]);
+    state[i * 4 + 3] = aes_mul11(a[0]) ^ aes_mul13(a[1]) ^ aes_mul9(a[2]) ^ aes_mul14(a[3]);
   }
 }
 

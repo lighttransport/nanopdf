@@ -320,6 +320,7 @@ class Picture : public Paint {
   uint32_t height_{0};
   Matrix   transform_{1, 0, 0, 0, 1, 0, 0, 0, 1};
   bool     interpolate_{false};
+  bool     opaque_{false};
 };
 
 // ---------------------------------------------------------------------------

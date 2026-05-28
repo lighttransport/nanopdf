@@ -222,11 +222,44 @@ static std::string decode_pdf_literal_string(const std::string& raw) {
   return out;
 }
 
+static bool token_eq1(std::string_view token, char a) {
+  return token.size() == 1 && token[0] == a;
+}
+
+static bool token_eq2(std::string_view token, char a, char b) {
+  return token.size() == 2 && token[0] == a && token[1] == b;
+}
+
+static bool token_eq3(std::string_view token, char a, char b, char c) {
+  return token.size() == 3 && token[0] == a && token[1] == b &&
+         token[2] == c;
+}
+
 static bool is_render_progress_operator(std::string_view token) {
-  return token == "f" || token == "F" || token == "f*" || token == "S" ||
-         token == "s" || token == "B" || token == "B*" || token == "b" ||
-         token == "b*" || token == "Tj" || token == "TJ" || token == "'" ||
-         token == "\"" || token == "Do" || token == "BI" || token == "sh";
+  if (token.empty() || token.size() > 2) return false;
+  switch (token[0]) {
+    case 'f':
+      return token_eq1(token, 'f') || token_eq2(token, 'f', '*');
+    case 'F':
+    case 'S':
+      return token_eq1(token, token[0]);
+    case 's':
+      return token_eq1(token, 's') || token_eq2(token, 's', 'h');
+    case 'B':
+      return token_eq1(token, 'B') || token_eq2(token, 'B', 'I') ||
+             token_eq2(token, 'B', '*');
+    case 'b':
+      return token_eq1(token, 'b') || token_eq2(token, 'b', '*');
+    case 'T':
+      return token_eq2(token, 'T', 'j') || token_eq2(token, 'T', 'J');
+    case '\'':
+    case '"':
+      return token_eq1(token, token[0]);
+    case 'D':
+      return token_eq2(token, 'D', 'o');
+    default:
+      return false;
+  }
 }
 
 static void skip_inline_image_payload(std::string_view content, size_t& pos) {
@@ -345,7 +378,7 @@ static size_t count_render_objects_impl(std::string_view content) {
     }
 
     count++;
-    if (token == "BI") {
+    if (token_eq2(token, 'B', 'I')) {
       skip_inline_image_payload(content, pos);
     }
   }
@@ -484,7 +517,7 @@ static size_t scan_do_extra_weight(std::string_view content,
     }
 
     std::string_view token(content.data() + start, pos - start);
-    if (token == "Do") {
+    if (token_eq2(token, 'D', 'o')) {
       if (!last_token.empty() && last_token[0] == '/') {
         extra += compute_xobject_extra_weight(last_token.substr(1),
                                                pdf, resources);
@@ -6487,6 +6520,10 @@ LightVGRenderResult LightVGBackend::get_buffer() {
 
   // Convert from ABGR8888 to RGBA8888
   result.pixels.resize(width_ * height_ * 4);
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  std::memcpy(result.pixels.data(), buffer_.data(), result.pixels.size());
+#else
   for (size_t i = 0; i < buffer_.size(); ++i) {
     uint32_t pixel = buffer_[i];
     uint8_t a = (pixel >> 24) & 0xFF;
@@ -6499,6 +6536,7 @@ LightVGRenderResult LightVGBackend::get_buffer() {
     result.pixels[i * 4 + 2] = b;
     result.pixels[i * 4 + 3] = a;
   }
+#endif
 
   result.success = true;
   return result;
@@ -6523,29 +6561,42 @@ bool LightVGBackend::save_to_png(const std::string& filename) {
 }
 
 bool LightVGBackend::save_to_file(const std::string& filename, const LightVGRenderOptions& options) {
-  auto result = get_buffer();
-  if (!result.success) {
+  if (!initialized_) {
     return false;
   }
 
   int ret = 0;
-  int width = static_cast<int>(result.width);
-  int height = static_cast<int>(result.height);
+  int width = static_cast<int>(width_);
+  int height = static_cast<int>(height_);
   int stride = width * 4;
+  const uint8_t* pixels = nullptr;
+  std::vector<uint8_t> converted_pixels;
+
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  pixels = reinterpret_cast<const uint8_t*>(buffer_.data());
+#else
+  auto result = get_buffer();
+  if (!result.success) {
+    return false;
+  }
+  converted_pixels = std::move(result.pixels);
+  pixels = converted_pixels.data();
+#endif
 
   switch (options.format) {
     case LightVGRenderOptions::Format::PNG: {
       stbi_write_png_compression_level = options.png_compression;
       ret = stbi_write_png(filename.c_str(), width, height, 4,
-                           result.pixels.data(), stride);
+                           pixels, stride);
       break;
     }
     case LightVGRenderOptions::Format::JPEG: {
       std::vector<uint8_t> rgb_pixels(width * height * 3);
       for (int i = 0; i < width * height; i++) {
-        rgb_pixels[i * 3 + 0] = result.pixels[i * 4 + 0];
-        rgb_pixels[i * 3 + 1] = result.pixels[i * 4 + 1];
-        rgb_pixels[i * 3 + 2] = result.pixels[i * 4 + 2];
+        rgb_pixels[i * 3 + 0] = pixels[i * 4 + 0];
+        rgb_pixels[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb_pixels[i * 3 + 2] = pixels[i * 4 + 2];
       }
       ret = stbi_write_jpg(filename.c_str(), width, height, 3,
                            rgb_pixels.data(), options.jpeg_quality);
@@ -6553,11 +6604,11 @@ bool LightVGBackend::save_to_file(const std::string& filename, const LightVGRend
     }
     case LightVGRenderOptions::Format::BMP:
       ret = stbi_write_bmp(filename.c_str(), width, height, 4,
-                           result.pixels.data());
+                           pixels);
       break;
     case LightVGRenderOptions::Format::TGA:
       ret = stbi_write_tga(filename.c_str(), width, height, 4,
-                           result.pixels.data());
+                           pixels);
       break;
   }
 
@@ -6777,6 +6828,13 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
 
   current_pdf_ = nullptr;
   current_page_ = nullptr;
+
+  if (!result_pixels_enabled_) {
+    result.success = true;
+    result.width = width_;
+    result.height = height_;
+    return result;
+  }
 
   result = get_buffer();
 
@@ -7073,6 +7131,13 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
 
   finish_progress();
 
+  if (!result_pixels_enabled_) {
+    result.success = true;
+    result.width = width_;
+    result.height = height_;
+    return result;
+  }
+
   return get_buffer();
 }
 
@@ -7228,9 +7293,14 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
 
     if (is_operator) {
       // Process operator with accumulated operands
+      auto tok1 = [&](char a) { return token_eq1(token, a); };
+      auto tok2 = [&](char a, char b) { return token_eq2(token, a, b); };
+      auto tok3 = [&](char a, char b, char c) {
+        return token_eq3(token, a, b, c);
+      };
 
       // Path construction operators
-      if (token == "m") {  // moveTo
+      if (tok1('m')) {  // moveTo
         if (operands.size() >= 2) {
           float x = nanopdf::stof_or(operands[0]);
           float y = nanopdf::stof_or(operands[1]);
@@ -7244,7 +7314,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.path_points.push_back({state_.current_x, state_.current_y});
           state_.in_path = true;
         }
-      } else if (token == "l") {  // lineTo
+      } else if (tok1('l')) {  // lineTo
         if (operands.size() >= 2) {
           float x = nanopdf::stof_or(operands[0]);
           float y = nanopdf::stof_or(operands[1]);
@@ -7257,7 +7327,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.path_commands.push_back(lvg::PathCommand::LineTo);
           state_.path_points.push_back({state_.current_x, state_.current_y});
         }
-      } else if (token == "c") {  // curveTo (cubic Bezier)
+      } else if (tok1('c')) {  // curveTo (cubic Bezier)
         if (operands.size() >= 6) {
           float x1 = nanopdf::stof_or(operands[0]);
           float y1 = nanopdf::stof_or(operands[1]);
@@ -7282,7 +7352,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.current_x = x3;
           state_.current_y = y3;
         }
-      } else if (token == "v") {  // curveTo variant (first control point = current point)
+      } else if (tok1('v')) {  // curveTo variant (first control point = current point)
         if (operands.size() >= 4) {
           float x2 = nanopdf::stof_or(operands[0]);
           float y2 = nanopdf::stof_or(operands[1]);
@@ -7303,7 +7373,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.current_x = x3;
           state_.current_y = y3;
         }
-      } else if (token == "y") {  // curveTo variant (second control point = end point)
+      } else if (tok1('y')) {  // curveTo variant (second control point = end point)
         if (operands.size() >= 4) {
           float x1 = nanopdf::stof_or(operands[0]);
           float y1 = nanopdf::stof_or(operands[1]);
@@ -7324,7 +7394,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.current_x = x3;
           state_.current_y = y3;
         }
-      } else if (token == "re") {  // rectangle
+      } else if (tok2('r', 'e')) {  // rectangle
         if (operands.size() >= 4) {
           float rx = nanopdf::stof_or(operands[0]);
           float ry = nanopdf::stof_or(operands[1]);
@@ -7366,20 +7436,20 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.current_y = corners[0][1];
           state_.in_path = true;
         }
-      } else if (token == "h") {  // Close path
+      } else if (tok1('h')) {  // Close path
         if (state_.in_path) {
           state_.path_commands.push_back(lvg::PathCommand::Close);
         }
       }
       // Path painting operators
-      else if (token == "f" || token == "F" || token == "f*") {  // fill (various winding rules)
+      else if (tok1('f') || tok1('F') || tok2('f', '*')) {  // fill (various winding rules)
         if (!state_.path_commands.empty()) {
           auto shape = lvg::Shape::gen();
           if (shape) {
             append_shape_geometry(shape, state_.path_commands, state_.path_points);
 
             // Set fill rule: f*/F* use even-odd, f/F use non-zero
-            if (token == "f*") {
+            if (tok2('f', '*')) {
               shape->fillRule(lvg::FillRule::EvenOdd);
             } else {
               shape->fillRule(lvg::FillRule::NonZero);
@@ -7400,13 +7470,13 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.in_path = false;
           advance_progress();
         }
-      } else if (token == "s") {  // close and stroke
+      } else if (tok1('s')) {  // close and stroke
         if (state_.in_path) {
           state_.path_commands.push_back(lvg::PathCommand::Close);
         }
         // Fall through to stroke
       }
-      if (token == "S" || token == "s") {  // stroke
+      if (tok1('S') || tok1('s')) {  // stroke
         if (!state_.path_commands.empty()) {
           // Snap thin axis-aligned lines to pixel grid to avoid AA fringe
           float stroke_w_px = state_.stroke_width * state_.scale;
@@ -7478,7 +7548,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.in_path = false;
           advance_progress();
         }
-      } else if (token == "b" || token == "b*") {  // close, fill and stroke
+      } else if (tok1('b') || tok2('b', '*')) {  // close, fill and stroke
         if (state_.in_path) {
           state_.path_commands.push_back(lvg::PathCommand::Close);
         }
@@ -7490,7 +7560,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
               append_shape_geometry(fill_shape, state_.path_commands,
                                     state_.path_points);
               // Set fill rule
-              if (token == "b*") {
+              if (tok2('b', '*')) {
                 fill_shape->fillRule(lvg::FillRule::EvenOdd);
               } else {
                 fill_shape->fillRule(lvg::FillRule::NonZero);
@@ -7543,7 +7613,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.in_path = false;
           advance_progress();
         }
-      } else if (token == "B" || token == "B*") {  // fill and stroke
+      } else if (tok1('B') || tok2('B', '*')) {  // fill and stroke
         if (!state_.path_commands.empty()) {
           // Fill first
           {
@@ -7552,7 +7622,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
               append_shape_geometry(fill_shape, state_.path_commands,
                                     state_.path_points);
               // Set fill rule
-              if (token == "B*") {
+              if (tok2('B', '*')) {
                 fill_shape->fillRule(lvg::FillRule::EvenOdd);
               } else {
                 fill_shape->fillRule(lvg::FillRule::NonZero);
@@ -7605,13 +7675,13 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.in_path = false;
           advance_progress();
         }
-      } else if (token == "n") {  // End path without fill or stroke
+      } else if (tok1('n')) {  // End path without fill or stroke
         state_.path_commands.clear();
         state_.path_points.clear();
         state_.in_path = false;
       }
       // Clipping path operators
-      else if (token == "W" || token == "W*") {
+      else if (tok1('W') || tok2('W', '*')) {
         // Set clipping path using current path
         // W = non-zero winding rule, W* = even-odd rule
         // The path will be used by subsequent paint operations
@@ -7619,41 +7689,41 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           // If we already have a clip, we need to intersect the new clip with it
           // For simplicity, we replace the clip (proper intersection is complex)
           state_.has_clip = true;
-          state_.clip_even_odd = (token == "W*");
+          state_.clip_even_odd = tok2('W', '*');
           state_.clip_commands = state_.path_commands;
           state_.clip_points = state_.path_points;
         }
       }
       // Color operators
-      else if (token == "rg") {  // Set RGB fill color
+      else if (tok2('r', 'g')) {  // Set RGB fill color
         if (operands.size() >= 3) {
           state_.fill_r = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
           state_.fill_g = static_cast<uint8_t>(nanopdf::stof_or(operands[1]) * 255);
           state_.fill_b = static_cast<uint8_t>(nanopdf::stof_or(operands[2]) * 255);
         }
-      } else if (token == "RG") {  // Set RGB stroke color
+      } else if (tok2('R', 'G')) {  // Set RGB stroke color
         if (operands.size() >= 3) {
           state_.stroke_r = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
           state_.stroke_g = static_cast<uint8_t>(nanopdf::stof_or(operands[1]) * 255);
           state_.stroke_b = static_cast<uint8_t>(nanopdf::stof_or(operands[2]) * 255);
         }
-      } else if (token == "g") {  // Set gray fill color
+      } else if (tok1('g')) {  // Set gray fill color
         if (operands.size() >= 1) {
           uint8_t gray = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
           state_.fill_r = state_.fill_g = state_.fill_b = gray;
         }
-      } else if (token == "G") {  // Set gray stroke color
+      } else if (tok1('G')) {  // Set gray stroke color
         if (operands.size() >= 1) {
           uint8_t gray = static_cast<uint8_t>(nanopdf::stof_or(operands[0]) * 255);
           state_.stroke_r = state_.stroke_g = state_.stroke_b = gray;
         }
-      } else if (token == "k") {  // Set CMYK fill color
+      } else if (tok1('k')) {  // Set CMYK fill color
         if (operands.size() >= 4) {
           cmyk_to_rgb(nanopdf::stof_or(operands[0]), nanopdf::stof_or(operands[1]),
                       nanopdf::stof_or(operands[2]), nanopdf::stof_or(operands[3]),
                       state_.fill_r, state_.fill_g, state_.fill_b);
         }
-      } else if (token == "K") {  // Set CMYK stroke color
+      } else if (tok1('K')) {  // Set CMYK stroke color
         if (operands.size() >= 4) {
           cmyk_to_rgb(nanopdf::stof_or(operands[0]), nanopdf::stof_or(operands[1]),
                       nanopdf::stof_or(operands[2]), nanopdf::stof_or(operands[3]),
@@ -7661,7 +7731,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       }
       // Color space operators
-      else if (token == "cs") {  // Set non-stroking color space
+      else if (tok2('c', 's')) {  // Set non-stroking color space
         if (operands.size() >= 1) {
           std::string cs_name = operands[0];
           if (!cs_name.empty() && cs_name[0] == '/') {
@@ -7671,7 +7741,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.fill_pattern.clear();  // Clear any previous pattern
           NANOPDF_LOG_TRACE("LightVG", "cs: set fill color space to '%s'", cs_name.c_str());
         }
-      } else if (token == "CS") {  // Set stroking color space
+      } else if (tok2('C', 'S')) {  // Set stroking color space
         if (operands.size() >= 1) {
           std::string cs_name = operands[0];
           if (!cs_name.empty() && cs_name[0] == '/') {
@@ -7681,7 +7751,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.stroke_pattern.clear();  // Clear any previous pattern
           NANOPDF_LOG_TRACE("LightVG", "CS: set stroke color space to '%s'", cs_name.c_str());
         }
-      } else if (token == "sc" || token == "scn") {  // Set non-stroking color
+      } else if (tok2('s', 'c') || tok3('s', 'c', 'n')) {  // Set non-stroking color
         // Check if last operand is a pattern name (starts with /)
         bool is_pattern = false;
         if (!operands.empty()) {
@@ -7708,7 +7778,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             state_.fill_r = state_.fill_g = state_.fill_b = gray;
           }
         }
-      } else if (token == "SC" || token == "SCN") {  // Set stroking color
+      } else if (tok2('S', 'C') || tok3('S', 'C', 'N')) {  // Set stroking color
         // Check if last operand is a pattern name (starts with /)
         bool is_pattern = false;
         if (!operands.empty()) {
@@ -7737,23 +7807,23 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       }
       // Line style operators
-      else if (token == "w") {  // Set line width
+      else if (tok1('w')) {  // Set line width
         if (operands.size() >= 1) {
           state_.stroke_width = nanopdf::stof_or(operands[0]);
         }
-      } else if (token == "J") {  // Set line cap style
+      } else if (tok1('J')) {  // Set line cap style
         if (operands.size() >= 1) {
           state_.line_cap = nanopdf::stoi_or(operands[0]);
         }
-      } else if (token == "j") {  // Set line join style
+      } else if (tok1('j')) {  // Set line join style
         if (operands.size() >= 1) {
           state_.line_join = nanopdf::stoi_or(operands[0]);
         }
-      } else if (token == "M") {  // Set miter limit
+      } else if (tok1('M')) {  // Set miter limit
         if (operands.size() >= 1) {
           state_.miter_limit = nanopdf::stof_or(operands[0]);
         }
-      } else if (token == "d") {  // Set dash pattern
+      } else if (tok1('d')) {  // Set dash pattern
         // Dash patterns: [array] phase
         // operands should contain: "[", values..., "]", phase
         state_.dash_pattern.clear();
@@ -7772,20 +7842,20 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             state_.dash_phase = nanopdf::stof_or(operands[i]);
           }
         }
-      } else if (token == "ri") {  // Set rendering intent
+      } else if (tok2('r', 'i')) {  // Set rendering intent
         if (!operands.empty()) {
           state_.rendering_intent = operands[0];
         }
-      } else if (token == "i") {  // Set flatness tolerance
+      } else if (tok1('i')) {  // Set flatness tolerance
         if (!operands.empty()) {
           state_.flatness = nanopdf::stof_or(operands[0]);
         }
       }
       // Graphics state operators
-      else if (token == "q") {  // Save graphics state
+      else if (tok1('q')) {  // Save graphics state
         state_stack.push_back(state_);
         font_state_stack.emplace_back(current_font_name_, current_font_);
-      } else if (token == "Q") {  // Restore graphics state
+      } else if (tok1('Q')) {  // Restore graphics state
         if (!state_stack.empty()) {
           state_ = state_stack.back();
           state_stack.pop_back();
@@ -7798,11 +7868,11 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       }
       // Graphics state dictionary (gs operator)
-      else if (token == "gs") {
+      else if (tok2('g', 's')) {
         if (!operands.empty()) apply_extgstate(operands[0]);
       }
       // Transformation matrix operators
-      else if (token == "cm") {  // Concatenate matrix
+      else if (tok2('c', 'm')) {  // Concatenate matrix
         if (operands.size() >= 6) {
           GraphicsState::Matrix m;
           m.a = nanopdf::stof_or(operands[0]);
@@ -7817,11 +7887,11 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       }
       // Text operators
-      else if (token == "BT") {  // Begin text
+      else if (tok2('B', 'T')) {  // Begin text
         state_.in_text_block = true;
         state_.text_matrix.reset();
         state_.text_line_matrix.reset();
-      } else if (token == "ET") {  // End text
+      } else if (tok2('E', 'T')) {  // End text
         state_.in_text_block = false;
 
         // If text clipping was active, apply accumulated text path to clipping
@@ -7840,7 +7910,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.text_clip_points.clear();
           state_.text_clip_active = false;
         }
-      } else if (token == "Td") {  // Move text position
+      } else if (tok2('T', 'd')) {  // Move text position
         if (operands.size() >= 2 && state_.in_text_block) {
           float tx = nanopdf::stof_or(operands[0]);
           float ty = nanopdf::stof_or(operands[1]);
@@ -7850,7 +7920,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.text_line_matrix.f += tx * state_.text_line_matrix.b + ty * state_.text_line_matrix.d;
           state_.text_matrix = state_.text_line_matrix;
         }
-      } else if (token == "TD") {  // Move text position and set leading
+      } else if (tok2('T', 'D')) {  // Move text position and set leading
         if (operands.size() >= 2 && state_.in_text_block) {
           float tx = nanopdf::stof_or(operands[0]);
           float ty = nanopdf::stof_or(operands[1]);
@@ -7860,7 +7930,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.text_line_matrix.f += tx * state_.text_line_matrix.b + ty * state_.text_line_matrix.d;
           state_.text_matrix = state_.text_line_matrix;
         }
-      } else if (token == "Tm") {  // Set text matrix
+      } else if (tok2('T', 'm')) {  // Set text matrix
         if (operands.size() >= 6 && state_.in_text_block) {
           // Text matrix [a b c d e f]
           state_.text_matrix.a = nanopdf::stof_or(operands[0]);
@@ -7871,7 +7941,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.text_matrix.f = nanopdf::stof_or(operands[5]);
           state_.text_line_matrix = state_.text_matrix;
         }
-      } else if (token == "T*") {  // Move to start of next line
+      } else if (tok2('T', '*')) {  // Move to start of next line
         if (state_.in_text_block) {
           // Equivalent to: 0 -TL Td
           float leading = state_.text_leading;
@@ -7882,34 +7952,34 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           state_.text_line_matrix.f += ty * state_.text_line_matrix.d;
           state_.text_matrix = state_.text_line_matrix;
         }
-      } else if (token == "TL") {  // Set text leading
+      } else if (tok2('T', 'L')) {  // Set text leading
         if (operands.size() >= 1) {
           state_.text_leading = nanopdf::stof_or(operands[0]);
         }
-      } else if (token == "Tc") {  // Set character spacing
+      } else if (tok2('T', 'c')) {  // Set character spacing
         if (operands.size() >= 1) {
           state_.char_spacing = nanopdf::stof_or(operands[0]);
         }
-      } else if (token == "Tw") {  // Set word spacing
+      } else if (tok2('T', 'w')) {  // Set word spacing
         if (operands.size() >= 1) {
           state_.word_spacing = nanopdf::stof_or(operands[0]);
         }
-      } else if (token == "Tz") {  // Set horizontal scaling
+      } else if (tok2('T', 'z')) {  // Set horizontal scaling
         if (operands.size() >= 1) {
           state_.horiz_scaling = nanopdf::stof_or(operands[0]);
         }
-      } else if (token == "Ts") {  // Set text rise
+      } else if (tok2('T', 's')) {  // Set text rise
         if (operands.size() >= 1) {
           state_.text_rise = nanopdf::stof_or(operands[0]);
         }
-      } else if (token == "Tr") {  // Set text rendering mode
+      } else if (tok2('T', 'r')) {  // Set text rendering mode
         // 0 = Fill, 1 = Stroke, 2 = Fill+Stroke, 3 = Invisible
         // 4 = Fill+Clip, 5 = Stroke+Clip, 6 = Fill+Stroke+Clip, 7 = Clip only
         if (operands.size() >= 1) {
           state_.text_render_mode = nanopdf::stoi_or(operands[0]);
           NANOPDF_LOG_TRACE("LightVG", "Tr: set text rendering mode to %d", state_.text_render_mode);
         }
-      } else if (token == "Tf") {  // Set font and size
+      } else if (tok2('T', 'f')) {  // Set font and size
         if (operands.size() >= 2) {
           // operands[0] is font name (with leading /), operands[1] is size
           std::string font_name = operands[0];
@@ -7959,7 +8029,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             }
           }
         }
-      } else if (token == "Tj") {  // Show text
+      } else if (tok2('T', 'j')) {  // Show text
         if (operands.size() >= 1 && state_.in_text_block) {
           // Remove parentheses or angle brackets from text string
           std::string text = operands[0];
@@ -8023,7 +8093,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
           advance_progress();
         }
-      } else if (token == "TJ") {  // Show text with positioning array
+      } else if (tok2('T', 'J')) {  // Show text with positioning array
         // TJ takes an array of strings and positioning adjustments
         if (state_.in_text_block) {
           // Use pre-computed vertical flag from Type0Font
@@ -8105,7 +8175,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           }
           advance_progress();
         }
-      } else if (token == "'" || token == "\"") {  // Move to next line and show text
+      } else if (tok1('\'') || tok1('"')) {  // Move to next line and show text
         if (operands.size() >= 1 && state_.in_text_block) {
           // Move to next line (T*)
           float ty = -state_.text_leading;
@@ -8116,7 +8186,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
 
           // For " operator, first two operands are word and char spacing
           size_t text_idx = operands.size() - 1;
-          if (token == "\"" && operands.size() >= 3) {
+          if (tok1('"') && operands.size() >= 3) {
             state_.word_spacing = nanopdf::stof_or(operands[0]);
             state_.char_spacing = nanopdf::stof_or(operands[1]);
           }
@@ -8174,14 +8244,14 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       }
       // Inline image (BI ... ID data EI)
-      else if (token == "BI") {
+      else if (tok2('B', 'I')) {
         parse_inline_image(content, pos);
         advance_progress();
         operands.clear();
         continue;  // Skip normal operand clearing
       }
       // XObject (Do operator for images/forms)
-      else if (token == "Do") {  // Paint XObject
+      else if (tok2('D', 'o')) {  // Paint XObject
         if (operands.size() >= 1 && current_pdf_ && current_page_) {
           bool rendered_xobject = false;
           std::string xobj_name = operands[0];
@@ -8329,21 +8399,21 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       }
       // Marked content operators (structure only, no-op for rendering)
-      else if (token == "BMC") {
+      else if (tok3('B', 'M', 'C')) {
         // Begin Marked Content - consume tag operand, no-op
         // operands[0] = tag name
-      } else if (token == "BDC") {
+      } else if (tok3('B', 'D', 'C')) {
         // Begin Marked Content with properties - consume operands, no-op
         // operands[0] = tag name, operands[1] = properties dict/name
-      } else if (token == "EMC") {
+      } else if (tok3('E', 'M', 'C')) {
         // End Marked Content - no operands, no-op
-      } else if (token == "MP") {
+      } else if (tok2('M', 'P')) {
         // Marked Content Point - consume tag operand, no-op
-      } else if (token == "DP") {
+      } else if (tok2('D', 'P')) {
         // Marked Content Point with properties - consume operands, no-op
       }
       // Shading operator (sh) - paint a shading pattern
-      else if (token == "sh") {
+      else if (tok2('s', 'h')) {
         if (operands.size() >= 1) {
           std::string shading_name = operands[0];
           // Remove leading '/' if present

@@ -61,6 +61,8 @@ void flatten_path(const std::vector<PathCommand>& cmds,
                   const std::vector<Point>& pts,
                   std::vector<Contour>& out) {
   Contour cur;
+  cur.pts.reserve(std::min<size_t>(pts.size(), 64));
+  out.reserve(out.size() + 1);
   size_t pi = 0;
   float lastx = 0, lasty = 0;
   float startx = 0, starty = 0;
@@ -71,6 +73,7 @@ void flatten_path(const std::vector<PathCommand>& cmds,
         if (!cur.pts.empty()) {
           out.push_back(std::move(cur));
           cur = Contour();
+          cur.pts.reserve(std::min<size_t>(pts.size() - pi, 64));
         }
         const Point& p = pts[pi++];
         cur.pts.push_back({p.x, p.y});
@@ -108,6 +111,7 @@ void flatten_path(const std::vector<PathCommand>& cmds,
           }
           out.push_back(std::move(cur));
           cur = Contour();
+          cur.pts.reserve(std::min<size_t>(pts.size() - pi, 64));
         }
         lastx = startx;
         lasty = starty;
@@ -957,6 +961,8 @@ Result Shape::close() {
 
 Result Shape::appendRect(float x, float y, float w, float h, float /*rx*/,
                          float /*ry*/) {
+  cmds_.reserve(cmds_.size() + 5);
+  pts_.reserve(pts_.size() + 4);
   moveTo(x, y);
   lineTo(x + w, y);
   lineTo(x + w, y + h);
@@ -968,6 +974,8 @@ Result Shape::appendRect(float x, float y, float w, float h, float /*rx*/,
 Result Shape::appendCircle(float cx, float cy, float rx, float ry) {
   // Approximate an ellipse with 4 cubic Bezier segments (Kappa = 0.5522847).
   constexpr float K = 0.5522847498307933f;
+  cmds_.reserve(cmds_.size() + 6);
+  pts_.reserve(pts_.size() + 13);
   float kx = rx * K;
   float ky = ry * K;
   moveTo(cx, cy - ry);
@@ -1431,6 +1439,68 @@ Picture::~Picture() {
   if (clipper_) delete clipper_;
 }
 
+static bool pixels_are_opaque(const uint32_t* pixels, size_t count) {
+  if (!pixels) return false;
+  for (size_t i = 0; i < count; ++i) {
+    if ((pixels[i] >> 24) != 255u) return false;
+  }
+  return true;
+}
+
+static void draw_opaque_nearest_image(lui_canvas_t* canvas,
+                                      const uint32_t* pixels,
+                                      int src_w, int src_h,
+                                      int dst_x, int dst_y,
+                                      int dst_w, int dst_h) {
+  if (!canvas || !pixels || src_w <= 0 || src_h <= 0 ||
+      dst_w <= 0 || dst_h <= 0) {
+    return;
+  }
+
+  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  int x0 = std::max(dst_x, clip.x);
+  int y0 = std::max(dst_y, clip.y);
+  int x1 = std::min(dst_x + dst_w, clip.x + clip.width);
+  int y1 = std::min(dst_y + dst_h, clip.y + clip.height);
+  if (x0 >= x1 || y0 >= y1) return;
+
+  lui_surface_t* dst = lui_canvas_get_surface(canvas);
+  if (!dst || !dst->pixels) return;
+
+  if (dst_w == src_w && dst_h == src_h) {
+    const int copy_w = x1 - x0;
+    for (int y = y0; y < y1; ++y) {
+      const int sy = y - dst_y;
+      const int sx = x0 - dst_x;
+      std::memcpy(dst->pixels + static_cast<size_t>(y) * dst->stride + x0,
+                  pixels + static_cast<size_t>(sy) * src_w + sx,
+                  static_cast<size_t>(copy_w) * sizeof(uint32_t));
+    }
+    return;
+  }
+
+  const int64_t denom_x = static_cast<int64_t>(2) * dst_w;
+  const int64_t denom_y = static_cast<int64_t>(2) * dst_h;
+  for (int y = y0; y < y1; ++y) {
+    int64_t sy_num =
+        (static_cast<int64_t>(2) * (y - dst_y) + 1) * src_h;
+    int sy = static_cast<int>(sy_num / denom_y);
+    if (sy < 0) sy = 0;
+    if (sy >= src_h) sy = src_h - 1;
+
+    uint32_t* dst_row = dst->pixels + static_cast<size_t>(y) * dst->stride;
+    const uint32_t* src_row = pixels + static_cast<size_t>(sy) * src_w;
+    for (int x = x0; x < x1; ++x) {
+      int64_t sx_num =
+          (static_cast<int64_t>(2) * (x - dst_x) + 1) * src_w;
+      int sx = static_cast<int>(sx_num / denom_x);
+      if (sx < 0) sx = 0;
+      if (sx >= src_w) sx = src_w - 1;
+      dst_row[x] = src_row[sx];
+    }
+  }
+}
+
 Result Picture::load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs,
                      bool premultiplied) {
   if (!data || w == 0 || h == 0) return Result::InvalidArguments;
@@ -1440,6 +1510,7 @@ Result Picture::load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs
   if (!premultiplied &&
       (cs == ColorSpace::ARGB8888 || cs == ColorSpace::ARGB8888S)) {
     pixels_.assign(data, data + static_cast<size_t>(w) * h);
+    opaque_ = pixels_are_opaque(pixels_.data(), pixels_.size());
     return Result::Success;
   }
 
@@ -1477,6 +1548,7 @@ Result Picture::load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs
     }
     pixels_[i] = pack_argb(r, g, b, a);
   }
+  opaque_ = pixels_are_opaque(pixels_.data(), pixels_.size());
   return Result::Success;
 }
 
@@ -1488,6 +1560,7 @@ Result Picture::load_argb_owned(std::vector<uint32_t>&& pixels, uint32_t w,
   width_ = w;
   height_ = h;
   if (!premultiplied) {
+    opaque_ = pixels_are_opaque(pixels.data(), pixels.size());
     pixels_ = std::move(pixels);
     return Result::Success;
   }
@@ -1676,6 +1749,13 @@ void Picture::draw_pixels(lui_canvas_t* canvas) {
     int dst_y = static_cast<int>(std::round(transform_.e23));
     lui_image_filter_t filter =
         interpolate_ ? LUI_IMAGE_FILTER_BILINEAR : LUI_IMAGE_FILTER_NEAREST;
+    if (opaque_ && filter == LUI_IMAGE_FILTER_NEAREST) {
+      draw_opaque_nearest_image(canvas, pixels_.data(),
+                                static_cast<int>(width_),
+                                static_cast<int>(height_),
+                                dst_x, dst_y, dst_w, dst_h);
+      return;
+    }
     lui_canvas_draw_image(canvas, dst_x, dst_y, dst_w, dst_h, &src, nullptr,
                           filter);
     return;
