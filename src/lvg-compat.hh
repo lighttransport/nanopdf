@@ -290,6 +290,8 @@ class Picture : public Paint {
   // Loads a buffer of ARGB/ABGR pixels. Picture takes a copy (we own it).
   Result load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs,
               bool premultiplied = false);
+  Result load_argb_owned(std::vector<uint32_t>&& pixels, uint32_t w, uint32_t h,
+                         bool premultiplied = false);
 
   Result transform(const Matrix& m);
   Result translate(float x, float y);

@@ -275,6 +275,17 @@ struct ImageXObject {
   ImageXObject& operator=(ImageXObject&& other) noexcept = default;
 };
 
+struct ImageParseOptions {
+  // Keep a copy of the original encoded stream bytes in ImageXObject::raw_data.
+  // Tools that export embedded images need this; renderers usually do not.
+  bool keep_raw_data{true};
+
+  // Store decoded image stream bytes in Pdf::decoded_stream_cache. Rendering
+  // backends that immediately convert images to their own pixel cache can
+  // disable this to avoid retaining a second large copy.
+  bool cache_decoded_stream{true};
+};
+
 // Forward declarations
 struct BaseFont;
 struct Type0Font;
@@ -1461,7 +1472,8 @@ DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj,
                            uint32_t obj_num, uint16_t gen_num);
 DecodedStream decode_stream(const Pdf& pdf, const Value& stream_obj,
                            uint32_t obj_num, uint16_t gen_num,
-                           int image_width, int image_height);
+                           int image_width, int image_height,
+                           bool cache_result = true);
 
 // Add parse_string function declaration
 bool parse_string(StreamReader& sr, Parser& parser, std::string* out_str);
@@ -1470,6 +1482,9 @@ bool parse_string(StreamReader& sr, Parser& parser, std::string* out_str);
 ColorSpace parse_color_space(const Pdf& pdf, const Value& cs_value);
 ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
                                  uint32_t obj_num = 0, uint16_t gen_num = 0);
+ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
+                                 uint32_t obj_num, uint16_t gen_num,
+                                 const ImageParseOptions& options);
 std::map<std::string, ImageXObject> parse_xobject_resources(const Pdf& pdf, const Dictionary& resources);
 
 // Text extraction functions

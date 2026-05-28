@@ -58,6 +58,10 @@ struct RenderOptions {
   RenderProgressCallback progress_callback;
   size_t progress_object_threshold{100};
   uint32_t progress_percent_step{1};
+
+  // Maximum pixels used when LightVG has to rasterize a PDF Type 1
+  // function-based shading into an intermediate bitmap. 0 means unlimited.
+  size_t max_function_shading_pixels{1024 * 1024};
 };
 
 // Identifies a concrete backend implementation. New backends append to this

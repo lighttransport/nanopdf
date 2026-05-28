@@ -3706,7 +3706,8 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 // Overload with image dimensions for CCITT decoding
 DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
                            uint32_t obj_num, uint16_t gen_num,
-                           int image_width, int image_height) {
+                           int image_width, int image_height,
+                           bool cache_result) {
   DecodedStream result;
 
   if (stream_obj.type != Value::STREAM) {
@@ -3717,7 +3718,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
   // Check cache first (only if we have a valid object number)
   uint64_t cache_key = 0;
-  if (obj_num > 0) {
+  if (obj_num > 0 && cache_result) {
     cache_key = make_decoded_stream_cache_key(obj_num, gen_num, image_width, image_height);
     {
       std::lock_guard<std::mutex> lock(pdf.cache_mutex);
@@ -3963,7 +3964,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   result.success = true;
 
   // Store in cache (only if we have a valid object number)
-  if (obj_num > 0 && cache_key != 0) {
+  if (obj_num > 0 && cache_key != 0 && cache_result) {
     // Prepare entry outside the lock
     Pdf::DecodedStreamCacheEntry entry;
     entry.data = result.data;  // Copy for cache
@@ -6677,6 +6678,13 @@ ColorSpace parse_color_space(const Pdf& pdf, const Value& cs_value) {
 // Image XObject parsing
 ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
                                  uint32_t obj_num, uint16_t gen_num) {
+  ImageParseOptions options;
+  return parse_image_xobject(pdf, stream_value, obj_num, gen_num, options);
+}
+
+ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
+                                 uint32_t obj_num, uint16_t gen_num,
+                                 const ImageParseOptions& options) {
   ImageXObject image;
 
   if (stream_value.type != Value::STREAM) {
@@ -6685,7 +6693,9 @@ ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
 
   const Dictionary& dict = stream_value.stream.dict;
 
-  image.raw_data = stream_value.stream.data;
+  if (options.keep_raw_data) {
+    image.raw_data = stream_value.stream.data;
+  }
 
   // Parse required entries
   auto width_it = dict.find("Width");
@@ -6757,7 +6767,8 @@ ImageXObject parse_image_xobject(const Pdf& pdf, const Value& stream_value,
   // Decode the image data (use obj_num/gen_num for decryption if needed)
   // Pass image dimensions to handle CCITT images with missing Rows/Columns params
   DecodedStream decoded = decode_stream(pdf, stream_value, obj_num, gen_num,
-                                        image.width, image.height);
+                                        image.width, image.height,
+                                        options.cache_decoded_stream);
   if (decoded.success) {
     image.data = std::move(decoded.data);
   }

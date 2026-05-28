@@ -36,6 +36,8 @@ extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
 
+static constexpr size_t kMaxCachedArgbImageBytes = 16 * 1024 * 1024;
+
 static uint64_t fnv1a64(const void* data, size_t len) {
   const uint8_t* p = static_cast<const uint8_t*>(data);
   uint64_t h = 14695981039346656037ULL;
@@ -2196,7 +2198,8 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
     FontCache cache;
     if (load_font_file(cached_path, cache.font_data)) {
       int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+      if (font_offset >= 0 &&
+          stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
         cache.initialized = true;
         font_cache_[font_name] = std::move(cache);
         return true;
@@ -2365,7 +2368,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
       FontCache cache;
       cache.font_data = pf->data;
       int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-      if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+      if (off >= 0 && stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
         cache.initialized = true;
         font_cache_[font_name] = std::move(cache);
         NANOPDF_LOG_DEBUG("LightVG", "Using FontProvider font: %s for '%s'", pf->name.c_str(), font_name.c_str());
@@ -2408,7 +2411,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
       FontCache cache;
       if (embedded_fonts::decompress_font(entry, cache.font_data)) {
         int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+        if (off >= 0 && stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
           if (ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
             cache.has_ttf_parse = true;
           }
@@ -2433,7 +2436,7 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
       FontCache cache;
       if (embedded_cjk_fonts::decompress_font(entry, cache.font_data)) {
         int off = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
+        if (off >= 0 && stbtt_InitFont(&cache.font_info, cache.font_data.data(), off)) {
           cache.initialized = true;
           if (ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
             cache.has_ttf_parse = true;
@@ -2461,7 +2464,8 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
       FontCache cache;
       if (load_font_file(cand, cache.font_data)) {
         int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-        if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+        if (font_offset >= 0 &&
+            stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
           cache.initialized = true;
           font_cache_[font_name] = std::move(cache);
           SharedFontFallbackCache::instance().store(font_name, cand);
@@ -2482,7 +2486,8 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
         FontCache cache;
         if (load_font_file(cand, cache.font_data)) {
           int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-          if (stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
+          if (font_offset >= 0 &&
+              stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset)) {
             cache.initialized = true;
             font_cache_[font_name] = std::move(cache);
             SharedFontFallbackCache::instance().store(font_name, cand);
@@ -2517,7 +2522,8 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
       cache.cid_to_gid = std::move(shared.cid_to_gid);
 
       int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-      bool stbtt_ok = stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset);
+      bool stbtt_ok = font_offset >= 0 &&
+                      stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset);
 
       if (shared.has_ttf_parse &&
           ttf_font_init(&cache.ttf, cache.font_data.data(), cache.font_data.size()) == 0) {
@@ -2577,6 +2583,14 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     return load_fallback_font_with_hint(font_name, font);
   }
 
+  if (decoded.data.size() >= 14 &&
+      std::memcmp(decoded.data.data(), "%!PS-AdobeFont", 14) == 0) {
+    NANOPDF_LOG_WARN("LightVG",
+                     "Embedded Type1 font '%s' is not supported by stbtt/ttf_parse; using fallback",
+                     font_name.c_str());
+    return load_fallback_font_with_hint(font_name, font);
+  }
+
   // Check for raw CFF data (stb_truetype can't parse raw CFF directly,
   // but DOES support OpenType-CFF with OTTO header natively)
   std::vector<uint16_t> cff_cid_to_gid;
@@ -2604,7 +2618,8 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
   // that case we proceed with ttf_parse as the sole outline backend. Only
   // bail to a system fallback if ttf_parse also can't read the file.
   int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
-  bool stbtt_ok = stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset);
+  bool stbtt_ok = font_offset >= 0 &&
+                  stbtt_InitFont(&cache.font_info, cache.font_data.data(), font_offset);
 
   // Initialize ttf_parse for kerning lookup (GPOS and kern table support).
   // For CID subsets that fail stbtt_InitFont (no cmap table), ttf_parse is
@@ -3003,7 +3018,8 @@ static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
 
 bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height,
                                uint8_t fill_r, uint8_t fill_g, uint8_t fill_b,
-                               const GraphicsState::Matrix* image_ctm) {
+                               const GraphicsState::Matrix* image_ctm,
+                               bool retain_converted_argb) {
   NANOPDF_LOG_DEBUG("LightVG", "draw_image: %dx%d at (%.1f,%.1f) size %.1fx%.1f, data=%zu bytes",
                     image.width, image.height, x, y, width, height, image.data.size());
 
@@ -3012,11 +3028,14 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
                      (void*)scene_, image.data.empty() ? 1 : 0);
     return false;
   }
+  last_image_argb_.clear();
 
   // Convert image data to ARGB8888 format for LightVG
   std::vector<uint32_t> argb_data;
   int img_width = image.width;
   int img_height = image.height;
+  bool pixels_are_premultiplied = false;
+  bool from_argb_cache = false;
 
   if (img_width <= 0 || img_height <= 0) {
     return false;
@@ -3027,6 +3046,7 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     // data layout: argb_data as uint32_t packed into uint8_t vector
     argb_data.resize(static_cast<size_t>(img_width) * img_height);
     memcpy(argb_data.data(), image.data.data(), argb_data.size() * sizeof(uint32_t));
+    from_argb_cache = true;
   } else {
     argb_data.resize(img_width * img_height);
 
@@ -3338,6 +3358,7 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
         };
         // Only 8-bit grayscale masks handled here; other bit depths fall through.
         if (smask_img.bits_per_component == 8) {
+          pixels_are_premultiplied = true;
           for (int py = 0; py < img_height; ++py) {
             int sy = (py * sh) / img_height;
             for (int px = 0; px < img_width; ++px) {
@@ -3350,6 +3371,7 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
             }
           }
         } else if (smask_img.bits_per_component == 1) {
+          pixels_are_premultiplied = true;
           int stride = (sw + 7) / 8;
           for (int py = 0; py < img_height; ++py) {
             int sy = (py * sh) / img_height;
@@ -3369,21 +3391,40 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   }
   }  // else (non-cached ARGB path)
 
-  // Save ARGB for render cache if needed.
-  last_image_argb_ = argb_data;
-
-  // Create LightVG Picture from raw data. lvg::Picture::load() copies the
-  // buffer, so the temporary vector can stay stack-owned.
+  // Create LightVG Picture from raw data.
   auto picture = lvg::Picture::gen();
   if (!picture) {
     return false;
   }
 
-  auto result = picture->load(argb_data.data(), img_width, img_height,
-                              lvg::ColorSpace::ARGB8888, true);
+  lvg::Result result = lvg::Result::Unknown;
+  if (!retain_converted_argb && !pixels_are_premultiplied) {
+    result = picture->load_argb_owned(std::move(argb_data), img_width, img_height,
+                                      false);
+  } else {
+    result = picture->load(argb_data.data(), img_width, img_height,
+                           lvg::ColorSpace::ARGB8888, pixels_are_premultiplied);
+  }
   if (result != lvg::Result::Success) {
     picture->unref();
     return false;
+  }
+
+  if (retain_converted_argb && !from_argb_cache) {
+    if (pixels_are_premultiplied) {
+      for (uint32_t& p : argb_data) {
+        uint32_t a = (p >> 24) & 0xff;
+        if (a > 0 && a < 255) {
+          uint32_t r = std::min<uint32_t>(255, (((p >> 16) & 0xff) * 255) / a);
+          uint32_t g = std::min<uint32_t>(255, (((p >> 8) & 0xff) * 255) / a);
+          uint32_t b = std::min<uint32_t>(255, ((p & 0xff) * 255) / a);
+          p = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+      }
+    }
+    // Move the converted pixels to the side-channel cache buffer after
+    // Picture::load() has copied them. This avoids a second full-image copy.
+    last_image_argb_ = std::move(argb_data);
   }
   picture->interpolate(image.interpolate);
 
@@ -3675,24 +3716,29 @@ static bool rasterize_function_shading(const Pdf& pdf, const Shading& shading,
   double inv_e = (c * f - d * e) / det;
   double inv_f = (b * e - a * f) / det;
 
-  // Rasterize each pixel
+  std::vector<double> inputs(2);
+  std::vector<double> outputs;
+  outputs.reserve(4);
+
+  // Rasterize each pixel. Advance the inverse transform incrementally within
+  // each row to avoid repeated divides and matrix multiplies in dense shadings.
   for (int py = 0; py < height; ++py) {
+    double uy = (height - 1 - py) / scale;
+    double dx = inv_c * uy + inv_e;
+    double dy = inv_d * uy + inv_f;
+    double dx_step = inv_a / scale;
+    double dy_step = inv_b / scale;
+
     for (int px = 0; px < width; ++px) {
-      // Convert pixel coords to user space (flip Y)
-      double ux = px / scale;
-      double uy = (height - 1 - py) / scale;
-
-      // Apply inverse matrix to get domain coordinates
-      double dx = inv_a * ux + inv_c * uy + inv_e;
-      double dy = inv_b * ux + inv_d * uy + inv_f;
-
       // Check if in domain
       uint8_t r = 128, g = 128, b = 128, alpha = 255;
 
       if (dx >= x_min && dx <= x_max && dy >= y_min && dy <= y_max) {
         // Evaluate function at (dx, dy)
-        std::vector<double> outputs;
-        if (evaluate_pdf_function(pdf, shading.function, {dx, dy}, outputs)) {
+        inputs[0] = dx;
+        inputs[1] = dy;
+        outputs.clear();
+        if (evaluate_pdf_function(pdf, shading.function, inputs, outputs)) {
           if (outputs.size() >= 3) {
             r = static_cast<uint8_t>(clamp14(outputs[0], 0.0, 1.0) * 255);
             g = static_cast<uint8_t>(clamp14(outputs[1], 0.0, 1.0) * 255);
@@ -3716,6 +3762,8 @@ static bool rasterize_function_shading(const Pdf& pdf, const Shading& shading,
       }
 
       pixels[py * width + px] = (alpha << 24) | (r << 16) | (g << 8) | b;
+      dx += dx_step;
+      dy += dy_step;
     }
   }
 
@@ -4080,6 +4128,15 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
     int raster_h = static_cast<int>(h);
     if (raster_w <= 0) raster_w = 256;
     if (raster_h <= 0) raster_h = 256;
+    if (max_function_shading_pixels_ > 0) {
+      size_t pixels = static_cast<size_t>(raster_w) * static_cast<size_t>(raster_h);
+      if (pixels > max_function_shading_pixels_) {
+        double ratio = std::sqrt(static_cast<double>(max_function_shading_pixels_) /
+                                 static_cast<double>(pixels));
+        raster_w = std::max(1, static_cast<int>(std::floor(raster_w * ratio)));
+        raster_h = std::max(1, static_cast<int>(std::floor(raster_h * ratio)));
+      }
+    }
 
     // Check render cache first
     uint32_t shading_obj = (shading_value.type == Value::REFERENCE) ? shading_value.ref_object_number : 0;
@@ -4090,11 +4147,11 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
       auto picture = lvg::Picture::gen();
       if (picture) {
         auto result = picture->load(reinterpret_cast<const uint32_t*>(cached.data.data()),
-                                     raster_w, raster_h, lvg::ColorSpace::ARGB8888, true);
+                                     raster_w, raster_h, lvg::ColorSpace::ARGB8888, false);
         if (result == lvg::Result::Success) {
           lvg::Matrix m;
-          m.e11 = 1.0f; m.e12 = 0.0f; m.e13 = x;
-          m.e21 = 0.0f; m.e22 = 1.0f; m.e23 = y;
+          m.e11 = w / static_cast<float>(raster_w); m.e12 = 0.0f; m.e13 = x;
+          m.e21 = 0.0f; m.e22 = h / static_cast<float>(raster_h); m.e23 = y;
           m.e31 = 0.0f; m.e32 = 0.0f; m.e33 = 1.0f;
           picture->transform(m);
           apply_soft_mask_opacity(picture);
@@ -4117,17 +4174,17 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
                 reinterpret_cast<uint32_t*>(entry.data.data()));
       RenderCache::instance().store(cache_key, std::move(entry));
 
-      // Create LightVG Picture from rasterized bitmap. Picture copies the
-      // input pixels during load().
+      // Create LightVG Picture from rasterized bitmap. The cache already has
+      // its own copy, so transfer the live raster buffer into the picture.
       auto picture = lvg::Picture::gen();
       if (picture) {
-        auto result = picture->load(pixels.data(), raster_w, raster_h,
-                                     lvg::ColorSpace::ARGB8888, true);
+        auto result = picture->load_argb_owned(std::move(pixels), raster_w,
+                                               raster_h, false);
         if (result == lvg::Result::Success) {
           // Position the picture at the shape location
           lvg::Matrix m;
-          m.e11 = 1.0f; m.e12 = 0.0f; m.e13 = x;
-          m.e21 = 0.0f; m.e22 = 1.0f; m.e23 = y;
+          m.e11 = w / static_cast<float>(raster_w); m.e12 = 0.0f; m.e13 = x;
+          m.e21 = 0.0f; m.e22 = h / static_cast<float>(raster_h); m.e23 = y;
           m.e31 = 0.0f; m.e32 = 0.0f; m.e33 = 1.0f;
           picture->transform(m);
 
@@ -6601,6 +6658,7 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   // Store antialias and LCD options
   antialias_ = options.antialias;
   enable_lcd_ = options.lcd_subpixel;
+  max_function_shading_pixels_ = options.max_function_shading_pixels;
   if (!antialias_) {
     NANOPDF_LOG_DEBUG("LightVG", "antialias=false requested, but ThorVG's built-in AA cannot be disabled");
   }
@@ -6786,6 +6844,8 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
 
 LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page) {
   LightVGRenderResult result;
+  LightVGRenderOptions default_options;
+  max_function_shading_pixels_ = default_options.max_function_shading_pixels;
 
   // Reset per-page resource resolution storage so it doesn't grow unbounded.
   lookup_resolved_owned_.clear();
@@ -8179,16 +8239,29 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                                state_.fill_r, state_.fill_g, state_.fill_b,
                                &state_.transform);
                   } else {
-                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value, xobj_num, xobj_gen);
+                    ImageParseOptions parse_options;
+                    parse_options.keep_raw_data = false;
+                    parse_options.cache_decoded_stream = false;
+                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value,
+                                                             xobj_num, xobj_gen,
+                                                             parse_options);
                     img_w = image.width;
                     img_h = image.height;
+                    const size_t converted_bytes =
+                        (img_w > 0 && img_h > 0)
+                            ? static_cast<size_t>(img_w) *
+                                  static_cast<size_t>(img_h) * sizeof(uint32_t)
+                            : 0;
+                    const bool cache_converted_argb =
+                        xobj_num != 0 && converted_bytes > 0 &&
+                        converted_bytes <= kMaxCachedArgbImageBytes;
                     draw_image(image, state_.transform.e, state_.transform.f,
                                state_.transform.a, state_.transform.d,
                                state_.fill_r, state_.fill_g, state_.fill_b,
-                               &state_.transform);
+                               &state_.transform, cache_converted_argb);
                     // Cache the result ARGB for future use. draw_image stores
                     // its result in last_image_argb_ when obj_num != 0.
-                    if (xobj_num != 0 && !last_image_argb_.empty()) {
+                    if (cache_converted_argb && !last_image_argb_.empty()) {
                       size_t n = static_cast<size_t>(img_w) *
                                  static_cast<size_t>(img_h);
                       RenderCacheEntry entry;

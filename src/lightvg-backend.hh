@@ -345,7 +345,8 @@ private:
   // fill_r/g/b: current non-stroking color, used to paint image mask pixels
   bool draw_image(const ImageXObject& image, float x, float y, float width, float height,
                   uint8_t fill_r = 0, uint8_t fill_g = 0, uint8_t fill_b = 0,
-                  const GraphicsState::Matrix* image_ctm = nullptr);
+                  const GraphicsState::Matrix* image_ctm = nullptr,
+                  bool retain_converted_argb = false);
 
   // Draw a shading (gradient)
   bool draw_shading(const std::string& shading_name);
@@ -461,6 +462,9 @@ private:
   // can store it in the render cache. Only filled when the image came from a
   // named XObject (obj_num != 0). Cleared once consumed.
   std::vector<uint32_t> last_image_argb_;
+
+  // Current render option for function-based shadings.
+  size_t max_function_shading_pixels_{1024 * 1024};
 
   // Reusable ARGB buffer for glyph rendering. Avoids per-glyph allocation
   // in draw_glyph_bitmap_by_index when the render cache misses.

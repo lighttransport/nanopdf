@@ -1436,6 +1436,13 @@ Result Picture::load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs
   if (!data || w == 0 || h == 0) return Result::InvalidArguments;
   width_  = w;
   height_ = h;
+
+  if (!premultiplied &&
+      (cs == ColorSpace::ARGB8888 || cs == ColorSpace::ARGB8888S)) {
+    pixels_.assign(data, data + static_cast<size_t>(w) * h);
+    return Result::Success;
+  }
+
   pixels_.resize(static_cast<size_t>(w) * h);
 
   // Convert source to lui_canvas's expected ARGB-packed
@@ -1471,6 +1478,20 @@ Result Picture::load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs
     pixels_[i] = pack_argb(r, g, b, a);
   }
   return Result::Success;
+}
+
+Result Picture::load_argb_owned(std::vector<uint32_t>&& pixels, uint32_t w,
+                                uint32_t h, bool premultiplied) {
+  if (w == 0 || h == 0 || pixels.size() != static_cast<size_t>(w) * h) {
+    return Result::InvalidArguments;
+  }
+  width_ = w;
+  height_ = h;
+  if (!premultiplied) {
+    pixels_ = std::move(pixels);
+    return Result::Success;
+  }
+  return load(pixels.data(), w, h, ColorSpace::ARGB8888, true);
 }
 
 Result Picture::transform(const Matrix& m) {
