@@ -221,6 +221,8 @@ nanopdf embeds or links the following third-party libraries:
 | [stb_image](https://github.com/nothings/stb) | 2.30 | MIT / Public Domain | Sean Barrett |
 | [stb_image_write](https://github.com/nothings/stb) | 1.16 | MIT / Public Domain | Sean Barrett |
 | [fpng](https://github.com/richgel999/fpng) | 1.0.6 | Public Domain / Unlicense | Rich Geldreich |
+| [fpnge](https://github.com/veluca93/fpnge) | — | Apache 2.0 | Google LLC, Luca Versari |
+| [libdeflate](https://github.com/ebiggers/libdeflate) | 1.25 | MIT | Eric Biggers |
 | [TinyDNGLoader](https://github.com/syoyo/tinydng) | — | MIT | Syoyo Fujita |
 | [nanostl](https://github.com/lighttransport/nanostl) | — | MIT | Light Transport Entertainment Inc. |
 | [fast_float](https://github.com/fastfloat/fast_float) (via nanostl) | — | Apache 2.0 / Boost 1.0 | Daniel Lemire et al. |
