@@ -27,7 +27,7 @@ int AttachmentExtractor::get_count() const {
     return 0;
   }
 
-  std::vector<std::pair<std::string, const Value*>> all_entries;
+  std::vector<std::pair<std::string, Value>> all_entries;
   collect_all_entries(root, all_entries);
   return static_cast<int>(all_entries.size());
 }
@@ -46,7 +46,7 @@ FileAttachment AttachmentExtractor::get_attachment(int index) const {
     return result;
   }
 
-  std::vector<std::pair<std::string, const Value*>> all_entries;
+  std::vector<std::pair<std::string, Value>> all_entries;
   collect_all_entries(root, all_entries);
 
   if (static_cast<size_t>(index) >= all_entries.size()) {
@@ -57,13 +57,9 @@ FileAttachment AttachmentExtractor::get_attachment(int index) const {
   const auto& entry = all_entries[index];
   result.name = entry.first;
 
-  if (entry.second) {
-    result = parse_filespec(*entry.second);
-    if (!result.success && result.name.empty()) {
-      result.name = entry.first;
-    }
-  } else {
-    result.error = "Null filespec value";
+  result = parse_filespec(entry.second);
+  if (!result.success && result.name.empty()) {
+    result.name = entry.first;
   }
 
   return result;
@@ -79,12 +75,12 @@ FileAttachment AttachmentExtractor::get_attachment_by_name(
     return result;
   }
 
-  std::vector<std::pair<std::string, const Value*>> all_entries;
+  std::vector<std::pair<std::string, Value>> all_entries;
   collect_all_entries(root, all_entries);
 
   for (const auto& entry : all_entries) {
-    if (entry.first == name && entry.second) {
-      return parse_filespec(*entry.second);
+    if (entry.first == name) {
+      return parse_filespec(entry.second);
     }
   }
 
@@ -100,7 +96,7 @@ std::vector<std::string> AttachmentExtractor::list_names() const {
     return names;
   }
 
-  std::vector<std::pair<std::string, const Value*>> all_entries;
+  std::vector<std::pair<std::string, Value>> all_entries;
   collect_all_entries(root, all_entries);
 
   names.reserve(all_entries.size());
@@ -208,8 +204,7 @@ bool AttachmentExtractor::parse_name_tree(NameTreeNode& root) const {
           name = names_array[i].str;
         }
 
-        const Value* value_ptr = &names_array[i + 1];
-        root.entries.push_back(std::make_pair(name, value_ptr));
+        root.entries.push_back(std::make_pair(name, names_array[i + 1]));
       }
     }
   }
@@ -222,7 +217,7 @@ bool AttachmentExtractor::parse_name_tree(NameTreeNode& root) const {
 
 void AttachmentExtractor::collect_all_entries(
     const NameTreeNode& node,
-    std::vector<std::pair<std::string, const Value*>>& out) const {
+    std::vector<std::pair<std::string, Value>>& out) const {
   // Add entries from this node
   out.insert(out.end(), node.entries.begin(), node.entries.end());
 
@@ -314,7 +309,11 @@ FileAttachment AttachmentExtractor::parse_filespec(
   }
 
   ResolvedObject stream_obj;
+  uint32_t stream_obj_num = 0;
+  uint16_t stream_gen_num = 0;
   if (stream->type == Value::REFERENCE) {
+    stream_obj_num = stream->ref_object_number;
+    stream_gen_num = stream->ref_generation_number;
     stream_obj = resolve_reference(pdf_, stream->ref_object_number,
                                    stream->ref_generation_number);
   } else if (stream->type == Value::STREAM) {
@@ -449,8 +448,17 @@ FileAttachment AttachmentExtractor::parse_filespec(
     }
   }
 
-  // Decode the file stream data
-  result.data = stream_obj.value.stream.data;
+  // Decode the file stream data through its filter chain (FlateDecode etc.).
+  // stream.data holds the raw (still-filtered) bytes; decode_stream applies the
+  // filters (and decryption, via the object id) to recover the file contents.
+  DecodedStream decoded =
+      decode_stream(pdf_, stream_obj.value, stream_obj_num, stream_gen_num);
+  if (decoded.success) {
+    result.data = std::move(decoded.data);
+  } else {
+    // Unfiltered or unsupported filter: fall back to the raw bytes.
+    result.data = stream_obj.value.stream.data;
+  }
 
   // If size wasn't in Params, use actual data size
   if (result.size == 0) {

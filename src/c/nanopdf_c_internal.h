@@ -33,6 +33,7 @@ nanopdf_status nanopdf__copy_owned_string(
 char* nanopdf__strdup(
     const nanopdf_allocator* allocator,
     const char* value);
+void nanopdf__document_destroy_cpp_bridge(nanopdf_document* document);
 
 #ifdef __cplusplus
 }  /* extern "C" */

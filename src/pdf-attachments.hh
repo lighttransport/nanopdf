@@ -68,7 +68,7 @@ class AttachmentExtractor {
 
   // Internal helpers
   struct NameTreeNode {
-    std::vector<std::pair<std::string, const Value*>> entries;
+    std::vector<std::pair<std::string, Value>> entries;
     std::vector<NameTreeNode> kids;
   };
 
@@ -77,7 +77,7 @@ class AttachmentExtractor {
 
   // Recursively collect all name-value pairs from name tree
   void collect_all_entries(const NameTreeNode& node,
-                          std::vector<std::pair<std::string, const Value*>>& out) const;
+                          std::vector<std::pair<std::string, Value>>& out) const;
 
   // Parse a single filespec dictionary into FileAttachment
   FileAttachment parse_filespec(const Value& filespec_value) const;

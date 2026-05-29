@@ -107,6 +107,18 @@ static char* encode_asciihex(const uint8_t* data, size_t size, size_t* out_size)
   return encoded;
 }
 
+static void encode_hex_string(const uint8_t* data, size_t size, char* out) {
+  static const char hex[] = "0123456789ABCDEF";
+  size_t i = 0;
+
+  TEST_CHECK(out != NULL);
+  for (i = 0; i < size; ++i) {
+    out[i * 2] = hex[(data[i] >> 4) & 0x0f];
+    out[i * 2 + 1] = hex[data[i] & 0x0f];
+  }
+  out[size * 2] = '\0';
+}
+
 static int has_zero_byte(const uint8_t* data, size_t size) {
   size_t i = 0;
   for (i = 0; i < size; ++i) {
@@ -137,6 +149,216 @@ static int buffer_contains_text(
   }
 
   return 0;
+}
+
+static size_t buffer_count_text(
+    const uint8_t* data, size_t size, const char* needle) {
+  size_t needle_size = strlen(needle);
+  size_t count = 0;
+  size_t i = 0;
+
+  if (!data || !needle || needle_size == 0 || needle_size > size) {
+    return 0;
+  }
+
+  for (i = 0; i + needle_size <= size; ++i) {
+    if (memcmp(data + i, needle, needle_size) == 0) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+static const char* find_test_font_path(void) {
+  static const char* const candidates[] = {
+      "../fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+      "fonts/noto-sans-jp/NotoSansJP-Regular.otf",
+      NULL};
+  size_t i = 0;
+
+  for (i = 0; candidates[i] != NULL; ++i) {
+    FILE* fp = fopen(candidates[i], "rb");
+    if (fp) {
+      fclose(fp);
+      return candidates[i];
+    }
+  }
+
+  return NULL;
+}
+
+static const char* find_test_attachment_source_path(void) {
+  static const char* const candidates[] = {
+      "../CMakeLists.txt",
+      "CMakeLists.txt",
+      NULL};
+  size_t i = 0;
+
+  for (i = 0; candidates[i] != NULL; ++i) {
+    FILE* fp = fopen(candidates[i], "rb");
+    if (fp) {
+      fclose(fp);
+      return candidates[i];
+    }
+  }
+
+  return NULL;
+}
+
+static void* read_file_bytes(const char* path, size_t* out_size) {
+  FILE* fp = NULL;
+  long file_size = 0;
+  void* data = NULL;
+
+  if (out_size) {
+    *out_size = 0;
+  }
+  if (!path) {
+    return NULL;
+  }
+
+  fp = fopen(path, "rb");
+  if (!fp) {
+    return NULL;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    return NULL;
+  }
+  file_size = ftell(fp);
+  if (file_size <= 0 || fseek(fp, 0, SEEK_SET) != 0) {
+    fclose(fp);
+    return NULL;
+  }
+
+  data = malloc((size_t)file_size);
+  if (!data) {
+    fclose(fp);
+    return NULL;
+  }
+  if (fread(data, 1, (size_t)file_size, fp) != (size_t)file_size) {
+    free(data);
+    fclose(fp);
+    return NULL;
+  }
+
+  fclose(fp);
+  if (out_size) {
+    *out_size = (size_t)file_size;
+  }
+  return data;
+}
+
+static int find_form_field_index_by_name(
+    nanopdf_document* document,
+    const char* partial_name) {
+  uint32_t field_count = 0;
+  uint32_t i = 0;
+
+  if (!document || !partial_name) {
+    return -1;
+  }
+
+  field_count = nanopdf_document_form_field_count(document);
+  for (i = 0; i < field_count; ++i) {
+    nanopdf_form_field_info field_info;
+    if (nanopdf_document_get_form_field_info(document, i, &field_info) ==
+            NANOPDF_STATUS_OK &&
+        field_info.partial_name &&
+        strcmp(field_info.partial_name, partial_name) == 0) {
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+
+static int basic_object_is_name(
+    const nanopdf_basic_object* object,
+    const char* expected_name) {
+  return object && expected_name &&
+         object->type == NANOPDF_BASIC_OBJECT_NAME &&
+         object->as.text != NULL &&
+         strcmp(object->as.text, expected_name) == 0;
+}
+
+static size_t find_first_page_annotation_count(
+    nanopdf_context* context,
+    const uint8_t* data,
+    size_t size) {
+  nanopdf_parse_options parse_options;
+  nanopdf_basic_document document;
+  size_t annotation_count = SIZE_MAX;
+  size_t object_number = 0;
+
+  if (!context || !data || size == 0) {
+    return SIZE_MAX;
+  }
+
+  nanopdf_default_parse_options(&parse_options);
+  nanopdf_basic_document_init(&document);
+
+  if (nanopdf_basic_document_parse(
+          context, data, size, &parse_options, &document) != NANOPDF_STATUS_OK) {
+    nanopdf_basic_document_destroy(nanopdf_context_get_allocator(context), &document);
+    return SIZE_MAX;
+  }
+
+  for (object_number = 1; object_number < document.xref_count; ++object_number) {
+    nanopdf_basic_object object;
+    const nanopdf_basic_dict* dict = NULL;
+    const nanopdf_basic_object* type_object = NULL;
+    const nanopdf_basic_object* annots_object = NULL;
+
+    if (!document.xrefs[object_number].present || !document.xrefs[object_number].in_use) {
+      continue;
+    }
+
+    nanopdf_basic_object_init(&object);
+    if (nanopdf_basic_load_object(
+            context,
+            &document,
+            (nanopdf_basic_ref){(uint32_t)object_number,
+                                document.xrefs[object_number].generation,
+                                1u},
+            &object) != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(nanopdf_context_get_allocator(context), &object);
+      continue;
+    }
+
+    dict = nanopdf_basic_object_as_dict(&object);
+    type_object = dict ? nanopdf_basic_dict_get(dict, "Type") : NULL;
+    if (!basic_object_is_name(type_object, "Page")) {
+      nanopdf_basic_object_destroy(nanopdf_context_get_allocator(context), &object);
+      continue;
+    }
+
+    annots_object = nanopdf_basic_dict_get(dict, "Annots");
+    if (!annots_object) {
+      annotation_count = 0;
+    } else if (annots_object->type == NANOPDF_BASIC_OBJECT_ARRAY) {
+      annotation_count = annots_object->as.array.count;
+    } else if (annots_object->type == NANOPDF_BASIC_OBJECT_REF) {
+      nanopdf_basic_object annots_array;
+      nanopdf_basic_object_init(&annots_array);
+      if (nanopdf_basic_load_object(
+              context,
+              &document,
+              annots_object->as.ref,
+              &annots_array) == NANOPDF_STATUS_OK &&
+          annots_array.type == NANOPDF_BASIC_OBJECT_ARRAY) {
+        annotation_count = annots_array.as.array.count;
+      }
+      nanopdf_basic_object_destroy(nanopdf_context_get_allocator(context), &annots_array);
+    }
+
+    nanopdf_basic_object_destroy(nanopdf_context_get_allocator(context), &object);
+    break;
+  }
+
+  nanopdf_basic_document_destroy(nanopdf_context_get_allocator(context), &document);
+  return annotation_count;
 }
 
 typedef struct TestBitBuilder {
@@ -678,6 +900,30 @@ static uint8_t* encode_runlength(const uint8_t* data, size_t size, size_t* out_s
   encoded[length++] = 128;
   *out_size = length;
   return encoded;
+}
+
+static uint8_t* build_rgba_png_sample(size_t* out_size) {
+  static const uint8_t rgba_pixels[] = {
+      255, 0, 0, 255,
+      0, 0, 255, 96,
+      0, 255, 0, 0,
+      255, 255, 0, 160};
+  void* png = tdefl_write_image_to_png_file_in_memory_ex(
+      rgba_pixels, 2, 2, 4, out_size, MZ_BEST_COMPRESSION, MZ_FALSE);
+  TEST_CHECK(png != NULL);
+  return (uint8_t*)png;
+}
+
+static uint8_t* build_rgb_png_sample(size_t* out_size) {
+  static const uint8_t rgb_pixels[] = {
+      255, 0, 0,
+      0, 255, 0,
+      0, 0, 255,
+      255, 255, 0};
+  void* png = tdefl_write_image_to_png_file_in_memory_ex(
+      rgb_pixels, 2, 2, 3, out_size, MZ_BEST_COMPRESSION, MZ_FALSE);
+  TEST_CHECK(png != NULL);
+  return (uint8_t*)png;
 }
 
 static uint8_t* build_minimal_one_page_pdf(size_t* out_size) {
@@ -7073,21 +7319,182 @@ static void test_nanopdf_c_writer_shapes_and_objects(void) {
   nanopdf_context* context = NULL;
   nanopdf_writer* writer = NULL;
   nanopdf_page_builder* page = NULL;
+  nanopdf_page_builder* template_page = NULL;
+  nanopdf_writer_text_layout* wrapped_layout = NULL;
+  nanopdf_writer_text_layout* overflow_layout = NULL;
+  nanopdf_writer_table* table = NULL;
   nanopdf_document* document = NULL;
   nanopdf_context_options context_options;
+  nanopdf_form_field_info field_info;
   nanopdf_object* form_stream = NULL;
   nanopdf_object* temp = NULL;
   nanopdf_object* zero = NULL;
   nanopdf_object* twelve = NULL;
   nanopdf_object* bbox = NULL;
   char* font_name = NULL;
+  char* embedded_font_name = NULL;
   char* image_name = NULL;
+  char* watermark_image_name = NULL;
+  char* layer_name = NULL;
+  char* configured_layer_name = NULL;
+  char* linear_gradient_name = NULL;
+  char* radial_gradient_name = NULL;
+  char* template_name = NULL;
   char* extracted_text = NULL;
+  char* form_value = NULL;
+  int root_bookmark_id = -1;
+  int child_bookmark_id = -1;
+  int configured_root_bookmark_id = -1;
+  int configured_child_bookmark_id = -1;
   nanopdf_object_ref form_ref = {0, 0, 0};
   void* pdf_data = NULL;
   size_t pdf_size = 0;
   char image_ref_token[64];
+  char watermark_image_ref_token[64];
+  char linear_gradient_ref_token[64];
+  char radial_gradient_ref_token[64];
+  char template_ref_token[64];
+  const char* dropdown_options[] = {"One", "Two", "Three"};
+  const char* listbox_options[] = {"Alpha", "Beta", "Gamma"};
+  const char* table_header_cells[] = {"Item", "Value"};
+  const char* table_row_one_cells[] = {"Alpha", "42"};
+  const char* table_row_two_cells[] = {"Beta", "84"};
+  const double table_column_widths[] = {42.0, 42.0};
+  const nanopdf_quad_points underline_quads[] = {
+      {20.0, 152.0, 88.0, 152.0, 88.0, 166.0, 20.0, 166.0}};
+  const nanopdf_quad_points strikeout_quads[] = {
+      {20.0, 96.0, 104.0, 96.0, 104.0, 108.0, 20.0, 108.0}};
+  const nanopdf_radio_option radio_options[] = {
+      {110.0, 70.0, 12.0, "Red"},
+      {126.0, 70.0, 12.0, "Green"},
+      {142.0, 70.0, 12.0, "Blue"}};
+  const nanopdf_color_stop linear_gradient_stops[] = {
+      {0.0, 1.0, 0.0, 0.0},
+      {1.0, 1.0, 1.0, 0.0}};
+  const nanopdf_color_stop radial_gradient_stops[] = {
+      {0.0, 0.0, 0.0, 1.0},
+      {1.0, 1.0, 1.0, 1.0}};
+  const char* embedded_font_path = NULL;
+  const char* attachment_file_path = NULL;
+  const char* link_uri = "https://example.com/nanopdf";
+  const char* global_watermark_text = "GLOBAL WATERMARK";
+  const char* page_zero_watermark_text = "PAGE ZERO WM";
+  const char* global_header_text = "Header %d/%D";
+  const char* global_footer_text = "Global footer";
+  const char* page_one_header_text = "Page two header";
+  const char* page_one_footer_text = "Page two footer";
+  const char* bates_page_zero_text = "DOC-007";
+  const char* bates_page_two_text = "DOC-011";
+  nanopdf_header_config header_config = {0};
+  nanopdf_header_config page_one_header_config = {0};
+  nanopdf_footer_config footer_config = {0};
+  nanopdf_footer_config page_one_footer_config = {0};
+  nanopdf_bates_config bates_config = {0};
+  nanopdf_layer_config layer_config = {0};
+  nanopdf_bookmark_config bookmark_config = {0};
+  nanopdf_bookmark_config child_bookmark_config = {0};
+  nanopdf_attachment_config attachment_config = {0};
+  nanopdf_writer_text_style wrapped_layout_style = {0};
+  nanopdf_writer_text_style overflow_layout_style = {0};
+  nanopdf_text_markup_config underline_markup = {0};
+  nanopdf_text_markup_config strikeout_markup = {0};
+  static const uint8_t k_attachment_data[] = "memory attachment payload";
+  static const uint8_t k_config_attachment_data[] = "config attachment payload";
   static const uint8_t k_form_stream_data[] = "0 0 1 rg 0 0 12 12 re f\n";
+  double layout_height = 0.0;
+  double table_height = 0.0;
+  int32_t layout_line_count = 0;
+  int wrapped_layout_overflow = 0;
+  int32_t overflow_layout_line_count = 0;
+  int overflow_layout_overflow = 0;
+
+  header_config.left.type = NANOPDF_HEADER_FOOTER_CONTENT_TEXT;
+  header_config.left.text = global_header_text;
+  header_config.center.type = NANOPDF_HEADER_FOOTER_CONTENT_TEXT;
+  header_config.center.text = "Shared header";
+  header_config.font_name = NULL;
+  header_config.font_size = 9.0;
+  header_config.r = 0.2;
+  header_config.g = 0.2;
+  header_config.b = 0.2;
+  header_config.margin_top = 16.0;
+  header_config.margin_left = 18.0;
+  header_config.margin_right = 18.0;
+  header_config.draw_line = 1;
+  header_config.line_width = 0.5;
+
+  page_one_header_config.center.type = NANOPDF_HEADER_FOOTER_CONTENT_TEXT;
+  page_one_header_config.center.text = page_one_header_text;
+  page_one_header_config.font_name = font_name;
+  page_one_header_config.font_size = 10.0;
+  page_one_header_config.r = 0.1;
+  page_one_header_config.g = 0.1;
+  page_one_header_config.b = 0.1;
+  page_one_header_config.margin_top = 18.0;
+  page_one_header_config.margin_left = 20.0;
+  page_one_header_config.margin_right = 20.0;
+  page_one_header_config.draw_line = 1;
+  page_one_header_config.line_width = 0.5;
+
+  footer_config.center.type = NANOPDF_HEADER_FOOTER_CONTENT_TEXT;
+  footer_config.center.text = global_footer_text;
+  footer_config.font_name = NULL;
+  footer_config.font_size = 9.0;
+  footer_config.r = 0.2;
+  footer_config.g = 0.2;
+  footer_config.b = 0.2;
+  footer_config.margin_bottom = 14.0;
+  footer_config.margin_left = 18.0;
+  footer_config.margin_right = 18.0;
+  footer_config.draw_line = 1;
+  footer_config.line_width = 0.5;
+
+  page_one_footer_config.center.type = NANOPDF_HEADER_FOOTER_CONTENT_TEXT;
+  page_one_footer_config.center.text = page_one_footer_text;
+  page_one_footer_config.font_name = font_name;
+  page_one_footer_config.font_size = 10.0;
+  page_one_footer_config.r = 0.1;
+  page_one_footer_config.g = 0.1;
+  page_one_footer_config.b = 0.1;
+  page_one_footer_config.margin_bottom = 14.0;
+  page_one_footer_config.margin_left = 20.0;
+  page_one_footer_config.margin_right = 20.0;
+  page_one_footer_config.draw_line = 1;
+  page_one_footer_config.line_width = 0.5;
+
+  bates_config.prefix = "DOC-";
+  bates_config.start_number = 7;
+  bates_config.digits = 3;
+  bates_config.increment = 2;
+  bates_config.font_size = 9.0;
+  bates_config.r = 0.15;
+  bates_config.g = 0.15;
+  bates_config.b = 0.15;
+  bates_config.position = NANOPDF_BATES_POSITION_BOTTOM_CENTER;
+  bates_config.margin_x = 16.0;
+  bates_config.margin_y = 28.0;
+  layer_config.name = "Locked Layer";
+  layer_config.visible = 0;
+  layer_config.printable = 0;
+  layer_config.locked = 1;
+  bookmark_config.title = "Configured root";
+  bookmark_config.page_index = 0;
+  bookmark_config.dest_y = 150.0;
+  bookmark_config.open = 0;
+  bookmark_config.bold = 1;
+  bookmark_config.italic = 1;
+  child_bookmark_config.title = "Configured child";
+  child_bookmark_config.page_index = 0;
+  child_bookmark_config.dest_y = 90.0;
+  child_bookmark_config.open = 1;
+  child_bookmark_config.bold = 0;
+  child_bookmark_config.italic = 1;
+  attachment_config.filename = "config.txt";
+  attachment_config.description = "configured attachment";
+  attachment_config.mime_type = "text/plain";
+  attachment_config.data = k_config_attachment_data;
+  attachment_config.size = sizeof(k_config_attachment_data) - 1;
+  attachment_config.use_compression = 0;
 
   nanopdf_default_context_options(&context_options);
   TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
@@ -7096,10 +7503,105 @@ static void test_nanopdf_c_writer_shapes_and_objects(void) {
   TEST_CHECK(nanopdf_writer_set_author(writer, "nanopdf-c") == NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_writer_set_subject(writer, "vector + object authoring") ==
              NANOPDF_STATUS_OK);
+  embedded_font_path = find_test_font_path();
+  attachment_file_path = find_test_attachment_source_path();
+  TEST_CHECK(embedded_font_path != NULL);
+  TEST_CHECK(attachment_file_path != NULL);
   TEST_CHECK(nanopdf_writer_add_standard_font(
                  writer, NANOPDF_STANDARD_FONT_HELVETICA, &font_name) ==
              NANOPDF_STATUS_OK);
   TEST_CHECK(font_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_truetype_font_from_file(
+                 writer,
+                 embedded_font_path,
+                 NANOPDF_FONT_EMBEDDING_SUBSET,
+                 &embedded_font_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(embedded_font_name != NULL);
+  wrapped_layout_style.font_name = font_name;
+  wrapped_layout_style.font_size = 10.0;
+  wrapped_layout_style.r = 0.0;
+  wrapped_layout_style.g = 0.0;
+  wrapped_layout_style.b = 0.0;
+  wrapped_layout_style.line_height = 1.15;
+  wrapped_layout_style.letter_spacing = 0.2;
+  wrapped_layout_style.word_spacing = 0.4;
+  overflow_layout_style.font_name = font_name;
+  overflow_layout_style.font_size = 10.0;
+  overflow_layout_style.r = 0.0;
+  overflow_layout_style.g = 0.0;
+  overflow_layout_style.b = 0.0;
+  overflow_layout_style.line_height = 1.1;
+  overflow_layout_style.letter_spacing = 0.0;
+  overflow_layout_style.word_spacing = 0.0;
+  underline_markup.type = NANOPDF_MARKUP_TYPE_UNDERLINE;
+  underline_markup.quads = underline_quads;
+  underline_markup.quad_count = 1;
+  underline_markup.r = 0.0;
+  underline_markup.g = 0.2;
+  underline_markup.b = 0.8;
+  underline_markup.alpha = 0.8;
+  underline_markup.author = "Reviewer";
+  underline_markup.contents = "Underline note";
+  underline_markup.print = 1;
+  strikeout_markup.type = NANOPDF_MARKUP_TYPE_STRIKE_OUT;
+  strikeout_markup.quads = strikeout_quads;
+  strikeout_markup.quad_count = 1;
+  strikeout_markup.r = 0.8;
+  strikeout_markup.g = 0.1;
+  strikeout_markup.b = 0.1;
+  strikeout_markup.alpha = 0.7;
+  strikeout_markup.author = "QA";
+  strikeout_markup.contents = "Strikeout note";
+  strikeout_markup.print = 1;
+  TEST_CHECK(nanopdf_writer_text_layout_create(writer, &wrapped_layout) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_width(wrapped_layout, 64.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_max_height(wrapped_layout, 80.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_alignment(
+                 wrapped_layout, NANOPDF_WRITER_TEXT_ALIGN_CENTER) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_style(
+                 wrapped_layout, &wrapped_layout_style) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_add_text(
+                 wrapped_layout, "Wrapped writer layout words for the new C API") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_create(writer, &overflow_layout) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_width(overflow_layout, 44.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_max_height(overflow_layout, 11.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_alignment(
+                 overflow_layout, NANOPDF_WRITER_TEXT_ALIGN_LEFT) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_set_style(
+                 overflow_layout, &overflow_layout_style) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_add_text(
+                 overflow_layout, "Overflow layout words for truncation") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_create(context, &table) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_position(table, 20.0, 34.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_width(table, 84.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_column_widths(
+                 table, table_column_widths, 2) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_text_color(table, 0.05, 0.05, 0.2) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_border(table, 0.75, 0.2, 0.2, 0.2) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_alternating_rows(
+                 table, 1, 0.94, 0.97, 1.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_add_header_row(
+                 table, table_header_cells, 2) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_add_row(
+                 table, table_row_one_cells, 2) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_add_row(
+                 table, table_row_two_cells, 2) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_calculate_height(table, &table_height) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(table_height > 0.0);
   TEST_CHECK(nanopdf_writer_add_image_from_memory(
                  writer,
                  k_jpeg_1x1_red,
@@ -7107,6 +7609,75 @@ static void test_nanopdf_c_writer_shapes_and_objects(void) {
                  NANOPDF_IMAGE_COMPRESSION_AUTO,
                  &image_name) == NANOPDF_STATUS_OK);
   TEST_CHECK(image_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_image_from_memory(
+                 writer,
+                 k_jpeg_1x1_red,
+                 sizeof(k_jpeg_1x1_red),
+                 NANOPDF_IMAGE_COMPRESSION_AUTO,
+                 &watermark_image_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(watermark_image_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_layer(writer, "Overlay", 0, &layer_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(layer_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_layer_config(
+                 writer, &layer_config, &configured_layer_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(configured_layer_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_linear_gradient(
+                 writer,
+                 20.0,
+                 24.0,
+                 56.0,
+                 24.0,
+                 linear_gradient_stops,
+                 2,
+                 0,
+                 1,
+                 &linear_gradient_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(linear_gradient_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_radial_gradient(
+                 writer,
+                 150.0,
+                 35.0,
+                 18.0,
+                 radial_gradient_stops,
+                 2,
+                 0,
+                 1,
+                 &radial_gradient_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(radial_gradient_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_attachment_from_memory(
+                 writer,
+                 "note.txt",
+                 k_attachment_data,
+                 sizeof(k_attachment_data) - 1,
+                 "generated from memory") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_attachment_from_file(
+                 writer, attachment_file_path, "attached from file") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_attachment(writer, &attachment_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_template(
+                 writer, 36.0, 20.0, &template_page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(template_page != NULL);
+  TEST_CHECK(nanopdf_page_builder_set_fill_gradient(
+                 template_page, linear_gradient_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_rectangle(
+                 template_page, 0.0, 0.0, 36.0, 20.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_fill(template_page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(template_page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(
+                 template_page, font_name, 8.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(
+                 template_page, 3.0, 6.0, "Tpl") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(template_page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_image(
+                 template_page, image_name, 26.0, 6.0, 6.0, 6.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close_template(
+                 template_page, &template_name) == NANOPDF_STATUS_OK);
+  template_page = NULL;
+  TEST_CHECK(template_name != NULL);
 
   TEST_CHECK(nanopdf_object_create_stream(context, &form_stream) == NANOPDF_STATUS_OK);
 
@@ -7151,13 +7722,54 @@ static void test_nanopdf_c_writer_shapes_and_objects(void) {
   TEST_CHECK(nanopdf_page_builder_circle(page, 100.0, 100.0, 20.0) ==
              NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_fill(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_fill_alpha(page, 0.4) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_stroke_alpha(page, 0.8) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_blend_mode(
+                 page, NANOPDF_BLEND_MODE_MULTIPLY) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_layer(page, layer_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_fill_color_rgb(page, 0.0, 0.0, 1.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_rectangle(page, 72.0, 24.0, 42.0, 42.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_fill(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_layer(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_reset_transparency(page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_fill_gradient(
+                 page, linear_gradient_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_rectangle(page, 118.0, 24.0, 18.0, 18.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_fill(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_stroke_gradient(
+                 page, radial_gradient_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_line_width(page, 3.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_line(page, 142.0, 28.0, 176.0, 52.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_stroke(page) == NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_set_font(page, font_name, 14.0) ==
              NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 160.0, "Hello C writer") ==
              NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(page, embedded_font_name, 13.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 132.0, "Embedded OTF") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_draw_image(page, image_name, 140.0, 140.0, 24.0, 24.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_template(
+                 page, template_name, 132.0, 108.0, 1.0, 1.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_add_link_uri(
+                 page, 18.0, 156.0, 90.0, 16.0, link_uri) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_add_highlight(
+                 page, 18.0, 154.0, 90.0, 18.0, 1.0, 1.0, 0.0, 0.35) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_add_text_markup(page, &underline_markup) ==
              NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_add_resource_ref(page, "XObject", "Fx1", form_ref) ==
              NANOPDF_STATUS_OK);
@@ -7165,34 +7777,423 @@ static void test_nanopdf_c_writer_shapes_and_objects(void) {
                  page, "q 1 0 0 1 60 60 cm /Fx1 Do Q\n") == NANOPDF_STATUS_OK);
   TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
   page = NULL;
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 200.0, 200.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(page, font_name, 12.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 100.0, "Second page body") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_text_layout(
+                 page, wrapped_layout, 112.0, 156.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_get_height(
+                 wrapped_layout, &layout_height) == NANOPDF_STATUS_OK);
+  TEST_CHECK(layout_height > 0.0);
+  TEST_CHECK(nanopdf_writer_text_layout_get_line_count(
+                 wrapped_layout, &layout_line_count) == NANOPDF_STATUS_OK);
+  TEST_CHECK(layout_line_count > 1);
+  TEST_CHECK(nanopdf_writer_text_layout_has_overflow(
+                 wrapped_layout, &wrapped_layout_overflow) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(wrapped_layout_overflow == 0);
+  TEST_CHECK(nanopdf_page_builder_draw_table(page, table) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 200.0, 200.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(page, font_name, 12.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 100.0, "Third page body") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_text_layout(
+                 page, overflow_layout, 116.0, 154.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_text_layout_get_line_count(
+                 overflow_layout, &overflow_layout_line_count) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(overflow_layout_line_count > 1);
+  TEST_CHECK(nanopdf_writer_text_layout_has_overflow(
+                 overflow_layout, &overflow_layout_overflow) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(overflow_layout_overflow == 1);
+  TEST_CHECK(nanopdf_page_builder_add_text_markup(page, &strikeout_markup) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_add_bookmark(
+                 writer, "Writer smoke page", 0, 180.0, &root_bookmark_id) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(root_bookmark_id >= 0);
+  TEST_CHECK(nanopdf_writer_add_bookmark_config(
+                 writer, &bookmark_config, &configured_root_bookmark_id) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(configured_root_bookmark_id >= 0);
+  TEST_CHECK(nanopdf_writer_add_child_bookmark(
+                 writer,
+                 root_bookmark_id,
+                 "Shapes section",
+                 0,
+                 100.0,
+                 &child_bookmark_id) == NANOPDF_STATUS_OK);
+  TEST_CHECK(child_bookmark_id >= 0);
+  TEST_CHECK(nanopdf_writer_add_child_bookmark_config(
+                 writer,
+                 configured_root_bookmark_id,
+                 &child_bookmark_config,
+                 &configured_child_bookmark_id) == NANOPDF_STATUS_OK);
+  TEST_CHECK(configured_child_bookmark_id >= 0);
+  TEST_CHECK(nanopdf_writer_add_text_field(
+                 writer, "Name", 0, 20.0, 96.0, 82.0, 18.0, "Alice") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_checkbox(
+                 writer, "Accept", 0, 110.0, 98.0, 12.0, 1, "Yes") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_dropdown(
+                 writer,
+                 "Mode",
+                 0,
+                 20.0,
+                 70.0,
+                 90.0,
+                 18.0,
+                 dropdown_options,
+                 3,
+                 1,
+                 0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_radio_group(
+                 writer, "Tone", 0, radio_options, 3, 1) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_listbox(
+                 writer,
+                 "Palette",
+                 0,
+                 20.0,
+                 40.0,
+                 90.0,
+                 22.0,
+                 listbox_options,
+                 3,
+                 2) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_button(
+                 writer, "Action", 0, 118.0, 40.0, 42.0, 18.0, "Run") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_image_watermark(
+                 writer,
+                 watermark_image_name,
+                 0.12,
+                 18.0,
+                 NANOPDF_WATERMARK_POSITION_CENTER,
+                 NANOPDF_WATERMARK_LAYER_BACKGROUND,
+                 0.0,
+                 0.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_clear_watermark(writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_text_watermark(
+                 writer,
+                 global_watermark_text,
+                 font_name,
+                 18.0,
+                 0.7,
+                 0.7,
+                 0.7,
+                 0.18,
+                 -30.0,
+                 NANOPDF_WATERMARK_POSITION_CENTER,
+                 NANOPDF_WATERMARK_LAYER_BACKGROUND) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_page_text_watermark(
+                 writer,
+                 0,
+                 page_zero_watermark_text,
+                 font_name,
+                 14.0,
+                 0.5,
+                 0.5,
+                 0.5,
+                 0.24,
+                 -18.0,
+                 NANOPDF_WATERMARK_POSITION_TOP_LEFT,
+                 NANOPDF_WATERMARK_LAYER_FOREGROUND) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_page_image_watermark(
+                 writer,
+                 2,
+                 watermark_image_name,
+                 0.22,
+                 24.0,
+                 NANOPDF_WATERMARK_POSITION_BOTTOM_RIGHT,
+                 NANOPDF_WATERMARK_LAYER_FOREGROUND,
+                 6.0,
+                 6.0) == NANOPDF_STATUS_OK);
+  page_one_header_config.font_name = font_name;
+  page_one_footer_config.font_name = font_name;
+  TEST_CHECK(nanopdf_writer_set_header(writer, &header_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_clear_header(writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_header(writer, &header_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_footer(writer, &footer_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_clear_footer(writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_footer(writer, &footer_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_page_header(writer, 1, &page_one_header_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_page_footer(writer, 1, &page_one_footer_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_skip_header_footer(writer, 2) ==
+             NANOPDF_STATUS_OK);
+  bates_config.font_name = font_name;
+  TEST_CHECK(nanopdf_writer_set_bates_numbering(writer, &bates_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_clear_bates_numbering(writer) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_bates_numbering(writer, &bates_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_skip_bates_number(writer, 1) ==
+             NANOPDF_STATUS_OK);
 
   TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
              NANOPDF_STATUS_OK);
   TEST_CHECK(pdf_data != NULL);
   TEST_CHECK(pdf_size > 0);
   snprintf(image_ref_token, sizeof(image_ref_token), "/%s ", image_name);
+  snprintf(watermark_image_ref_token, sizeof(watermark_image_ref_token), "/%s ", watermark_image_name);
+  snprintf(linear_gradient_ref_token, sizeof(linear_gradient_ref_token), "/%s ", linear_gradient_name);
+  snprintf(radial_gradient_ref_token, sizeof(radial_gradient_ref_token), "/%s ", radial_gradient_name);
+  snprintf(template_ref_token, sizeof(template_ref_token), "/%s ", template_name);
   TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Form"));
   TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Image"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Type0"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/ToUnicode "));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Link"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Highlight"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Underline"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /StrikeOut"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, link_uri));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/QuadPoints ["));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Contents (Underline note)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Contents (Strikeout note)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (Reviewer)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (QA)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Type /OCG"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/OCProperties "));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Name (Overlay)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Name (Locked Layer)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/OFF ["));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Locked ["));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Usage << /Print << /PrintState /OFF >> >>"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Type /Pattern"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/PatternType 2"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/ShadingType 2"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/ShadingType 3"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Pattern <<"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Type /Outlines"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Outlines "));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/NeedAppearances true"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/FT /Tx"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/FT /Btn"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/FT /Ch"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (Name)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (Accept)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (Mode)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (Tone)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (Palette)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/T (Action)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/V (Alice)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/V /Yes"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/V (Two)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/V /Green"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/V (Gamma)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Ff 32768"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Ff 65536"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Kids ["));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/MK << /CA (Run) >>"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Title (Writer smoke page)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Title (Shapes section)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Title (Configured root)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Title (Configured child)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/F 3"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Count -"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Names "));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/EmbeddedFiles <<"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Type /Filespec"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Type /EmbeddedFile"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Desc (generated from memory)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Desc (attached from file)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Desc (configured attachment)"));
+  /* MIME subtype is written as a PDF name with '/' escaped as #2F so the
+     name token does not break dictionary parsing (text/plain -> text#2Fplain). */
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/Subtype /text#2Fplain"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "(note.txt)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "(config.txt)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "config attachment payload"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "(CMakeLists.txt)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/BM /Multiply"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/ca 0.4"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/CA 0.8"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Properties <<"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/MC0 "));
+  TEST_CHECK(buffer_count_text((const uint8_t*)pdf_data, pdf_size,
+                               "/Type /ExtGState") >= 7);
+  TEST_CHECK(buffer_count_text((const uint8_t*)pdf_data, pdf_size,
+                               "/Type /Filespec") == 3);
+  TEST_CHECK(buffer_count_text((const uint8_t*)pdf_data, pdf_size,
+                               "/Type /EmbeddedFile") == 3);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  linear_gradient_ref_token));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  radial_gradient_ref_token));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  template_ref_token));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  "/BBox [0 0 36 20]"));
   TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Fx1 "));
   TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, image_ref_token));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
+                                  watermark_image_ref_token));
   TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size,
                                   "/Title (C writer smoke)"));
 
   TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
              NANOPDF_STATUS_OK);
-  TEST_CHECK(nanopdf_document_page_count(document) == 1);
+  TEST_CHECK(nanopdf_document_page_count(document) == 3);
+  TEST_CHECK(nanopdf_document_form_field_count(document) == 6u);
+  TEST_CHECK(nanopdf_document_get_form_field_info(document, 0, &field_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_TEXT);
+  TEST_CHECK(strcmp(field_info.partial_name, "Name") == 0);
+  TEST_CHECK(nanopdf_document_copy_form_field_value(document, 0, &form_value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strcmp(form_value, "Alice") == 0);
+  nanopdf_free(context, form_value);
+  form_value = NULL;
+  TEST_CHECK(nanopdf_document_get_form_field_info(document, 1, &field_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_BUTTON);
+  TEST_CHECK(strcmp(field_info.partial_name, "Accept") == 0);
+  TEST_CHECK(nanopdf_document_copy_form_field_value(document, 1, &form_value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strcmp(form_value, "Yes") == 0);
+  nanopdf_free(context, form_value);
+  form_value = NULL;
+  TEST_CHECK(nanopdf_document_get_form_field_info(document, 2, &field_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_CHOICE);
+  TEST_CHECK(strcmp(field_info.partial_name, "Mode") == 0);
+  TEST_CHECK(nanopdf_document_copy_form_field_value(document, 2, &form_value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strcmp(form_value, "Two") == 0);
+  nanopdf_free(context, form_value);
+  form_value = NULL;
+  TEST_CHECK(nanopdf_document_get_form_field_info(document, 3, &field_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_BUTTON);
+  TEST_CHECK(strcmp(field_info.partial_name, "Tone") == 0);
+  TEST_CHECK(nanopdf_document_copy_form_field_value(document, 3, &form_value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strcmp(form_value, "Green") == 0);
+  nanopdf_free(context, form_value);
+  form_value = NULL;
+  TEST_CHECK(nanopdf_document_get_form_field_info(document, 4, &field_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_CHOICE);
+  TEST_CHECK(strcmp(field_info.partial_name, "Palette") == 0);
+  TEST_CHECK(nanopdf_document_copy_form_field_value(document, 4, &form_value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strcmp(form_value, "Gamma") == 0);
+  nanopdf_free(context, form_value);
+  form_value = NULL;
+  TEST_CHECK(nanopdf_document_get_form_field_info(document, 5, &field_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_BUTTON);
+  TEST_CHECK(strcmp(field_info.partial_name, "Action") == 0);
   TEST_CHECK(nanopdf_page_extract_text(document, 0, &extracted_text) ==
              NANOPDF_STATUS_OK);
   TEST_CHECK(strstr(extracted_text, "Hello C writer") != NULL);
+  TEST_CHECK(strstr(extracted_text, page_zero_watermark_text) != NULL);
+  TEST_CHECK(strstr(extracted_text, "Shared header") != NULL);
+  TEST_CHECK(strstr(extracted_text, "Header 1/3") != NULL);
+  TEST_CHECK(strstr(extracted_text, global_footer_text) != NULL);
+  TEST_CHECK(strstr(extracted_text, bates_page_zero_text) != NULL);
+  nanopdf_free(context, extracted_text);
+  extracted_text = NULL;
+  TEST_CHECK(nanopdf_page_extract_text(document, 1, &extracted_text) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strstr(extracted_text, "Second page body") != NULL);
+  TEST_CHECK(strstr(extracted_text, global_watermark_text) != NULL);
+  TEST_CHECK(strstr(extracted_text, page_one_header_text) != NULL);
+  TEST_CHECK(strstr(extracted_text, page_one_footer_text) != NULL);
+  TEST_CHECK(strstr(extracted_text, "Wrapped") != NULL);
+  TEST_CHECK(strstr(extracted_text, "layout") != NULL);
+  TEST_CHECK(strstr(extracted_text, "API") != NULL);
+  TEST_CHECK(strstr(extracted_text, "Item") != NULL);
+  TEST_CHECK(strstr(extracted_text, "Value") != NULL);
+  TEST_CHECK(strstr(extracted_text, "Alpha") != NULL);
+  TEST_CHECK(strstr(extracted_text, "84") != NULL);
+  TEST_CHECK(strstr(extracted_text, "DOC-009") == NULL);
+  nanopdf_free(context, extracted_text);
+  extracted_text = NULL;
+  TEST_CHECK(nanopdf_page_extract_text(document, 2, &extracted_text) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(strstr(extracted_text, "Third page body") != NULL);
+  TEST_CHECK(strstr(extracted_text, global_watermark_text) == NULL);
+  TEST_CHECK(strstr(extracted_text, "Shared header") == NULL);
+  TEST_CHECK(strstr(extracted_text, global_footer_text) == NULL);
+  TEST_CHECK(strstr(extracted_text, bates_page_two_text) != NULL);
 
   if (document) {
     nanopdf_document_close(document);
+  }
+  if (overflow_layout) {
+    nanopdf_writer_text_layout_destroy(overflow_layout);
+  }
+  if (wrapped_layout) {
+    nanopdf_writer_text_layout_destroy(wrapped_layout);
+  }
+  if (table) {
+    nanopdf_writer_table_destroy(table);
+  }
+  if (form_value) {
+    nanopdf_free(context, form_value);
   }
   if (extracted_text) {
     nanopdf_free(context, extracted_text);
   }
   if (image_name) {
     nanopdf_free(context, image_name);
+  }
+  if (watermark_image_name) {
+    nanopdf_free(context, watermark_image_name);
+  }
+  if (template_name) {
+    nanopdf_free(context, template_name);
+  }
+  if (radial_gradient_name) {
+    nanopdf_free(context, radial_gradient_name);
+  }
+  if (linear_gradient_name) {
+    nanopdf_free(context, linear_gradient_name);
+  }
+  if (layer_name) {
+    nanopdf_free(context, layer_name);
+  }
+  if (configured_layer_name) {
+    nanopdf_free(context, configured_layer_name);
+  }
+  if (embedded_font_name) {
+    nanopdf_free(context, embedded_font_name);
   }
   if (font_name) {
     nanopdf_free(context, font_name);
@@ -7203,6 +8204,9 @@ static void test_nanopdf_c_writer_shapes_and_objects(void) {
   if (page) {
     nanopdf_page_builder_discard(page);
   }
+  if (template_page) {
+    nanopdf_page_builder_discard(template_page);
+  }
   nanopdf_object_destroy(form_stream);
   nanopdf_object_destroy(bbox);
   nanopdf_object_destroy(zero);
@@ -7210,6 +8214,3149 @@ static void test_nanopdf_c_writer_shapes_and_objects(void) {
   nanopdf_object_destroy(temp);
   nanopdf_writer_destroy(writer);
   nanopdf_context_destroy(context);
+}
+
+static void test_nanopdf_c_incremental_writer(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_writer* update_writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_form_field_info field_info;
+  void* initial_pdf = NULL;
+  size_t initial_pdf_size = 0;
+  void* updated_pdf = NULL;
+  size_t updated_pdf_size = 0;
+  char* value = NULL;
+  const char* dropdown_options[] = {"One", "Two", "Three"};
+  int has_existing_pdf = 0;
+  int32_t revision_count = 0;
+  int name_index = -1;
+  int accept_index = -1;
+  int mode_index = -1;
+  size_t annotation_count = SIZE_MAX;
+  nanopdf_quad_points underline_quad = {18.0, 22.0, 78.0, 22.0, 78.0, 14.0, 18.0, 14.0};
+  nanopdf_text_markup_config markup_config;
+
+  nanopdf_default_context_options(&context_options);
+  memset(&markup_config, 0, sizeof(markup_config));
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 160.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_add_highlight(
+                 page, 22.0, 18.0, 48.0, 8.0, 1.0, 1.0, 0.0, 0.5) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_add_text_field(
+                 writer, "Name", 0, 18.0, 84.0, 72.0, 16.0, "Alice") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_checkbox(
+                 writer, "Accept", 0, 18.0, 58.0, 12.0, 1, "Yes") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_dropdown(
+                 writer,
+                 "Mode",
+                 0,
+                 18.0,
+                 30.0,
+                 76.0,
+                 16.0,
+                 dropdown_options,
+                 3,
+                 1,
+                 0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &initial_pdf, &initial_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(initial_pdf != NULL);
+  TEST_CHECK(initial_pdf_size > 0);
+
+  TEST_CHECK(nanopdf_writer_create(context, &update_writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_load_existing_memory(
+                 update_writer, initial_pdf, initial_pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_has_existing_pdf(
+                 update_writer, &has_existing_pdf) == NANOPDF_STATUS_OK);
+  TEST_CHECK(has_existing_pdf == 1);
+  TEST_CHECK(nanopdf_writer_get_revision_count(
+                 update_writer, &revision_count) == NANOPDF_STATUS_OK);
+  TEST_CHECK(revision_count >= 1);
+  TEST_CHECK(nanopdf_writer_set_field_value(
+                 update_writer, "Name", "Bob") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_field_checked(
+                 update_writer, "Accept", 0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_field_choice(
+                 update_writer, "Mode", "Three") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_delete_existing_annotation(
+                 update_writer, 0, 0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_existing_text_annotation(
+                 update_writer, 0, 104.0, 82.0, 14.0, 14.0, "Incremental note") ==
+             NANOPDF_STATUS_OK);
+  markup_config.type = NANOPDF_MARKUP_TYPE_UNDERLINE;
+  markup_config.quads = &underline_quad;
+  markup_config.quad_count = 1;
+  markup_config.r = 1.0;
+  markup_config.g = 0.0;
+  markup_config.b = 0.0;
+  markup_config.alpha = 0.75;
+  markup_config.author = "Updater";
+  markup_config.contents = "Updated underline";
+  markup_config.print = 1;
+  TEST_CHECK(nanopdf_writer_add_existing_text_markup(
+                 update_writer, 0, &markup_config) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_existing_link_uri(
+                 update_writer,
+                 0,
+                 18.0,
+                 98.0,
+                 54.0,
+                 10.0,
+                 "https://example.com/incremental") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_incremental_memory(
+                 update_writer, &updated_pdf, &updated_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(updated_pdf != NULL);
+  TEST_CHECK(updated_pdf_size > initial_pdf_size);
+  TEST_CHECK(memcmp(updated_pdf, initial_pdf, initial_pdf_size) == 0);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/Prev "));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/V (Bob)"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/V /Off"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/V (Three)"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/Subtype /Text"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/Subtype /Underline"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/Subtype /Link"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf,
+      updated_pdf_size,
+      "/Contents (Incremental note)"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf,
+      updated_pdf_size,
+      "/Contents (Updated underline)"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf,
+      updated_pdf_size,
+      "https://example.com/incremental"));
+
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, updated_pdf, updated_pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 1);
+    TEST_CHECK(nanopdf_document_form_field_count(document) == 3u);
+
+    name_index = find_form_field_index_by_name(document, "Name");
+    accept_index = find_form_field_index_by_name(document, "Accept");
+    mode_index = find_form_field_index_by_name(document, "Mode");
+    TEST_CHECK(name_index >= 0);
+    TEST_CHECK(accept_index >= 0);
+    TEST_CHECK(mode_index >= 0);
+
+    TEST_CHECK(nanopdf_document_get_form_field_info(document, (uint32_t)name_index, &field_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_TEXT);
+    TEST_CHECK(nanopdf_document_copy_form_field_value(document, (uint32_t)name_index, &value) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(strcmp(value, "Bob") == 0);
+    nanopdf_free(context, value);
+    value = NULL;
+
+    TEST_CHECK(nanopdf_document_get_form_field_info(document, (uint32_t)accept_index, &field_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_BUTTON);
+    TEST_CHECK(nanopdf_document_copy_form_field_value(document, (uint32_t)accept_index, &value) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(strcmp(value, "Off") == 0);
+    nanopdf_free(context, value);
+    value = NULL;
+
+    TEST_CHECK(nanopdf_document_get_form_field_info(document, (uint32_t)mode_index, &field_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_CHOICE);
+    TEST_CHECK(nanopdf_document_copy_form_field_value(document, (uint32_t)mode_index, &value) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(strcmp(value, "Three") == 0);
+  }
+  annotation_count = find_first_page_annotation_count(
+      context, (const uint8_t*)updated_pdf, updated_pdf_size);
+  TEST_CHECK(annotation_count == 6u);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (value) {
+    nanopdf_free(context, value);
+  }
+  if (updated_pdf) {
+    nanopdf_free(context, updated_pdf);
+  }
+  if (initial_pdf) {
+    nanopdf_free(context, initial_pdf);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  nanopdf_writer_destroy(update_writer);
+  nanopdf_writer_destroy(writer);
+  nanopdf_context_destroy(context);
+}
+
+static void test_nanopdf_c_writer_link_configs(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_writer* update_writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_link_config page_link_config = {0};
+  nanopdf_link_config existing_link_config = {0};
+  nanopdf_link_config existing_goto_link_config = {0};
+  void* initial_pdf = NULL;
+  size_t initial_pdf_size = 0;
+  void* updated_pdf = NULL;
+  size_t updated_pdf_size = 0;
+  const char* page_legacy_uri = "https://example.com/legacy";
+  const char* page_config_uri = "https://example.com/config";
+  const char* existing_legacy_uri = "https://example.com/incremental/legacy";
+  const char* existing_config_uri = "https://example.com/incremental/config";
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 160.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_add_link_uri(
+                 page, 12.0, 80.0, 54.0, 12.0, page_legacy_uri) ==
+             NANOPDF_STATUS_OK);
+
+  page_link_config.x = 12.0;
+  page_link_config.y = 56.0;
+  page_link_config.width = 72.0;
+  page_link_config.height = 12.0;
+  page_link_config.action = NANOPDF_LINK_ACTION_URI;
+  page_link_config.uri = page_config_uri;
+  page_link_config.show_border = 1;
+  TEST_CHECK(nanopdf_page_builder_add_link_config(page, &page_link_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 160.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &initial_pdf, &initial_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(initial_pdf != NULL);
+  TEST_CHECK(buffer_count_text(
+                 (const uint8_t*)initial_pdf, initial_pdf_size, "/Subtype /Link") == 2u);
+  TEST_CHECK(buffer_count_text(
+                 (const uint8_t*)initial_pdf, initial_pdf_size, "/Border [0 0 0]") == 1u);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)initial_pdf, initial_pdf_size, page_legacy_uri));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)initial_pdf, initial_pdf_size, page_config_uri));
+
+  TEST_CHECK(nanopdf_writer_create(context, &update_writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_load_existing_memory(
+                 update_writer, initial_pdf, initial_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_existing_link_uri(
+                 update_writer, 0, 92.0, 80.0, 54.0, 12.0, existing_legacy_uri) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_existing_link_goto(
+                 update_writer, 0, 92.0, 32.0, 54.0, 12.0, 1, 64.0) ==
+             NANOPDF_STATUS_OK);
+
+  existing_link_config.x = 92.0;
+  existing_link_config.y = 56.0;
+  existing_link_config.width = 56.0;
+  existing_link_config.height = 12.0;
+  existing_link_config.action = NANOPDF_LINK_ACTION_URI;
+  existing_link_config.uri = existing_config_uri;
+  existing_link_config.show_border = 1;
+  TEST_CHECK(nanopdf_writer_add_existing_link_config(
+                 update_writer, 0, &existing_link_config) ==
+             NANOPDF_STATUS_OK);
+  existing_goto_link_config.x = 92.0;
+  existing_goto_link_config.y = 8.0;
+  existing_goto_link_config.width = 56.0;
+  existing_goto_link_config.height = 12.0;
+  existing_goto_link_config.action = NANOPDF_LINK_ACTION_GOTO;
+  existing_goto_link_config.dest_page_index = 1;
+  existing_goto_link_config.dest_y = 72.0;
+  existing_goto_link_config.show_border = 1;
+  TEST_CHECK(nanopdf_writer_add_existing_link_config(
+                 update_writer, 0, &existing_goto_link_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_incremental_memory(
+                 update_writer, &updated_pdf, &updated_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(updated_pdf != NULL);
+  TEST_CHECK(updated_pdf_size > initial_pdf_size);
+  TEST_CHECK(memcmp(updated_pdf, initial_pdf, initial_pdf_size) == 0);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, "/Prev "));
+  TEST_CHECK(buffer_count_text(
+                 (const uint8_t*)updated_pdf, updated_pdf_size, "/Subtype /Link") == 6u);
+  TEST_CHECK(buffer_count_text(
+                 (const uint8_t*)updated_pdf, updated_pdf_size, "/Border [0 0 0]") == 3u);
+  TEST_CHECK(buffer_count_text(
+                 (const uint8_t*)updated_pdf, updated_pdf_size, "/Dest [") == 2u);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, existing_legacy_uri));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)updated_pdf, updated_pdf_size, existing_config_uri));
+
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, updated_pdf, updated_pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 2);
+  }
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (updated_pdf) {
+    nanopdf_free(context, updated_pdf);
+  }
+  if (initial_pdf) {
+    nanopdf_free(context, initial_pdf);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (update_writer) {
+    nanopdf_writer_destroy(update_writer);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_table_configs(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_writer_table* table = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_writer_table_cell header_row_cells[2];
+  nanopdf_writer_table_row header_row;
+  nanopdf_writer_table_cell span_row_cells[1];
+  nanopdf_writer_table_cell styled_row_cells[2];
+  nanopdf_writer_table_row styled_row;
+  nanopdf_writer_table_cell_style header_style;
+  char* font_name = NULL;
+  char* alt_font_name = NULL;
+  char* header_font_name = NULL;
+  char* extracted_text = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  double table_height = 0.0;
+  char alt_font_ref_token[64];
+  char header_font_ref_token[64];
+  const char* header_cells[] = {"Name", "Value"};
+  const double column_widths[] = {60.0, 60.0};
+
+  nanopdf_default_context_options(&context_options);
+  nanopdf_default_writer_table_cell(&header_row_cells[0]);
+  nanopdf_default_writer_table_cell(&header_row_cells[1]);
+  nanopdf_default_writer_table_row(&header_row);
+  nanopdf_default_writer_table_cell(&span_row_cells[0]);
+  nanopdf_default_writer_table_cell(&styled_row_cells[0]);
+  nanopdf_default_writer_table_cell(&styled_row_cells[1]);
+  nanopdf_default_writer_table_row(&styled_row);
+  nanopdf_default_writer_table_cell_style(&header_style);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_standard_font(
+                 writer, NANOPDF_STANDARD_FONT_HELVETICA, &font_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(font_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_standard_font(
+                 writer, NANOPDF_STANDARD_FONT_COURIER, &alt_font_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(alt_font_name != NULL);
+  TEST_CHECK(nanopdf_writer_add_standard_font(
+                 writer, NANOPDF_STANDARD_FONT_TIMES_ROMAN, &header_font_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(header_font_name != NULL);
+
+  TEST_CHECK(nanopdf_writer_table_create(context, &table) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_position(table, 18.0, 20.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_width(table, 120.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_column_widths(
+                 table, column_widths, 2) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_table_set_font(table, font_name, 10.0) ==
+             NANOPDF_STATUS_OK);
+  header_style.font_name = NULL;
+  header_style.has_background = 1;
+  header_style.bg_r = 0.82;
+  header_style.bg_g = 0.9;
+  header_style.bg_b = 1.0;
+  TEST_CHECK(nanopdf_writer_table_set_header_style(table, &header_style) ==
+             NANOPDF_STATUS_OK);
+  header_row_cells[0].text = header_cells[0];
+  header_row_cells[0].style.font_name = header_font_name;
+  header_row_cells[0].style.font_size = 12.0;
+  header_row_cells[0].style.align = NANOPDF_TABLE_CELL_ALIGN_CENTER;
+  header_row_cells[1].text = header_cells[1];
+  header_row_cells[1].style.font_name = header_font_name;
+  header_row_cells[1].style.font_size = 12.0;
+  header_row_cells[1].style.align = NANOPDF_TABLE_CELL_ALIGN_CENTER;
+  header_row.height = 24.0;
+  header_row.cells = header_row_cells;
+  header_row.cell_count = 2;
+  TEST_CHECK(nanopdf_writer_table_add_header_row_config(
+                 table, &header_row) == NANOPDF_STATUS_OK);
+
+  span_row_cells[0].text = "Span row";
+  span_row_cells[0].colspan = 2;
+  span_row_cells[0].style.has_background = 1;
+  span_row_cells[0].style.bg_r = 0.88;
+  span_row_cells[0].style.bg_g = 0.93;
+  span_row_cells[0].style.bg_b = 1.0;
+  span_row_cells[0].style.align = NANOPDF_TABLE_CELL_ALIGN_CENTER;
+  TEST_CHECK(nanopdf_writer_table_add_row_cells(
+                 table, span_row_cells, 1) == NANOPDF_STATUS_OK);
+
+  styled_row_cells[0].text = "Gamma";
+  styled_row_cells[0].style.font_name = font_name;
+  styled_row_cells[0].style.font_size = 12.0;
+  styled_row_cells[0].style.text_r = 0.1;
+  styled_row_cells[0].style.text_g = 0.1;
+  styled_row_cells[0].style.text_b = 0.6;
+  styled_row_cells[0].style.has_background = 1;
+  styled_row_cells[0].style.bg_r = 0.95;
+  styled_row_cells[0].style.bg_g = 0.95;
+  styled_row_cells[0].style.bg_b = 0.75;
+  styled_row_cells[1].text = "Delta";
+  styled_row_cells[1].style.font_name = alt_font_name;
+  styled_row_cells[1].style.font_size = 11.0;
+  styled_row_cells[1].style.text_r = 0.7;
+  styled_row_cells[1].style.text_g = 0.1;
+  styled_row_cells[1].style.text_b = 0.1;
+  styled_row_cells[1].style.align = NANOPDF_TABLE_CELL_ALIGN_RIGHT;
+  styled_row_cells[1].style.valign = NANOPDF_TABLE_CELL_VALIGN_TOP;
+  styled_row_cells[1].style.padding_right = 7.0;
+  styled_row_cells[1].style.padding_top = 3.0;
+  styled_row.row_style.align = NANOPDF_TABLE_CELL_ALIGN_CENTER;
+  styled_row.height = 40.0;
+  styled_row.cells = styled_row_cells;
+  styled_row.cell_count = 2;
+  TEST_CHECK(nanopdf_writer_table_add_row_config(table, &styled_row) ==
+             NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_table_calculate_height(table, &table_height) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(fabs(table_height - 83.0) < 0.001);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 180.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_table(page, table) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  snprintf(alt_font_ref_token, sizeof(alt_font_ref_token), "/%s ", alt_font_name);
+  snprintf(header_font_ref_token, sizeof(header_font_ref_token), "/%s ", header_font_name);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, alt_font_ref_token));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, header_font_ref_token));
+
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 1);
+    TEST_CHECK(nanopdf_page_extract_text(document, 0, &extracted_text) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(strstr(extracted_text, "Name") != NULL);
+    TEST_CHECK(strstr(extracted_text, "Value") != NULL);
+    TEST_CHECK(strstr(extracted_text, "Span row") != NULL);
+    TEST_CHECK(strstr(extracted_text, "Gamma") != NULL);
+    TEST_CHECK(strstr(extracted_text, "Delta") != NULL);
+  }
+
+  if (extracted_text) {
+    nanopdf_free(context, extracted_text);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (alt_font_name) {
+    nanopdf_free(context, alt_font_name);
+  }
+  if (header_font_name) {
+    nanopdf_free(context, header_font_name);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (table) {
+    nanopdf_writer_table_destroy(table);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_state_getters(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_writer* update_writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_pdf_version version = NANOPDF_PDF_VERSION_1_4;
+  int32_t page_count = -1;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_get_version(writer, &version) == NANOPDF_STATUS_OK);
+  TEST_CHECK(version == NANOPDF_PDF_VERSION_1_4);
+  TEST_CHECK(nanopdf_writer_set_version(writer, NANOPDF_PDF_VERSION_1_7) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_get_version(writer, &version) == NANOPDF_STATUS_OK);
+  TEST_CHECK(version == NANOPDF_PDF_VERSION_1_7);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 80.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 140.0, 90.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_get_page_count(writer, &page_count) == NANOPDF_STATUS_OK);
+  TEST_CHECK(page_count == 2);
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+
+  TEST_CHECK(nanopdf_writer_create(context, &update_writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_load_existing_memory(
+                 update_writer, pdf_data, pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_get_version(update_writer, &version) == NANOPDF_STATUS_OK);
+  TEST_CHECK(version == NANOPDF_PDF_VERSION_1_7);
+  TEST_CHECK(nanopdf_writer_get_page_count(update_writer, &page_count) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(page_count == 2);
+
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (update_writer) {
+    nanopdf_writer_destroy(update_writer);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_page_labels(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  nanopdf_page_label front_matter;
+  nanopdf_page_label appendix;
+  nanopdf_page_label parsed_label;
+  uint32_t page_index_value = 0;
+  int page_index;
+  nanopdf_context_options context_options;
+
+  memset(&front_matter, 0, sizeof(front_matter));
+  memset(&appendix, 0, sizeof(appendix));
+  memset(&parsed_label, 0, sizeof(parsed_label));
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+
+  for (page_index = 0; page_index < 3; ++page_index) {
+    TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+    page = NULL;
+  }
+
+  front_matter.style = NANOPDF_PAGE_LABEL_STYLE_LOWERCASE_ROMAN;
+  front_matter.prefix = "front-";
+  front_matter.start_value = 1;
+  TEST_CHECK(nanopdf_writer_set_page_label(writer, 0, &front_matter) ==
+             NANOPDF_STATUS_OK);
+
+  appendix.style = NANOPDF_PAGE_LABEL_STYLE_DECIMAL_ARABIC;
+  appendix.prefix = "A-";
+  appendix.start_value = 7;
+  TEST_CHECK(nanopdf_writer_set_page_label(writer, 2, &appendix) ==
+             NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/PageLabels "));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Nums ["));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/S /r"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "(front-)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/S /D"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "(A-)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/St 7"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_page_label_count(document) == 2u);
+  TEST_CHECK(nanopdf_document_get_page_label(document, 0u, &page_index_value, &parsed_label) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(page_index_value == 0u);
+  TEST_CHECK(parsed_label.style == NANOPDF_PAGE_LABEL_STYLE_LOWERCASE_ROMAN);
+  TEST_CHECK(parsed_label.prefix != NULL);
+  TEST_CHECK(strcmp(parsed_label.prefix, "front-") == 0);
+  TEST_CHECK(parsed_label.start_value == 1u);
+  TEST_CHECK(nanopdf_document_get_page_label(document, 1u, &page_index_value, &parsed_label) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(page_index_value == 2u);
+  TEST_CHECK(parsed_label.style == NANOPDF_PAGE_LABEL_STYLE_DECIMAL_ARABIC);
+  TEST_CHECK(parsed_label.prefix != NULL);
+  TEST_CHECK(strcmp(parsed_label.prefix, "A-") == 0);
+  TEST_CHECK(parsed_label.start_value == 7u);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_named_destinations(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  double intro_position[3] = {12.0, 88.0, 1.25};
+  double appendix_position[1] = {64.0};
+  nanopdf_named_destination intro;
+  nanopdf_named_destination appendix;
+  nanopdf_named_destination parsed_dest_0;
+  nanopdf_named_destination parsed_dest_1;
+  const nanopdf_named_destination* parsed_intro = NULL;
+  const nanopdf_named_destination* parsed_appendix = NULL;
+  int page_index;
+  nanopdf_context_options context_options;
+
+  memset(&intro, 0, sizeof(intro));
+  memset(&appendix, 0, sizeof(appendix));
+  memset(&parsed_dest_0, 0, sizeof(parsed_dest_0));
+  memset(&parsed_dest_1, 0, sizeof(parsed_dest_1));
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+
+  for (page_index = 0; page_index < 2; ++page_index) {
+    TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+    page = NULL;
+  }
+
+  intro.name = "intro";
+  intro.page_index = 0;
+  intro.fit_type = "XYZ";
+  intro.position = intro_position;
+  intro.position_count = 3;
+  TEST_CHECK(nanopdf_writer_add_named_destination(writer, &intro) ==
+             NANOPDF_STATUS_OK);
+
+  appendix.name = "appendix";
+  appendix.page_index = 1;
+  appendix.fit_type = "FitH";
+  appendix.position = appendix_position;
+  appendix.position_count = 1;
+  TEST_CHECK(nanopdf_writer_add_named_destination(writer, &appendix) ==
+             NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Dests <<"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "(intro)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/XYZ 12 88 1.25]"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "(appendix)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/FitH 64]"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_named_destination_count(document) == 2u);
+  TEST_CHECK(nanopdf_document_get_named_destination(document, 0u, &parsed_dest_0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_get_named_destination(document, 1u, &parsed_dest_1) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(parsed_dest_0.name != NULL);
+  TEST_CHECK(parsed_dest_1.name != NULL);
+  parsed_intro = strcmp(parsed_dest_0.name, "intro") == 0 ? &parsed_dest_0 : &parsed_dest_1;
+  parsed_appendix =
+      strcmp(parsed_dest_0.name, "appendix") == 0 ? &parsed_dest_0 : &parsed_dest_1;
+  TEST_CHECK(parsed_intro->name != NULL);
+  TEST_CHECK(parsed_intro->page_index == 0u);
+  TEST_CHECK(parsed_intro->fit_type != NULL);
+  TEST_CHECK(strcmp(parsed_intro->fit_type, "XYZ") == 0);
+  TEST_CHECK(parsed_intro->position_count == 3u);
+  TEST_CHECK(fabs(parsed_intro->position[0] - 12.0) < 0.001);
+  TEST_CHECK(fabs(parsed_intro->position[1] - 88.0) < 0.001);
+  TEST_CHECK(fabs(parsed_intro->position[2] - 1.25) < 0.001);
+  TEST_CHECK(parsed_appendix->name != NULL);
+  TEST_CHECK(parsed_appendix->page_index == 1u);
+  TEST_CHECK(parsed_appendix->fit_type != NULL);
+  TEST_CHECK(strcmp(parsed_appendix->fit_type, "FitH") == 0);
+  TEST_CHECK(parsed_appendix->position_count == 1u);
+  TEST_CHECK(fabs(parsed_appendix->position[0] - 64.0) < 0.001);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_open_action(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  double intro_position[3] = {0.0, 72.0, 1.0};
+  nanopdf_named_destination intro;
+  int page_index;
+  nanopdf_context_options context_options;
+  char* open_action = NULL;
+
+  memset(&intro, 0, sizeof(intro));
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+
+  for (page_index = 0; page_index < 2; ++page_index) {
+    TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+    page = NULL;
+  }
+
+  intro.name = "intro";
+  intro.page_index = 0;
+  intro.fit_type = "XYZ";
+  intro.position = intro_position;
+  intro.position_count = 3;
+  TEST_CHECK(nanopdf_writer_add_named_destination(writer, &intro) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_open_action_named_destination(writer, "intro") ==
+             NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/OpenAction (intro)"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Dests <<"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_copy_open_action_named_destination(document, &open_action) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(open_action != NULL);
+  TEST_CHECK(strcmp(open_action, "intro") == 0);
+
+  if (open_action) {
+    nanopdf_free(context, open_action);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_page_layout_mode(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  nanopdf_context_options context_options;
+  nanopdf_page_layout layout = NANOPDF_PAGE_LAYOUT_DEFAULT;
+  nanopdf_page_mode mode = NANOPDF_PAGE_MODE_DEFAULT;
+
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_page_layout(
+                 writer, NANOPDF_PAGE_LAYOUT_TWO_COLUMN_LEFT) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_page_mode(
+                 writer, NANOPDF_PAGE_MODE_USE_OUTLINES) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/PageLayout /TwoColumnLeft"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/PageMode /UseOutlines"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_get_page_layout(document, &layout) == NANOPDF_STATUS_OK);
+  TEST_CHECK(layout == NANOPDF_PAGE_LAYOUT_TWO_COLUMN_LEFT);
+  TEST_CHECK(nanopdf_document_get_page_mode(document, &mode) == NANOPDF_STATUS_OK);
+  TEST_CHECK(mode == NANOPDF_PAGE_MODE_USE_OUTLINES);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_viewer_preferences(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  nanopdf_viewer_preferences preferences;
+  nanopdf_viewer_preferences parsed_preferences;
+  nanopdf_context_options context_options;
+
+  memset(&preferences, 0, sizeof(preferences));
+  memset(&parsed_preferences, 0, sizeof(parsed_preferences));
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  preferences.hide_toolbar = 1;
+  preferences.fit_window = 1;
+  preferences.display_doc_title = 1;
+  TEST_CHECK(nanopdf_writer_set_viewer_preferences(writer, &preferences) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/ViewerPreferences <<"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/HideToolbar true"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/FitWindow true"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/DisplayDocTitle true"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_get_viewer_preferences(document, &parsed_preferences) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(parsed_preferences.hide_toolbar == 1);
+  TEST_CHECK(parsed_preferences.fit_window == 1);
+  TEST_CHECK(parsed_preferences.display_doc_title == 1);
+  TEST_CHECK(parsed_preferences.hide_menubar == 0);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_language(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  nanopdf_context_options context_options;
+  char* language = NULL;
+
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_language(writer, "en-US") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/Lang (en-US)"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_copy_language(document, &language) == NANOPDF_STATUS_OK);
+  TEST_CHECK(language != NULL);
+  TEST_CHECK(strcmp(language, "en-US") == 0);
+
+  if (language) {
+    nanopdf_free(context, language);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_xmp_metadata(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  char* parsed_xmp = NULL;
+  const char* xmp_xml =
+      "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n"
+      "  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
+      "    <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n"
+      "      <dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">nanopdf xmp</rdf:li></rdf:Alt></dc:title>\n"
+      "    </rdf:Description>\n"
+      "  </rdf:RDF>\n"
+      "</x:xmpmeta>\n"
+      "<?xpacket end=\"w\"?>";
+  nanopdf_context_options context_options;
+
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_xmp_metadata(writer, xmp_xml) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/Type /Metadata"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/Subtype /XML"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "nanopdf xmp"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_copy_xmp_metadata(document, &parsed_xmp) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(parsed_xmp != NULL);
+  TEST_CHECK(strcmp(parsed_xmp, xmp_xml) == 0);
+
+  if (parsed_xmp) {
+    nanopdf_free(context, parsed_xmp);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_output_intents(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  const char icc_profile[] = "FAKEICC_PROFILE";
+  nanopdf_output_intent output_intent;
+  nanopdf_output_intent parsed_output_intent;
+  nanopdf_context_options context_options;
+
+  memset(&output_intent, 0, sizeof(output_intent));
+  memset(&parsed_output_intent, 0, sizeof(parsed_output_intent));
+  nanopdf_default_context_options(&context_options);
+
+  output_intent.subtype = "GTS_PDFA1";
+  output_intent.output_condition = "sRGB IEC61966-2.1";
+  output_intent.output_condition_identifier = "sRGB IEC61966-2.1";
+  output_intent.registry_name = "https://www.color.org";
+  output_intent.info = "nanopdf output intent";
+  output_intent.dest_output_profile.data = icc_profile;
+  output_intent.dest_output_profile.size = sizeof(icc_profile) - 1;
+  output_intent.color_components = 3;
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_output_intent(writer, &output_intent) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/OutputIntents ["));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/Type /OutputIntent"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/S /GTS_PDFA1"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "(sRGB IEC61966-2.1)"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/N 3"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "FAKEICC_PROFILE"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_output_intent_count(document) == 1u);
+  TEST_CHECK(nanopdf_document_get_output_intent(document, 0u, &parsed_output_intent) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(parsed_output_intent.subtype != NULL);
+  TEST_CHECK(strcmp(parsed_output_intent.subtype, "GTS_PDFA1") == 0);
+  TEST_CHECK(parsed_output_intent.output_condition != NULL);
+  TEST_CHECK(strcmp(parsed_output_intent.output_condition, "sRGB IEC61966-2.1") == 0);
+  TEST_CHECK(parsed_output_intent.color_components == 3);
+  TEST_CHECK(parsed_output_intent.dest_output_profile.size == sizeof(icc_profile) - 1);
+  TEST_CHECK(parsed_output_intent.dest_output_profile.data != NULL);
+  TEST_CHECK(memcmp(
+                 parsed_output_intent.dest_output_profile.data,
+                 icc_profile,
+                 sizeof(icc_profile) - 1) == 0);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_mark_info(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  nanopdf_mark_info mark_info;
+  nanopdf_mark_info parsed_mark_info;
+  nanopdf_context_options context_options;
+
+  memset(&mark_info, 0, sizeof(mark_info));
+  memset(&parsed_mark_info, 0, sizeof(parsed_mark_info));
+  nanopdf_default_context_options(&context_options);
+  mark_info.marked = 1;
+  mark_info.suspects = 0;
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_mark_info(writer, &mark_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/MarkInfo <<"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/Marked true"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)pdf_data, pdf_size, "/Suspects false"));
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_get_mark_info(document, &parsed_mark_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(parsed_mark_info.marked == 1);
+  TEST_CHECK(parsed_mark_info.suspects == 0);
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_signature_writer(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_signature_field_config signature_config;
+  nanopdf_timestamp_config timestamp_config;
+  nanopdf_signature_placeholder placeholder;
+  nanopdf_form_field_info field_info;
+  void* prepared_pdf = NULL;
+  size_t prepared_pdf_size = 0;
+  void* signed_pdf = NULL;
+  size_t signed_pdf_size = 0;
+  size_t placeholder_count = 0;
+  char expected_byte_range[80];
+  int has_timestamp = 0;
+  int field_index = -1;
+  const uint8_t signature_bytes[] = {0x01, 0x02, 0xa0, 0xff};
+
+  nanopdf_default_context_options(&context_options);
+  memset(&signature_config, 0, sizeof(signature_config));
+  memset(&timestamp_config, 0, sizeof(timestamp_config));
+  memset(&placeholder, 0, sizeof(placeholder));
+
+  signature_config.name = "Approval";
+  signature_config.page_index = 0;
+  signature_config.x = 24.0;
+  signature_config.y = 24.0;
+  signature_config.width = 96.0;
+  signature_config.height = 32.0;
+  signature_config.visible = 1;
+  signature_config.reason = "Review";
+  signature_config.location = "Tokyo";
+  signature_config.contact_info = "qa@example.com";
+  signature_config.filter = NANOPDF_SIGNATURE_FILTER_ADOBE_PPK_LITE;
+  signature_config.subfilter = NANOPDF_SIGNATURE_SUBFILTER_PKCS7_DETACHED;
+  signature_config.is_certification = 1;
+  signature_config.mdp_permissions = NANOPDF_MDP_PERMISSIONS_FORM_FILL_AND_SIGN;
+
+  timestamp_config.server_url = "https://tsa.example.test";
+  timestamp_config.timeout_ms = 15000;
+  timestamp_config.embed_in_signature = 1;
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_timestamp_config(writer, &timestamp_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_has_timestamp_config(writer, &has_timestamp) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_timestamp == 1);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 160.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 24.0, 84.0, "Sign me") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_add_signature_field(writer, &signature_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_for_signing_memory(
+                 writer, 32u, &prepared_pdf, &prepared_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(prepared_pdf != NULL);
+  TEST_CHECK(prepared_pdf_size > 0);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf,
+      prepared_pdf_size,
+      "/ByteRange [0 0000000000 0000000000 0000000000]"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/FT /Sig"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/TransformMethod /DocMDP"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/TransformParams << /Type /TransformParams /P 2 /V /1.2 >>"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/Perms << /DocMDP "));
+
+  TEST_CHECK(nanopdf_writer_get_signature_placeholder_count(
+                 writer, &placeholder_count) == NANOPDF_STATUS_OK);
+  TEST_CHECK(placeholder_count == 1u);
+  TEST_CHECK(nanopdf_writer_get_signature_placeholder(
+                 writer, 0u, &placeholder) == NANOPDF_STATUS_OK);
+  TEST_CHECK(placeholder.field_name != NULL);
+  TEST_CHECK(strcmp(placeholder.field_name, "Approval") == 0);
+  TEST_CHECK(placeholder.contents_length == 32u);
+  TEST_CHECK(placeholder.byte_range_1 > 0u);
+  TEST_CHECK(placeholder.byte_range_2 > placeholder.byte_range_1);
+  TEST_CHECK(placeholder.byte_range_3 > 0u);
+
+  TEST_CHECK(nanopdf_apply_precomputed_signature(
+                 context,
+                 prepared_pdf,
+                 prepared_pdf_size,
+                 &placeholder,
+                 signature_bytes,
+                 sizeof(signature_bytes),
+                 &signed_pdf,
+                 &signed_pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(signed_pdf != NULL);
+  TEST_CHECK(signed_pdf_size == prepared_pdf_size);
+
+  snprintf(
+      expected_byte_range,
+      sizeof(expected_byte_range),
+      "/ByteRange [0 %010zu %010zu %010zu]",
+      placeholder.byte_range_1,
+      placeholder.byte_range_2,
+      placeholder.byte_range_3);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)signed_pdf, signed_pdf_size, expected_byte_range));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)signed_pdf, signed_pdf_size, "/Contents <0102a0ff"));
+
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, signed_pdf, signed_pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 1u);
+    TEST_CHECK(nanopdf_document_form_field_count(document) == 1u);
+    field_index = find_form_field_index_by_name(document, "Approval");
+    TEST_CHECK(field_index == 0);
+    TEST_CHECK(nanopdf_document_get_form_field_info(document, 0u, &field_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_SIGNATURE);
+    TEST_CHECK(field_info.partial_name != NULL);
+    TEST_CHECK(strcmp(field_info.partial_name, "Approval") == 0);
+  }
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (signed_pdf) {
+    nanopdf_free(context, signed_pdf);
+  }
+  if (prepared_pdf) {
+    nanopdf_free(context, prepared_pdf);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  nanopdf_writer_destroy(writer);
+  nanopdf_context_destroy(context);
+}
+
+static void test_nanopdf_c_incremental_signature_writer(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_writer* update_writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_signature_field_config signature_config;
+  nanopdf_signature_placeholder placeholder;
+  nanopdf_form_field_info field_info;
+  void* initial_pdf = NULL;
+  size_t initial_pdf_size = 0;
+  void* prepared_pdf = NULL;
+  size_t prepared_pdf_size = 0;
+  void* signed_pdf = NULL;
+  size_t signed_pdf_size = 0;
+  size_t placeholder_count = 0;
+  int field_index = -1;
+  char expected_byte_range[80];
+  const uint8_t signature_bytes[] = {0xde, 0xad, 0xbe, 0xef};
+
+  nanopdf_default_context_options(&context_options);
+  memset(&signature_config, 0, sizeof(signature_config));
+  memset(&placeholder, 0, sizeof(placeholder));
+
+  signature_config.name = "IncrementalApproval";
+  signature_config.page_index = 0;
+  signature_config.x = 18.0;
+  signature_config.y = 18.0;
+  signature_config.width = 90.0;
+  signature_config.height = 24.0;
+  signature_config.visible = 1;
+  signature_config.filter = NANOPDF_SIGNATURE_FILTER_ADOBE_PPK_LITE;
+  signature_config.subfilter = NANOPDF_SIGNATURE_SUBFILTER_PKCS7_DETACHED;
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 160.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 24.0, 84.0, "Existing page") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &initial_pdf, &initial_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(initial_pdf != NULL);
+  TEST_CHECK(initial_pdf_size > 0);
+
+  TEST_CHECK(nanopdf_writer_create(context, &update_writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_load_existing_memory(
+                 update_writer, initial_pdf, initial_pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_signature_field(update_writer, &signature_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_incremental_for_signing_memory(
+                 update_writer, 24u, &prepared_pdf, &prepared_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(prepared_pdf != NULL);
+  TEST_CHECK(prepared_pdf_size > initial_pdf_size);
+  TEST_CHECK(memcmp(prepared_pdf, initial_pdf, initial_pdf_size) == 0);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/Prev "));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf,
+      prepared_pdf_size,
+      "/ByteRange [0 0000000000 0000000000 0000000000]"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/FT /Sig"));
+
+  TEST_CHECK(nanopdf_writer_get_signature_placeholder_count(
+                 update_writer, &placeholder_count) == NANOPDF_STATUS_OK);
+  TEST_CHECK(placeholder_count == 1u);
+  TEST_CHECK(nanopdf_writer_get_signature_placeholder(
+                 update_writer, 0u, &placeholder) == NANOPDF_STATUS_OK);
+  TEST_CHECK(placeholder.field_name != NULL);
+  TEST_CHECK(strcmp(placeholder.field_name, "IncrementalApproval") == 0);
+  TEST_CHECK(placeholder.contents_length == 24u);
+  TEST_CHECK(placeholder.byte_range_1 > initial_pdf_size);
+  TEST_CHECK(placeholder.byte_range_2 > placeholder.byte_range_1);
+  TEST_CHECK(placeholder.byte_range_3 > 0u);
+
+  TEST_CHECK(nanopdf_apply_precomputed_signature(
+                 context,
+                 prepared_pdf,
+                 prepared_pdf_size,
+                 &placeholder,
+                 signature_bytes,
+                 sizeof(signature_bytes),
+                 &signed_pdf,
+                 &signed_pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(signed_pdf != NULL);
+  TEST_CHECK(signed_pdf_size == prepared_pdf_size);
+
+  snprintf(
+      expected_byte_range,
+      sizeof(expected_byte_range),
+      "/ByteRange [0 %010zu %010zu %010zu]",
+      placeholder.byte_range_1,
+      placeholder.byte_range_2,
+      placeholder.byte_range_3);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)signed_pdf, signed_pdf_size, expected_byte_range));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)signed_pdf, signed_pdf_size, "/Contents <deadbeef"));
+
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, signed_pdf, signed_pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 1u);
+    TEST_CHECK(nanopdf_document_form_field_count(document) == 1u);
+    field_index = find_form_field_index_by_name(document, "IncrementalApproval");
+    TEST_CHECK(field_index == 0);
+    TEST_CHECK(nanopdf_document_get_form_field_info(document, 0u, &field_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(field_info.type == NANOPDF_FIELD_TYPE_SIGNATURE);
+    TEST_CHECK(field_info.partial_name != NULL);
+    TEST_CHECK(strcmp(field_info.partial_name, "IncrementalApproval") == 0);
+  }
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (signed_pdf) {
+    nanopdf_free(context, signed_pdf);
+  }
+  if (prepared_pdf) {
+    nanopdf_free(context, prepared_pdf);
+  }
+  if (initial_pdf) {
+    nanopdf_free(context, initial_pdf);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (update_writer) {
+    nanopdf_writer_destroy(update_writer);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_signature_permissions_writer(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_signature_field_config signature_config;
+  void* prepared_pdf = NULL;
+  size_t prepared_pdf_size = 0;
+
+  nanopdf_default_context_options(&context_options);
+  memset(&signature_config, 0, sizeof(signature_config));
+
+  signature_config.name = "Certify";
+  signature_config.page_index = 0;
+  signature_config.x = 12.0;
+  signature_config.y = 12.0;
+  signature_config.width = 72.0;
+  signature_config.height = 24.0;
+  signature_config.visible = 1;
+  signature_config.filter = NANOPDF_SIGNATURE_FILTER_ADOBE_PPK_LITE;
+  signature_config.subfilter = NANOPDF_SIGNATURE_SUBFILTER_PKCS7_DETACHED;
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_signature_permissions(
+                 writer, NANOPDF_MDP_PERMISSIONS_NO_CHANGES) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 80.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_add_signature_field(writer, &signature_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_for_signing_memory(
+                 writer, 16u, &prepared_pdf, &prepared_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(prepared_pdf != NULL);
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/TransformMethod /DocMDP"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf,
+      prepared_pdf_size,
+      "/TransformParams << /Type /TransformParams /P 1 /V /1.2 >>"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)prepared_pdf, prepared_pdf_size, "/Perms << /DocMDP "));
+
+  if (prepared_pdf) {
+    nanopdf_free(context, prepared_pdf);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_font_resources(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_context_options context_options;
+  const char* font_path = NULL;
+  void* font_data = NULL;
+  size_t font_size = 0;
+  char* standard_font_name = NULL;
+  char* embedded_font_name = NULL;
+  char* postscript_name = NULL;
+  char* family_name = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  int has_font = 0;
+  int32_t glyph_width = 0;
+  nanopdf_font_metrics_summary metrics;
+
+  nanopdf_default_context_options(&context_options);
+  memset(&metrics, 0, sizeof(metrics));
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+
+  font_path = find_test_font_path();
+  TEST_CHECK(font_path != NULL);
+  font_data = read_file_bytes(font_path, &font_size);
+  TEST_CHECK(font_data != NULL);
+  TEST_CHECK(font_size > 0);
+
+  TEST_CHECK(nanopdf_writer_has_font_resource(writer, "MissingFont", &has_font) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_font == 0);
+  TEST_CHECK(nanopdf_writer_add_standard_font(
+                 writer, NANOPDF_STANDARD_FONT_HELVETICA, &standard_font_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(standard_font_name != NULL);
+  TEST_CHECK(nanopdf_writer_has_font_resource(writer, standard_font_name, &has_font) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_font == 1);
+
+  TEST_CHECK(nanopdf_writer_add_truetype_font_from_memory(
+                 writer,
+                 font_data,
+                 font_size,
+                 NANOPDF_FONT_EMBEDDING_SUBSET,
+                 &embedded_font_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(embedded_font_name != NULL);
+  TEST_CHECK(nanopdf_writer_has_font_resource(writer, embedded_font_name, &has_font) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_font == 1);
+  TEST_CHECK(nanopdf_writer_get_font_metrics(
+                 writer, embedded_font_name, &metrics) == NANOPDF_STATUS_OK);
+  TEST_CHECK(metrics.units_per_em > 0);
+  TEST_CHECK(metrics.ascender > metrics.descender);
+  TEST_CHECK(metrics.bbox[0] <= metrics.bbox[2]);
+  TEST_CHECK(metrics.bbox[1] <= metrics.bbox[3]);
+  TEST_CHECK(nanopdf_writer_get_font_codepoint_width(
+                 writer, embedded_font_name, (uint32_t)'A', &glyph_width) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(glyph_width > 0);
+  TEST_CHECK(nanopdf_writer_copy_font_postscript_name(
+                 writer, embedded_font_name, &postscript_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(postscript_name != NULL);
+  TEST_CHECK(postscript_name[0] != '\0');
+  TEST_CHECK(nanopdf_writer_copy_font_family_name(
+                 writer, embedded_font_name, &family_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(family_name != NULL);
+  TEST_CHECK(family_name[0] != '\0');
+  TEST_CHECK(nanopdf_writer_copy_font_postscript_name(
+                 writer, standard_font_name, &postscript_name) ==
+             NANOPDF_STATUS_NOT_FOUND);
+  TEST_CHECK(nanopdf_writer_copy_font_family_name(
+                 writer, standard_font_name, &family_name) ==
+             NANOPDF_STATUS_NOT_FOUND);
+  TEST_CHECK(nanopdf_writer_get_font_metrics(
+                 writer, standard_font_name, &metrics) == NANOPDF_STATUS_NOT_FOUND);
+  TEST_CHECK(nanopdf_writer_mark_font_text_used(
+                 writer, embedded_font_name, "Subset glyph hints ABC") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_mark_font_text_used(
+                 writer, "MissingFont", "abc") == NANOPDF_STATUS_NOT_FOUND);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 180.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(page, standard_font_name, 12.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 18.0, 88.0, "Standard font") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(page, embedded_font_name, 12.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 18.0, 58.0, "ABC") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Subtype /Type0"));
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/ToUnicode "));
+
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (family_name) {
+    nanopdf_free(context, family_name);
+  }
+  if (postscript_name) {
+    nanopdf_free(context, postscript_name);
+  }
+  if (embedded_font_name) {
+    nanopdf_free(context, embedded_font_name);
+  }
+  if (standard_font_name) {
+    nanopdf_free(context, standard_font_name);
+  }
+  if (font_data) {
+    free(font_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_security_defaults(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* signature_writer = NULL;
+  nanopdf_writer* encryption_writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_signature_field_config signature_config;
+  nanopdf_timestamp_config timestamp_config;
+  nanopdf_writer_encryption_config encryption_config;
+  void* prepared_pdf = NULL;
+  size_t prepared_pdf_size = 0;
+  size_t placeholder_count = 0;
+  int has_timestamp = 0;
+  int is_encrypted = 0;
+  nanopdf_encryption_algorithm algorithm = NANOPDF_ENCRYPTION_NONE;
+
+  nanopdf_default_context_options(&context_options);
+  memset(&signature_config, 0xCD, sizeof(signature_config));
+  memset(&timestamp_config, 0xCD, sizeof(timestamp_config));
+  memset(&encryption_config, 0xCD, sizeof(encryption_config));
+
+  nanopdf_default_signature_field_config(&signature_config);
+  nanopdf_default_timestamp_config(&timestamp_config);
+  nanopdf_default_writer_encryption_config(&encryption_config);
+
+  TEST_CHECK(signature_config.name != NULL);
+  TEST_CHECK(strcmp(signature_config.name, "Signature1") == 0);
+  TEST_CHECK(signature_config.visible == 1);
+  TEST_CHECK(signature_config.filter == NANOPDF_SIGNATURE_FILTER_ADOBE_PPK_LITE);
+  TEST_CHECK(signature_config.subfilter == NANOPDF_SIGNATURE_SUBFILTER_PKCS7_DETACHED);
+  TEST_CHECK(signature_config.mdp_permissions ==
+             NANOPDF_MDP_PERMISSIONS_ANNOTATE_FORM_FILL_SIGN);
+  TEST_CHECK(timestamp_config.timeout_ms == 30000);
+  TEST_CHECK(timestamp_config.embed_in_signature == 1);
+  TEST_CHECK(encryption_config.algorithm == NANOPDF_ENCRYPTION_AES_128);
+  TEST_CHECK(encryption_config.allow_print == 1);
+  TEST_CHECK(encryption_config.allow_modify == 0);
+  TEST_CHECK(encryption_config.allow_copy == 1);
+  TEST_CHECK(encryption_config.encrypt_metadata == 1);
+
+  timestamp_config.server_url = "https://tsa.example.test";
+  encryption_config.owner_password = "owner-pass";
+  encryption_config.user_password = "user-pass";
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_create(context, &signature_writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_timestamp_config(signature_writer, &timestamp_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_has_timestamp_config(signature_writer, &has_timestamp) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_timestamp == 1);
+  TEST_CHECK(nanopdf_writer_begin_page(signature_writer, 220.0, 100.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_add_signature_field(signature_writer, &signature_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_for_signing_memory(
+                 signature_writer, 16u, &prepared_pdf, &prepared_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(prepared_pdf != NULL);
+  TEST_CHECK(nanopdf_writer_get_signature_placeholder_count(
+                 signature_writer, &placeholder_count) == NANOPDF_STATUS_OK);
+  TEST_CHECK(placeholder_count == 1u);
+
+  TEST_CHECK(nanopdf_writer_create(context, &encryption_writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_encryption(encryption_writer, &encryption_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_is_encrypted(encryption_writer, &is_encrypted) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(is_encrypted == 1);
+  TEST_CHECK(nanopdf_writer_get_encryption_algorithm(encryption_writer, &algorithm) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(algorithm == NANOPDF_ENCRYPTION_AES_128);
+
+  if (prepared_pdf) {
+    nanopdf_free(context, prepared_pdf);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (signature_writer) {
+    nanopdf_writer_destroy(signature_writer);
+  }
+  if (encryption_writer) {
+    nanopdf_writer_destroy(encryption_writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static uint8_t* create_writer_pdf_with_page_texts(
+    const char* const* texts,
+    const double* widths,
+    const double* heights,
+    size_t text_count,
+    size_t* out_size) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_context_options context_options;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  uint8_t* copy = NULL;
+  size_t i;
+
+  if (out_size) {
+    *out_size = 0;
+  }
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+
+  for (i = 0; i < text_count; ++i) {
+    double width = widths ? widths[i] : 200.0;
+    double height = heights ? heights[i] : 120.0;
+    TEST_CHECK(nanopdf_writer_begin_page(writer, width, height, &page) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_show_text_at(
+                   page, 24.0, 72.0, texts[i]) == NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+    page = NULL;
+  }
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(pdf_size > 0);
+  copy = (uint8_t*)malloc(pdf_size);
+  TEST_CHECK(copy != NULL);
+  if (copy) {
+    memcpy(copy, pdf_data, pdf_size);
+  }
+  if (out_size) {
+    *out_size = pdf_size;
+  }
+
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  nanopdf_writer_destroy(writer);
+  nanopdf_context_destroy(context);
+  return copy;
+}
+
+static uint8_t* build_redaction_fixture_pdf(size_t* out_size) {
+  const char* header = "%PDF-1.4\n";
+  const char* obj1 =
+      "1 0 obj\n"
+      "<< /Type /Catalog /Pages 2 0 R >>\n"
+      "endobj\n";
+  const char* obj2 =
+      "2 0 obj\n"
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n"
+      "endobj\n";
+  const char* obj3 =
+      "3 0 obj\n"
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 120] "
+      "/Resources << /Font << /F1 6 0 R >> >> "
+      "/Contents 4 0 R /Annots [5 0 R] >>\n"
+      "endobj\n";
+  const char* content = "BT /F1 18 Tf 24 72 Td (Sensitive Data) Tj ET\n";
+  const char* obj5 =
+      "5 0 obj\n"
+      "<< /Type /Annot /Subtype /Redact /Rect [20 60 160 90] /IC [0 0 0] /F 4 /P 3 0 R >>\n"
+      "endobj\n";
+  const char* obj6 =
+      "6 0 obj\n"
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n"
+      "endobj\n";
+  char* pdf = (char*)malloc(4096);
+  size_t length = 0;
+  size_t off1;
+  size_t off2;
+  size_t off3;
+  size_t off4;
+  size_t off5;
+  size_t off6;
+  size_t xref_off;
+
+  TEST_CHECK(pdf != NULL);
+  append_text(pdf, &length, header);
+  off1 = length;
+  append_text(pdf, &length, obj1);
+  off2 = length;
+  append_text(pdf, &length, obj2);
+  off3 = length;
+  append_text(pdf, &length, obj3);
+  off4 = length;
+  append_format(pdf, &length, "4 0 obj\n<< /Length %zu >>\nstream\n", strlen(content));
+  append_text(pdf, &length, content);
+  append_text(pdf, &length, "endstream\nendobj\n");
+  off5 = length;
+  append_text(pdf, &length, obj5);
+  off6 = length;
+  append_text(pdf, &length, obj6);
+  xref_off = length;
+
+  append_text(pdf, &length, "xref\n0 7\n");
+  append_text(pdf, &length, "0000000000 65535 f \n");
+  append_format(pdf, &length, "%010zu 00000 n \n", off1);
+  append_format(pdf, &length, "%010zu 00000 n \n", off2);
+  append_format(pdf, &length, "%010zu 00000 n \n", off3);
+  append_format(pdf, &length, "%010zu 00000 n \n", off4);
+  append_format(pdf, &length, "%010zu 00000 n \n", off5);
+  append_format(pdf, &length, "%010zu 00000 n \n", off6);
+  append_text(pdf, &length, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+  append_text(pdf, &length, "startxref\n");
+  append_format(pdf, &length, "%zu\n", xref_off);
+  append_text(pdf, &length, "%%EOF\n");
+
+  if (out_size) {
+    *out_size = length;
+  }
+  return (uint8_t*)pdf;
+}
+
+static void test_nanopdf_c_pdf_composition(void) {
+  const char* source_texts[] = {"First Source Page", "Second Source Page"};
+  const double source_widths[] = {180.0, 320.0};
+  const double source_heights[] = {100.0, 140.0};
+  const char* merge_a_texts[] = {"Merge A"};
+  const double merge_a_widths[] = {240.0};
+  const double merge_a_heights[] = {110.0};
+  const char* merge_b_texts[] = {"Merge B"};
+  const double merge_b_widths[] = {360.0};
+  const double merge_b_heights[] = {150.0};
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_parse_options parse_options;
+  nanopdf_page_info page_info;
+  nanopdf_buffer_view merge_inputs[2];
+  uint8_t* source_pdf = NULL;
+  uint8_t* merge_a_pdf = NULL;
+  uint8_t* merge_b_pdf = NULL;
+  uint8_t* redact_source_pdf = NULL;
+  size_t source_pdf_size = 0;
+  size_t merge_a_pdf_size = 0;
+  size_t merge_b_pdf_size = 0;
+  size_t redact_source_pdf_size = 0;
+  void* imported_pdf = NULL;
+  size_t imported_pdf_size = 0;
+  void* split_pdf = NULL;
+  size_t split_pdf_size = 0;
+  void* merged_pdf = NULL;
+  size_t merged_pdf_size = 0;
+  void* redacted_pdf = NULL;
+  size_t redacted_pdf_size = 0;
+  char* text = NULL;
+  int32_t imported_page_count = 0;
+  int32_t import_indices[] = {1};
+  int32_t split_indices[] = {0};
+
+  source_pdf = create_writer_pdf_with_page_texts(
+      source_texts, source_widths, source_heights, 2u, &source_pdf_size);
+  merge_a_pdf = create_writer_pdf_with_page_texts(
+      merge_a_texts, merge_a_widths, merge_a_heights, 1u, &merge_a_pdf_size);
+  merge_b_pdf = create_writer_pdf_with_page_texts(
+      merge_b_texts, merge_b_widths, merge_b_heights, 1u, &merge_b_pdf_size);
+  redact_source_pdf = build_redaction_fixture_pdf(&redact_source_pdf_size);
+  TEST_CHECK(source_pdf != NULL);
+  TEST_CHECK(merge_a_pdf != NULL);
+  TEST_CHECK(merge_b_pdf != NULL);
+  TEST_CHECK(redact_source_pdf != NULL);
+
+  nanopdf_default_context_options(&context_options);
+  nanopdf_default_parse_options(&parse_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 200.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 24.0, 72.0, "Imported Cover") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_import_pages_from_memory(
+                 writer,
+                 source_pdf,
+                 source_pdf_size,
+                 import_indices,
+                 1u,
+                 &imported_page_count) == NANOPDF_STATUS_OK);
+  TEST_CHECK(imported_page_count == 1);
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &imported_pdf, &imported_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(imported_pdf != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, imported_pdf, imported_pdf_size, &parse_options, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 2u);
+    TEST_CHECK(nanopdf_page_extract_text(document, 0u, &text) == NANOPDF_STATUS_OK);
+    TEST_CHECK(text != NULL);
+    TEST_CHECK(strstr(text, "Imported Cover") != NULL);
+    if (text) {
+      nanopdf_free(context, text);
+      text = NULL;
+    }
+    TEST_CHECK(nanopdf_document_get_page_info(document, 1u, &page_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(fabs(page_info.width - 320.0) < 0.001);
+    TEST_CHECK(fabs(page_info.height - 140.0) < 0.001);
+  }
+  if (text) {
+    nanopdf_free(context, text);
+    text = NULL;
+  }
+  if (document) {
+    nanopdf_document_close(document);
+    document = NULL;
+  }
+  if (imported_pdf) {
+    nanopdf_free(context, imported_pdf);
+    imported_pdf = NULL;
+  }
+  nanopdf_writer_destroy(writer);
+  writer = NULL;
+
+  TEST_CHECK(nanopdf_split_pdf_memory(
+                 context,
+                 source_pdf,
+                 source_pdf_size,
+                 split_indices,
+                 1u,
+                 &split_pdf,
+                 &split_pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(split_pdf != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, split_pdf, split_pdf_size, &parse_options, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 1u);
+    TEST_CHECK(nanopdf_document_get_page_info(document, 0u, &page_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(fabs(page_info.width - 180.0) < 0.001);
+    TEST_CHECK(fabs(page_info.height - 100.0) < 0.001);
+  }
+  if (text) {
+    nanopdf_free(context, text);
+    text = NULL;
+  }
+  if (document) {
+    nanopdf_document_close(document);
+    document = NULL;
+  }
+  if (split_pdf) {
+    nanopdf_free(context, split_pdf);
+    split_pdf = NULL;
+  }
+
+  merge_inputs[0].data = merge_a_pdf;
+  merge_inputs[0].size = merge_a_pdf_size;
+  merge_inputs[1].data = merge_b_pdf;
+  merge_inputs[1].size = merge_b_pdf_size;
+  TEST_CHECK(nanopdf_merge_pdfs_memory(
+                 context, merge_inputs, 2u, &merged_pdf, &merged_pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(merged_pdf != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, merged_pdf, merged_pdf_size, &parse_options, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 2u);
+    TEST_CHECK(nanopdf_document_get_page_info(document, 0u, &page_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(fabs(page_info.width - 240.0) < 0.001);
+    TEST_CHECK(fabs(page_info.height - 110.0) < 0.001);
+    TEST_CHECK(nanopdf_document_get_page_info(document, 1u, &page_info) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(fabs(page_info.width - 360.0) < 0.001);
+    TEST_CHECK(fabs(page_info.height - 150.0) < 0.001);
+  }
+  if (text) {
+    nanopdf_free(context, text);
+    text = NULL;
+  }
+  if (document) {
+    nanopdf_document_close(document);
+    document = NULL;
+  }
+  if (merged_pdf) {
+    nanopdf_free(context, merged_pdf);
+    merged_pdf = NULL;
+  }
+
+  TEST_CHECK(nanopdf_apply_redactions_memory(
+                 context,
+                 redact_source_pdf,
+                 redact_source_pdf_size,
+                 &redacted_pdf,
+                 &redacted_pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(redacted_pdf != NULL);
+  TEST_CHECK(!buffer_contains_text(
+      (const uint8_t*)redacted_pdf, redacted_pdf_size, "/Subtype /Redact"));
+  TEST_CHECK(buffer_contains_text(
+      (const uint8_t*)redacted_pdf, redacted_pdf_size, "/Subtype /Highlight"));
+  TEST_CHECK(nanopdf_document_open_memory(
+                 context, redacted_pdf, redacted_pdf_size, &parse_options, &document) ==
+             NANOPDF_STATUS_OK);
+  if (document) {
+    TEST_CHECK(nanopdf_document_page_count(document) == 1u);
+  }
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (redacted_pdf) {
+    nanopdf_free(context, redacted_pdf);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+  free(source_pdf);
+  free(merge_a_pdf);
+  free(merge_b_pdf);
+  free(redact_source_pdf);
+}
+
+static void test_nanopdf_c_writer_metadata(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  char* value = NULL;
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_version(writer, NANOPDF_PDF_VERSION_1_7) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_title(writer, "Metadata Title") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_author(writer, "Metadata Author") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_subject(writer, "Metadata Subject") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_keywords(writer, "alpha,beta,gamma") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_creator(writer, "metadata-test") == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_producer(writer, "metadata-producer") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_custom_info(writer, "Company", "Light Transport") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_custom_info(writer, "BuildFlavor", "c-smoke") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_custom_info(writer, "Producer", "bad") ==
+             NANOPDF_STATUS_INVALID_ARGUMENT);
+  TEST_CHECK(nanopdf_writer_set_trapped(writer, NANOPDF_TRAPPED_STATE_FALSE) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_creation_date(writer, "D:20260526193000") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_modification_date(writer, "D:20260526193100") ==
+             NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 80.0, &page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(pdf_size > 0);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "%PDF-1.7"));
+
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_TITLE, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "Metadata Title") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_AUTHOR, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "Metadata Author") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_SUBJECT, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "Metadata Subject") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_KEYWORDS, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "alpha,beta,gamma") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_CREATOR, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "metadata-test") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_PRODUCER, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "metadata-producer") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_custom_info_value(document, "Company", &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "Light Transport") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_custom_info_value(document, "BuildFlavor", &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "c-smoke") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_custom_info_value(document, "MissingKey", &value) ==
+             NANOPDF_STATUS_NOT_FOUND);
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_TRAPPED, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "False") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_CREATION_DATE, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "D:20260526193000") == 0);
+  nanopdf_free(context, value);
+  value = NULL;
+
+  TEST_CHECK(nanopdf_document_copy_info_value(document, NANOPDF_INFO_MOD_DATE, &value) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(value != NULL);
+  TEST_CHECK(strcmp(value, "D:20260526193100") == 0);
+
+  if (value) {
+    nanopdf_free(context, value);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_document_id(void) {
+  static const uint8_t id1_bytes[16] = {
+      0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+      0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F};
+  static const uint8_t id2_bytes[16] = {
+      0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+      0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF};
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_buffer_view id1_view;
+  nanopdf_buffer_view id2_view;
+  char id1_hex[33];
+  char id2_hex[33];
+  char trailer_id[96];
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+
+  memset(&id1_view, 0, sizeof(id1_view));
+  memset(&id2_view, 0, sizeof(id2_view));
+  id1_view.data = id1_bytes;
+  id1_view.size = sizeof(id1_bytes);
+  id2_view.data = id2_bytes;
+  id2_view.size = sizeof(id2_bytes);
+  encode_hex_string(id1_bytes, sizeof(id1_bytes), id1_hex);
+  encode_hex_string(id2_bytes, sizeof(id2_bytes), id2_hex);
+  snprintf(trailer_id, sizeof(trailer_id), "/ID [<%s> <%s>]", id1_hex, id2_hex);
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_document_id(writer, &id1_view, &id2_view) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 72.0, 72.0, &page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, trailer_id));
+
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_generate_document_id(void) {
+  static const uint8_t id1_bytes[16] = {
+      0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+      0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F};
+  static const uint8_t id2_bytes[16] = {
+      0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+      0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF};
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_buffer_view id1_view;
+  nanopdf_buffer_view id2_view;
+  char id1_hex[33];
+  char id2_hex[33];
+  char trailer_id[96];
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+
+  memset(&id1_view, 0, sizeof(id1_view));
+  memset(&id2_view, 0, sizeof(id2_view));
+  id1_view.data = id1_bytes;
+  id1_view.size = sizeof(id1_bytes);
+  id2_view.data = id2_bytes;
+  id2_view.size = sizeof(id2_bytes);
+  encode_hex_string(id1_bytes, sizeof(id1_bytes), id1_hex);
+  encode_hex_string(id2_bytes, sizeof(id2_bytes), id2_hex);
+  snprintf(trailer_id, sizeof(trailer_id), "/ID [<%s> <%s>]", id1_hex, id2_hex);
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_set_document_id(writer, &id1_view, &id2_view) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_generate_document_id(writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 72.0, 72.0, &page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/ID [<"));
+  TEST_CHECK(!buffer_contains_text((const uint8_t*)pdf_data, pdf_size, trailer_id));
+
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_image_convenience(void) {
+  static const uint8_t mono_checker_8x8[] = {
+      0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55};
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_page_info page_info;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  char* image_name = NULL;
+  int has_image = 0;
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_add_ccitt_image(
+                 writer,
+                 mono_checker_8x8,
+                 8u,
+                 8u,
+                 &image_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(image_name != NULL);
+  TEST_CHECK(nanopdf_writer_has_image_resource(writer, image_name, &has_image) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_image == 1);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 64.0, 64.0, &page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_image(page, image_name, 8.0, 8.0, 48.0, 48.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_add_image_page_from_memory(
+                 writer,
+                 k_jpeg_1x1_red,
+                 sizeof(k_jpeg_1x1_red),
+                 144.0,
+                 216.0,
+                 12.0) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_image_page_fit_from_memory(
+                 writer,
+                 k_jpeg_1x1_red,
+                 sizeof(k_jpeg_1x1_red),
+                 5.0) == NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/CCITTFaxDecode"));
+
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_page_count(document) == 3u);
+
+  TEST_CHECK(nanopdf_document_get_page_info(document, 0, &page_info) == NANOPDF_STATUS_OK);
+  TEST_CHECK(fabs(page_info.width - 64.0) < 0.001);
+  TEST_CHECK(fabs(page_info.height - 64.0) < 0.001);
+
+  TEST_CHECK(nanopdf_document_get_page_info(document, 1, &page_info) == NANOPDF_STATUS_OK);
+  TEST_CHECK(fabs(page_info.width - 144.0) < 0.001);
+  TEST_CHECK(fabs(page_info.height - 216.0) < 0.001);
+
+  TEST_CHECK(nanopdf_document_get_page_info(document, 2, &page_info) == NANOPDF_STATUS_OK);
+  TEST_CHECK(fabs(page_info.width - 11.0) < 0.001);
+  TEST_CHECK(fabs(page_info.height - 11.0) < 0.001);
+
+  if (image_name) {
+    nanopdf_free(context, image_name);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_writer_alpha_image(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_page_info page_info;
+  uint8_t* png_data = NULL;
+  size_t png_size = 0;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  char* image_name = NULL;
+  int has_image = 0;
+
+  png_data = build_rgba_png_sample(&png_size);
+  TEST_CHECK(png_data != NULL);
+  TEST_CHECK(png_size > 0);
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_image_with_alpha_from_memory(
+                 writer,
+                 png_data,
+                 png_size,
+                 NANOPDF_IMAGE_COMPRESSION_FLATE,
+                 &image_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(image_name != NULL);
+  TEST_CHECK(nanopdf_writer_has_image_resource(writer, image_name, &has_image) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_image == 1);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 90.0, 90.0, &page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_image(page, image_name, 10.0, 10.0, 70.0, 70.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/SMask"));
+
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_page_count(document) == 1u);
+  TEST_CHECK(nanopdf_document_get_page_info(document, 0, &page_info) == NANOPDF_STATUS_OK);
+  TEST_CHECK(fabs(page_info.width - 90.0) < 0.001);
+  TEST_CHECK(fabs(page_info.height - 90.0) < 0.001);
+
+  if (image_name) {
+    nanopdf_free(context, image_name);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+  if (png_data) {
+    mz_free(png_data);
+  }
+}
+
+static void test_nanopdf_c_writer_mask_image(void) {
+  static const uint8_t mask_bytes[] = {0, 64, 128, 255};
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_context_options context_options;
+  nanopdf_page_info page_info;
+  nanopdf_soft_mask_config mask_config;
+  uint8_t* png_data = NULL;
+  size_t png_size = 0;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  char* image_name = NULL;
+  int has_image = 0;
+
+  png_data = build_rgb_png_sample(&png_size);
+  TEST_CHECK(png_data != NULL);
+  TEST_CHECK(png_size > 0);
+
+  memset(&mask_config, 0, sizeof(mask_config));
+  mask_config.data.data = mask_bytes;
+  mask_config.data.size = sizeof(mask_bytes);
+  mask_config.width = 2u;
+  mask_config.height = 2u;
+  mask_config.invert = 1;
+
+  nanopdf_default_context_options(&context_options);
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_image_with_mask_from_memory(
+                 writer,
+                 png_data,
+                 png_size,
+                 &mask_config,
+                 NANOPDF_IMAGE_COMPRESSION_FLATE,
+                 &image_name) == NANOPDF_STATUS_OK);
+  TEST_CHECK(image_name != NULL);
+  TEST_CHECK(nanopdf_writer_has_image_resource(writer, image_name, &has_image) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(has_image == 1);
+
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 96.0, 96.0, &page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_draw_image(page, image_name, 8.0, 8.0, 80.0, 80.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) == NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/SMask"));
+
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_page_count(document) == 1u);
+  TEST_CHECK(nanopdf_document_get_page_info(document, 0, &page_info) == NANOPDF_STATUS_OK);
+  TEST_CHECK(fabs(page_info.width - 96.0) < 0.001);
+  TEST_CHECK(fabs(page_info.height - 96.0) < 0.001);
+
+  if (image_name) {
+    nanopdf_free(context, image_name);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+  if (png_data) {
+    mz_free(png_data);
+  }
+}
+
+static void test_nanopdf_c_writer_encryption(void) {
+  const nanopdf_encryption_algorithm algorithms[] = {
+      NANOPDF_ENCRYPTION_RC4_40,
+      NANOPDF_ENCRYPTION_RC4_128,
+      NANOPDF_ENCRYPTION_AES_128,
+      NANOPDF_ENCRYPTION_AES_256};
+  size_t i;
+
+  for (i = 0; i < sizeof(algorithms) / sizeof(algorithms[0]); ++i) {
+    nanopdf_context* context = NULL;
+    nanopdf_writer* writer = NULL;
+    nanopdf_page_builder* page = NULL;
+    nanopdf_document* document = NULL;
+    nanopdf_context_options context_options;
+    nanopdf_parse_options parse_options;
+    nanopdf_writer_encryption_config encryption_config;
+    nanopdf_encryption_algorithm algorithm = NANOPDF_ENCRYPTION_NONE;
+    void* pdf_data = NULL;
+    size_t pdf_size = 0;
+    char* text = NULL;
+    int is_encrypted = 0;
+
+    nanopdf_default_context_options(&context_options);
+    nanopdf_default_parse_options(&parse_options);
+    memset(&encryption_config, 0, sizeof(encryption_config));
+
+    encryption_config.algorithm = algorithms[i];
+    encryption_config.user_password = "user-secret";
+    encryption_config.owner_password = "owner-secret";
+    encryption_config.allow_print = 1;
+    encryption_config.allow_copy = 1;
+    encryption_config.allow_annotate = 1;
+    encryption_config.allow_fill_forms = 1;
+    encryption_config.allow_accessibility = 1;
+    encryption_config.allow_print_high_quality = 1;
+    encryption_config.encrypt_metadata = 1;
+
+    TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_writer_begin_page(writer, 160.0, 120.0, &page) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_show_text_at(page, 24.0, 72.0, "Top Secret") ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+    page = NULL;
+
+    TEST_CHECK(nanopdf_writer_set_encryption(writer, &encryption_config) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(nanopdf_writer_is_encrypted(writer, &is_encrypted) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(is_encrypted == 1);
+    TEST_CHECK(nanopdf_writer_get_encryption_algorithm(writer, &algorithm) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(algorithm == algorithms[i]);
+
+    TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+               NANOPDF_STATUS_OK);
+    TEST_CHECK(pdf_data != NULL);
+    TEST_CHECK(pdf_size > 0);
+    TEST_CHECK(buffer_contains_text((const uint8_t*)pdf_data, pdf_size, "/Encrypt "));
+
+    TEST_CHECK(nanopdf_document_open_memory(
+                   context, pdf_data, pdf_size, NULL, &document) ==
+               NANOPDF_STATUS_ENCRYPTED);
+    TEST_CHECK(document == NULL);
+
+    parse_options.password = "user-secret";
+    TEST_CHECK(nanopdf_document_open_memory(
+                   context, pdf_data, pdf_size, &parse_options, &document) ==
+               NANOPDF_STATUS_OK);
+    if (document) {
+      TEST_CHECK(nanopdf_document_page_count(document) == 1u);
+      TEST_CHECK(nanopdf_page_extract_text(document, 0, &text) == NANOPDF_STATUS_OK);
+      TEST_CHECK(text != NULL);
+      TEST_CHECK(strstr(text, "Top Secret") != NULL);
+    }
+
+    if (text) {
+      nanopdf_free(context, text);
+      text = NULL;
+    }
+    if (document) {
+      nanopdf_document_close(document);
+      document = NULL;
+    }
+
+    parse_options.password = "owner-secret";
+    TEST_CHECK(nanopdf_document_open_memory(
+                   context, pdf_data, pdf_size, &parse_options, &document) ==
+               NANOPDF_STATUS_OK);
+    if (document) {
+      TEST_CHECK(nanopdf_page_extract_text(document, 0, &text) == NANOPDF_STATUS_OK);
+      TEST_CHECK(text != NULL);
+      TEST_CHECK(strstr(text, "Top Secret") != NULL);
+    }
+
+    if (text) {
+      nanopdf_free(context, text);
+    }
+    if (document) {
+      nanopdf_document_close(document);
+    }
+    if (pdf_data) {
+      nanopdf_free(context, pdf_data);
+    }
+    if (page) {
+      nanopdf_page_builder_discard(page);
+    }
+    nanopdf_writer_destroy(writer);
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_annotation_readback(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  nanopdf_annotation_info annotation;
+  nanopdf_link_config link = {0};
+  nanopdf_status status = NANOPDF_STATUS_OK;
+  nanopdf_context_options context_options;
+
+  memset(&annotation, 0, sizeof(annotation));
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 180.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+
+  link.x = 18.0;
+  link.y = 64.0;
+  link.width = 72.0;
+  link.height = 12.0;
+  link.action = NANOPDF_LINK_ACTION_URI;
+  link.uri = "https://example.com/annot";
+  link.show_border = 1;
+  TEST_CHECK(nanopdf_page_builder_add_link_config(page, &link) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_annotation_count(document, 0u) == 1u);
+  status = nanopdf_page_get_annotation(document, 0u, 0u, &annotation);
+  TEST_CHECK(status == NANOPDF_STATUS_OK);
+  if (status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(annotation.type == NANOPDF_ANNOTATION_TYPE_LINK);
+    TEST_CHECK(annotation.action_type == NANOPDF_ANNOTATION_ACTION_URI);
+    TEST_CHECK(annotation.uri != NULL);
+    TEST_CHECK(strcmp(annotation.uri, "https://example.com/annot") == 0);
+    TEST_CHECK(annotation.rect[0] == 18.0);
+    TEST_CHECK(annotation.rect[2] >= 90.0);
+  }
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_bookmark_readback(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  nanopdf_bookmark_info bookmark;
+  int root_id = -1;
+  int child_id = -1;
+  nanopdf_status status = NANOPDF_STATUS_OK;
+  nanopdf_context_options context_options;
+
+  memset(&bookmark, 0, sizeof(bookmark));
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_add_bookmark(writer, "Root bookmark", 0u, 84.0, &root_id) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(root_id >= 0);
+  TEST_CHECK(nanopdf_writer_add_child_bookmark(
+                 writer, root_id, "Child bookmark", 1u, 36.0, &child_id) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(child_id >= 0);
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_bookmark_count(document) == 2u);
+  status = nanopdf_document_get_bookmark(document, 0u, &bookmark);
+  TEST_CHECK(status == NANOPDF_STATUS_OK);
+  if (status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(bookmark.title != NULL);
+    TEST_CHECK(strcmp(bookmark.title, "Root bookmark") == 0);
+    TEST_CHECK(bookmark.depth == 0u);
+    TEST_CHECK(bookmark.action == NANOPDF_BOOKMARK_ACTION_GOTO);
+    TEST_CHECK(bookmark.page_index == 0u);
+  }
+  status = nanopdf_document_get_bookmark(document, 1u, &bookmark);
+  TEST_CHECK(status == NANOPDF_STATUS_OK);
+  if (status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(bookmark.title != NULL);
+    TEST_CHECK(strcmp(bookmark.title, "Child bookmark") == 0);
+    TEST_CHECK(bookmark.depth == 1u);
+    TEST_CHECK(bookmark.page_index == 1u);
+  }
+
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_attachment_readback(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  void* attachment_data = NULL;
+  size_t attachment_size = 0;
+  nanopdf_attachment_config attachment_config;
+  nanopdf_attachment_info attachment_info;
+  nanopdf_status status = NANOPDF_STATUS_OK;
+  nanopdf_context_options context_options;
+  static const uint8_t k_memory_attachment[] = "attachment payload";
+
+  memset(&attachment_config, 0, sizeof(attachment_config));
+  memset(&attachment_info, 0, sizeof(attachment_info));
+  nanopdf_default_context_options(&context_options);
+
+  attachment_config.filename = "payload.txt";
+  attachment_config.description = "payload attachment";
+  attachment_config.mime_type = "text/plain";
+  attachment_config.data = k_memory_attachment;
+  attachment_config.size = sizeof(k_memory_attachment) - 1;
+  attachment_config.use_compression = 1u;
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+  TEST_CHECK(nanopdf_writer_add_attachment(writer, &attachment_config) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+
+  TEST_CHECK(nanopdf_document_attachment_count(document) == 1u);
+  status = nanopdf_document_get_attachment_info(document, 0u, &attachment_info);
+  TEST_CHECK(status == NANOPDF_STATUS_OK);
+  if (status == NANOPDF_STATUS_OK) {
+    TEST_CHECK(attachment_info.name != NULL);
+    TEST_CHECK(strcmp(attachment_info.name, "payload.txt") == 0);
+    TEST_CHECK(attachment_info.description != NULL);
+    TEST_CHECK(strcmp(attachment_info.description, "payload attachment") == 0);
+    TEST_CHECK(attachment_info.mime_type != NULL);
+    TEST_CHECK(strcmp(attachment_info.mime_type, "text/plain") == 0);
+    TEST_CHECK(attachment_info.size == sizeof(k_memory_attachment) - 1);
+  }
+
+  TEST_CHECK(nanopdf_document_copy_attachment_data(
+                 document, 0u, &attachment_data, &attachment_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(attachment_data != NULL);
+  TEST_CHECK(attachment_size == sizeof(k_memory_attachment) - 1);
+  TEST_CHECK(memcmp(attachment_data, k_memory_attachment, attachment_size) == 0);
+
+  if (attachment_data) {
+    nanopdf_free(context, attachment_data);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_table_extraction(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_table_result* tables = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  char* font_name = NULL;
+  char* csv = NULL;
+  nanopdf_table_extraction_options options;
+  nanopdf_table_info table_info;
+  nanopdf_table_cell_info cell_info;
+  nanopdf_context_options context_options;
+
+  memset(&table_info, 0, sizeof(table_info));
+  memset(&cell_info, 0, sizeof(cell_info));
+  nanopdf_default_context_options(&context_options);
+  nanopdf_default_table_extraction_options(&options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_add_standard_font(
+                 writer, NANOPDF_STANDARD_FONT_HELVETICA, &font_name) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 220.0, 220.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_begin_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_set_font(page, font_name, 12.0) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 180.0, "Name") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 90.0, 180.0, "Age") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 150.0, 180.0, "City") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 160.0, "Alice") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 90.0, 160.0, "25") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 150.0, 160.0, "NYC") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 20.0, 140.0, "Bob") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 90.0, 140.0, "30") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_show_text_at(page, 150.0, 140.0, "LA") ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_end_text(page) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+
+  options.alignment_tolerance = 8.0;
+  options.min_rows = 2;
+  options.min_cols = 2;
+  options.max_cell_gap = 80.0;
+  TEST_CHECK(nanopdf_page_extract_tables(document, 0u, &options, &tables) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(tables != NULL);
+  TEST_CHECK(nanopdf_table_result_table_count(tables) >= 1u);
+  TEST_CHECK(nanopdf_table_result_get_table_info(tables, 0u, &table_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(table_info.row_count >= 2u);
+  TEST_CHECK(table_info.column_count >= 2u);
+  TEST_CHECK(nanopdf_table_result_table_cell_count(tables, 0u) >= 4u);
+  TEST_CHECK(nanopdf_table_result_get_table_cell(tables, 0u, 0u, &cell_info) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(cell_info.text != NULL);
+  TEST_CHECK(strlen(cell_info.text) > 0u);
+  TEST_CHECK(nanopdf_table_result_copy_table_text(
+                 tables, 0u, NANOPDF_TABLE_OUTPUT_CSV, &csv) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(csv != NULL);
+  TEST_CHECK(strstr(csv, "Alice") != NULL);
+  TEST_CHECK(strstr(csv, "Bob") != NULL);
+
+  if (csv) {
+    nanopdf_free(context, csv);
+  }
+  if (tables) {
+    nanopdf_table_result_destroy(tables);
+  }
+  if (font_name) {
+    nanopdf_free(context, font_name);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
+}
+
+static void test_nanopdf_c_pdfa_validation(void) {
+  nanopdf_context* context = NULL;
+  nanopdf_writer* writer = NULL;
+  nanopdf_page_builder* page = NULL;
+  nanopdf_document* document = NULL;
+  nanopdf_pdfa_report* report = NULL;
+  void* pdf_data = NULL;
+  size_t pdf_size = 0;
+  size_t violation_count = 0;
+  size_t violation_index = 0;
+  int found_missing_xmp = 0;
+  nanopdf_pdfa_summary summary;
+  nanopdf_pdfa_violation violation;
+  nanopdf_context_options context_options;
+
+  memset(&summary, 0, sizeof(summary));
+  memset(&violation, 0, sizeof(violation));
+  nanopdf_default_context_options(&context_options);
+
+  TEST_CHECK(nanopdf_context_create(&context_options, &context) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_create(context, &writer) == NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_writer_begin_page(writer, 120.0, 120.0, &page) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_page_builder_close(page) == NANOPDF_STATUS_OK);
+  page = NULL;
+
+  TEST_CHECK(nanopdf_writer_write_memory(writer, &pdf_data, &pdf_size) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(pdf_data != NULL);
+  TEST_CHECK(nanopdf_document_open_memory(context, pdf_data, pdf_size, NULL, &document) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(nanopdf_document_validate_pdfa(document, &report) == NANOPDF_STATUS_OK);
+  TEST_CHECK(report != NULL);
+  TEST_CHECK(nanopdf_pdfa_report_get_summary(report, &summary) ==
+             NANOPDF_STATUS_OK);
+  TEST_CHECK(summary.valid == 0);
+  violation_count = nanopdf_pdfa_report_violation_count(report);
+  TEST_CHECK(violation_count > 0u);
+  for (violation_index = 0; violation_index < violation_count; ++violation_index) {
+    TEST_CHECK(nanopdf_pdfa_report_get_violation(report, violation_index, &violation) ==
+               NANOPDF_STATUS_OK);
+    if (violation.rule == NANOPDF_PDFA_RULE_MISSING_XMP_METADATA) {
+      found_missing_xmp = 1;
+    }
+  }
+  TEST_CHECK(found_missing_xmp == 1);
+
+  if (report) {
+    nanopdf_pdfa_report_destroy(report);
+  }
+  if (document) {
+    nanopdf_document_close(document);
+  }
+  if (pdf_data) {
+    nanopdf_free(context, pdf_data);
+  }
+  if (page) {
+    nanopdf_page_builder_discard(page);
+  }
+  if (writer) {
+    nanopdf_writer_destroy(writer);
+  }
+  if (context) {
+    nanopdf_context_destroy(context);
+  }
 }
 
 struct TEST_ENTRY TEST_LIST[] = {
@@ -7220,6 +11367,40 @@ struct TEST_ENTRY TEST_LIST[] = {
     {"nanopdf_c_utf16be_info", test_nanopdf_c_utf16be_info},
     {"nanopdf_c_pdfdocencoding_info", test_nanopdf_c_pdfdocencoding_info},
     {"nanopdf_c_native_forms", test_nanopdf_c_native_forms},
+    {"nanopdf_c_incremental_writer", test_nanopdf_c_incremental_writer},
+    {"nanopdf_c_writer_link_configs", test_nanopdf_c_writer_link_configs},
+    {"nanopdf_c_writer_table_configs", test_nanopdf_c_writer_table_configs},
+    {"nanopdf_c_annotation_readback", test_nanopdf_c_annotation_readback},
+    {"nanopdf_c_bookmark_readback", test_nanopdf_c_bookmark_readback},
+    {"nanopdf_c_attachment_readback", test_nanopdf_c_attachment_readback},
+    {"nanopdf_c_table_extraction", test_nanopdf_c_table_extraction},
+    {"nanopdf_c_pdfa_validation", test_nanopdf_c_pdfa_validation},
+    {"nanopdf_c_writer_state_getters", test_nanopdf_c_writer_state_getters},
+    {"nanopdf_c_writer_page_labels", test_nanopdf_c_writer_page_labels},
+    {"nanopdf_c_writer_named_destinations",
+     test_nanopdf_c_writer_named_destinations},
+    {"nanopdf_c_writer_open_action", test_nanopdf_c_writer_open_action},
+    {"nanopdf_c_writer_page_layout_mode",
+     test_nanopdf_c_writer_page_layout_mode},
+    {"nanopdf_c_writer_viewer_preferences",
+     test_nanopdf_c_writer_viewer_preferences},
+    {"nanopdf_c_writer_language", test_nanopdf_c_writer_language},
+    {"nanopdf_c_writer_xmp_metadata", test_nanopdf_c_writer_xmp_metadata},
+    {"nanopdf_c_writer_output_intents", test_nanopdf_c_writer_output_intents},
+    {"nanopdf_c_writer_mark_info", test_nanopdf_c_writer_mark_info},
+    {"nanopdf_c_signature_writer", test_nanopdf_c_signature_writer},
+    {"nanopdf_c_incremental_signature_writer", test_nanopdf_c_incremental_signature_writer},
+    {"nanopdf_c_signature_permissions_writer", test_nanopdf_c_signature_permissions_writer},
+    {"nanopdf_c_writer_font_resources", test_nanopdf_c_writer_font_resources},
+    {"nanopdf_c_writer_security_defaults", test_nanopdf_c_writer_security_defaults},
+    {"nanopdf_c_pdf_composition", test_nanopdf_c_pdf_composition},
+    {"nanopdf_c_writer_metadata", test_nanopdf_c_writer_metadata},
+    {"nanopdf_c_writer_document_id", test_nanopdf_c_writer_document_id},
+    {"nanopdf_c_writer_generate_document_id", test_nanopdf_c_writer_generate_document_id},
+    {"nanopdf_c_writer_image_convenience", test_nanopdf_c_writer_image_convenience},
+    {"nanopdf_c_writer_alpha_image", test_nanopdf_c_writer_alpha_image},
+    {"nanopdf_c_writer_mask_image", test_nanopdf_c_writer_mask_image},
+    {"nanopdf_c_writer_encryption", test_nanopdf_c_writer_encryption},
     {"nanopdf_c_xref_stream", test_nanopdf_c_xref_stream},
     {"nanopdf_c_object_stream", test_nanopdf_c_object_stream},
     {"nanopdf_c_prev_chain", test_nanopdf_c_prev_chain},

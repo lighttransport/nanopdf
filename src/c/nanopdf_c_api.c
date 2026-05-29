@@ -14,6 +14,7 @@ typedef struct nanopdf_document {
   size_t owned_size;
   nanopdf_basic_document basic;
   nanopdf_parse_options parse_options;
+  void* cpp_bridge;
 } nanopdf_document;
 
 typedef struct nanopdf_text_layout {
@@ -74,8 +75,26 @@ static const char* get_basic_info_value(
       return document->creation_date;
     case NANOPDF_INFO_MOD_DATE:
       return document->mod_date;
+    case NANOPDF_INFO_TRAPPED:
+      return document->trapped;
   }
 
+  return NULL;
+}
+
+static const char* get_basic_custom_info_value(
+    const nanopdf_basic_document* document,
+    const char* key) {
+  size_t i = 0;
+  if (!document || !key) {
+    return NULL;
+  }
+  for (i = 0; i < document->custom_info_count; ++i) {
+    if (document->custom_info[i].key &&
+        strcmp(document->custom_info[i].key, key) == 0) {
+      return document->custom_info[i].value;
+    }
+  }
   return NULL;
 }
 
@@ -265,6 +284,7 @@ void nanopdf_document_close(nanopdf_document* document) {
     return;
   }
 
+  nanopdf__document_destroy_cpp_bridge(document);
   nanopdf_basic_document_destroy(&document->context->allocator, &document->basic);
   nanopdf__allocator_free(&document->context->allocator, document->owned_data);
   nanopdf__allocator_free(&document->context->allocator, document);
@@ -325,7 +345,7 @@ nanopdf_status nanopdf_document_copy_info_value(
   }
 
   value = get_basic_info_value(&document->basic, key);
-  if (!value && key >= NANOPDF_INFO_TITLE && key <= NANOPDF_INFO_MOD_DATE) {
+  if (!value && key >= NANOPDF_INFO_TITLE && key <= NANOPDF_INFO_TRAPPED) {
     value = "";
   }
   if (!value) {
@@ -336,6 +356,337 @@ nanopdf_status nanopdf_document_copy_info_value(
   }
 
   return copy_string(document->context, value, out_value);
+}
+
+nanopdf_status nanopdf_document_copy_custom_info_value(
+    nanopdf_document* document,
+    const char* key,
+    char** out_value) {
+  const char* value = NULL;
+
+  if (validate_document_handle(document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!key || key[0] == '\0') {
+    return set_error(
+        document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "custom metadata key is null or empty");
+  }
+  if (!out_value) {
+    return set_error(
+        document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "custom metadata output pointer is null");
+  }
+
+  value = get_basic_custom_info_value(&document->basic, key);
+  if (!value) {
+    return set_error(
+        document->context,
+        NANOPDF_STATUS_NOT_FOUND,
+        "custom metadata key was not found");
+  }
+
+  return copy_string(document->context, value, out_value);
+}
+
+nanopdf_status nanopdf_document_copy_language(
+    const nanopdf_document* document,
+    char** out_language) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_language) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "language output pointer is null");
+  }
+  if (!mutable_document->basic.language) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_NOT_FOUND,
+        "document language was not found");
+  }
+
+  return copy_string(mutable_document->context, mutable_document->basic.language, out_language);
+}
+
+nanopdf_status nanopdf_document_copy_xmp_metadata(
+    const nanopdf_document* document,
+    char** out_xml) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_xml) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "XMP output pointer is null");
+  }
+  if (!mutable_document->basic.xmp_metadata) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_NOT_FOUND,
+        "XMP metadata was not found");
+  }
+
+  return copy_string(mutable_document->context, mutable_document->basic.xmp_metadata, out_xml);
+}
+
+nanopdf_status nanopdf_document_copy_open_action_named_destination(
+    const nanopdf_document* document,
+    char** out_destination_name) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_destination_name) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "open action output pointer is null");
+  }
+  if (!mutable_document->basic.open_action_named_destination) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_NOT_FOUND,
+        "open action named destination was not found");
+  }
+
+  return copy_string(
+      mutable_document->context,
+      mutable_document->basic.open_action_named_destination,
+      out_destination_name);
+}
+
+nanopdf_status nanopdf_document_get_page_layout(
+    const nanopdf_document* document,
+    nanopdf_page_layout* out_layout) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_layout) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "page layout output pointer is null");
+  }
+
+  *out_layout = mutable_document->basic.page_layout;
+  return clear_success(mutable_document->context);
+}
+
+nanopdf_status nanopdf_document_get_page_mode(
+    const nanopdf_document* document,
+    nanopdf_page_mode* out_mode) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_mode) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "page mode output pointer is null");
+  }
+
+  *out_mode = mutable_document->basic.page_mode;
+  return clear_success(mutable_document->context);
+}
+
+nanopdf_status nanopdf_document_get_viewer_preferences(
+    const nanopdf_document* document,
+    nanopdf_viewer_preferences* out_preferences) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_preferences) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "viewer preferences output pointer is null");
+  }
+  if (!mutable_document->basic.has_viewer_preferences) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_NOT_FOUND,
+        "viewer preferences were not found");
+  }
+
+  *out_preferences = mutable_document->basic.viewer_preferences;
+  return clear_success(mutable_document->context);
+}
+
+nanopdf_status nanopdf_document_get_mark_info(
+    const nanopdf_document* document,
+    nanopdf_mark_info* out_mark_info) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_mark_info) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "mark info output pointer is null");
+  }
+  if (!mutable_document->basic.has_mark_info) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_NOT_FOUND,
+        "MarkInfo was not found");
+  }
+
+  *out_mark_info = mutable_document->basic.mark_info;
+  return clear_success(mutable_document->context);
+}
+
+uint32_t nanopdf_document_output_intent_count(const nanopdf_document* document) {
+  const nanopdf_document* immutable_document = document;
+  if (!immutable_document || !immutable_document->context) {
+    return 0;
+  }
+  return (uint32_t)immutable_document->basic.output_intent_count;
+}
+
+nanopdf_status nanopdf_document_get_output_intent(
+    const nanopdf_document* document,
+    uint32_t index,
+    nanopdf_output_intent* out_output_intent) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+  const size_t output_intent_index = (size_t)index;
+  const nanopdf_basic_output_intent* source = NULL;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_output_intent) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "output intent output pointer is null");
+  }
+  if (output_intent_index >= mutable_document->basic.output_intent_count) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "output intent index is out of range");
+  }
+
+  source = &mutable_document->basic.output_intents[output_intent_index];
+  memset(out_output_intent, 0, sizeof(*out_output_intent));
+  out_output_intent->subtype = source->subtype;
+  out_output_intent->output_condition = source->output_condition;
+  out_output_intent->output_condition_identifier = source->output_condition_identifier;
+  out_output_intent->registry_name = source->registry_name;
+  out_output_intent->info = source->info;
+  out_output_intent->dest_output_profile.data = source->dest_output_profile_data;
+  out_output_intent->dest_output_profile.size = source->dest_output_profile_size;
+  out_output_intent->color_components = source->color_components;
+  return clear_success(mutable_document->context);
+}
+
+uint32_t nanopdf_document_page_label_count(const nanopdf_document* document) {
+  const nanopdf_document* immutable_document = document;
+  if (!immutable_document || !immutable_document->context) {
+    return 0;
+  }
+  return (uint32_t)immutable_document->basic.page_label_count;
+}
+
+nanopdf_status nanopdf_document_get_page_label(
+    const nanopdf_document* document,
+    uint32_t index,
+    uint32_t* out_page_index,
+    nanopdf_page_label* out_label) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+  const size_t page_label_index = (size_t)index;
+  const nanopdf_basic_page_label_entry* source = NULL;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_page_index) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "page label index output pointer is null");
+  }
+  if (!out_label) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "page label output pointer is null");
+  }
+  if (page_label_index >= mutable_document->basic.page_label_count) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "page label index is out of range");
+  }
+
+  source = &mutable_document->basic.page_labels[page_label_index];
+  *out_page_index = source->page_index;
+  memset(out_label, 0, sizeof(*out_label));
+  out_label->style = source->style;
+  out_label->prefix = source->prefix;
+  out_label->start_value = source->start_value;
+  return clear_success(mutable_document->context);
+}
+
+uint32_t nanopdf_document_named_destination_count(const nanopdf_document* document) {
+  const nanopdf_document* immutable_document = document;
+  if (!immutable_document || !immutable_document->context) {
+    return 0;
+  }
+  return (uint32_t)immutable_document->basic.named_destination_count;
+}
+
+nanopdf_status nanopdf_document_get_named_destination(
+    const nanopdf_document* document,
+    uint32_t index,
+    nanopdf_named_destination* out_destination) {
+  nanopdf_document* mutable_document = (nanopdf_document*)document;
+  const size_t destination_index = (size_t)index;
+  const nanopdf_basic_named_destination* source = NULL;
+
+  if (validate_document_handle(mutable_document, "document handle is null") != NANOPDF_STATUS_OK) {
+    return NANOPDF_STATUS_INVALID_ARGUMENT;
+  }
+  if (!out_destination) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "named destination output pointer is null");
+  }
+  if (destination_index >= mutable_document->basic.named_destination_count) {
+    return set_error(
+        mutable_document->context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "named destination index is out of range");
+  }
+
+  source = &mutable_document->basic.named_destinations[destination_index];
+  memset(out_destination, 0, sizeof(*out_destination));
+  out_destination->name = source->name;
+  out_destination->page_index = source->page_index;
+  out_destination->fit_type = source->fit_type;
+  out_destination->position = source->position;
+  out_destination->position_count = source->position_count;
+  return clear_success(mutable_document->context);
 }
 
 nanopdf_status nanopdf_page_extract_text(

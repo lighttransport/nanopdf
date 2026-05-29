@@ -699,6 +699,7 @@ set(NANOPDF_C_API_SOURCES
   src/c/nanopdf_basic_document.c
   src/c/nanopdf_basic_layout.c
   src/c/nanopdf_c_api.c
+  src/c/nanopdf_parse_bridge.cc
   src/c/nanopdf_write.cc
   src/third_party/miniz.c
 )

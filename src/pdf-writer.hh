@@ -34,6 +34,57 @@ enum class PdfVersion {
   v2_0,  // PDF 2.0 (ISO 32000-2)
 };
 
+enum class PageLayout {
+  Unset,
+  SinglePage,
+  OneColumn,
+  TwoColumnLeft,
+  TwoColumnRight,
+  TwoPageLeft,
+  TwoPageRight,
+};
+
+enum class PageMode {
+  Unset,
+  UseNone,
+  UseOutlines,
+  UseThumbs,
+  FullScreen,
+  UseOC,
+  UseAttachments,
+};
+
+struct ViewerPreferences {
+  bool hide_toolbar = false;
+  bool hide_menubar = false;
+  bool hide_window_ui = false;
+  bool fit_window = false;
+  bool center_window = false;
+  bool display_doc_title = false;
+};
+
+struct OutputIntentConfig {
+  std::string subtype = "GTS_PDFA1";
+  std::string output_condition;
+  std::string output_condition_id;
+  std::string registry_name;
+  std::string info;
+  std::vector<uint8_t> dest_output_profile;
+  int color_components = 3;
+};
+
+struct MarkInfoConfig {
+  bool marked = true;
+  bool suspects = false;
+};
+
+enum class TrappedState {
+  Unset,
+  False,
+  True,
+  Unknown,
+};
+
 /// Signature filter type
 enum class SignatureFilter {
   AdobePPKLite,    // Adobe.PPKLite (most common)
@@ -828,6 +879,9 @@ class TableBuilder {
   /// Set default text color
   void set_text_color(double r, double g, double b);
 
+  /// Set header row style
+  void set_header_style(const CellStyle& style);
+
   /// Set border style
   void set_border(double width, double r = 0, double g = 0, double b = 0);
 
@@ -842,6 +896,8 @@ class TableBuilder {
 
   /// Add a header row (calls add_row internally with header styling)
   void add_header_row(const std::vector<std::string>& cells);
+  void add_header_row(const std::vector<WriterTableCell>& cells);
+  void add_header_row(const TableRow& row);
 
   /// Add a data row
   void add_row(const std::vector<std::string>& cells);
@@ -917,6 +973,8 @@ class PageBuilder {
   void set_stroke_alpha(double alpha);   // 0.0-1.0
   void set_blend_mode(BlendMode mode);
   void reset_transparency();             // Reset to opaque
+  void set_fill_gradient(const std::string& name);
+  void set_stroke_gradient(const std::string& name);
 
   // Link annotations (added to page)
   void add_link(double x, double y, double w, double h, const std::string& uri);
@@ -1035,8 +1093,12 @@ class TextLayout {
 /// Page template (Form XObject) for reusable content
 class Template {
  public:
-  Template(double width, double height);
+  Template(PdfWriter* writer, double width, double height);
   ~Template();
+  Template(const Template&) = delete;
+  Template& operator=(const Template&) = delete;
+  Template(Template&& other) noexcept;
+  Template& operator=(Template&& other) noexcept;
 
   void set_size(double width, double height);
 
@@ -1045,10 +1107,9 @@ class Template {
 
  private:
   friend class PdfWriter;
+  PdfWriter* writer_ = nullptr;
   double width_, height_;
-  std::string content_;
-  std::vector<std::string> used_images_;
-  std::vector<std::string> used_fonts_;
+  std::unique_ptr<PageBuilder> builder_;
 };
 
 /// PDF document writer
@@ -1107,8 +1168,31 @@ class PdfWriter {
   void set_subject(const std::string& subject);
   void set_keywords(const std::string& keywords);
   void set_creator(const std::string& creator);
+  void set_producer(const std::string& producer);
+  void set_custom_info(const std::string& key, const std::string& value);
+  void clear_custom_info(const std::string& key);
   void set_creation_date(const std::string& date);  // Format: D:YYYYMMDDHHmmSS
   void set_modification_date(const std::string& date);
+  void set_page_label(uint32_t page_index, const PageLabel& label);
+  void clear_page_labels();
+  void add_named_destination(const NamedDestination& destination);
+  void clear_named_destinations();
+  void set_open_action_named_destination(const std::string& destination_name);
+  void clear_open_action();
+  void set_page_layout(PageLayout layout);
+  void set_page_mode(PageMode mode);
+  void set_viewer_preferences(const ViewerPreferences& preferences);
+  void clear_viewer_preferences();
+  void set_language(const std::string& language);
+  void clear_language();
+  void set_xmp_metadata(const std::string& xml);
+  void clear_xmp_metadata();
+  void add_output_intent(const OutputIntentConfig& config);
+  void clear_output_intents();
+  void set_mark_info(const MarkInfoConfig& config);
+  void clear_mark_info();
+  void set_trapped(TrappedState trapped);
+  void clear_trapped();
 
   // Resource management
   /// Add an image resource. Returns resource name (e.g., "Im1")
@@ -1134,6 +1218,8 @@ class PdfWriter {
 
   /// Add a standard font. Returns resource name (e.g., "F1")
   std::string add_standard_font(StandardFont font);
+  bool has_font_resource(const std::string& name) const;
+  bool has_image_resource(const std::string& name) const;
 
   // ============================================================
   // Font Embedding
@@ -1175,6 +1261,7 @@ class PdfWriter {
   /// Add a child bookmark under a parent. Returns child bookmark ID.
   int add_child_bookmark(int parent_id, const std::string& title,
                          int page_index, double y = 0);
+  int add_child_bookmark(int parent_id, const BookmarkConfig& config);
 
   // ============================================================
   // Attachments
@@ -1219,7 +1306,8 @@ class PdfWriter {
 
   /// Add a list box. Returns field name.
   std::string add_listbox(const std::string& name, int page, double x, double y,
-                          double w, double h, const std::vector<std::string>& options);
+                          double w, double h, const std::vector<std::string>& options,
+                          int selected = 0);
 
   /// Add a push button. Returns field name.
   std::string add_button(const std::string& name, int page, double x, double y,
@@ -1241,6 +1329,7 @@ class PdfWriter {
 
   /// Add a template to the document. Returns template name (e.g., "Fm1")
   std::string add_template(const Template& tmpl);
+  std::string add_template(double width, double height, const PageBuilder& builder);
 
   /// Draw a template on the current page (use inside page builder callback)
   void use_template(PageBuilder& builder, const std::string& name, double x, double y,
@@ -1487,6 +1576,13 @@ class PdfWriter {
   /// @return true if the annotation was queued
   bool add_highlight_to_existing_page(int page_index,
                                        const HighlightConfig& config);
+
+  /// Add a text markup annotation to an existing PDF page.
+  /// @param page_index  0-based page index
+  /// @param config      Text markup configuration with subtype and quad points
+  /// @return true if the annotation was queued
+  bool add_text_markup_to_existing_page(int page_index,
+                                         const TextMarkupConfig& config);
 
   /// Add a link annotation to an existing PDF page.
   /// @param page_index  0-based page index

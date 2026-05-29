@@ -10,6 +10,8 @@ extern "C" {
 void nanopdf_default_context_options(nanopdf_context_options* options);
 void nanopdf_default_parse_options(nanopdf_parse_options* options);
 void nanopdf_default_text_layout_options(nanopdf_text_layout_options* options);
+void nanopdf_default_table_extraction_options(
+    nanopdf_table_extraction_options* options);
 
 nanopdf_status nanopdf_context_create(
     const nanopdf_context_options* options,

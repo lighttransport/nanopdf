@@ -20,6 +20,9 @@ typedef struct nanopdf_basic_page {
   double width;
   double height;
   double rotation;
+  uint32_t object_number;
+  uint16_t generation;
+  uint8_t valid;
   nanopdf_basic_content_ref* contents;
   size_t content_count;
   size_t content_capacity;
@@ -44,6 +47,37 @@ typedef struct nanopdf_basic_form_field {
   char* value;
   uint32_t flags;
 } nanopdf_basic_form_field;
+
+typedef struct nanopdf_basic_info_entry {
+  char* key;
+  char* value;
+} nanopdf_basic_info_entry;
+
+typedef struct nanopdf_basic_output_intent {
+  char* subtype;
+  char* output_condition;
+  char* output_condition_identifier;
+  char* registry_name;
+  char* info;
+  uint8_t* dest_output_profile_data;
+  size_t dest_output_profile_size;
+  int32_t color_components;
+} nanopdf_basic_output_intent;
+
+typedef struct nanopdf_basic_page_label_entry {
+  uint32_t page_index;
+  nanopdf_page_label_style style;
+  char* prefix;
+  uint32_t start_value;
+} nanopdf_basic_page_label_entry;
+
+typedef struct nanopdf_basic_named_destination {
+  char* name;
+  uint32_t page_index;
+  char* fit_type;
+  double* position;
+  size_t position_count;
+} nanopdf_basic_named_destination;
 
 typedef enum nanopdf_basic_security_algorithm {
   NANOPDF_BASIC_SECURITY_NONE = 0,
@@ -84,6 +118,28 @@ typedef struct nanopdf_basic_document {
   char* producer;
   char* creation_date;
   char* mod_date;
+  char* trapped;
+  char* language;
+  char* xmp_metadata;
+  char* open_action_named_destination;
+  nanopdf_page_layout page_layout;
+  nanopdf_page_mode page_mode;
+  uint8_t has_viewer_preferences;
+  nanopdf_viewer_preferences viewer_preferences;
+  uint8_t has_mark_info;
+  nanopdf_mark_info mark_info;
+  nanopdf_basic_output_intent* output_intents;
+  size_t output_intent_count;
+  size_t output_intent_capacity;
+  nanopdf_basic_page_label_entry* page_labels;
+  size_t page_label_count;
+  size_t page_label_capacity;
+  nanopdf_basic_named_destination* named_destinations;
+  size_t named_destination_count;
+  size_t named_destination_capacity;
+  nanopdf_basic_info_entry* custom_info;
+  size_t custom_info_count;
+  size_t custom_info_capacity;
   nanopdf_basic_form_field* form_fields;
   size_t form_field_count;
   size_t form_field_capacity;

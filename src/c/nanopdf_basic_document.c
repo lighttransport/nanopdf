@@ -1745,6 +1745,7 @@ static int duplicate_basic_content(
 static nanopdf_status append_page_contents(
     nanopdf_context* context,
     nanopdf_basic_document* document,
+    nanopdf_ref page_ref,
     const nanopdf_box* media_box,
     double rotation,
     const nanopdf_basic_content_ref* contents,
@@ -1770,6 +1771,9 @@ static nanopdf_status append_page_contents(
   page_index = document->page_count;
   memset(&document->pages[page_index], 0, sizeof(document->pages[page_index]));
   document->pages[page_index].rotation = rotation;
+  document->pages[page_index].object_number = page_ref.object_number;
+  document->pages[page_index].generation = page_ref.generation;
+  document->pages[page_index].valid = page_ref.valid;
   if (media_box->valid) {
     document->pages[page_index].width =
         media_box->values[2] - media_box->values[0];
@@ -1882,10 +1886,11 @@ static nanopdf_status NANOPDF_MAYBE_UNUSED parse_document_info(
     nanopdf_basic_document* document) {
   static const char* keys[] = {
       "Title", "Author", "Subject", "Keywords",
-      "Creator", "Producer", "CreationDate", "ModDate"};
+      "Creator", "Producer", "CreationDate", "ModDate", "Trapped"};
   char** targets[] = {
       &document->title, &document->author, &document->subject, &document->keywords,
-      &document->creator, &document->producer, &document->creation_date, &document->mod_date};
+      &document->creator, &document->producer, &document->creation_date,
+      &document->mod_date, &document->trapped};
   size_t i;
 
   for (i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
@@ -1922,6 +1927,46 @@ static void destroy_basic_form_field(
   nanopdf__allocator_free(allocator, field->mapping_name);
   nanopdf__allocator_free(allocator, field->value);
   memset(field, 0, sizeof(*field));
+}
+
+static void destroy_basic_output_intent(
+    const nanopdf_allocator* allocator,
+    nanopdf_basic_output_intent* output_intent) {
+  if (!allocator || !output_intent) {
+    return;
+  }
+
+  nanopdf__allocator_free(allocator, output_intent->subtype);
+  nanopdf__allocator_free(allocator, output_intent->output_condition);
+  nanopdf__allocator_free(allocator, output_intent->output_condition_identifier);
+  nanopdf__allocator_free(allocator, output_intent->registry_name);
+  nanopdf__allocator_free(allocator, output_intent->info);
+  nanopdf__allocator_free(allocator, output_intent->dest_output_profile_data);
+  memset(output_intent, 0, sizeof(*output_intent));
+}
+
+static void destroy_basic_page_label_entry(
+    const nanopdf_allocator* allocator,
+    nanopdf_basic_page_label_entry* page_label) {
+  if (!allocator || !page_label) {
+    return;
+  }
+
+  nanopdf__allocator_free(allocator, page_label->prefix);
+  memset(page_label, 0, sizeof(*page_label));
+}
+
+static void destroy_basic_named_destination(
+    const nanopdf_allocator* allocator,
+    nanopdf_basic_named_destination* destination) {
+  if (!allocator || !destination) {
+    return;
+  }
+
+  nanopdf__allocator_free(allocator, destination->name);
+  nanopdf__allocator_free(allocator, destination->fit_type);
+  nanopdf__allocator_free(allocator, destination->position);
+  memset(destination, 0, sizeof(*destination));
 }
 
 static char* duplicate_joined_name(
@@ -3085,7 +3130,7 @@ static nanopdf_status walk_page_tree_object(
       (type_obj && type_obj->type == NANOPDF_BASIC_OBJECT_NAME &&
        strcmp(type_obj->as.text, "Page") == 0)) {
     status = append_page_contents(
-        context, out_document, &media_box, rotate, content_refs, content_count);
+        context, out_document, node_ref, &media_box, rotate, content_refs, content_count);
     if (content_refs) {
       size_t j;
       for (j = 0; j < content_count; ++j) {
@@ -3118,6 +3163,63 @@ static nanopdf_status walk_page_tree_object(
   return clear_status(context);
 }
 
+static int is_standard_document_info_key(const char* key) {
+  return key &&
+      (strcmp(key, "Title") == 0 || strcmp(key, "Author") == 0 ||
+       strcmp(key, "Subject") == 0 || strcmp(key, "Keywords") == 0 ||
+       strcmp(key, "Creator") == 0 || strcmp(key, "Producer") == 0 ||
+       strcmp(key, "CreationDate") == 0 || strcmp(key, "ModDate") == 0 ||
+       strcmp(key, "Trapped") == 0);
+}
+
+static int append_custom_document_info(
+    nanopdf_context* context,
+    nanopdf_basic_document* document,
+    const char* key,
+    const nanopdf_basic_object* value) {
+  nanopdf_basic_info_entry* resized = NULL;
+  char* key_copy = NULL;
+  char* value_copy = NULL;
+  size_t new_capacity = 0;
+  nanopdf_basic_info_entry* entry = NULL;
+
+  if (!context || !document || !key || !value) {
+    return 0;
+  }
+  if (document->custom_info_count == document->custom_info_capacity) {
+    new_capacity =
+        document->custom_info_capacity == 0 ? 4 : document->custom_info_capacity * 2;
+    resized = (nanopdf_basic_info_entry*)nanopdf__allocator_realloc(
+        &context->allocator,
+        document->custom_info,
+        new_capacity * sizeof(*document->custom_info));
+    if (!resized) {
+      return 0;
+    }
+    memset(
+        resized + document->custom_info_capacity,
+        0,
+        (new_capacity - document->custom_info_capacity) * sizeof(*document->custom_info));
+    document->custom_info = resized;
+    document->custom_info_capacity = new_capacity;
+  }
+
+  key_copy = (char*)nanopdf__allocator_alloc(&context->allocator, strlen(key) + 1);
+  if (!key_copy) {
+    return 0;
+  }
+  memcpy(key_copy, key, strlen(key) + 1);
+  if (!duplicate_object_text(context, value, &value_copy)) {
+    nanopdf__allocator_free(&context->allocator, key_copy);
+    return 0;
+  }
+
+  entry = &document->custom_info[document->custom_info_count++];
+  entry->key = key_copy;
+  entry->value = value_copy;
+  return 1;
+}
+
 static nanopdf_status parse_document_info_object(
     nanopdf_context* context,
     const nanopdf_basic_document* document,
@@ -3125,11 +3227,11 @@ static nanopdf_status parse_document_info_object(
     nanopdf_basic_document* out_document) {
   static const char* keys[] = {
       "Title", "Author", "Subject", "Keywords",
-      "Creator", "Producer", "CreationDate", "ModDate"};
+      "Creator", "Producer", "CreationDate", "ModDate", "Trapped"};
   char** targets[] = {
       &out_document->title, &out_document->author, &out_document->subject,
       &out_document->keywords, &out_document->creator, &out_document->producer,
-      &out_document->creation_date, &out_document->mod_date};
+      &out_document->creation_date, &out_document->mod_date, &out_document->trapped};
   nanopdf_basic_object info_object;
   const nanopdf_basic_dict* dict = NULL;
   size_t i = 0;
@@ -3174,7 +3276,963 @@ static nanopdf_status parse_document_info_object(
     nanopdf_basic_object_destroy(&context->allocator, &resolved_value);
   }
 
+  for (i = 0; i < dict->count; ++i) {
+    nanopdf_basic_object resolved_value;
+    const nanopdf_basic_object* value = NULL;
+    const char* key = dict->entries[i].key;
+
+    if (!key || is_standard_document_info_key(key)) {
+      continue;
+    }
+
+    nanopdf_basic_object_init(&resolved_value);
+    value = dict_get_resolved(
+        context, document, dict, key, &resolved_value, &status);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_value);
+      nanopdf_basic_object_destroy(&context->allocator, &info_object);
+      return status;
+    }
+    if (value &&
+        value->type != NANOPDF_BASIC_OBJECT_STRING &&
+        value->type != NANOPDF_BASIC_OBJECT_NAME &&
+        value->type != NANOPDF_BASIC_OBJECT_ARRAY) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_value);
+      continue;
+    }
+    if (value &&
+        !append_custom_document_info(context, out_document, key, value)) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_value);
+      nanopdf_basic_object_destroy(&context->allocator, &info_object);
+      return set_status(
+          context, NANOPDF_STATUS_OUT_OF_MEMORY, "failed to store custom document info");
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_value);
+  }
+
   nanopdf_basic_object_destroy(&context->allocator, &info_object);
+  return clear_status(context);
+}
+
+static int map_catalog_page_layout(
+    const nanopdf_basic_object* object,
+    nanopdf_page_layout* out_layout) {
+  if (!object || !out_layout || object->type != NANOPDF_BASIC_OBJECT_NAME) {
+    return 0;
+  }
+  if (strcmp(object->as.text, "SinglePage") == 0) {
+    *out_layout = NANOPDF_PAGE_LAYOUT_SINGLE_PAGE;
+    return 1;
+  }
+  if (strcmp(object->as.text, "OneColumn") == 0) {
+    *out_layout = NANOPDF_PAGE_LAYOUT_ONE_COLUMN;
+    return 1;
+  }
+  if (strcmp(object->as.text, "TwoColumnLeft") == 0) {
+    *out_layout = NANOPDF_PAGE_LAYOUT_TWO_COLUMN_LEFT;
+    return 1;
+  }
+  if (strcmp(object->as.text, "TwoColumnRight") == 0) {
+    *out_layout = NANOPDF_PAGE_LAYOUT_TWO_COLUMN_RIGHT;
+    return 1;
+  }
+  if (strcmp(object->as.text, "TwoPageLeft") == 0) {
+    *out_layout = NANOPDF_PAGE_LAYOUT_TWO_PAGE_LEFT;
+    return 1;
+  }
+  if (strcmp(object->as.text, "TwoPageRight") == 0) {
+    *out_layout = NANOPDF_PAGE_LAYOUT_TWO_PAGE_RIGHT;
+    return 1;
+  }
+  return 0;
+}
+
+static int map_catalog_page_mode(
+    const nanopdf_basic_object* object,
+    nanopdf_page_mode* out_mode) {
+  if (!object || !out_mode || object->type != NANOPDF_BASIC_OBJECT_NAME) {
+    return 0;
+  }
+  if (strcmp(object->as.text, "UseNone") == 0) {
+    *out_mode = NANOPDF_PAGE_MODE_USE_NONE;
+    return 1;
+  }
+  if (strcmp(object->as.text, "UseOutlines") == 0) {
+    *out_mode = NANOPDF_PAGE_MODE_USE_OUTLINES;
+    return 1;
+  }
+  if (strcmp(object->as.text, "UseThumbs") == 0) {
+    *out_mode = NANOPDF_PAGE_MODE_USE_THUMBS;
+    return 1;
+  }
+  if (strcmp(object->as.text, "FullScreen") == 0) {
+    *out_mode = NANOPDF_PAGE_MODE_FULL_SCREEN;
+    return 1;
+  }
+  if (strcmp(object->as.text, "UseOC") == 0) {
+    *out_mode = NANOPDF_PAGE_MODE_USE_OC;
+    return 1;
+  }
+  if (strcmp(object->as.text, "UseAttachments") == 0) {
+    *out_mode = NANOPDF_PAGE_MODE_USE_ATTACHMENTS;
+    return 1;
+  }
+  return 0;
+}
+
+static int duplicate_stream_bytes_as_text(
+    nanopdf_context* context,
+    const nanopdf_basic_object* object,
+    char** out_text) {
+  char* buffer = NULL;
+
+  if (!context || !object || !out_text ||
+      object->type != NANOPDF_BASIC_OBJECT_STREAM) {
+    return 0;
+  }
+
+  buffer = (char*)nanopdf__allocator_alloc(
+      &context->allocator, object->as.stream.size + 1);
+  if (!buffer) {
+    return 0;
+  }
+  if (object->as.stream.size > 0) {
+    memcpy(buffer, object->as.stream.data, object->as.stream.size);
+  }
+  buffer[object->as.stream.size] = '\0';
+  *out_text = buffer;
+  return 1;
+}
+
+static int duplicate_stream_bytes(
+    nanopdf_context* context,
+    const nanopdf_basic_object* object,
+    uint8_t** out_data,
+    size_t* out_size) {
+  uint8_t* buffer = NULL;
+
+  if (!context || !object || !out_data || !out_size ||
+      object->type != NANOPDF_BASIC_OBJECT_STREAM) {
+    return 0;
+  }
+
+  *out_data = NULL;
+  *out_size = 0;
+  if (object->as.stream.size == 0) {
+    return 1;
+  }
+
+  buffer = (uint8_t*)nanopdf__allocator_alloc(
+      &context->allocator, object->as.stream.size);
+  if (!buffer) {
+    return 0;
+  }
+  memcpy(buffer, object->as.stream.data, object->as.stream.size);
+  *out_data = buffer;
+  *out_size = object->as.stream.size;
+  return 1;
+}
+
+static int append_output_intent(
+    nanopdf_context* context,
+    nanopdf_basic_document* document,
+    const nanopdf_basic_dict* dict,
+    const nanopdf_basic_document* source_document) {
+  nanopdf_basic_output_intent* resized = NULL;
+  size_t new_capacity = 0;
+  nanopdf_basic_output_intent* entry = NULL;
+  nanopdf_basic_object resolved_obj;
+  const nanopdf_basic_object* value = NULL;
+  nanopdf_status status = NANOPDF_STATUS_OK;
+
+  if (!context || !document || !dict || !source_document) {
+    return 0;
+  }
+  if (document->output_intent_count == document->output_intent_capacity) {
+    new_capacity = document->output_intent_capacity == 0 ?
+        2 : document->output_intent_capacity * 2;
+    resized = (nanopdf_basic_output_intent*)nanopdf__allocator_realloc(
+        &context->allocator,
+        document->output_intents,
+        new_capacity * sizeof(*document->output_intents));
+    if (!resized) {
+      return 0;
+    }
+    memset(
+        resized + document->output_intent_capacity,
+        0,
+        (new_capacity - document->output_intent_capacity) * sizeof(*document->output_intents));
+    document->output_intents = resized;
+    document->output_intent_capacity = new_capacity;
+  }
+
+  entry = &document->output_intents[document->output_intent_count];
+  memset(entry, 0, sizeof(*entry));
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, dict, "S", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return 0;
+  }
+  if (value && !duplicate_object_text(context, value, &entry->subtype)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return 0;
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, dict, "OutputCondition", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  if (value && !duplicate_object_text(context, value, &entry->output_condition)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, dict, "OutputConditionIdentifier", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  if (value &&
+      !duplicate_object_text(context, value, &entry->output_condition_identifier)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, dict, "RegistryName", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  if (value && !duplicate_object_text(context, value, &entry->registry_name)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, dict, "Info", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  if (value && !duplicate_object_text(context, value, &entry->info)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, dict, "DestOutputProfile", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_STREAM &&
+      !duplicate_stream_bytes(
+          context,
+          value,
+          &entry->dest_output_profile_data,
+          &entry->dest_output_profile_size)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_output_intent(&context->allocator, entry);
+    return 0;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_STREAM) {
+    nanopdf_basic_object resolved_profile_n;
+    const nanopdf_basic_object* profile_n = NULL;
+
+    nanopdf_basic_object_init(&resolved_profile_n);
+    profile_n = dict_get_resolved(
+        context,
+        source_document,
+        &value->as.stream.dict,
+        "N",
+        &resolved_profile_n,
+        &status);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_profile_n);
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      destroy_basic_output_intent(&context->allocator, entry);
+      return 0;
+    }
+    if (profile_n && profile_n->type == NANOPDF_BASIC_OBJECT_NUMBER) {
+      entry->color_components = (int32_t)profile_n->as.number;
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_profile_n);
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  document->output_intent_count++;
+  return 1;
+}
+
+static int map_page_label_style(
+    const nanopdf_basic_object* object,
+    nanopdf_page_label_style* out_style) {
+  if (!object || !out_style) {
+    return 0;
+  }
+  if (object->type != NANOPDF_BASIC_OBJECT_NAME) {
+    return 0;
+  }
+  if (strcmp(object->as.text, "D") == 0) {
+    *out_style = NANOPDF_PAGE_LABEL_STYLE_DECIMAL_ARABIC;
+    return 1;
+  }
+  if (strcmp(object->as.text, "R") == 0) {
+    *out_style = NANOPDF_PAGE_LABEL_STYLE_UPPERCASE_ROMAN;
+    return 1;
+  }
+  if (strcmp(object->as.text, "r") == 0) {
+    *out_style = NANOPDF_PAGE_LABEL_STYLE_LOWERCASE_ROMAN;
+    return 1;
+  }
+  if (strcmp(object->as.text, "A") == 0) {
+    *out_style = NANOPDF_PAGE_LABEL_STYLE_UPPERCASE_LETTERS;
+    return 1;
+  }
+  if (strcmp(object->as.text, "a") == 0) {
+    *out_style = NANOPDF_PAGE_LABEL_STYLE_LOWERCASE_LETTERS;
+    return 1;
+  }
+  return 0;
+}
+
+static int append_page_label_entry(
+    nanopdf_context* context,
+    nanopdf_basic_document* document,
+    uint32_t page_index,
+    const nanopdf_basic_dict* label_dict,
+    const nanopdf_basic_document* source_document) {
+  nanopdf_basic_page_label_entry* resized = NULL;
+  size_t new_capacity = 0;
+  nanopdf_basic_page_label_entry* entry = NULL;
+  nanopdf_basic_object resolved_obj;
+  const nanopdf_basic_object* value = NULL;
+  nanopdf_status status = NANOPDF_STATUS_OK;
+
+  if (!context || !document || !label_dict || !source_document) {
+    return 0;
+  }
+  if (document->page_label_count == document->page_label_capacity) {
+    new_capacity = document->page_label_capacity == 0 ?
+        4 : document->page_label_capacity * 2;
+    resized = (nanopdf_basic_page_label_entry*)nanopdf__allocator_realloc(
+        &context->allocator,
+        document->page_labels,
+        new_capacity * sizeof(*document->page_labels));
+    if (!resized) {
+      return 0;
+    }
+    memset(
+        resized + document->page_label_capacity,
+        0,
+        (new_capacity - document->page_label_capacity) * sizeof(*document->page_labels));
+    document->page_labels = resized;
+    document->page_label_capacity = new_capacity;
+  }
+
+  entry = &document->page_labels[document->page_label_count];
+  memset(entry, 0, sizeof(*entry));
+  entry->page_index = page_index;
+  entry->style = NANOPDF_PAGE_LABEL_STYLE_NONE;
+  entry->start_value = 1u;
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, label_dict, "S", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return 0;
+  }
+  if (value) {
+    map_page_label_style(value, &entry->style);
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, label_dict, "P", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_page_label_entry(&context->allocator, entry);
+    return 0;
+  }
+  if (value && !duplicate_object_text(context, value, &entry->prefix)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_page_label_entry(&context->allocator, entry);
+    return 0;
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, source_document, label_dict, "St", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    destroy_basic_page_label_entry(&context->allocator, entry);
+    return 0;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_NUMBER &&
+      value->as.number > 0.0) {
+    entry->start_value = (uint32_t)value->as.number;
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  document->page_label_count++;
+  return 1;
+}
+
+static int find_page_index_for_ref(
+    const nanopdf_basic_document* document,
+    nanopdf_ref page_ref,
+    uint32_t* out_page_index) {
+  size_t i = 0;
+  if (!document || !out_page_index || !page_ref.valid) {
+    return 0;
+  }
+  for (i = 0; i < document->page_count; ++i) {
+    if (document->pages[i].valid &&
+        document->pages[i].object_number == page_ref.object_number &&
+        document->pages[i].generation == page_ref.generation) {
+      *out_page_index = (uint32_t)i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int append_named_destination_entry(
+    nanopdf_context* context,
+    nanopdf_basic_document* document,
+    const char* name,
+    const nanopdf_basic_object* destination_array) {
+  nanopdf_basic_named_destination* resized = NULL;
+  size_t new_capacity = 0;
+  nanopdf_basic_named_destination* entry = NULL;
+  nanopdf_ref page_ref = {0, 0, 0};
+  uint32_t page_index = 0;
+  size_t numeric_count = 0;
+  size_t i = 0;
+
+  if (!context || !document || !name || !destination_array ||
+      destination_array->type != NANOPDF_BASIC_OBJECT_ARRAY ||
+      destination_array->as.array.count < 2) {
+    return 0;
+  }
+  if (!basic_object_to_ref(&destination_array->as.array.items[0], &page_ref) ||
+      !find_page_index_for_ref(document, page_ref, &page_index)) {
+    return 0;
+  }
+
+  if (document->named_destination_count == document->named_destination_capacity) {
+    new_capacity = document->named_destination_capacity == 0 ?
+        4 : document->named_destination_capacity * 2;
+    resized = (nanopdf_basic_named_destination*)nanopdf__allocator_realloc(
+        &context->allocator,
+        document->named_destinations,
+        new_capacity * sizeof(*document->named_destinations));
+    if (!resized) {
+      return 0;
+    }
+    memset(
+        resized + document->named_destination_capacity,
+        0,
+        (new_capacity - document->named_destination_capacity) *
+            sizeof(*document->named_destinations));
+    document->named_destinations = resized;
+    document->named_destination_capacity = new_capacity;
+  }
+
+  entry = &document->named_destinations[document->named_destination_count];
+  memset(entry, 0, sizeof(*entry));
+  entry->page_index = page_index;
+  entry->name = nanopdf__strdup(&context->allocator, name);
+  if (!entry->name) {
+    return 0;
+  }
+  if (!duplicate_object_text(
+          context, &destination_array->as.array.items[1], &entry->fit_type)) {
+    destroy_basic_named_destination(&context->allocator, entry);
+    return 0;
+  }
+
+  for (i = 2; i < destination_array->as.array.count; ++i) {
+    if (destination_array->as.array.items[i].type == NANOPDF_BASIC_OBJECT_NUMBER) {
+      numeric_count++;
+    }
+  }
+  if (numeric_count > 0) {
+    size_t numeric_index = 0;
+    entry->position = (double*)nanopdf__allocator_alloc(
+        &context->allocator, numeric_count * sizeof(*entry->position));
+    if (!entry->position) {
+      destroy_basic_named_destination(&context->allocator, entry);
+      return 0;
+    }
+    for (i = 2; i < destination_array->as.array.count; ++i) {
+      if (destination_array->as.array.items[i].type == NANOPDF_BASIC_OBJECT_NUMBER) {
+        entry->position[numeric_index++] = destination_array->as.array.items[i].as.number;
+      }
+    }
+    entry->position_count = numeric_count;
+  }
+
+  document->named_destination_count++;
+  return 1;
+}
+
+static nanopdf_status parse_catalog_preferences(
+    nanopdf_context* context,
+    const nanopdf_basic_document* document,
+    const nanopdf_basic_dict* root_dict,
+    nanopdf_basic_document* out_document) {
+  nanopdf_basic_object resolved_obj;
+  const nanopdf_basic_object* value = NULL;
+  nanopdf_status status = NANOPDF_STATUS_OK;
+
+  if (!context || !document || !root_dict || !out_document) {
+    return set_status(
+        context,
+        NANOPDF_STATUS_INVALID_ARGUMENT,
+        "invalid arguments to parse catalog preferences");
+  }
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "Lang", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value &&
+      !duplicate_object_text(context, value, &out_document->language)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return set_status(
+        context, NANOPDF_STATUS_OUT_OF_MEMORY, "failed to store document language");
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "Metadata", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_STREAM &&
+      !duplicate_stream_bytes_as_text(context, value, &out_document->xmp_metadata)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return set_status(
+        context, NANOPDF_STATUS_OUT_OF_MEMORY, "failed to store XMP metadata");
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "OpenAction", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value &&
+      (value->type == NANOPDF_BASIC_OBJECT_STRING ||
+       value->type == NANOPDF_BASIC_OBJECT_NAME ||
+       value->type == NANOPDF_BASIC_OBJECT_ARRAY) &&
+      !duplicate_object_text(
+          context, value, &out_document->open_action_named_destination)) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return set_status(
+        context,
+        NANOPDF_STATUS_OUT_OF_MEMORY,
+        "failed to store open action named destination");
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "PageLayout", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value) {
+    map_catalog_page_layout(value, &out_document->page_layout);
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "PageMode", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value) {
+    map_catalog_page_mode(value, &out_document->page_mode);
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "ViewerPreferences", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_DICT) {
+    const nanopdf_basic_dict* prefs = &value->as.dict;
+    const nanopdf_basic_object* bool_obj = NULL;
+    nanopdf_basic_object resolved_bool;
+
+    out_document->has_viewer_preferences = 1u;
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, prefs, "HideToolbar", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->viewer_preferences.hide_toolbar =
+          (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, prefs, "HideMenubar", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->viewer_preferences.hide_menubar =
+          (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, prefs, "HideWindowUI", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->viewer_preferences.hide_window_ui =
+          (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, prefs, "FitWindow", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->viewer_preferences.fit_window =
+          (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, prefs, "CenterWindow", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->viewer_preferences.center_window =
+          (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, prefs, "DisplayDocTitle", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->viewer_preferences.display_doc_title =
+          (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "MarkInfo", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_DICT) {
+    const nanopdf_basic_dict* mark_info = &value->as.dict;
+    const nanopdf_basic_object* bool_obj = NULL;
+    nanopdf_basic_object resolved_bool;
+
+    out_document->has_mark_info = 1u;
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, mark_info, "Marked", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->mark_info.marked = (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+
+    nanopdf_basic_object_init(&resolved_bool);
+    bool_obj = dict_get_resolved(
+        context, document, mark_info, "Suspects", &resolved_bool, &status);
+    if (status == NANOPDF_STATUS_OK && bool_obj &&
+        bool_obj->type == NANOPDF_BASIC_OBJECT_BOOL) {
+      out_document->mark_info.suspects = (uint8_t)(bool_obj->as.boolean ? 1 : 0);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_bool);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "OutputIntents", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_ARRAY) {
+    size_t i;
+    for (i = 0; i < value->as.array.count; ++i) {
+      nanopdf_basic_object resolved_item;
+      const nanopdf_basic_object* item = NULL;
+
+      nanopdf_basic_object_init(&resolved_item);
+      item = resolve_object_reference(
+          context, document, &value->as.array.items[i], &resolved_item, &status);
+      if (status != NANOPDF_STATUS_OK) {
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_item);
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+        return status;
+      }
+      if (item && item->type == NANOPDF_BASIC_OBJECT_DICT &&
+          !append_output_intent(
+              context, out_document, &item->as.dict, document)) {
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_item);
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+        return set_status(
+            context,
+            NANOPDF_STATUS_OUT_OF_MEMORY,
+            "failed to store output intent");
+      }
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_item);
+    }
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "PageLabels", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_DICT) {
+    nanopdf_basic_object resolved_nums;
+    const nanopdf_basic_object* nums = NULL;
+
+    nanopdf_basic_object_init(&resolved_nums);
+    nums = dict_get_resolved(
+        context, document, &value->as.dict, "Nums", &resolved_nums, &status);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_nums);
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+    if (nums && nums->type == NANOPDF_BASIC_OBJECT_ARRAY) {
+      size_t i;
+      for (i = 0; i + 1 < nums->as.array.count; i += 2) {
+        const nanopdf_basic_object* page_index_obj = &nums->as.array.items[i];
+        nanopdf_basic_object resolved_label;
+        const nanopdf_basic_object* label_obj = NULL;
+
+        if (page_index_obj->type != NANOPDF_BASIC_OBJECT_NUMBER ||
+            page_index_obj->as.number < 0.0) {
+          continue;
+        }
+        nanopdf_basic_object_init(&resolved_label);
+        label_obj = resolve_object_reference(
+            context, document, &nums->as.array.items[i + 1], &resolved_label, &status);
+        if (status != NANOPDF_STATUS_OK) {
+          nanopdf_basic_object_destroy(&context->allocator, &resolved_label);
+          nanopdf_basic_object_destroy(&context->allocator, &resolved_nums);
+          nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+          return status;
+        }
+        if (label_obj && label_obj->type == NANOPDF_BASIC_OBJECT_DICT &&
+            !append_page_label_entry(
+                context,
+                out_document,
+                (uint32_t)page_index_obj->as.number,
+                &label_obj->as.dict,
+                document)) {
+          nanopdf_basic_object_destroy(&context->allocator, &resolved_label);
+          nanopdf_basic_object_destroy(&context->allocator, &resolved_nums);
+          nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+          return set_status(
+              context,
+              NANOPDF_STATUS_OUT_OF_MEMORY,
+              "failed to store page label");
+        }
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_label);
+      }
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_nums);
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+
+  return clear_status(context);
+}
+
+static nanopdf_status parse_catalog_named_destinations(
+    nanopdf_context* context,
+    const nanopdf_basic_document* document,
+    const nanopdf_basic_dict* root_dict,
+    nanopdf_basic_document* out_document) {
+  nanopdf_basic_object resolved_obj;
+  const nanopdf_basic_object* value = NULL;
+  nanopdf_status status = NANOPDF_STATUS_OK;
+
+  nanopdf_basic_object_init(&resolved_obj);
+  value = dict_get_resolved(
+      context, document, root_dict, "Names", &resolved_obj, &status);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+    return status;
+  }
+  if (value && value->type == NANOPDF_BASIC_OBJECT_DICT) {
+    nanopdf_basic_object resolved_dests;
+    const nanopdf_basic_object* dests = NULL;
+
+    nanopdf_basic_object_init(&resolved_dests);
+    dests = dict_get_resolved(
+        context, document, &value->as.dict, "Dests", &resolved_dests, &status);
+    if (status != NANOPDF_STATUS_OK) {
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_dests);
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+      return status;
+    }
+    if (dests && dests->type == NANOPDF_BASIC_OBJECT_DICT) {
+      nanopdf_basic_object resolved_names;
+      const nanopdf_basic_object* names = NULL;
+
+      nanopdf_basic_object_init(&resolved_names);
+      names = dict_get_resolved(
+          context, document, &dests->as.dict, "Names", &resolved_names, &status);
+      if (status != NANOPDF_STATUS_OK) {
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_names);
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_dests);
+        nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+        return status;
+      }
+      if (names && names->type == NANOPDF_BASIC_OBJECT_ARRAY) {
+        size_t i;
+        for (i = 0; i + 1 < names->as.array.count; i += 2) {
+          char* destination_name = NULL;
+          nanopdf_basic_object resolved_destination;
+          const nanopdf_basic_object* destination_value = NULL;
+
+          if (!duplicate_object_text(context, &names->as.array.items[i], &destination_name)) {
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_names);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_dests);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+            return set_status(
+                context,
+                NANOPDF_STATUS_OUT_OF_MEMORY,
+                "failed to store named destination name");
+          }
+          nanopdf_basic_object_init(&resolved_destination);
+          destination_value = resolve_object_reference(
+              context,
+              document,
+              &names->as.array.items[i + 1],
+              &resolved_destination,
+              &status);
+          if (status != NANOPDF_STATUS_OK) {
+            nanopdf__allocator_free(&context->allocator, destination_name);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_destination);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_names);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_dests);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+            return status;
+          }
+          if (destination_value &&
+              !append_named_destination_entry(
+                  context, out_document, destination_name, destination_value)) {
+            nanopdf__allocator_free(&context->allocator, destination_name);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_destination);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_names);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_dests);
+            nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
+            return set_status(
+                context,
+                NANOPDF_STATUS_OUT_OF_MEMORY,
+                "failed to store named destination");
+          }
+          nanopdf__allocator_free(&context->allocator, destination_name);
+          nanopdf_basic_object_destroy(&context->allocator, &resolved_destination);
+        }
+      }
+      nanopdf_basic_object_destroy(&context->allocator, &resolved_names);
+    }
+    nanopdf_basic_object_destroy(&context->allocator, &resolved_dests);
+  }
+  nanopdf_basic_object_destroy(&context->allocator, &resolved_obj);
   return clear_status(context);
 }
 
@@ -4284,6 +5342,39 @@ void nanopdf_basic_document_destroy(
   nanopdf__allocator_free(allocator, document->producer);
   nanopdf__allocator_free(allocator, document->creation_date);
   nanopdf__allocator_free(allocator, document->mod_date);
+  nanopdf__allocator_free(allocator, document->trapped);
+  nanopdf__allocator_free(allocator, document->language);
+  nanopdf__allocator_free(allocator, document->xmp_metadata);
+  nanopdf__allocator_free(allocator, document->open_action_named_destination);
+  if (document->output_intents) {
+    size_t i;
+    for (i = 0; i < document->output_intent_count; ++i) {
+      destroy_basic_output_intent(allocator, &document->output_intents[i]);
+    }
+  }
+  nanopdf__allocator_free(allocator, document->output_intents);
+  if (document->page_labels) {
+    size_t i;
+    for (i = 0; i < document->page_label_count; ++i) {
+      destroy_basic_page_label_entry(allocator, &document->page_labels[i]);
+    }
+  }
+  nanopdf__allocator_free(allocator, document->page_labels);
+  if (document->named_destinations) {
+    size_t i;
+    for (i = 0; i < document->named_destination_count; ++i) {
+      destroy_basic_named_destination(allocator, &document->named_destinations[i]);
+    }
+  }
+  nanopdf__allocator_free(allocator, document->named_destinations);
+  if (document->custom_info) {
+    size_t i;
+    for (i = 0; i < document->custom_info_count; ++i) {
+      nanopdf__allocator_free(allocator, document->custom_info[i].key);
+      nanopdf__allocator_free(allocator, document->custom_info[i].value);
+    }
+  }
+  nanopdf__allocator_free(allocator, document->custom_info);
   nanopdf__allocator_free(allocator, document->security.file_id);
   if (document->form_fields) {
     size_t i;
@@ -4416,8 +5507,22 @@ xref_ready:
     return set_status(context, NANOPDF_STATUS_MALFORMED, "catalog Pages reference missing");
   }
 
+  status = parse_catalog_preferences(context, out_document, root_dict, out_document);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &root_object);
+    nanopdf_basic_document_destroy(&context->allocator, out_document);
+    return status;
+  }
+
   status = walk_page_tree_object(
       context, out_document, pages_ref, &inherited_media_box, 0.0, out_document);
+  if (status != NANOPDF_STATUS_OK) {
+    nanopdf_basic_object_destroy(&context->allocator, &root_object);
+    nanopdf_basic_document_destroy(&context->allocator, out_document);
+    return status;
+  }
+
+  status = parse_catalog_named_destinations(context, out_document, root_dict, out_document);
   if (status != NANOPDF_STATUS_OK) {
     nanopdf_basic_object_destroy(&context->allocator, &root_object);
     nanopdf_basic_document_destroy(&context->allocator, out_document);

@@ -53,6 +53,20 @@ void nanopdf_default_text_layout_options(nanopdf_text_layout_options* options) {
   options->detect_rtl = 1;
 }
 
+void nanopdf_default_table_extraction_options(
+    nanopdf_table_extraction_options* options) {
+  if (!options) {
+    return;
+  }
+
+  options->alignment_tolerance = 2.0;
+  options->min_rows = 2;
+  options->min_cols = 2;
+  options->max_cell_gap = 50.0;
+  options->min_chars_per_cell = 1;
+  options->debug = 0;
+}
+
 void* nanopdf__allocator_alloc(const nanopdf_allocator* allocator, size_t size) {
   if (!allocator || !allocator->alloc) {
     return NULL;

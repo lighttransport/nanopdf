@@ -19,6 +19,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -209,23 +210,24 @@ bool extract_font_metrics(const uint8_t* data, size_t size, FontMetrics& metrics
     }
   }
 
-  // Try family name if PostScript name not found
-  if (metrics.font_name.empty()) {
-    name = stbtt_GetFontNameString(&font, &name_len,
-        STBTT_PLATFORM_ID_MICROSOFT, STBTT_MS_EID_UNICODE_BMP,
-        STBTT_MS_LANG_ENGLISH, 1);  // 1 = Family name
-    if (name && name_len > 0) {
-      std::string family_name;
-      for (int i = 0; i + 1 < name_len; i += 2) {
-        uint16_t c = (static_cast<uint8_t>(name[i]) << 8) |
-                     static_cast<uint8_t>(name[i + 1]);
-        if (c > 0 && c < 128) {
-          family_name += static_cast<char>(c);
-        }
+  // Try family name independently so callers can inspect it even when the
+  // PostScript name is also present.
+  name = stbtt_GetFontNameString(&font, &name_len,
+      STBTT_PLATFORM_ID_MICROSOFT, STBTT_MS_EID_UNICODE_BMP,
+      STBTT_MS_LANG_ENGLISH, 1);  // 1 = Family name
+  if (name && name_len > 0) {
+    std::string family_name;
+    for (int i = 0; i + 1 < name_len; i += 2) {
+      uint16_t c = (static_cast<uint8_t>(name[i]) << 8) |
+                   static_cast<uint8_t>(name[i + 1]);
+      if (c > 0 && c < 128) {
+        family_name += static_cast<char>(c);
       }
-      if (!family_name.empty()) {
+    }
+    if (!family_name.empty()) {
+      metrics.family_name = family_name;
+      if (metrics.font_name.empty()) {
         metrics.font_name = family_name;
-        metrics.family_name = family_name;
       }
     }
   }
@@ -295,6 +297,54 @@ bool extract_font_metrics(const uint8_t* data, size_t size, FontMetrics& metrics
   metrics.flags.nonsymbolic = true;
 
   return true;
+}
+
+std::vector<std::pair<uint32_t, uint16_t>> collect_page_object_refs(const Pdf& pdf) {
+  std::vector<std::pair<uint32_t, uint16_t>> page_obj_nums;
+  auto root_it = pdf.trailer.find("Root");
+  if (root_it == pdf.trailer.end() || root_it->second.type != Value::REFERENCE) {
+    return page_obj_nums;
+  }
+
+  ResolvedObject root = resolve_reference(
+      pdf, root_it->second.ref_object_number, root_it->second.ref_generation_number);
+  if (!root.success || root.value.type != Value::DICTIONARY) {
+    return page_obj_nums;
+  }
+
+  auto pages_it = root.value.dict.find("Pages");
+  if (pages_it == root.value.dict.end() || pages_it->second.type != Value::REFERENCE) {
+    return page_obj_nums;
+  }
+
+  std::function<void(uint32_t, uint16_t)> collect_pages;
+  collect_pages = [&](uint32_t obj_n, uint16_t gen_n) {
+    ResolvedObject node = resolve_reference(pdf, obj_n, gen_n);
+    if (!node.success || node.value.type != Value::DICTIONARY) return;
+
+    auto type_it = node.value.dict.find("Type");
+    if (type_it != node.value.dict.end() &&
+        type_it->second.type == Value::NAME &&
+        type_it->second.name == "Page") {
+      page_obj_nums.push_back({obj_n, gen_n});
+      return;
+    }
+
+    auto kids_it = node.value.dict.find("Kids");
+    if (kids_it == node.value.dict.end() || kids_it->second.type != Value::ARRAY) {
+      return;
+    }
+
+    for (const auto& kid : kids_it->second.array) {
+      if (kid.type == Value::REFERENCE) {
+        collect_pages(kid.ref_object_number, kid.ref_generation_number);
+      }
+    }
+  };
+
+  collect_pages(
+      pages_it->second.ref_object_number, pages_it->second.ref_generation_number);
+  return page_obj_nums;
 }
 
 }  // namespace
@@ -410,15 +460,116 @@ std::string escape_pdf_string(const std::string& s) {
   return result;
 }
 
+std::string serialize_pdf_value(
+    const Value& value,
+    const std::function<std::string(const std::string&)>& string_formatter = {}) {
+  auto format_string = [&](const std::string& s) {
+    if (string_formatter) {
+      return string_formatter(s);
+    }
+    return "(" + escape_pdf_string(s) + ")";
+  };
+
+  switch (value.type) {
+    case Value::BOOLEAN:
+      return value.boolean ? "true" : "false";
+
+    case Value::NUMBER:
+      return format_number(value.number);
+
+    case Value::STRING:
+      return format_string(value.str);
+
+    case Value::NAME:
+      return "/" + value.name;
+
+    case Value::ARRAY: {
+      std::string serialized = "[";
+      for (size_t i = 0; i < value.array.size(); ++i) {
+        if (i > 0) serialized += " ";
+        serialized += serialize_pdf_value(value.array[i], string_formatter);
+      }
+      serialized += "]";
+      return serialized;
+    }
+
+    case Value::DICTIONARY: {
+      std::string serialized = "<<";
+      for (const auto& item : value.dict) {
+        serialized += "\n/";
+        serialized += item.first;
+        serialized += " ";
+        serialized += serialize_pdf_value(item.second, string_formatter);
+      }
+      serialized += "\n>>";
+      return serialized;
+    }
+
+    case Value::REFERENCE:
+      return std::to_string(value.ref_object_number) + " " +
+             std::to_string(value.ref_generation_number) + " R";
+
+    case Value::NULL_OBJ:
+    case Value::UNDEFINED:
+      return "null";
+
+    case Value::STREAM:
+      return "null";
+  }
+
+  return "null";
+}
+
+bool pdf_name_needs_escape(unsigned char ch) {
+  switch (ch) {
+    case 0:
+    case '(':
+    case ')':
+    case '<':
+    case '>':
+    case '[':
+    case ']':
+    case '{':
+    case '}':
+    case '/':
+    case '%':
+    case '#':
+      return true;
+    default:
+      break;
+  }
+  return ch <= 0x20 || ch >= 0x7f;
+}
+
+std::string escape_pdf_name(const std::string& input) {
+  static const char hex[] = "0123456789ABCDEF";
+  std::string escaped;
+  escaped.reserve(input.size());
+  for (unsigned char ch : input) {
+    if (pdf_name_needs_escape(ch)) {
+      escaped += '#';
+      escaped += hex[(ch >> 4) & 0x0f];
+      escaped += hex[ch & 0x0f];
+    } else {
+      escaped += static_cast<char>(ch);
+    }
+  }
+  return escaped;
+}
+
 // Compress data using zlib
 std::vector<uint8_t> compress_data(const uint8_t* data, size_t size) {
   std::vector<uint8_t> compressed;
-  if (size == 0) return compressed;
-
   uLongf compressed_size = compressBound(static_cast<uLong>(size));
+  if (compressed_size == 0) {
+    compressed_size = 16;
+  }
   compressed.resize(compressed_size);
 
-  int result = compress2(compressed.data(), &compressed_size, data,
+  static const uint8_t kEmptyInput = 0;
+  const uint8_t* input = size > 0 ? data : &kEmptyInput;
+
+  int result = compress2(compressed.data(), &compressed_size, input,
                          static_cast<uLong>(size), Z_DEFAULT_COMPRESSION);
   if (result != Z_OK) {
     compressed.clear();
@@ -481,6 +632,9 @@ std::vector<uint8_t> generate_random_id() {
   for (int i = 0; i < 16; ++i) {
     seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
     id[i] = static_cast<uint8_t>(seed >> 56);
+    if (id[i] == 0) {
+      id[i] = 1;
+    }
   }
   return id;
 }
@@ -837,6 +991,7 @@ std::vector<uint8_t> compute_encryption_key_r4(
     int32_t permissions,
     const std::vector<uint8_t>& doc_id,
     int key_length,
+    int revision,
     bool encrypt_metadata) {
   // Step 1: Pad password
   std::vector<uint8_t> padded = pad_password(password);
@@ -865,13 +1020,14 @@ std::vector<uint8_t> compute_encryption_key_r4(
   uint8_t digest[16];
   md5.get_digest(digest);
 
-  // Step 8: For revision 3+, do 50 additional MD5 iterations
   int n = key_length / 8;  // Key length in bytes
-  for (int i = 0; i < 50; ++i) {
-    crypto::MD5 md5_iter;
-    md5_iter.update(digest, n);
-    md5_iter.finalize();
-    md5_iter.get_digest(digest);
+  if (revision >= 3) {
+    for (int i = 0; i < 50; ++i) {
+      crypto::MD5 md5_iter;
+      md5_iter.update(digest, n);
+      md5_iter.finalize();
+      md5_iter.get_digest(digest);
+    }
   }
 
   return std::vector<uint8_t>(digest, digest + n);
@@ -881,7 +1037,8 @@ std::vector<uint8_t> compute_encryption_key_r4(
 std::vector<uint8_t> compute_o_value(
     const std::string& owner_password,
     const std::string& user_password,
-    int key_length) {
+    int key_length,
+    int revision) {
   // Step 1-4: MD5 of padded owner password (or user if owner is empty)
   std::string owner = owner_password.empty() ? user_password : owner_password;
   std::vector<uint8_t> padded = pad_password(owner);
@@ -892,13 +1049,14 @@ std::vector<uint8_t> compute_o_value(
   uint8_t digest[16];
   md5.get_digest(digest);
 
-  // Step 5: For revision 3+, do 50 additional iterations
   int n = key_length / 8;
-  for (int i = 0; i < 50; ++i) {
-    crypto::MD5 md5_iter;
-    md5_iter.update(digest, n);
-    md5_iter.finalize();
-    md5_iter.get_digest(digest);
+  if (revision >= 3) {
+    for (int i = 0; i < 50; ++i) {
+      crypto::MD5 md5_iter;
+      md5_iter.update(digest, n);
+      md5_iter.finalize();
+      md5_iter.get_digest(digest);
+    }
   }
 
   // Step 6: Use first n bytes as RC4 key
@@ -907,15 +1065,21 @@ std::vector<uint8_t> compute_o_value(
   // Step 7: Pad user password and encrypt with RC4
   std::vector<uint8_t> o_value = pad_password(user_password);
 
-  // For revision 3+, do 20 iterations with modified keys
-  for (int i = 0; i < 20; ++i) {
-    std::vector<uint8_t> iter_key(n);
-    for (int j = 0; j < n; ++j) {
-      iter_key[j] = rc4_key[j] ^ static_cast<uint8_t>(i);
-    }
+  if (revision == 2) {
     crypto::RC4 rc4;
-    rc4.init(iter_key.data(), iter_key.size());
+    rc4.init(rc4_key.data(), rc4_key.size());
     rc4.crypt(o_value.data(), o_value.size());
+  } else {
+    // For revision 3+, do 20 iterations with modified keys
+    for (int i = 0; i < 20; ++i) {
+      std::vector<uint8_t> iter_key(n);
+      for (int j = 0; j < n; ++j) {
+        iter_key[j] = rc4_key[j] ^ static_cast<uint8_t>(i);
+      }
+      crypto::RC4 rc4;
+      rc4.init(iter_key.data(), iter_key.size());
+      rc4.crypt(o_value.data(), o_value.size());
+    }
   }
 
   return o_value;
@@ -924,7 +1088,16 @@ std::vector<uint8_t> compute_o_value(
 // Compute U value (user password hash) - Algorithm 5 (revision 3+)
 std::vector<uint8_t> compute_u_value(
     const std::vector<uint8_t>& encryption_key,
-    const std::vector<uint8_t>& doc_id) {
+    const std::vector<uint8_t>& doc_id,
+    int revision) {
+  if (revision == 2) {
+    std::vector<uint8_t> u_value(kPasswordPadding, kPasswordPadding + 32);
+    crypto::RC4 rc4;
+    rc4.init(encryption_key.data(), encryption_key.size());
+    rc4.crypt(u_value.data(), u_value.size());
+    return u_value;
+  }
+
   // Step 1: MD5 of password padding + document ID
   crypto::MD5 md5;
   md5.update(kPasswordPadding, 32);
@@ -1344,6 +1517,19 @@ void PageBuilder::reset_transparency() {
   current_fill_alpha_ = 1.0;
   current_stroke_alpha_ = 1.0;
   current_blend_mode_ = BlendMode::Normal;
+  std::string gs_name = get_or_create_extgstate(
+      current_fill_alpha_, current_stroke_alpha_, current_blend_mode_);
+  emit("/" + gs_name + " gs\n");
+}
+
+void PageBuilder::set_fill_gradient(const std::string& name) {
+  emit("/Pattern cs\n");
+  emit("/" + name + " scn\n");
+}
+
+void PageBuilder::set_stroke_gradient(const std::string& name) {
+  emit("/Pattern CS\n");
+  emit("/" + name + " SCN\n");
 }
 
 void PageBuilder::add_link(double x, double y, double w, double h, const std::string& uri) {
@@ -1471,6 +1657,10 @@ void TableBuilder::set_text_color(double r, double g, double b) {
   config_.text_b = b;
 }
 
+void TableBuilder::set_header_style(const CellStyle& style) {
+  config_.header_style = style;
+}
+
 void TableBuilder::set_border(double width, double r, double g, double b) {
   config_.border_width = width;
   config_.border_r = r;
@@ -1494,15 +1684,23 @@ void TableBuilder::set_alternating_rows(bool enabled, double r, double g, double
 }
 
 void TableBuilder::add_header_row(const std::vector<std::string>& cells) {
-  config_.has_header = true;
   TableRow row;
-  row.row_style = config_.header_style;
   for (const auto& text : cells) {
     WriterTableCell cell;
     cell.text = text;
     row.cells.push_back(cell);
   }
-  // Insert header at beginning if there are already rows
+  add_header_row(row);
+}
+
+void TableBuilder::add_header_row(const std::vector<WriterTableCell>& cells) {
+  TableRow row;
+  row.cells = cells;
+  add_header_row(row);
+}
+
+void TableBuilder::add_header_row(const TableRow& row) {
+  config_.has_header = true;
   if (rows_.empty()) {
     rows_.push_back(row);
   } else {
@@ -1588,8 +1786,17 @@ void PageBuilder::draw_table(const TableBuilder& table) {
   // Start drawing from top-left (y is at top of table)
   double current_y = cfg.y + total_height;
 
-  // Get font name
-  std::string font_name = cfg.font_name.empty() ? "F1" : cfg.font_name;
+  // Ensure the table has a usable font resource even when the caller relies on
+  // the default table font.
+  std::string default_font_name = cfg.font_name;
+  if (default_font_name.empty() ||
+      (writer_ && !writer_->has_font_resource(default_font_name))) {
+    if (writer_) {
+      default_font_name = writer_->add_standard_font(StandardFont::Helvetica);
+    } else if (default_font_name.empty()) {
+      default_font_name = "F1";
+    }
+  }
 
   // Draw each row
   for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
@@ -1649,21 +1856,107 @@ void PageBuilder::draw_table(const TableBuilder& table) {
 
       // Draw cell text
       if (!cell.text.empty()) {
-        // Determine text properties
-        double text_size = (cell.style.font_size > 0) ? cell.style.font_size : cfg.font_size;
-        double text_r = (cell.style.font_size > 0) ? cell.style.text_r : cfg.text_r;
-        double text_g = (cell.style.font_size > 0) ? cell.style.text_g : cfg.text_g;
-        double text_b = (cell.style.font_size > 0) ? cell.style.text_b : cfg.text_b;
+        const CellStyle default_cell_style;
 
-        // Use row style if available
-        CellAlign align = is_header ? cfg.header_style.align : cell.style.align;
-        if (row.row_style.align != CellAlign::Left) {
+        // Determine text properties
+        std::string text_font_name = default_font_name;
+        double text_size = cfg.font_size;
+        double text_r = cfg.text_r;
+        double text_g = cfg.text_g;
+        double text_b = cfg.text_b;
+
+        if (is_header) {
+          if (!cfg.header_style.font_name.empty()) {
+            text_font_name = cfg.header_style.font_name;
+          }
+          if (cfg.header_style.font_size > 0) {
+            text_size = cfg.header_style.font_size;
+            text_r = cfg.header_style.text_r;
+            text_g = cfg.header_style.text_g;
+            text_b = cfg.header_style.text_b;
+          }
+        }
+
+        if (!row.row_style.font_name.empty()) {
+          text_font_name = row.row_style.font_name;
+        }
+        if (row.row_style.font_size > 0) {
+          text_size = row.row_style.font_size;
+          text_r = row.row_style.text_r;
+          text_g = row.row_style.text_g;
+          text_b = row.row_style.text_b;
+        }
+
+        if (!cell.style.font_name.empty()) {
+          text_font_name = cell.style.font_name;
+        }
+        if (cell.style.font_size > 0) {
+          text_size = cell.style.font_size;
+          text_r = cell.style.text_r;
+          text_g = cell.style.text_g;
+          text_b = cell.style.text_b;
+        }
+
+        if (writer_ && !writer_->has_font_resource(text_font_name)) {
+          text_font_name = default_font_name;
+        }
+
+        CellAlign align = is_header ? cfg.header_style.align : default_cell_style.align;
+        if (row.row_style.align != default_cell_style.align) {
           align = row.row_style.align;
+        }
+        if (cell.style.align != default_cell_style.align) {
+          align = cell.style.align;
+        }
+
+        CellVAlign valign = is_header ? cfg.header_style.valign : default_cell_style.valign;
+        if (row.row_style.valign != default_cell_style.valign) {
+          valign = row.row_style.valign;
+        }
+        if (cell.style.valign != default_cell_style.valign) {
+          valign = cell.style.valign;
+        }
+
+        double padding_left = is_header
+                                  ? cfg.header_style.padding_left
+                                  : default_cell_style.padding_left;
+        double padding_right = is_header
+                                   ? cfg.header_style.padding_right
+                                   : default_cell_style.padding_right;
+        double padding_top = is_header
+                                 ? cfg.header_style.padding_top
+                                 : default_cell_style.padding_top;
+        double padding_bottom = is_header
+                                    ? cfg.header_style.padding_bottom
+                                    : default_cell_style.padding_bottom;
+
+        if (row.row_style.padding_left != default_cell_style.padding_left) {
+          padding_left = row.row_style.padding_left;
+        }
+        if (row.row_style.padding_right != default_cell_style.padding_right) {
+          padding_right = row.row_style.padding_right;
+        }
+        if (row.row_style.padding_top != default_cell_style.padding_top) {
+          padding_top = row.row_style.padding_top;
+        }
+        if (row.row_style.padding_bottom != default_cell_style.padding_bottom) {
+          padding_bottom = row.row_style.padding_bottom;
+        }
+        if (cell.style.padding_left != default_cell_style.padding_left) {
+          padding_left = cell.style.padding_left;
+        }
+        if (cell.style.padding_right != default_cell_style.padding_right) {
+          padding_right = cell.style.padding_right;
+        }
+        if (cell.style.padding_top != default_cell_style.padding_top) {
+          padding_top = cell.style.padding_top;
+        }
+        if (cell.style.padding_bottom != default_cell_style.padding_bottom) {
+          padding_bottom = cell.style.padding_bottom;
         }
 
         // Calculate text position
-        double padding = 4;
-        double text_x = current_x + padding;
+        double text_x = current_x + padding_left;
         double text_width = cell.text.length() * text_size * 0.5;
 
         switch (align) {
@@ -1671,16 +1964,27 @@ void PageBuilder::draw_table(const TableBuilder& table) {
             text_x = current_x + (cell_width - text_width) / 2;
             break;
           case CellAlign::Right:
-            text_x = current_x + cell_width - text_width - padding;
+            text_x = current_x + cell_width - text_width - padding_right;
             break;
           default:
             break;
         }
 
-        double text_y = current_y + (row_height - text_size) / 2;
+        double text_y = current_y + padding_bottom +
+                        ((row_height - padding_top - padding_bottom - text_size) / 2);
+        switch (valign) {
+          case CellVAlign::Top:
+            text_y = current_y + row_height - text_size - padding_top;
+            break;
+          case CellVAlign::Bottom:
+            text_y = current_y + padding_bottom;
+            break;
+          case CellVAlign::Middle:
+            break;
+        }
 
         begin_text();
-        set_font(font_name, text_size);
+        set_font(text_font_name, text_size);
         emit(format_number(text_r) + " " + format_number(text_g) + " " +
              format_number(text_b) + " rg\n");
         text_position(text_x, text_y);
@@ -1924,7 +2228,13 @@ void PageBuilder::show_text(const std::string& text) {
 }
 
 void PageBuilder::show_text_at(double x, double y, const std::string& text) {
-  text_position(x, y);
+  emit_number(1);
+  emit_number(0);
+  emit_number(0);
+  emit_number(1);
+  emit_number(x);
+  emit_number(y);
+  emit("Tm\n");
   show_text(text);
 }
 
@@ -1946,8 +2256,23 @@ struct PdfWriter::Impl {
   std::string subject;
   std::string keywords;
   std::string creator = "nanopdf";
+  std::string producer = "nanopdf";
+  std::map<std::string, std::string> custom_info;
   std::string creation_date;
   std::string modification_date;
+  PageLabels page_labels;
+  std::map<std::string, NamedDestination> named_destinations;
+  std::string open_action_destination_name;
+  PageLayout page_layout = PageLayout::Unset;
+  PageMode page_mode = PageMode::Unset;
+  bool has_viewer_preferences = false;
+  ViewerPreferences viewer_preferences;
+  std::string language;
+  std::string xmp_metadata_xml;
+  std::vector<OutputIntentConfig> output_intents;
+  bool has_mark_info = false;
+  MarkInfoConfig mark_info;
+  TrappedState trapped = TrappedState::Unset;
 
   // Permissions (for certification signatures)
   bool has_permissions = false;
@@ -2086,6 +2411,7 @@ struct PdfWriter::Impl {
   enum class AnnotationUpdateType {
     AddText,
     AddHighlight,
+    AddTextMarkup,
     AddLink,
     Delete
   };
@@ -2100,6 +2426,9 @@ struct PdfWriter::Impl {
 
     // For AddHighlight:
     HighlightConfig highlight_config;
+
+    // For AddTextMarkup:
+    TextMarkupConfig text_markup_config;
 
     // For AddLink:
     LinkConfig link_config;
@@ -2175,6 +2504,7 @@ struct PdfWriter::Impl {
     std::string internal_name;  // MC0, MC1, etc.
     bool visible = true;
     bool printable = true;
+    bool locked = false;
     int obj_id = 0;
   };
   std::vector<LayerData> layers;
@@ -2249,6 +2579,11 @@ struct PdfWriter::Impl {
     std::string content;
     std::vector<std::string> used_images;
     std::vector<std::string> used_fonts;
+    std::vector<std::string> used_extgstates;
+    std::vector<std::string> used_layers;
+    std::vector<std::string> used_patterns;
+    std::vector<std::string> used_templates;
+    std::vector<CustomResourceRef> custom_resources;
     int obj_id = 0;
 
     // For imported pages: pre-built resource dictionary string and
@@ -2314,6 +2649,7 @@ struct PdfWriter::Impl {
 
   // Output buffer
   std::ostringstream output;
+  int current_obj_id = 0;
 
   int allocate_obj() { return next_obj_id++; }
 
@@ -2322,10 +2658,39 @@ struct PdfWriter::Impl {
       obj_offsets.push_back(0);
     }
     obj_offsets[obj_id] = output.tellp();
+    current_obj_id = obj_id;
     output << obj_id << " 0 obj\n";
   }
 
-  void write_obj_end() { output << "endobj\n"; }
+  void write_obj_end() {
+    output << "endobj\n";
+    current_obj_id = 0;
+  }
+
+  std::string format_pdf_string_for_object(
+      int obj_id, const std::string& plain_text) const {
+    if (!encryption_enabled || obj_id <= 0 || obj_id == encrypt_obj_id) {
+      return "(" + escape_pdf_string(plain_text) + ")";
+    }
+
+    std::vector<uint8_t> plain_bytes(plain_text.begin(), plain_text.end());
+    std::vector<uint8_t> encrypted_bytes = encrypt_data(
+        plain_bytes, encryption_key, obj_id, 0, encryption_config.algorithm);
+    return "<" + bytes_to_hex(encrypted_bytes) + ">";
+  }
+
+  std::string format_pdf_string(const std::string& plain_text) const {
+    return format_pdf_string_for_object(current_obj_id, plain_text);
+  }
+
+  std::vector<uint8_t> prepare_stream_data(
+      int obj_id, const std::vector<uint8_t>& plain_data) const {
+    if (!encryption_enabled || obj_id == encrypt_obj_id) {
+      return plain_data;
+    }
+    return encrypt_data(
+        plain_data, encryption_key, obj_id, 0, encryption_config.algorithm);
+  }
 
   std::string get_image_resource(const std::string& name) {
     for (const auto& img : images) {
@@ -3020,12 +3385,112 @@ void PdfWriter::set_creator(const std::string& creator) {
   impl_->creator = creator;
 }
 
+void PdfWriter::set_producer(const std::string& producer) {
+  impl_->producer = producer;
+}
+
+void PdfWriter::set_custom_info(
+    const std::string& key,
+    const std::string& value) {
+  impl_->custom_info[key] = value;
+}
+
+void PdfWriter::clear_custom_info(const std::string& key) {
+  impl_->custom_info.erase(key);
+}
+
 void PdfWriter::set_creation_date(const std::string& date) {
   impl_->creation_date = date;
 }
 
 void PdfWriter::set_modification_date(const std::string& date) {
   impl_->modification_date = date;
+}
+
+void PdfWriter::set_page_label(uint32_t page_index, const PageLabel& label) {
+  impl_->page_labels.labels[page_index] = label;
+}
+
+void PdfWriter::clear_page_labels() {
+  impl_->page_labels.labels.clear();
+}
+
+void PdfWriter::add_named_destination(const NamedDestination& destination) {
+  impl_->named_destinations[destination.name] = destination;
+}
+
+void PdfWriter::clear_named_destinations() {
+  impl_->named_destinations.clear();
+}
+
+void PdfWriter::set_open_action_named_destination(
+    const std::string& destination_name) {
+  impl_->open_action_destination_name = destination_name;
+}
+
+void PdfWriter::clear_open_action() {
+  impl_->open_action_destination_name.clear();
+}
+
+void PdfWriter::set_page_layout(PageLayout layout) {
+  impl_->page_layout = layout;
+}
+
+void PdfWriter::set_page_mode(PageMode mode) {
+  impl_->page_mode = mode;
+}
+
+void PdfWriter::set_viewer_preferences(
+    const ViewerPreferences& preferences) {
+  impl_->viewer_preferences = preferences;
+  impl_->has_viewer_preferences = true;
+}
+
+void PdfWriter::clear_viewer_preferences() {
+  impl_->viewer_preferences = ViewerPreferences{};
+  impl_->has_viewer_preferences = false;
+}
+
+void PdfWriter::set_language(const std::string& language) {
+  impl_->language = language;
+}
+
+void PdfWriter::clear_language() {
+  impl_->language.clear();
+}
+
+void PdfWriter::set_xmp_metadata(const std::string& xml) {
+  impl_->xmp_metadata_xml = xml;
+}
+
+void PdfWriter::clear_xmp_metadata() {
+  impl_->xmp_metadata_xml.clear();
+}
+
+void PdfWriter::add_output_intent(const OutputIntentConfig& config) {
+  impl_->output_intents.push_back(config);
+}
+
+void PdfWriter::clear_output_intents() {
+  impl_->output_intents.clear();
+}
+
+void PdfWriter::set_mark_info(const MarkInfoConfig& config) {
+  impl_->mark_info = config;
+  impl_->has_mark_info = true;
+}
+
+void PdfWriter::clear_mark_info() {
+  impl_->mark_info = MarkInfoConfig{};
+  impl_->has_mark_info = false;
+}
+
+void PdfWriter::set_trapped(TrappedState trapped) {
+  impl_->trapped = trapped;
+}
+
+void PdfWriter::clear_trapped() {
+  impl_->trapped = TrappedState::Unset;
 }
 
 // ============================================================
@@ -3061,6 +3526,19 @@ bool PdfWriter::load_existing(const std::vector<uint8_t>& data, std::string* err
   if (memcmp(data.data(), "%PDF-", 5) != 0) {
     if (error) *error = "Not a valid PDF (missing header)";
     return false;
+  }
+  if (data.size() >= 8) {
+    if (data[5] == '1' && data[6] == '.' && data[7] == '4') {
+      impl_->version = PdfVersion::v1_4;
+    } else if (data[5] == '1' && data[6] == '.' && data[7] == '5') {
+      impl_->version = PdfVersion::v1_5;
+    } else if (data[5] == '1' && data[6] == '.' && data[7] == '6') {
+      impl_->version = PdfVersion::v1_6;
+    } else if (data[5] == '1' && data[6] == '.' && data[7] == '7') {
+      impl_->version = PdfVersion::v1_7;
+    } else if (data[5] == '2' && data[6] == '.' && data[7] == '0') {
+      impl_->version = PdfVersion::v2_0;
+    }
   }
 
   // Find startxref
@@ -3175,6 +3653,21 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
   // Track objects we're adding in this update
   std::vector<std::pair<int, size_t>> new_obj_offsets;  // obj_id -> offset in output
 
+  int certification_sig_obj_id = 0;
+  MdpPermissions certification_permissions = impl_->permissions;
+  for (const auto& sig_field : impl_->signature_fields) {
+    if (sig_field.config.is_certification) {
+      certification_sig_obj_id = sig_field.sig_obj_id;
+      certification_permissions = sig_field.config.mdp_permissions;
+      break;
+    }
+  }
+  if (certification_sig_obj_id == 0 &&
+      impl_->has_permissions &&
+      !impl_->signature_fields.empty()) {
+    certification_sig_obj_id = impl_->signature_fields.front().sig_obj_id;
+  }
+
   // Write new image objects
   for (auto& img_res : impl_->images) {
     size_t obj_offset = base_offset + impl_->output.tellp();
@@ -3259,11 +3752,14 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
     if (!decode_parms.empty()) {
       impl_->output << decode_parms << "\n";
     }
-    impl_->output << "/Length " << stream_data.size() << "\n";
+    std::vector<uint8_t> encrypted_stream_data =
+        impl_->prepare_stream_data(img_res.obj_id, stream_data);
+    impl_->output << "/Length " << encrypted_stream_data.size() << "\n";
     impl_->output << ">>\n";
     impl_->output << "stream\n";
-    impl_->output.write(reinterpret_cast<const char*>(stream_data.data()),
-                        stream_data.size());
+    impl_->output.write(
+        reinterpret_cast<const char*>(encrypted_stream_data.data()),
+        encrypted_stream_data.size());
     impl_->output << "\nendstream\n";
     impl_->output << "endobj\n";
   }
@@ -3298,13 +3794,20 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
     impl_->output << "/SubFilter /" << get_subfilter_name(config.subfilter) << "\n";
 
     if (!config.reason.empty()) {
-      impl_->output << "/Reason (" << escape_pdf_string(config.reason) << ")\n";
+      impl_->output << "/Reason "
+                    << impl_->format_pdf_string_for_object(sig_field.sig_obj_id, config.reason)
+                    << "\n";
     }
     if (!config.location.empty()) {
-      impl_->output << "/Location (" << escape_pdf_string(config.location) << ")\n";
+      impl_->output << "/Location "
+                    << impl_->format_pdf_string_for_object(sig_field.sig_obj_id, config.location)
+                    << "\n";
     }
     if (!config.contact_info.empty()) {
-      impl_->output << "/ContactInfo (" << escape_pdf_string(config.contact_info) << ")\n";
+      impl_->output << "/ContactInfo "
+                    << impl_->format_pdf_string_for_object(
+                           sig_field.sig_obj_id, config.contact_info)
+                    << "\n";
     }
     impl_->output << "/M (" << get_pdf_timestamp() << ")\n";
 
@@ -3320,6 +3823,13 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
       impl_->output << "00";
     }
     impl_->output << ">\n";
+
+    if (sig_field.sig_obj_id == certification_sig_obj_id) {
+      impl_->output << "/Reference [<< /Type /SigRef /TransformMethod /DocMDP "
+                    << "/TransformParams << /Type /TransformParams /P "
+                    << static_cast<int>(certification_permissions)
+                    << " /V /1.2 >> >>]\n";
+    }
 
     impl_->output << ">>\n";
     impl_->output << "endobj\n";
@@ -3341,7 +3851,9 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
     impl_->output << "/Type /Annot\n";
     impl_->output << "/Subtype /Widget\n";
     impl_->output << "/FT /Sig\n";
-    impl_->output << "/T (" << escape_pdf_string(config.name) << ")\n";
+    impl_->output << "/T "
+                  << impl_->format_pdf_string_for_object(sig_field.field_obj_id, config.name)
+                  << "\n";
     impl_->output << "/V " << sig_field.sig_obj_id << " 0 R\n";
     impl_->output << "/F " << (config.visible ? 4 : 6) << "\n";
     // Note: /P would reference existing page object - needs page tracking
@@ -3355,18 +3867,107 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
 
   // Write AcroForm if we have signature fields
   if (impl_->has_acroform && !impl_->signature_fields.empty()) {
+    Pdf existing_pdf;
+    ResolvedObject root_obj;
+    std::map<std::string, Value> existing_acroform_dict;
+    std::vector<Value> existing_acroform_fields;
+    bool parsed_existing_pdf = parse_from_memory(
+        impl_->existing_pdf.data(), impl_->existing_pdf.size(), &existing_pdf);
+
+    if (!parsed_existing_pdf) {
+      result.success = false;
+      result.error = "Failed to parse existing PDF for incremental signing";
+      return result;
+    }
+
+    root_obj = resolve_reference(
+        existing_pdf, impl_->existing_root_obj, impl_->existing_root_gen);
+    if (!root_obj.success || root_obj.value.type != Value::DICTIONARY) {
+      result.success = false;
+      result.error = "Failed to resolve existing catalog for incremental signing";
+      return result;
+    }
+
+    auto acroform_it = root_obj.value.dict.find("AcroForm");
+    if (acroform_it != root_obj.value.dict.end()) {
+      Value acroform_value = acroform_it->second;
+      if (acroform_value.type == Value::REFERENCE) {
+        ResolvedObject resolved_acroform = resolve_reference(
+            existing_pdf,
+            acroform_value.ref_object_number,
+            acroform_value.ref_generation_number);
+        if (resolved_acroform.success &&
+            resolved_acroform.value.type == Value::DICTIONARY) {
+          acroform_value = resolved_acroform.value;
+        }
+      }
+      if (acroform_value.type == Value::DICTIONARY) {
+        existing_acroform_dict = acroform_value.dict;
+        auto fields_it = existing_acroform_dict.find("Fields");
+        if (fields_it != existing_acroform_dict.end()) {
+          Value fields_value = fields_it->second;
+          if (fields_value.type == Value::REFERENCE) {
+            ResolvedObject resolved_fields = resolve_reference(
+                existing_pdf,
+                fields_value.ref_object_number,
+                fields_value.ref_generation_number);
+            if (resolved_fields.success &&
+                resolved_fields.value.type == Value::ARRAY) {
+              existing_acroform_fields = resolved_fields.value.array;
+            }
+          } else if (fields_value.type == Value::ARRAY) {
+            existing_acroform_fields = fields_value.array;
+          }
+        }
+      }
+    }
+
     size_t acroform_offset = base_offset + impl_->output.tellp();
     new_obj_offsets.push_back({impl_->acroform_obj_id, acroform_offset});
 
     impl_->output << impl_->acroform_obj_id << " 0 obj\n";
     impl_->output << "<<\n";
+    for (const auto& entry : existing_acroform_dict) {
+      if (entry.first == "Fields" || entry.first == "SigFlags") continue;
+      impl_->output << "/" << entry.first << " "
+                    << serialize_pdf_value(entry.second) << "\n";
+    }
     impl_->output << "/Fields [";
-    for (size_t i = 0; i < impl_->signature_fields.size(); ++i) {
-      if (i > 0) impl_->output << " ";
-      impl_->output << impl_->signature_fields[i].field_obj_id << " 0 R";
+    bool first_field = true;
+    for (const auto& existing_field : existing_acroform_fields) {
+      if (existing_field.type != Value::REFERENCE) continue;
+      if (!first_field) impl_->output << " ";
+      impl_->output << existing_field.ref_object_number << " "
+                    << existing_field.ref_generation_number << " R";
+      first_field = false;
+    }
+    for (const auto& sig_field : impl_->signature_fields) {
+      if (!first_field) impl_->output << " ";
+      impl_->output << sig_field.field_obj_id << " 0 R";
+      first_field = false;
     }
     impl_->output << "]\n";
     impl_->output << "/SigFlags 3\n";
+    impl_->output << ">>\n";
+    impl_->output << "endobj\n";
+
+    size_t root_offset = base_offset + impl_->output.tellp();
+    new_obj_offsets.push_back({impl_->existing_root_obj, root_offset});
+
+    impl_->output << impl_->existing_root_obj << " "
+                  << impl_->existing_root_gen << " obj\n";
+    impl_->output << "<<\n";
+    for (const auto& entry : root_obj.value.dict) {
+      if (entry.first == "AcroForm") continue;
+      if (entry.first == "Perms" && certification_sig_obj_id != 0) continue;
+      impl_->output << "/" << entry.first << " "
+                    << serialize_pdf_value(entry.second) << "\n";
+    }
+    impl_->output << "/AcroForm " << impl_->acroform_obj_id << " 0 R\n";
+    if (certification_sig_obj_id != 0) {
+      impl_->output << "/Perms << /DocMDP " << certification_sig_obj_id
+                    << " 0 R >>\n";
+    }
     impl_->output << ">>\n";
     impl_->output << "endobj\n";
   }
@@ -3394,47 +3995,8 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
           impl_->output << "<<\n";
           for (const auto& kv : resolved.value.dict) {
             if (kv.first == "V" || kv.first == "AS") continue;  // Skip old value
-            // Simple serialization of common value types
-            impl_->output << "/" << kv.first << " ";
-            const Value& v = kv.second;
-            if (v.type == Value::NAME) {
-              impl_->output << "/" << v.name;
-            } else if (v.type == Value::NUMBER) {
-              if (v.number == static_cast<int64_t>(v.number)) {
-                impl_->output << static_cast<int64_t>(v.number);
-              } else {
-                impl_->output << format_number(v.number);
-              }
-            } else if (v.type == Value::STRING) {
-              impl_->output << "(" << escape_pdf_string(v.str) << ")";
-            } else if (v.type == Value::BOOLEAN) {
-              impl_->output << (v.boolean ? "true" : "false");
-            } else if (v.type == Value::REFERENCE) {
-              impl_->output << v.ref_object_number << " "
-                            << v.ref_generation_number << " R";
-            } else if (v.type == Value::ARRAY) {
-              impl_->output << "[";
-              for (size_t ai = 0; ai < v.array.size(); ++ai) {
-                if (ai > 0) impl_->output << " ";
-                const Value& av = v.array[ai];
-                if (av.type == Value::NUMBER) {
-                  if (av.number == static_cast<int64_t>(av.number)) {
-                    impl_->output << static_cast<int64_t>(av.number);
-                  } else {
-                    impl_->output << format_number(av.number);
-                  }
-                } else if (av.type == Value::REFERENCE) {
-                  impl_->output << av.ref_object_number << " "
-                                << av.ref_generation_number << " R";
-                } else if (av.type == Value::NAME) {
-                  impl_->output << "/" << av.name;
-                } else if (av.type == Value::STRING) {
-                  impl_->output << "(" << escape_pdf_string(av.str) << ")";
-                }
-              }
-              impl_->output << "]";
-            }
-            impl_->output << "\n";
+            impl_->output << "/" << kv.first << " "
+                          << serialize_pdf_value(kv.second) << "\n";
           }
           // Write updated value
           impl_->output << "/V " << update.value << "\n";
@@ -3459,8 +4021,8 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
     }
   }
 
-  // Write annotation updates for existing pages
-  if (!impl_->annotation_updates.empty()) {
+  // Write annotation updates and signature widgets for existing pages
+  if (!impl_->annotation_updates.empty() || !impl_->signature_fields.empty()) {
     // Parse existing PDF to get page /Annots arrays
     Pdf existing_pdf;
     bool parsed = parse_from_memory(impl_->existing_pdf.data(),
@@ -3470,71 +4032,48 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
     }
 
     if (parsed) {
+      const auto existing_page_refs = collect_page_object_refs(existing_pdf);
+
       // Group updates by page
       std::map<int, std::vector<const Impl::AnnotationUpdate*>> page_updates;
       for (const auto& update : impl_->annotation_updates) {
         page_updates[update.page_index].push_back(&update);
       }
+      std::map<int, std::vector<int>> signature_widgets_by_page;
+      for (const auto& sig_field : impl_->signature_fields) {
+        signature_widgets_by_page[sig_field.config.page].push_back(
+            sig_field.field_obj_id);
+      }
+      std::set<int> pages_to_update;
+      for (const auto& entry : page_updates) {
+        pages_to_update.insert(entry.first);
+      }
+      for (const auto& entry : signature_widgets_by_page) {
+        pages_to_update.insert(entry.first);
+      }
 
-      for (auto& kv : page_updates) {
-        int page_idx = kv.first;
-        const auto& updates = kv.second;
+      for (int page_idx : pages_to_update) {
+        static const std::vector<const Impl::AnnotationUpdate*> kEmptyUpdates;
+        static const std::vector<int> kEmptySignatureWidgets;
+        auto updates_it = page_updates.find(page_idx);
+        auto sig_widgets_it = signature_widgets_by_page.find(page_idx);
+        const auto& updates =
+            (updates_it != page_updates.end()) ? updates_it->second : kEmptyUpdates;
+        const auto& signature_widgets =
+            (sig_widgets_it != signature_widgets_by_page.end())
+                ? sig_widgets_it->second
+                : kEmptySignatureWidgets;
 
         if (page_idx < 0 || page_idx >= static_cast<int>(existing_pdf.catalog.pages.size())) {
           continue;
         }
 
-        const auto& page = existing_pdf.catalog.pages[page_idx];
-
-        // Get the page's object number from the xref
-        // We need to find the page object number. Pages are indexed in catalog order.
-        // Find the page object by looking it up.
         uint32_t page_obj_num = 0;
         uint16_t page_gen = 0;
 
-        // The page object number should be stored when we parse.
-        // Look for pages in the xref that are page objects.
-        // Use a simpler approach: scan the /Pages /Kids array.
-        {
-          auto root_it = existing_pdf.trailer.find("Root");
-          if (root_it != existing_pdf.trailer.end() && root_it->second.type == Value::REFERENCE) {
-            ResolvedObject root = resolve_reference(existing_pdf, root_it->second.ref_object_number,
-                                                    root_it->second.ref_generation_number);
-            if (root.success && root.value.type == Value::DICTIONARY) {
-              auto pages_it = root.value.dict.find("Pages");
-              if (pages_it != root.value.dict.end() && pages_it->second.type == Value::REFERENCE) {
-                // Collect page obj numbers by traversing /Kids
-                std::vector<std::pair<uint32_t, uint16_t>> page_obj_nums;
-                std::function<void(uint32_t, uint16_t)> collect_pages;
-                collect_pages = [&](uint32_t obj_n, uint16_t gen_n) {
-                  ResolvedObject node = resolve_reference(existing_pdf, obj_n, gen_n);
-                  if (!node.success || node.value.type != Value::DICTIONARY) return;
-                  auto type_it = node.value.dict.find("Type");
-                  if (type_it != node.value.dict.end() && type_it->second.type == Value::NAME) {
-                    if (type_it->second.name == "Page") {
-                      page_obj_nums.push_back({obj_n, gen_n});
-                      return;
-                    }
-                  }
-                  auto kids_it = node.value.dict.find("Kids");
-                  if (kids_it != node.value.dict.end() && kids_it->second.type == Value::ARRAY) {
-                    for (const auto& kid : kids_it->second.array) {
-                      if (kid.type == Value::REFERENCE) {
-                        collect_pages(kid.ref_object_number, kid.ref_generation_number);
-                      }
-                    }
-                  }
-                };
-                collect_pages(pages_it->second.ref_object_number,
-                              pages_it->second.ref_generation_number);
-
-                if (page_idx < static_cast<int>(page_obj_nums.size())) {
-                  page_obj_num = page_obj_nums[page_idx].first;
-                  page_gen = page_obj_nums[page_idx].second;
-                }
-              }
-            }
-          }
+        if (page_idx >= 0 && page_idx < static_cast<int>(existing_page_refs.size())) {
+          page_obj_num = existing_page_refs[page_idx].first;
+          page_gen = existing_page_refs[page_idx].second;
         }
 
         if (page_obj_num == 0) continue;
@@ -3591,60 +4130,88 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
           impl_->output << "<<\n";
           impl_->output << "/Type /Annot\n";
 
+          auto write_text_markup_annotation =
+              [&](const TextMarkupConfig& markup) {
+                const char* subtype = "/Highlight";
+                switch (markup.type) {
+                  case MarkupType::Highlight: subtype = "/Highlight"; break;
+                  case MarkupType::Underline: subtype = "/Underline"; break;
+                  case MarkupType::Squiggly: subtype = "/Squiggly"; break;
+                  case MarkupType::StrikeOut: subtype = "/StrikeOut"; break;
+                }
+                impl_->output << "/Subtype " << subtype << "\n";
+
+                double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
+                for (const auto& q : markup.quads) {
+                  min_x = std::min({min_x, q.x1, q.x2, q.x3, q.x4});
+                  min_y = std::min({min_y, q.y1, q.y2, q.y3, q.y4});
+                  max_x = std::max({max_x, q.x1, q.x2, q.x3, q.x4});
+                  max_y = std::max({max_y, q.y1, q.y2, q.y3, q.y4});
+                }
+                impl_->output << "/Rect [" << format_number(min_x) << " "
+                              << format_number(min_y) << " "
+                              << format_number(max_x) << " "
+                              << format_number(max_y) << "]\n";
+
+                impl_->output << "/QuadPoints [";
+                bool first_quad = true;
+                for (const auto& q : markup.quads) {
+                  if (!first_quad) impl_->output << " ";
+                  impl_->output << format_number(q.x1) << " " << format_number(q.y1) << " "
+                                << format_number(q.x2) << " " << format_number(q.y2) << " "
+                                << format_number(q.x3) << " " << format_number(q.y3) << " "
+                                << format_number(q.x4) << " " << format_number(q.y4);
+                  first_quad = false;
+                }
+                impl_->output << "]\n";
+                impl_->output << "/C [" << format_number(markup.r) << " "
+                              << format_number(markup.g) << " "
+                              << format_number(markup.b) << "]\n";
+                if (markup.alpha < 1.0) {
+                  impl_->output << "/CA " << format_number(markup.alpha) << "\n";
+                }
+                if (!markup.contents.empty()) {
+                  impl_->output << "/Contents "
+                                << impl_->format_pdf_string_for_object(
+                                       annot_obj_id, markup.contents)
+                                << "\n";
+                }
+                if (!markup.author.empty()) {
+                  impl_->output << "/T "
+                                << impl_->format_pdf_string_for_object(
+                                       annot_obj_id, markup.author)
+                                << "\n";
+                }
+                impl_->output << "/F " << (markup.print ? 4 : 0) << "\n";
+                impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
+              };
+
           if (upd->update_type == Impl::AnnotationUpdateType::AddText) {
             impl_->output << "/Subtype /Text\n";
             impl_->output << "/Rect [" << format_number(upd->x) << " "
                           << format_number(upd->y) << " "
                           << format_number(upd->x + upd->w) << " "
                           << format_number(upd->y + upd->h) << "]\n";
-            impl_->output << "/Contents (" << escape_pdf_string(upd->contents) << ")\n";
+            impl_->output << "/Contents "
+                          << impl_->format_pdf_string_for_object(
+                                 annot_obj_id, upd->contents)
+                          << "\n";
             impl_->output << "/F 4\n";  // Print flag
             impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
           } else if (upd->update_type == Impl::AnnotationUpdateType::AddHighlight) {
-            const auto& hc = upd->highlight_config;
-            impl_->output << "/Subtype /Highlight\n";
-
-            // Build rect from quads bounding box
-            double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
-            for (const auto& q : hc.quads) {
-              double xs[] = {q.x1, q.x2, q.x3, q.x4};
-              double ys[] = {q.y1, q.y2, q.y3, q.y4};
-              for (int i = 0; i < 4; ++i) {
-                if (xs[i] < min_x) min_x = xs[i];
-                if (xs[i] > max_x) max_x = xs[i];
-                if (ys[i] < min_y) min_y = ys[i];
-                if (ys[i] > max_y) max_y = ys[i];
-              }
-            }
-            impl_->output << "/Rect [" << format_number(min_x) << " "
-                          << format_number(min_y) << " "
-                          << format_number(max_x) << " "
-                          << format_number(max_y) << "]\n";
-
-            // QuadPoints
-            impl_->output << "/QuadPoints [";
-            for (size_t qi = 0; qi < hc.quads.size(); ++qi) {
-              const auto& q = hc.quads[qi];
-              if (qi > 0) impl_->output << " ";
-              impl_->output << format_number(q.x4) << " " << format_number(q.y4) << " "
-                            << format_number(q.x3) << " " << format_number(q.y3) << " "
-                            << format_number(q.x1) << " " << format_number(q.y1) << " "
-                            << format_number(q.x2) << " " << format_number(q.y2);
-            }
-            impl_->output << "]\n";
-
-            // Color
-            impl_->output << "/C [" << format_number(hc.r) << " "
-                          << format_number(hc.g) << " "
-                          << format_number(hc.b) << "]\n";
-            if (!hc.contents.empty()) {
-              impl_->output << "/Contents (" << escape_pdf_string(hc.contents) << ")\n";
-            }
-            if (!hc.author.empty()) {
-              impl_->output << "/T (" << escape_pdf_string(hc.author) << ")\n";
-            }
-            impl_->output << "/F " << (hc.print ? 4 : 0) << "\n";
-            impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
+            TextMarkupConfig markup;
+            markup.type = MarkupType::Highlight;
+            markup.quads = upd->highlight_config.quads;
+            markup.r = upd->highlight_config.r;
+            markup.g = upd->highlight_config.g;
+            markup.b = upd->highlight_config.b;
+            markup.alpha = upd->highlight_config.alpha;
+            markup.author = upd->highlight_config.author;
+            markup.contents = upd->highlight_config.contents;
+            markup.print = upd->highlight_config.print;
+            write_text_markup_annotation(markup);
+          } else if (upd->update_type == Impl::AnnotationUpdateType::AddTextMarkup) {
+            write_text_markup_annotation(upd->text_markup_config);
           } else if (upd->update_type == Impl::AnnotationUpdateType::AddLink) {
             const auto& lc = upd->link_config;
             impl_->output << "/Subtype /Link\n";
@@ -3658,11 +4225,18 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
             }
 
             if (lc.action == LinkAction::URI && !lc.uri.empty()) {
-              impl_->output << "/A << /Type /Action /S /URI /URI ("
-                            << escape_pdf_string(lc.uri) << ") >>\n";
+              impl_->output << "/A << /Type /Action /S /URI /URI "
+                            << impl_->format_pdf_string_for_object(annot_obj_id, lc.uri)
+                            << " >>\n";
             } else if (lc.action == LinkAction::GoTo) {
-              impl_->output << "/Dest [" << lc.dest_page << " /XYZ null "
-                            << format_number(lc.dest_y) << " null]\n";
+              if (lc.dest_page >= 0 &&
+                  lc.dest_page < static_cast<int>(existing_page_refs.size())) {
+                impl_->output << "/Dest ["
+                              << existing_page_refs[lc.dest_page].first << " "
+                              << existing_page_refs[lc.dest_page].second
+                              << " R /XYZ null "
+                              << format_number(lc.dest_y) << " null]\n";
+              }
             }
 
             impl_->output << "/F 4\n";
@@ -3671,6 +4245,9 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
 
           impl_->output << ">>\n";
           impl_->output << "endobj\n";
+        }
+        for (int widget_obj_id : signature_widgets) {
+          new_annot_obj_ids.push_back(widget_obj_id);
         }
 
         // Now write the updated page object with modified /Annots array
@@ -3685,64 +4262,8 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
         if (orig_page.success && orig_page.value.type == Value::DICTIONARY) {
           for (const auto& entry : orig_page.value.dict) {
             if (entry.first == "Annots") continue;  // We'll write our own
-            impl_->output << "/" << entry.first << " ";
-            const Value& v = entry.second;
-            if (v.type == Value::NAME) {
-              impl_->output << "/" << v.name;
-            } else if (v.type == Value::NUMBER) {
-              if (v.number == static_cast<int64_t>(v.number)) {
-                impl_->output << static_cast<int64_t>(v.number);
-              } else {
-                impl_->output << format_number(v.number);
-              }
-            } else if (v.type == Value::STRING) {
-              impl_->output << "(" << escape_pdf_string(v.str) << ")";
-            } else if (v.type == Value::BOOLEAN) {
-              impl_->output << (v.boolean ? "true" : "false");
-            } else if (v.type == Value::REFERENCE) {
-              impl_->output << v.ref_object_number << " "
-                            << v.ref_generation_number << " R";
-            } else if (v.type == Value::ARRAY) {
-              impl_->output << "[";
-              for (size_t ai = 0; ai < v.array.size(); ++ai) {
-                if (ai > 0) impl_->output << " ";
-                const Value& av = v.array[ai];
-                if (av.type == Value::NUMBER) {
-                  if (av.number == static_cast<int64_t>(av.number)) {
-                    impl_->output << static_cast<int64_t>(av.number);
-                  } else {
-                    impl_->output << format_number(av.number);
-                  }
-                } else if (av.type == Value::REFERENCE) {
-                  impl_->output << av.ref_object_number << " "
-                                << av.ref_generation_number << " R";
-                } else if (av.type == Value::NAME) {
-                  impl_->output << "/" << av.name;
-                } else if (av.type == Value::STRING) {
-                  impl_->output << "(" << escape_pdf_string(av.str) << ")";
-                }
-              }
-              impl_->output << "]";
-            } else if (v.type == Value::DICTIONARY) {
-              // Nested dictionary - write inline
-              impl_->output << "<<";
-              for (const auto& dkv : v.dict) {
-                impl_->output << " /" << dkv.first << " ";
-                const Value& dv = dkv.second;
-                if (dv.type == Value::NAME) impl_->output << "/" << dv.name;
-                else if (dv.type == Value::NUMBER) {
-                  if (dv.number == static_cast<int64_t>(dv.number))
-                    impl_->output << static_cast<int64_t>(dv.number);
-                  else
-                    impl_->output << format_number(dv.number);
-                }
-                else if (dv.type == Value::STRING) impl_->output << "(" << escape_pdf_string(dv.str) << ")";
-                else if (dv.type == Value::BOOLEAN) impl_->output << (dv.boolean ? "true" : "false");
-                else if (dv.type == Value::REFERENCE) impl_->output << dv.ref_object_number << " " << dv.ref_generation_number << " R";
-              }
-              impl_->output << " >>";
-            }
-            impl_->output << "\n";
+            impl_->output << "/" << entry.first << " "
+                          << serialize_pdf_value(entry.second) << "\n";
           }
         }
 
@@ -3947,6 +4468,34 @@ WriteResult apply_signature(std::vector<uint8_t>& pdf_data,
     return result;
   }
 
+  if (part1_length > 9999999999ULL || part2_offset > 9999999999ULL ||
+      part2_length > 9999999999ULL) {
+    result.error = "ByteRange value exceeds placeholder width";
+    return result;
+  }
+
+  {
+    char byte_range_text[64];
+    int written = std::snprintf(
+        byte_range_text,
+        sizeof(byte_range_text),
+        "/ByteRange [0 %010zu %010zu %010zu]",
+        part1_length,
+        part2_offset,
+        part2_length);
+    if (written <= 0 || static_cast<size_t>(written) != 47) {
+      result.error = "failed to format ByteRange";
+      return result;
+    }
+    if (placeholder.byte_range_offset + static_cast<size_t>(written) > pdf_data.size()) {
+      result.error = "ByteRange placeholder offset exceeds PDF data size";
+      return result;
+    }
+    std::memcpy(pdf_data.data() + placeholder.byte_range_offset,
+                byte_range_text,
+                static_cast<size_t>(written));
+  }
+
   // Collect the data covered by ByteRange (everything except the signature hex)
   std::vector<uint8_t> data_to_sign;
   data_to_sign.reserve(part1_length + part2_length);
@@ -4029,7 +4578,7 @@ void PdfWriter::set_encryption(const EncryptionConfig& config) {
   int32_t perm_flags = config.permissions.to_flags();
 
   if (config.algorithm == EncryptionAlgorithm::AES_256) {
-    // AES-256 uses different key derivation (PDF 2.0 / Extension Level 3)
+    // AES-256 uses the revision-5 SHA-256 based key derivation.
     // Generate random file encryption key
     impl_->encryption_key = generate_random_bytes(32);
 
@@ -4118,12 +4667,15 @@ void PdfWriter::set_encryption(const EncryptionConfig& config) {
   } else {
     // RC4 or AES-128 (revision 4)
     int key_length = 128;  // bits
+    int revision = 4;
     if (config.algorithm == EncryptionAlgorithm::RC4_40) {
       key_length = 40;
+      revision = 2;
     }
 
     // Compute O value
-    impl_->o_value = compute_o_value(config.owner_password, config.user_password, key_length);
+    impl_->o_value = compute_o_value(
+        config.owner_password, config.user_password, key_length, revision);
 
     // Compute encryption key
     impl_->encryption_key = compute_encryption_key_r4(
@@ -4132,10 +4684,12 @@ void PdfWriter::set_encryption(const EncryptionConfig& config) {
         perm_flags,
         impl_->doc_id1,
         key_length,
+        revision,
         config.encrypt_metadata);
 
     // Compute U value
-    impl_->u_value = compute_u_value(impl_->encryption_key, impl_->doc_id1);
+    impl_->u_value = compute_u_value(
+        impl_->encryption_key, impl_->doc_id1, revision);
   }
 }
 
@@ -4203,6 +4757,14 @@ int PdfWriter::add_bookmark(const BookmarkConfig& config) {
 
 int PdfWriter::add_child_bookmark(int parent_id, const std::string& title,
                                   int page_index, double y) {
+  BookmarkConfig config;
+  config.title = title;
+  config.page_index = page_index;
+  config.y_position = y;
+  return add_child_bookmark(parent_id, config);
+}
+
+int PdfWriter::add_child_bookmark(int parent_id, const BookmarkConfig& config) {
   if (parent_id < 0 || parent_id >= static_cast<int>(impl_->outlines.size())) {
     return -1;
   }
@@ -4210,10 +4772,13 @@ int PdfWriter::add_child_bookmark(int parent_id, const std::string& title,
   int id = static_cast<int>(impl_->outlines.size());
 
   Impl::OutlineItem item;
-  item.title = title;
-  item.dest_page = page_index;
-  item.dest_y = y;
+  item.title = config.title;
+  item.dest_page = config.page_index;
+  item.dest_y = config.y_position;
   item.parent_id = parent_id;
+  item.open = config.open;
+  item.bold = config.bold;
+  item.italic = config.italic;
   item.obj_id = impl_->allocate_obj();
 
   // Link to parent
@@ -4307,6 +4872,7 @@ std::string PdfWriter::add_layer(const LayerConfig& config) {
   layer.internal_name = internal_name;
   layer.visible = config.visible;
   layer.printable = config.printable;
+  layer.locked = config.locked;
   layer.obj_id = impl_->allocate_obj();
 
   impl_->layers.push_back(layer);
@@ -4324,6 +4890,12 @@ std::string PdfWriter::add_layer(const LayerConfig& config) {
 // ============================================================
 
 std::string PdfWriter::add_text_field(const TextFieldConfig& config) {
+  if (!impl_->has_existing) {
+    if (config.page < 0 || static_cast<size_t>(config.page) >= impl_->pages.size()) {
+      return "";
+    }
+  }
+
   ensure_acroform();
 
   Impl::FormFieldData field;
@@ -4345,11 +4917,21 @@ std::string PdfWriter::add_text_field(const TextFieldConfig& config) {
   field.field_obj_id = impl_->allocate_obj();
   field.appearance_obj_id = impl_->allocate_obj();
 
+  if (!impl_->has_existing && static_cast<size_t>(config.page) < impl_->pages.size()) {
+    impl_->pages[config.page].annotation_refs.push_back(field.field_obj_id);
+  }
+
   impl_->form_fields.push_back(field);
   return config.name;
 }
 
 std::string PdfWriter::add_checkbox(const CheckboxConfig& config) {
+  if (!impl_->has_existing) {
+    if (config.page < 0 || static_cast<size_t>(config.page) >= impl_->pages.size()) {
+      return "";
+    }
+  }
+
   ensure_acroform();
 
   Impl::FormFieldData field;
@@ -4365,11 +4947,21 @@ std::string PdfWriter::add_checkbox(const CheckboxConfig& config) {
   field.field_obj_id = impl_->allocate_obj();
   field.appearance_obj_id = impl_->allocate_obj();
 
+  if (!impl_->has_existing && static_cast<size_t>(config.page) < impl_->pages.size()) {
+    impl_->pages[config.page].annotation_refs.push_back(field.field_obj_id);
+  }
+
   impl_->form_fields.push_back(field);
   return config.name;
 }
 
 std::string PdfWriter::add_radio_group(const RadioGroupConfig& config) {
+  if (!impl_->has_existing) {
+    if (config.page < 0 || static_cast<size_t>(config.page) >= impl_->pages.size()) {
+      return "";
+    }
+  }
+
   ensure_acroform();
 
   Impl::FormFieldData field;
@@ -4396,11 +4988,23 @@ std::string PdfWriter::add_radio_group(const RadioGroupConfig& config) {
     }
   }
 
+  if (!impl_->has_existing && static_cast<size_t>(config.page) < impl_->pages.size()) {
+    for (int widget_obj_id : field.radio_widget_ids) {
+      impl_->pages[config.page].annotation_refs.push_back(widget_obj_id);
+    }
+  }
+
   impl_->form_fields.push_back(field);
   return config.name;
 }
 
 std::string PdfWriter::add_dropdown(const DropdownConfig& config) {
+  if (!impl_->has_existing) {
+    if (config.page < 0 || static_cast<size_t>(config.page) >= impl_->pages.size()) {
+      return "";
+    }
+  }
+
   ensure_acroform();
 
   Impl::FormFieldData field;
@@ -4417,12 +5021,34 @@ std::string PdfWriter::add_dropdown(const DropdownConfig& config) {
   field.field_obj_id = impl_->allocate_obj();
   field.appearance_obj_id = impl_->allocate_obj();
 
+  if (!impl_->has_existing && static_cast<size_t>(config.page) < impl_->pages.size()) {
+    impl_->pages[config.page].annotation_refs.push_back(field.field_obj_id);
+  }
+
   impl_->form_fields.push_back(field);
   return config.name;
 }
 
 std::string PdfWriter::add_listbox(const std::string& name, int page, double x, double y,
-                                   double w, double h, const std::vector<std::string>& options) {
+                                   double w, double h,
+                                   const std::vector<std::string>& options,
+                                   int selected) {
+  if (!impl_->has_existing) {
+    if (page < 0 || static_cast<size_t>(page) >= impl_->pages.size()) {
+      return "";
+    }
+  }
+  if (selected < -1) {
+    return "";
+  }
+  if (options.empty()) {
+    if (selected != -1) {
+      return "";
+    }
+  } else if (selected >= static_cast<int>(options.size())) {
+    return "";
+  }
+
   ensure_acroform();
 
   Impl::FormFieldData field;
@@ -4434,8 +5060,13 @@ std::string PdfWriter::add_listbox(const std::string& name, int page, double x, 
   field.width = w;
   field.height = h;
   field.options = options;
+  field.selected = options.empty() ? -1 : selected;
   field.field_obj_id = impl_->allocate_obj();
   field.appearance_obj_id = impl_->allocate_obj();
+
+  if (!impl_->has_existing && static_cast<size_t>(page) < impl_->pages.size()) {
+    impl_->pages[page].annotation_refs.push_back(field.field_obj_id);
+  }
 
   impl_->form_fields.push_back(field);
   return name;
@@ -4443,6 +5074,12 @@ std::string PdfWriter::add_listbox(const std::string& name, int page, double x, 
 
 std::string PdfWriter::add_button(const std::string& name, int page, double x, double y,
                                   double w, double h, const std::string& caption) {
+  if (!impl_->has_existing) {
+    if (page < 0 || static_cast<size_t>(page) >= impl_->pages.size()) {
+      return "";
+    }
+  }
+
   ensure_acroform();
 
   Impl::FormFieldData field;
@@ -4456,6 +5093,10 @@ std::string PdfWriter::add_button(const std::string& name, int page, double x, d
   field.caption = caption;
   field.field_obj_id = impl_->allocate_obj();
   field.appearance_obj_id = impl_->allocate_obj();
+
+  if (!impl_->has_existing && static_cast<size_t>(page) < impl_->pages.size()) {
+    impl_->pages[page].annotation_refs.push_back(field.field_obj_id);
+  }
 
   impl_->form_fields.push_back(field);
   return name;
@@ -4498,10 +5139,29 @@ std::string PdfWriter::create_gradient(const GradientConfig& config) {
 // Page Templates Implementation
 // ============================================================
 
-Template::Template(double width, double height)
-    : width_(width), height_(height) {}
+Template::Template(PdfWriter* writer, double width, double height)
+    : writer_(writer),
+      width_(width),
+      height_(height),
+      builder_(std::make_unique<PageBuilder>(writer)) {}
 
-Template::~Template() {}
+Template::~Template() = default;
+
+Template::Template(Template&& other) noexcept
+    : writer_(other.writer_),
+      width_(other.width_),
+      height_(other.height_),
+      builder_(std::move(other.builder_)) {}
+
+Template& Template::operator=(Template&& other) noexcept {
+  if (this != &other) {
+    writer_ = other.writer_;
+    width_ = other.width_;
+    height_ = other.height_;
+    builder_ = std::move(other.builder_);
+  }
+  return *this;
+}
 
 void Template::set_size(double width, double height) {
   width_ = width;
@@ -4509,27 +5169,73 @@ void Template::set_size(double width, double height) {
 }
 
 PageBuilder& Template::builder() {
-  // This is a placeholder - the actual builder is created when
-  // the template is added to the document
-  static PageBuilder dummy(nullptr);
-  return dummy;
+  return *builder_;
 }
 
 Template PdfWriter::create_template(double width, double height) {
-  return Template(width, height);
+  return Template(this, width, height);
 }
 
 std::string PdfWriter::add_template(const Template& tmpl) {
+  if (!tmpl.builder_) {
+    return "";
+  }
+  return add_template(tmpl.width_, tmpl.height_, *tmpl.builder_);
+}
+
+std::string PdfWriter::add_template(double width, double height,
+                                    const PageBuilder& builder) {
   impl_->template_counter++;
   std::string name = "Fm" + std::to_string(impl_->template_counter);
 
   Impl::TemplateData tdata;
   tdata.name = name;
-  tdata.width = tmpl.width_;
-  tdata.height = tmpl.height_;
-  tdata.content = tmpl.content_;
-  tdata.used_images = tmpl.used_images_;
-  tdata.used_fonts = tmpl.used_fonts_;
+  tdata.width = width;
+  tdata.height = height;
+  tdata.content = builder.content_;
+
+  for (const auto& img : impl_->images) {
+    if (tdata.content.find("/" + img.name + " Do") != std::string::npos) {
+      tdata.used_images.push_back(img.name);
+    }
+  }
+  for (const auto& font : impl_->fonts) {
+    if (tdata.content.find("/" + font.name + " ") != std::string::npos) {
+      tdata.used_fonts.push_back(font.name);
+    }
+  }
+  for (const auto& ef : impl_->embedded_fonts) {
+    if (tdata.content.find("/" + ef.name + " ") != std::string::npos) {
+      tdata.used_fonts.push_back(ef.name);
+    }
+  }
+  for (const auto& gs : impl_->extgstates) {
+    if (tdata.content.find("/" + gs.name + " gs") != std::string::npos) {
+      tdata.used_extgstates.push_back(gs.name);
+    }
+  }
+  for (const auto& layer : impl_->layers) {
+    if (tdata.content.find("/" + layer.internal_name + " BDC") != std::string::npos) {
+      tdata.used_layers.push_back(layer.internal_name);
+    }
+  }
+  for (const auto& grad : impl_->gradients) {
+    if (tdata.content.find("/" + grad.name + " ") != std::string::npos) {
+      tdata.used_patterns.push_back(grad.name);
+    }
+  }
+  for (const auto& tmpl_ref : impl_->templates) {
+    if (tdata.content.find("/" + tmpl_ref.name + " Do") != std::string::npos) {
+      tdata.used_templates.push_back(tmpl_ref.name);
+    }
+  }
+  for (const auto& resource : builder.custom_resources_) {
+    Impl::CustomResourceRef custom_resource;
+    custom_resource.category = resource.category;
+    custom_resource.name = resource.name;
+    custom_resource.obj_id = resource.obj_id;
+    tdata.custom_resources.push_back(std::move(custom_resource));
+  }
   tdata.obj_id = impl_->allocate_obj();
 
   impl_->templates.push_back(tdata);
@@ -4605,39 +5311,165 @@ TextLayout PdfWriter::create_text_layout() {
 
 void PdfWriter::draw_text_layout(PageBuilder& builder, const TextLayout& layout,
                                  double x, double y) {
-  // Process pending text into lines with word wrapping
   TextLayout& mutable_layout = const_cast<TextLayout&>(layout);
   auto* impl = mutable_layout.impl_;
+  std::string font_name = impl->style.font_name;
+  if (font_name.empty() || !has_font_resource(font_name)) {
+    font_name = add_standard_font(StandardFont::Helvetica);
+  }
 
-  // Add any remaining pending text
+  auto measure_text_width = [&](const std::string& text,
+                                const FontMetrics* metrics) -> double {
+    double width = 0.0;
+    for (size_t i = 0; i < text.size(); ++i) {
+      unsigned char ch = static_cast<unsigned char>(text[i]);
+      if (metrics && metrics->units_per_em > 0) {
+        width += metrics->get_width(static_cast<uint32_t>(ch)) *
+                 impl->style.font_size / metrics->units_per_em;
+      } else {
+        width += impl->style.font_size * (ch == ' ' ? 0.28 : 0.5);
+      }
+      if (i + 1 < text.size()) {
+        width += impl->style.letter_spacing;
+        if (text[i] == ' ') {
+          width += impl->style.word_spacing;
+        }
+      }
+    }
+    return width;
+  };
+
+  auto wrap_line = [&](const std::string& text,
+                       const FontMetrics* metrics,
+                       std::vector<TextLayout::Impl::Line>* out_lines) {
+    std::vector<std::string> words;
+    std::string word;
+
+    if (text.empty()) {
+      out_lines->push_back({"", 0.0});
+      return;
+    }
+    if (impl->width <= 0.0) {
+      out_lines->push_back({text, measure_text_width(text, metrics)});
+      return;
+    }
+
+    for (char ch : text) {
+      if (ch == ' ' || ch == '\t') {
+        if (!word.empty()) {
+          words.push_back(word);
+          word.clear();
+        }
+      } else {
+        word.push_back(ch);
+      }
+    }
+    if (!word.empty()) {
+      words.push_back(word);
+    }
+    if (words.empty()) {
+      out_lines->push_back({"", 0.0});
+      return;
+    }
+
+    auto append_word_segments = [&](const std::string& source_word,
+                                    std::string* current_line) {
+      std::string segment;
+      for (char ch : source_word) {
+        std::string candidate = segment + ch;
+        if (!segment.empty() &&
+            measure_text_width(candidate, metrics) > impl->width) {
+          if (!current_line->empty()) {
+            out_lines->push_back(
+                {*current_line, measure_text_width(*current_line, metrics)});
+            current_line->clear();
+          }
+          out_lines->push_back({segment, measure_text_width(segment, metrics)});
+          segment.assign(1, ch);
+        } else {
+          segment = candidate;
+        }
+      }
+      if (!segment.empty()) {
+        *current_line = segment;
+      }
+    };
+
+    std::string current_line;
+    for (const auto& current_word : words) {
+      std::string candidate =
+          current_line.empty() ? current_word : current_line + " " + current_word;
+      if (current_line.empty() &&
+          measure_text_width(current_word, metrics) > impl->width) {
+        append_word_segments(current_word, &current_line);
+      } else if (measure_text_width(candidate, metrics) <= impl->width) {
+        current_line = candidate;
+      } else {
+        out_lines->push_back(
+            {current_line, measure_text_width(current_line, metrics)});
+        if (measure_text_width(current_word, metrics) > impl->width) {
+          current_line.clear();
+          append_word_segments(current_word, &current_line);
+        } else {
+          current_line = current_word;
+        }
+      }
+    }
+    if (!current_line.empty()) {
+      out_lines->push_back(
+          {current_line, measure_text_width(current_line, metrics)});
+    }
+  };
+
   if (!impl->pending_text.empty()) {
     impl->lines.push_back({impl->pending_text, 0});
     impl->pending_text.clear();
   }
 
-  // Get font metrics for width calculation
-  const FontMetrics* metrics = get_font_metrics(impl->style.font_name);
+  const FontMetrics* metrics = get_font_metrics(font_name);
+  std::vector<TextLayout::Impl::Line> wrapped_lines;
+  wrapped_lines.reserve(std::max<size_t>(1, impl->lines.size()));
+  for (const auto& line : impl->lines) {
+    wrap_line(line.text, metrics, &wrapped_lines);
+  }
+  impl->lines = wrapped_lines;
 
-  // Calculate line height
   double line_height = impl->style.font_size * impl->style.line_height;
+  int drawable_lines = static_cast<int>(impl->lines.size());
+  impl->overflow = false;
+  if (impl->max_height > 0.0 && line_height > 0.0) {
+    drawable_lines = static_cast<int>(std::floor(impl->max_height / line_height + 1e-9));
+    if (drawable_lines < 0) {
+      drawable_lines = 0;
+    }
+    if (drawable_lines < static_cast<int>(impl->lines.size())) {
+      impl->overflow = true;
+    }
+  }
 
-  // Draw text
   builder.begin_text();
-  builder.set_font(impl->style.font_name, impl->style.font_size);
+  builder.set_font(font_name, impl->style.font_size);
   builder.set_fill_color(impl->style.r, impl->style.g, impl->style.b);
+  if (impl->style.letter_spacing != 0.0) {
+    builder.emit_number(impl->style.letter_spacing);
+    builder.emit("Tc\n");
+  }
+  if (impl->style.word_spacing != 0.0) {
+    builder.emit_number(impl->style.word_spacing);
+    builder.emit("Tw\n");
+  }
 
   double current_y = y;
+  int drawn_lines = 0;
   for (const auto& line : impl->lines) {
-    // Calculate x position based on alignment
+    if (drawn_lines >= drawable_lines) {
+      break;
+    }
+
     double line_x = x;
-    if (impl->alignment == TextAlign::Center || impl->alignment == TextAlign::Right) {
-      double text_width = 0;
-      if (metrics && metrics->units_per_em > 0) {
-        for (unsigned char ch : line.text) {
-          int glyph_width = metrics->get_width(static_cast<uint32_t>(ch));
-          text_width += glyph_width * impl->style.font_size / metrics->units_per_em;
-        }
-      }
+    if ((impl->alignment == TextAlign::Center || impl->alignment == TextAlign::Right) &&
+        impl->width > 0.0) {
+      double text_width = line.width;
       if (impl->alignment == TextAlign::Center) {
         line_x = x + (impl->width - text_width) / 2.0;
       } else {
@@ -4646,15 +5478,21 @@ void PdfWriter::draw_text_layout(PageBuilder& builder, const TextLayout& layout,
     }
 
     if (!line.text.empty()) {
-      builder.text_position(line_x, current_y);
+      builder.emit_number(1);
+      builder.emit_number(0);
+      builder.emit_number(0);
+      builder.emit_number(1);
+      builder.emit_number(line_x);
+      builder.emit_number(current_y);
+      builder.emit("Tm\n");
       builder.show_text(line.text);
     }
     current_y -= line_height;
+    drawn_lines++;
   }
 
   builder.end_text();
-
-  impl->calculated_height = y - current_y;
+  impl->calculated_height = line_height * drawn_lines;
 }
 
 // ============================================================================
@@ -4730,6 +5568,14 @@ void PdfWriter::clear_footer() {
 }
 
 int PdfWriter::get_page_count() const {
+  if (impl_->has_existing && impl_->pages.empty()) {
+    Pdf existing_pdf;
+    if (parse_from_memory(
+            impl_->existing_pdf.data(), impl_->existing_pdf.size(), &existing_pdf) &&
+        existing_pdf.load_document_structure()) {
+      return static_cast<int>(existing_pdf.catalog.pages.size());
+    }
+  }
   return static_cast<int>(impl_->pages.size());
 }
 
@@ -4943,6 +5789,29 @@ std::string PdfWriter::add_standard_font(StandardFont font) {
   impl_->fonts.push_back(std::move(res));
 
   return name;
+}
+
+bool PdfWriter::has_font_resource(const std::string& name) const {
+  for (const auto& font : impl_->fonts) {
+    if (font.name == name) {
+      return true;
+    }
+  }
+  for (const auto& font : impl_->embedded_fonts) {
+    if (font.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool PdfWriter::has_image_resource(const std::string& name) const {
+  for (const auto& image : impl_->images) {
+    if (image.name == name) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ============================================================================
@@ -5885,11 +6754,14 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
       impl_->output << "/ColorSpace /DeviceGray\n";
       impl_->output << "/BitsPerComponent 8\n";
       impl_->output << "/Filter /FlateDecode\n";
-      impl_->output << "/Length " << alpha_compressed.size() << "\n";
+      std::vector<uint8_t> encrypted_alpha_compressed =
+          impl_->prepare_stream_data(img_res.smask_obj_id, alpha_compressed);
+      impl_->output << "/Length " << encrypted_alpha_compressed.size() << "\n";
       impl_->output << ">>\n";
       impl_->output << "stream\n";
-      impl_->output.write(reinterpret_cast<const char*>(alpha_compressed.data()),
-                          alpha_compressed.size());
+      impl_->output.write(
+          reinterpret_cast<const char*>(encrypted_alpha_compressed.data()),
+          encrypted_alpha_compressed.size());
       impl_->output << "\nendstream\n";
       impl_->write_obj_end();
     }
@@ -5995,11 +6867,13 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     if (img_res.has_alpha && img_res.smask_obj_id > 0) {
       impl_->output << "/SMask " << img_res.smask_obj_id << " 0 R\n";
     }
-    impl_->output << "/Length " << stream_data.size() << "\n";
+    std::vector<uint8_t> encrypted_image_stream =
+        impl_->prepare_stream_data(img_res.obj_id, stream_data);
+    impl_->output << "/Length " << encrypted_image_stream.size() << "\n";
     impl_->output << ">>\n";
     impl_->output << "stream\n";
-    impl_->output.write(reinterpret_cast<const char*>(stream_data.data()),
-                        stream_data.size());
+    impl_->output.write(reinterpret_cast<const char*>(encrypted_image_stream.data()),
+                        encrypted_image_stream.size());
     impl_->output << "\nendstream\n";
     impl_->write_obj_end();
   }
@@ -6045,12 +6919,14 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->write_obj_start(ef.file_obj_id);
     impl_->output << "<<\n";
     impl_->output << "/Filter /FlateDecode\n";
-    impl_->output << "/Length " << compressed_font.size() << "\n";
+    std::vector<uint8_t> encrypted_font_stream =
+        impl_->prepare_stream_data(ef.file_obj_id, compressed_font);
+    impl_->output << "/Length " << encrypted_font_stream.size() << "\n";
     impl_->output << "/Length1 " << font_stream_data.size() << "\n";
     impl_->output << ">>\n";
     impl_->output << "stream\n";
-    impl_->output.write(reinterpret_cast<const char*>(compressed_font.data()),
-                        compressed_font.size());
+    impl_->output.write(reinterpret_cast<const char*>(encrypted_font_stream.data()),
+                        encrypted_font_stream.size());
     impl_->output << "\nendstream\n";
     impl_->write_obj_end();
 
@@ -6066,11 +6942,13 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->write_obj_start(ef.tounicode_obj_id);
     impl_->output << "<<\n";
     impl_->output << "/Filter /FlateDecode\n";
-    impl_->output << "/Length " << compressed_cmap.size() << "\n";
+    std::vector<uint8_t> encrypted_cmap_stream =
+        impl_->prepare_stream_data(ef.tounicode_obj_id, compressed_cmap);
+    impl_->output << "/Length " << encrypted_cmap_stream.size() << "\n";
     impl_->output << ">>\n";
     impl_->output << "stream\n";
-    impl_->output.write(reinterpret_cast<const char*>(compressed_cmap.data()),
-                        compressed_cmap.size());
+    impl_->output.write(reinterpret_cast<const char*>(encrypted_cmap_stream.data()),
+                        encrypted_cmap_stream.size());
     impl_->output << "\nendstream\n";
     impl_->write_obj_end();
 
@@ -6245,11 +7123,13 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->write_obj_start(content_obj_ids[i]);
     impl_->output << "<<\n";
     impl_->output << "/Filter /FlateDecode\n";
-    impl_->output << "/Length " << compressed.size() << "\n";
+    std::vector<uint8_t> encrypted_content_stream =
+        impl_->prepare_stream_data(content_obj_ids[i], compressed);
+    impl_->output << "/Length " << encrypted_content_stream.size() << "\n";
     impl_->output << ">>\n";
     impl_->output << "stream\n";
-    impl_->output.write(reinterpret_cast<const char*>(compressed.data()),
-                        compressed.size());
+    impl_->output.write(reinterpret_cast<const char*>(encrypted_content_stream.data()),
+                        encrypted_content_stream.size());
     impl_->output << "\nendstream\n";
     impl_->write_obj_end();
   }
@@ -6428,8 +7308,8 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
       }
 
       if (link.action == LinkAction::URI) {
-        impl_->output << "/A << /Type /Action /S /URI /URI ("
-                      << escape_pdf_string(link.uri) << ") >>\n";
+        impl_->output << "/A << /Type /Action /S /URI /URI "
+                      << impl_->format_pdf_string(link.uri) << " >>\n";
       } else if (link.action == LinkAction::GoTo) {
         // Reference to page object
         if (link.dest_page >= 0 && link.dest_page < static_cast<int>(page_obj_ids.size())) {
@@ -6500,12 +7380,12 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
 
       // Author (T in PDF)
       if (!hl.author.empty()) {
-        impl_->output << "/T (" << escape_pdf_string(hl.author) << ")\n";
+        impl_->output << "/T " << impl_->format_pdf_string(hl.author) << "\n";
       }
 
       // Contents (comment text)
       if (!hl.contents.empty()) {
-        impl_->output << "/Contents (" << escape_pdf_string(hl.contents) << ")\n";
+        impl_->output << "/Contents " << impl_->format_pdf_string(hl.contents) << "\n";
       }
 
       // Flags: bit 3 = NoZoom, bit 4 = NoRotate, bit 2 = Print
@@ -6541,8 +7421,10 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->write_obj_start(layer.obj_id);
     impl_->output << "<<\n";
     impl_->output << "/Type /OCG\n";
-    impl_->output << "/Name (" << escape_pdf_string(layer.name) << ")\n";
+    impl_->output << "/Name " << impl_->format_pdf_string(layer.name) << "\n";
     impl_->output << "/Intent /View\n";
+    impl_->output << "/Usage << /Print << /PrintState /"
+                  << (layer.printable ? "ON" : "OFF") << " >> >>\n";
     impl_->output << ">>\n";
     impl_->write_obj_end();
   }
@@ -6582,7 +7464,7 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
       const auto& item = impl_->outlines[i];
       impl_->write_obj_start(item.obj_id);
       impl_->output << "<<\n";
-      impl_->output << "/Title (" << escape_pdf_string(item.title) << ")\n";
+      impl_->output << "/Title " << impl_->format_pdf_string(item.title) << "\n";
 
       // Parent reference
       if (item.parent_id >= 0) {
@@ -6639,16 +7521,21 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->output << "<<\n";
     impl_->output << "/Type /EmbeddedFile\n";
     if (!att.mime_type.empty()) {
-      impl_->output << "/Subtype /" << att.mime_type << "\n";
+      // The Subtype is a PDF name; MIME types contain '/' (e.g. text/plain)
+      // which must be escaped as #2F or the name token breaks dict parsing.
+      impl_->output << "/Subtype /" << escape_pdf_name(att.mime_type) << "\n";
     }
     impl_->output << "/Params << /Size " << att.data.size() << " >>\n";
     if (att.compress && !att.data.empty()) {
       impl_->output << "/Filter /FlateDecode\n";
     }
-    impl_->output << "/Length " << file_data.size() << "\n";
+    std::vector<uint8_t> encrypted_attachment_stream =
+        impl_->prepare_stream_data(att.embedded_file_obj_id, file_data);
+    impl_->output << "/Length " << encrypted_attachment_stream.size() << "\n";
     impl_->output << ">>\n";
     impl_->output << "stream\n";
-    impl_->output.write(reinterpret_cast<const char*>(file_data.data()), file_data.size());
+    impl_->output.write(reinterpret_cast<const char*>(encrypted_attachment_stream.data()),
+                        encrypted_attachment_stream.size());
     impl_->output << "\nendstream\n";
     impl_->write_obj_end();
 
@@ -6656,10 +7543,10 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->write_obj_start(att.filespec_obj_id);
     impl_->output << "<<\n";
     impl_->output << "/Type /Filespec\n";
-    impl_->output << "/F (" << escape_pdf_string(att.filename) << ")\n";
-    impl_->output << "/UF (" << escape_pdf_string(att.filename) << ")\n";
+    impl_->output << "/F " << impl_->format_pdf_string(att.filename) << "\n";
+    impl_->output << "/UF " << impl_->format_pdf_string(att.filename) << "\n";
     if (!att.description.empty()) {
-      impl_->output << "/Desc (" << escape_pdf_string(att.description) << ")\n";
+      impl_->output << "/Desc " << impl_->format_pdf_string(att.description) << "\n";
     }
     impl_->output << "/EF << /F " << att.embedded_file_obj_id << " 0 R >>\n";
     impl_->output << ">>\n";
@@ -6753,10 +7640,27 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
   for (const auto& imp_obj : impl_->imported_objects) {
     impl_->write_obj_start(imp_obj.obj_id);
     if (imp_obj.is_stream) {
-      impl_->output << imp_obj.stream_dict << "\n";
+      std::string stream_dict = imp_obj.stream_dict;
+      std::vector<uint8_t> encrypted_imported_stream =
+          impl_->prepare_stream_data(imp_obj.obj_id, imp_obj.stream_data);
+      size_t length_pos = stream_dict.find("/Length ");
+      if (length_pos != std::string::npos) {
+        size_t length_value_start = length_pos + 8;
+        size_t length_value_end = length_value_start;
+        while (length_value_end < stream_dict.size() &&
+               std::isdigit(static_cast<unsigned char>(stream_dict[length_value_end]))) {
+          ++length_value_end;
+        }
+        stream_dict.replace(
+            length_value_start,
+            length_value_end - length_value_start,
+            std::to_string(encrypted_imported_stream.size()));
+      }
+      impl_->output << stream_dict << "\n";
       impl_->output << "stream\n";
-      impl_->output.write(reinterpret_cast<const char*>(imp_obj.stream_data.data()),
-                          imp_obj.stream_data.size());
+      impl_->output.write(
+          reinterpret_cast<const char*>(encrypted_imported_stream.data()),
+          encrypted_imported_stream.size());
       impl_->output << "\nendstream\n";
     } else {
       impl_->output << imp_obj.serialized_data << "\n";
@@ -6781,9 +7685,25 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
       // For imported pages: use the pre-built resource dictionary
       impl_->output << "/Resources " << tmpl.imported_resources_str << "\n";
     } else {
-      // Template resources (simplified - just fonts and images)
+      auto has_custom_category = [&](const std::string& category) {
+        for (const auto& resource : tmpl.custom_resources) {
+          if (resource.category == category) {
+            return true;
+          }
+        }
+        return false;
+      };
+      auto write_custom_category_entries = [&](const std::string& category) {
+        for (const auto& resource : tmpl.custom_resources) {
+          if (resource.category == category) {
+            impl_->output << "    /" << resource.name << " "
+                          << resource.obj_id << " 0 R\n";
+          }
+        }
+      };
+
       impl_->output << "/Resources <<\n";
-      if (!tmpl.used_fonts.empty()) {
+      if (!tmpl.used_fonts.empty() || has_custom_category("Font")) {
         impl_->output << "  /Font <<\n";
         for (const auto& font_name : tmpl.used_fonts) {
           std::string ref = impl_->get_font_resource(font_name);
@@ -6791,9 +7711,11 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
             impl_->output << "    /" << font_name << " " << ref << "\n";
           }
         }
+        write_custom_category_entries("Font");
         impl_->output << "  >>\n";
       }
-      if (!tmpl.used_images.empty()) {
+      if (!tmpl.used_images.empty() || !tmpl.used_templates.empty() ||
+          has_custom_category("XObject")) {
         impl_->output << "  /XObject <<\n";
         for (const auto& img_name : tmpl.used_images) {
           std::string ref = impl_->get_image_resource(img_name);
@@ -6801,18 +7723,306 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
             impl_->output << "    /" << img_name << " " << ref << "\n";
           }
         }
+        for (const auto& tmpl_name : tmpl.used_templates) {
+          for (const auto& nested : impl_->templates) {
+            if (nested.name == tmpl_name) {
+              impl_->output << "    /" << tmpl_name << " "
+                            << nested.obj_id << " 0 R\n";
+              break;
+            }
+          }
+        }
+        write_custom_category_entries("XObject");
         impl_->output << "  >>\n";
       }
+      if (!tmpl.used_extgstates.empty() || has_custom_category("ExtGState")) {
+        impl_->output << "  /ExtGState <<\n";
+        for (const auto& gs_name : tmpl.used_extgstates) {
+          for (const auto& gs : impl_->extgstates) {
+            if (gs.name == gs_name) {
+              impl_->output << "    /" << gs_name << " " << gs.obj_id << " 0 R\n";
+              break;
+            }
+          }
+        }
+        write_custom_category_entries("ExtGState");
+        impl_->output << "  >>\n";
+      }
+      if (!tmpl.used_patterns.empty() || has_custom_category("Pattern")) {
+        impl_->output << "  /Pattern <<\n";
+        for (const auto& pat_name : tmpl.used_patterns) {
+          for (const auto& grad : impl_->gradients) {
+            if (grad.name == pat_name) {
+              impl_->output << "    /" << pat_name << " "
+                            << grad.pattern_obj_id << " 0 R\n";
+              break;
+            }
+          }
+        }
+        write_custom_category_entries("Pattern");
+        impl_->output << "  >>\n";
+      }
+      if (!tmpl.used_layers.empty() || has_custom_category("Properties")) {
+        impl_->output << "  /Properties <<\n";
+        for (const auto& layer_name : tmpl.used_layers) {
+          for (const auto& layer : impl_->layers) {
+            if (layer.internal_name == layer_name) {
+              impl_->output << "    /" << layer_name << " "
+                            << layer.obj_id << " 0 R\n";
+              break;
+            }
+          }
+        }
+        write_custom_category_entries("Properties");
+        impl_->output << "  >>\n";
+      }
+
+      std::set<std::string> standard_categories = {
+          "XObject", "Font", "ExtGState", "Pattern", "Properties"};
+      std::set<std::string> extra_categories;
+      for (const auto& resource : tmpl.custom_resources) {
+        if (!standard_categories.count(resource.category)) {
+          extra_categories.insert(resource.category);
+        }
+      }
+      for (const auto& category : extra_categories) {
+        impl_->output << "  /" << category << " <<\n";
+        write_custom_category_entries(category);
+        impl_->output << "  >>\n";
+      }
+
       impl_->output << ">>\n";
     }
 
     impl_->output << "/Filter /FlateDecode\n";
-    impl_->output << "/Length " << compressed.size() << "\n";
+    std::vector<uint8_t> encrypted_template_stream =
+        impl_->prepare_stream_data(tmpl.obj_id, compressed);
+    impl_->output << "/Length " << encrypted_template_stream.size() << "\n";
     impl_->output << ">>\n";
     impl_->output << "stream\n";
-    impl_->output.write(reinterpret_cast<const char*>(compressed.data()), compressed.size());
+    impl_->output.write(reinterpret_cast<const char*>(encrypted_template_stream.data()),
+                        encrypted_template_stream.size());
     impl_->output << "\nendstream\n";
     impl_->write_obj_end();
+  }
+
+  // Write regular form field objects
+  for (const auto& field : impl_->form_fields) {
+    if (field.page < 0 || field.page >= static_cast<int>(page_obj_ids.size())) {
+      continue;
+    }
+
+    auto write_widget_rect = [&](double x, double y, double width, double height) {
+      impl_->output << "/Rect [" << format_number(x) << " "
+                    << format_number(y) << " "
+                    << format_number(x + width) << " "
+                    << format_number(y + height) << "]\n";
+    };
+
+    auto write_string_array = [&](const std::vector<std::string>& values) {
+      impl_->output << "[";
+      for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) impl_->output << " ";
+        impl_->output << impl_->format_pdf_string(values[i]);
+      }
+      impl_->output << "]";
+    };
+
+    auto write_default_appearance = [&](double font_size) {
+      double effective_font_size = font_size > 0.0 ? font_size : 12.0;
+      impl_->output << "/DA (/Helv " << format_number(effective_font_size)
+                    << " Tf 0 g)\n";
+    };
+
+    switch (field.type) {
+      case Impl::FormFieldData::Type::Text: {
+        int flags = 0;
+        if (field.read_only) flags |= 1;
+        if (field.required) flags |= 2;
+        if (field.multiline) flags |= 4096;
+        if (field.password) flags |= 8192;
+
+        impl_->write_obj_start(field.field_obj_id);
+        impl_->output << "<<\n";
+        impl_->output << "/Type /Annot\n";
+        impl_->output << "/Subtype /Widget\n";
+        impl_->output << "/FT /Tx\n";
+        impl_->output << "/T " << impl_->format_pdf_string(field.name) << "\n";
+        impl_->output << "/P " << page_obj_ids[field.page] << " 0 R\n";
+        impl_->output << "/F 4\n";
+        write_widget_rect(field.x, field.y, field.width, field.height);
+        if (!field.value.empty()) {
+          impl_->output << "/V " << impl_->format_pdf_string(field.value) << "\n";
+          impl_->output << "/DV " << impl_->format_pdf_string(field.value) << "\n";
+        }
+        if (flags != 0) {
+          impl_->output << "/Ff " << flags << "\n";
+        }
+        if (field.max_length > 0) {
+          impl_->output << "/MaxLen " << field.max_length << "\n";
+        }
+        write_default_appearance(field.font_size);
+        impl_->output << ">>\n";
+        impl_->write_obj_end();
+        break;
+      }
+      case Impl::FormFieldData::Type::Checkbox: {
+        std::string export_name = field.export_value.empty() ? "Yes" : field.export_value;
+        std::string state_name = field.checked ? export_name : "Off";
+
+        impl_->write_obj_start(field.field_obj_id);
+        impl_->output << "<<\n";
+        impl_->output << "/Type /Annot\n";
+        impl_->output << "/Subtype /Widget\n";
+        impl_->output << "/FT /Btn\n";
+        impl_->output << "/T " << impl_->format_pdf_string(field.name) << "\n";
+        impl_->output << "/P " << page_obj_ids[field.page] << " 0 R\n";
+        impl_->output << "/F 4\n";
+        write_widget_rect(field.x, field.y, field.width, field.height);
+        impl_->output << "/V /" << escape_pdf_name(state_name) << "\n";
+        impl_->output << "/AS /" << escape_pdf_name(state_name) << "\n";
+        impl_->output << ">>\n";
+        impl_->write_obj_end();
+        break;
+      }
+      case Impl::FormFieldData::Type::Radio: {
+        std::string selected_value;
+
+        if (field.selected >= 0 &&
+            field.selected < static_cast<int>(field.options.size())) {
+          size_t colon = field.options[field.selected].find(':');
+          if (colon != std::string::npos) {
+            selected_value = field.options[field.selected].substr(colon + 1);
+          }
+        }
+
+        impl_->write_obj_start(field.field_obj_id);
+        impl_->output << "<<\n";
+        impl_->output << "/FT /Btn\n";
+        impl_->output << "/Ff 32768\n";
+        impl_->output << "/T " << impl_->format_pdf_string(field.name) << "\n";
+        if (!selected_value.empty()) {
+          impl_->output << "/V /" << escape_pdf_name(selected_value) << "\n";
+        }
+        impl_->output << "/Kids [";
+        for (size_t i = 0; i < field.radio_widget_ids.size(); ++i) {
+          if (i > 0) impl_->output << " ";
+          impl_->output << field.radio_widget_ids[i] << " 0 R";
+        }
+        impl_->output << "]\n";
+        impl_->output << ">>\n";
+        impl_->write_obj_end();
+
+        for (size_t i = 0; i < field.radio_widget_ids.size() && i < field.options.size(); ++i) {
+          const std::string& encoded_option = field.options[i];
+          size_t colon = encoded_option.find(':');
+          std::string geometry = colon == std::string::npos
+                                     ? encoded_option
+                                     : encoded_option.substr(0, colon);
+          std::string value = colon == std::string::npos
+                                  ? encoded_option
+                                  : encoded_option.substr(colon + 1);
+          double x = 0.0;
+          double y = 0.0;
+          double size = 12.0;
+          char separator1 = 0;
+          char separator2 = 0;
+          std::istringstream geometry_stream(geometry);
+          geometry_stream >> x >> separator1 >> y >> separator2 >> size;
+
+          impl_->write_obj_start(field.radio_widget_ids[i]);
+          impl_->output << "<<\n";
+          impl_->output << "/Type /Annot\n";
+          impl_->output << "/Subtype /Widget\n";
+          impl_->output << "/Parent " << field.field_obj_id << " 0 R\n";
+          impl_->output << "/P " << page_obj_ids[field.page] << " 0 R\n";
+          impl_->output << "/F 4\n";
+          write_widget_rect(x, y, size, size);
+          impl_->output << "/AS /"
+                        << escape_pdf_name(
+                               (static_cast<int>(i) == field.selected) ? value : "Off")
+                        << "\n";
+          impl_->output << ">>\n";
+          impl_->write_obj_end();
+        }
+        break;
+      }
+      case Impl::FormFieldData::Type::Dropdown:
+      case Impl::FormFieldData::Type::Listbox: {
+        int flags = field.read_only ? 1 : 0;
+        std::string selected_value;
+
+        if (field.type == Impl::FormFieldData::Type::Dropdown) {
+          flags |= 131072;
+          if (field.editable) {
+            flags |= 262144;
+          }
+        }
+        if (field.selected >= 0 &&
+            field.selected < static_cast<int>(field.options.size())) {
+          selected_value = field.options[field.selected];
+        }
+
+        impl_->write_obj_start(field.field_obj_id);
+        impl_->output << "<<\n";
+        impl_->output << "/Type /Annot\n";
+        impl_->output << "/Subtype /Widget\n";
+        impl_->output << "/FT /Ch\n";
+        impl_->output << "/T " << impl_->format_pdf_string(field.name) << "\n";
+        impl_->output << "/P " << page_obj_ids[field.page] << " 0 R\n";
+        impl_->output << "/F 4\n";
+        write_widget_rect(field.x, field.y, field.width, field.height);
+        impl_->output << "/Opt ";
+        write_string_array(field.options);
+        impl_->output << "\n";
+        if (!selected_value.empty()) {
+          impl_->output << "/V " << impl_->format_pdf_string(selected_value) << "\n";
+          impl_->output << "/DV " << impl_->format_pdf_string(selected_value) << "\n";
+        }
+        if (flags != 0) {
+          impl_->output << "/Ff " << flags << "\n";
+        }
+        write_default_appearance(field.font_size);
+        impl_->output << ">>\n";
+        impl_->write_obj_end();
+        break;
+      }
+      case Impl::FormFieldData::Type::Button: {
+        impl_->write_obj_start(field.field_obj_id);
+        impl_->output << "<<\n";
+        impl_->output << "/Type /Annot\n";
+        impl_->output << "/Subtype /Widget\n";
+        impl_->output << "/FT /Btn\n";
+        impl_->output << "/Ff 65536\n";
+        impl_->output << "/T " << impl_->format_pdf_string(field.name) << "\n";
+        impl_->output << "/P " << page_obj_ids[field.page] << " 0 R\n";
+        impl_->output << "/F 4\n";
+        write_widget_rect(field.x, field.y, field.width, field.height);
+        if (!field.caption.empty()) {
+          impl_->output << "/MK << /CA " << impl_->format_pdf_string(field.caption)
+                        << " >>\n";
+        }
+        write_default_appearance(field.font_size);
+        impl_->output << ">>\n";
+        impl_->write_obj_end();
+        break;
+      }
+    }
+  }
+
+  int certification_sig_obj_id = 0;
+  MdpPermissions certification_permissions = impl_->permissions;
+  for (const auto& sig_field : impl_->signature_fields) {
+    if (sig_field.config.is_certification) {
+      certification_sig_obj_id = sig_field.sig_obj_id;
+      certification_permissions = sig_field.config.mdp_permissions;
+      break;
+    }
+  }
+  if (certification_sig_obj_id == 0 &&
+      impl_->has_permissions &&
+      !impl_->signature_fields.empty()) {
+    certification_sig_obj_id = impl_->signature_fields.front().sig_obj_id;
   }
 
   // Write signature field objects
@@ -6827,13 +8037,13 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->output << "/SubFilter /" << get_subfilter_name(config.subfilter) << "\n";
 
     if (!config.reason.empty()) {
-      impl_->output << "/Reason (" << escape_pdf_string(config.reason) << ")\n";
+      impl_->output << "/Reason " << impl_->format_pdf_string(config.reason) << "\n";
     }
     if (!config.location.empty()) {
-      impl_->output << "/Location (" << escape_pdf_string(config.location) << ")\n";
+      impl_->output << "/Location " << impl_->format_pdf_string(config.location) << "\n";
     }
     if (!config.contact_info.empty()) {
-      impl_->output << "/ContactInfo (" << escape_pdf_string(config.contact_info) << ")\n";
+      impl_->output << "/ContactInfo " << impl_->format_pdf_string(config.contact_info) << "\n";
     }
     impl_->output << "/M (" << get_pdf_timestamp() << ")\n";
 
@@ -6849,6 +8059,13 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
       impl_->output << "00";
     }
     impl_->output << ">\n";
+
+    if (sig_field.sig_obj_id == certification_sig_obj_id) {
+      impl_->output << "/Reference [<< /Type /SigRef /TransformMethod /DocMDP "
+                    << "/TransformParams << /Type /TransformParams /P "
+                    << static_cast<int>(certification_permissions)
+                    << " /V /1.2 >> >>]\n";
+    }
 
     impl_->output << ">>\n";
     impl_->write_obj_end();
@@ -6867,7 +8084,7 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
     impl_->output << "/Type /Annot\n";
     impl_->output << "/Subtype /Widget\n";
     impl_->output << "/FT /Sig\n";
-    impl_->output << "/T (" << escape_pdf_string(config.name) << ")\n";
+    impl_->output << "/T " << impl_->format_pdf_string(config.name) << "\n";
     impl_->output << "/V " << sig_field.sig_obj_id << " 0 R\n";
     impl_->output << "/F " << (config.visible ? 4 : 6) << "\n";  // Print flag (4) or Hidden+Print (6)
     impl_->output << "/P " << page_obj_ids[config.page] << " 0 R\n";
@@ -6897,27 +8114,46 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
       impl_->output << "/BBox [0 0 " << format_number(config.width) << " "
                     << format_number(config.height) << "]\n";
       impl_->output << "/Filter /FlateDecode\n";
-      impl_->output << "/Length " << ap_compressed.size() << "\n";
+      std::vector<uint8_t> encrypted_appearance_stream =
+          impl_->prepare_stream_data(sig_field.appearance_obj_id, ap_compressed);
+      impl_->output << "/Length " << encrypted_appearance_stream.size() << "\n";
       impl_->output << ">>\n";
       impl_->output << "stream\n";
-      impl_->output.write(reinterpret_cast<const char*>(ap_compressed.data()),
-                          ap_compressed.size());
+      impl_->output.write(
+          reinterpret_cast<const char*>(encrypted_appearance_stream.data()),
+          encrypted_appearance_stream.size());
       impl_->output << "\nendstream\n";
       impl_->write_obj_end();
     }
   }
 
   // Write AcroForm object if present
-  if (impl_->has_acroform && !impl_->signature_fields.empty()) {
+  if (impl_->has_acroform &&
+      (!impl_->signature_fields.empty() || !impl_->form_fields.empty())) {
     impl_->write_obj_start(impl_->acroform_obj_id);
     impl_->output << "<<\n";
     impl_->output << "/Fields [";
+    bool first_field = true;
+    for (const auto& field : impl_->form_fields) {
+      if (field.page < 0 || field.page >= static_cast<int>(page_obj_ids.size())) {
+        continue;
+      }
+      if (!first_field) impl_->output << " ";
+      impl_->output << field.field_obj_id << " 0 R";
+      first_field = false;
+    }
     for (size_t i = 0; i < impl_->signature_fields.size(); ++i) {
-      if (i > 0) impl_->output << " ";
+      if (!first_field) impl_->output << " ";
       impl_->output << impl_->signature_fields[i].field_obj_id << " 0 R";
+      first_field = false;
     }
     impl_->output << "]\n";
-    impl_->output << "/SigFlags 3\n";  // SignaturesExist + AppendOnly
+    impl_->output << "/NeedAppearances true\n";
+    impl_->output << "/DA (/Helv 12 Tf 0 g)\n";
+    impl_->output << "/DR << /Font << /Helv << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>\n";
+    if (!impl_->signature_fields.empty()) {
+      impl_->output << "/SigFlags 3\n";  // SignaturesExist + AppendOnly
+    }
     impl_->output << ">>\n";
     impl_->write_obj_end();
   }
@@ -6936,20 +8172,158 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
   impl_->output << ">>\n";
   impl_->write_obj_end();
 
-  // Write Names dictionary (for attachments)
+  // Write PageLabels number tree
+  int page_labels_obj_id = 0;
+  if (!impl_->page_labels.labels.empty()) {
+    auto label_style_name = [](PageLabelStyle style) -> const char* {
+      switch (style) {
+        case PageLabelStyle::DecimalArabic:
+          return "D";
+        case PageLabelStyle::UppercaseRoman:
+          return "R";
+        case PageLabelStyle::LowercaseRoman:
+          return "r";
+        case PageLabelStyle::UppercaseLetters:
+          return "A";
+        case PageLabelStyle::LowercaseLetters:
+          return "a";
+        case PageLabelStyle::None:
+          return nullptr;
+      }
+      return nullptr;
+    };
+
+    page_labels_obj_id = impl_->allocate_obj();
+    impl_->write_obj_start(page_labels_obj_id);
+    impl_->output << "<<\n";
+    impl_->output << "/Nums [\n";
+    for (const auto& entry : impl_->page_labels.labels) {
+      const PageLabel& label = entry.second;
+      const char* style_name = label_style_name(label.style);
+      impl_->output << "  " << entry.first << " <<\n";
+      if (style_name) {
+        impl_->output << "    /S /" << style_name << "\n";
+      }
+      if (!label.prefix.empty()) {
+        impl_->output << "    /P "
+                      << impl_->format_pdf_string(label.prefix) << "\n";
+      }
+      if (label.start_value > 1) {
+        impl_->output << "    /St " << label.start_value << "\n";
+      }
+      impl_->output << "  >>\n";
+    }
+    impl_->output << "]\n";
+    impl_->output << ">>\n";
+    impl_->write_obj_end();
+  }
+
+  // Write XMP metadata stream
+  int metadata_obj_id = 0;
+  if (!impl_->xmp_metadata_xml.empty()) {
+    metadata_obj_id = impl_->allocate_obj();
+    impl_->write_obj_start(metadata_obj_id);
+    impl_->output << "<<\n";
+    impl_->output << "/Type /Metadata\n";
+    impl_->output << "/Subtype /XML\n";
+    impl_->output << "/Length " << impl_->xmp_metadata_xml.size() << "\n";
+    impl_->output << ">>\n";
+    impl_->output << "stream\n";
+    impl_->output.write(
+        impl_->xmp_metadata_xml.data(),
+        static_cast<std::streamsize>(impl_->xmp_metadata_xml.size()));
+    impl_->output << "\nendstream\n";
+    impl_->write_obj_end();
+  }
+
+  // Write OutputIntents and ICC profile streams
+  std::vector<int> output_intent_obj_ids;
+  for (const auto& output_intent : impl_->output_intents) {
+    int profile_obj_id = impl_->allocate_obj();
+    int output_intent_obj_id = impl_->allocate_obj();
+
+    impl_->write_obj_start(profile_obj_id);
+    impl_->output << "<<\n";
+    impl_->output << "/N " << output_intent.color_components << "\n";
+    impl_->output << "/Length " << output_intent.dest_output_profile.size() << "\n";
+    impl_->output << ">>\n";
+    impl_->output << "stream\n";
+    if (!output_intent.dest_output_profile.empty()) {
+      impl_->output.write(
+          reinterpret_cast<const char*>(output_intent.dest_output_profile.data()),
+          static_cast<std::streamsize>(output_intent.dest_output_profile.size()));
+    }
+    impl_->output << "\nendstream\n";
+    impl_->write_obj_end();
+
+    impl_->write_obj_start(output_intent_obj_id);
+    impl_->output << "<<\n";
+    impl_->output << "/Type /OutputIntent\n";
+    impl_->output << "/S /" << output_intent.subtype << "\n";
+    if (!output_intent.output_condition.empty()) {
+      impl_->output << "/OutputCondition "
+                    << impl_->format_pdf_string(output_intent.output_condition)
+                    << "\n";
+    }
+    if (!output_intent.output_condition_id.empty()) {
+      impl_->output << "/OutputConditionIdentifier "
+                    << impl_->format_pdf_string(output_intent.output_condition_id)
+                    << "\n";
+    }
+    if (!output_intent.registry_name.empty()) {
+      impl_->output << "/RegistryName "
+                    << impl_->format_pdf_string(output_intent.registry_name)
+                    << "\n";
+    }
+    if (!output_intent.info.empty()) {
+      impl_->output << "/Info "
+                    << impl_->format_pdf_string(output_intent.info)
+                    << "\n";
+    }
+    impl_->output << "/DestOutputProfile " << profile_obj_id << " 0 R\n";
+    impl_->output << ">>\n";
+    impl_->write_obj_end();
+    output_intent_obj_ids.push_back(output_intent_obj_id);
+  }
+
+  // Write Names dictionary (for attachments and named destinations)
   int names_obj_id = 0;
-  if (!impl_->attachments.empty()) {
+  if (!impl_->attachments.empty() || !impl_->named_destinations.empty()) {
     names_obj_id = impl_->allocate_obj();
     impl_->write_obj_start(names_obj_id);
     impl_->output << "<<\n";
-    impl_->output << "/EmbeddedFiles <<\n";
-    impl_->output << "  /Names [\n";
-    for (const auto& att : impl_->attachments) {
-      impl_->output << "    (" << escape_pdf_string(att.filename) << ") "
-                    << att.filespec_obj_id << " 0 R\n";
+    if (!impl_->attachments.empty()) {
+      impl_->output << "/EmbeddedFiles <<\n";
+      impl_->output << "  /Names [\n";
+      for (const auto& att : impl_->attachments) {
+        impl_->output << "    " << impl_->format_pdf_string(att.filename) << " "
+                      << att.filespec_obj_id << " 0 R\n";
+      }
+      impl_->output << "  ]\n";
+      impl_->output << ">>\n";
     }
-    impl_->output << "  ]\n";
-    impl_->output << ">>\n";
+    if (!impl_->named_destinations.empty()) {
+      impl_->output << "/Dests <<\n";
+      impl_->output << "  /Names [\n";
+      for (const auto& entry : impl_->named_destinations) {
+        const NamedDestination& dest = entry.second;
+        std::string fit_type = dest.fit_type.empty() ? "Fit" : dest.fit_type;
+
+        if (dest.page_number >= page_obj_ids.size()) {
+          result.error = "Named destination page index out of range";
+          return result;
+        }
+
+        impl_->output << "    " << impl_->format_pdf_string(entry.first) << " ["
+                      << page_obj_ids[dest.page_number] << " 0 R /" << fit_type;
+        for (double value : dest.position) {
+          impl_->output << " " << format_number(value);
+        }
+        impl_->output << "]\n";
+      }
+      impl_->output << "  ]\n";
+      impl_->output << ">>\n";
+    }
     impl_->output << ">>\n";
     impl_->write_obj_end();
   }
@@ -6974,6 +8348,7 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
 
     // List layers that are off by default
     bool has_off = false;
+    bool has_locked = false;
     for (const auto& layer : impl_->layers) {
       if (!layer.visible) {
         if (!has_off) {
@@ -6984,8 +8359,18 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
         }
         impl_->output << layer.obj_id << " 0 R";
       }
+      if (layer.locked) {
+        if (!has_locked) {
+          impl_->output << "  /Locked [";
+          has_locked = true;
+        } else {
+          impl_->output << " ";
+        }
+        impl_->output << layer.obj_id << " 0 R";
+      }
     }
     if (has_off) impl_->output << "]\n";
+    if (has_locked) impl_->output << "]\n";
 
     impl_->output << ">>\n";
     impl_->output << ">>\n";
@@ -6997,12 +8382,106 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
   impl_->output << "<<\n";
   impl_->output << "/Type /Catalog\n";
   impl_->output << "/Pages " << pages_id << " 0 R\n";
+  if (impl_->page_layout != PageLayout::Unset) {
+    const char* layout_name = nullptr;
+    switch (impl_->page_layout) {
+      case PageLayout::SinglePage:
+        layout_name = "SinglePage";
+        break;
+      case PageLayout::OneColumn:
+        layout_name = "OneColumn";
+        break;
+      case PageLayout::TwoColumnLeft:
+        layout_name = "TwoColumnLeft";
+        break;
+      case PageLayout::TwoColumnRight:
+        layout_name = "TwoColumnRight";
+        break;
+      case PageLayout::TwoPageLeft:
+        layout_name = "TwoPageLeft";
+        break;
+      case PageLayout::TwoPageRight:
+        layout_name = "TwoPageRight";
+        break;
+      case PageLayout::Unset:
+        break;
+    }
+    if (layout_name) {
+      impl_->output << "/PageLayout /" << layout_name << "\n";
+    }
+  }
+  if (impl_->page_mode != PageMode::Unset) {
+    const char* mode_name = nullptr;
+    switch (impl_->page_mode) {
+      case PageMode::UseNone:
+        mode_name = "UseNone";
+        break;
+      case PageMode::UseOutlines:
+        mode_name = "UseOutlines";
+        break;
+      case PageMode::UseThumbs:
+        mode_name = "UseThumbs";
+        break;
+      case PageMode::FullScreen:
+        mode_name = "FullScreen";
+        break;
+      case PageMode::UseOC:
+        mode_name = "UseOC";
+        break;
+      case PageMode::UseAttachments:
+        mode_name = "UseAttachments";
+        break;
+      case PageMode::Unset:
+        break;
+    }
+    if (mode_name) {
+      impl_->output << "/PageMode /" << mode_name << "\n";
+    }
+  }
+  if (!impl_->language.empty()) {
+    impl_->output << "/Lang " << impl_->format_pdf_string(impl_->language)
+                  << "\n";
+  }
+  if (impl_->has_mark_info) {
+    impl_->output << "/MarkInfo <<\n";
+    impl_->output << "  /Marked "
+                  << (impl_->mark_info.marked ? "true" : "false") << "\n";
+    impl_->output << "  /Suspects "
+                  << (impl_->mark_info.suspects ? "true" : "false") << "\n";
+    impl_->output << ">>\n";
+  }
+  if (impl_->has_viewer_preferences) {
+    const ViewerPreferences& prefs = impl_->viewer_preferences;
+    impl_->output << "/ViewerPreferences <<\n";
+    if (prefs.hide_toolbar) {
+      impl_->output << "  /HideToolbar true\n";
+    }
+    if (prefs.hide_menubar) {
+      impl_->output << "  /HideMenubar true\n";
+    }
+    if (prefs.hide_window_ui) {
+      impl_->output << "  /HideWindowUI true\n";
+    }
+    if (prefs.fit_window) {
+      impl_->output << "  /FitWindow true\n";
+    }
+    if (prefs.center_window) {
+      impl_->output << "  /CenterWindow true\n";
+    }
+    if (prefs.display_doc_title) {
+      impl_->output << "  /DisplayDocTitle true\n";
+    }
+    impl_->output << ">>\n";
+  }
 
   // AcroForm (for signatures and form fields)
   bool has_form_content = impl_->has_acroform &&
       (!impl_->signature_fields.empty() || !impl_->form_fields.empty());
   if (has_form_content) {
     impl_->output << "/AcroForm " << impl_->acroform_obj_id << " 0 R\n";
+  }
+  if (certification_sig_obj_id > 0) {
+    impl_->output << "/Perms << /DocMDP " << certification_sig_obj_id << " 0 R >>\n";
   }
 
   // Outlines/Bookmarks
@@ -7019,6 +8498,33 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
   if (ocproperties_obj_id > 0) {
     impl_->output << "/OCProperties " << ocproperties_obj_id << " 0 R\n";
   }
+  if (page_labels_obj_id > 0) {
+    impl_->output << "/PageLabels " << page_labels_obj_id << " 0 R\n";
+  }
+  if (metadata_obj_id > 0) {
+    impl_->output << "/Metadata " << metadata_obj_id << " 0 R\n";
+  }
+  if (!output_intent_obj_ids.empty()) {
+    impl_->output << "/OutputIntents [";
+    for (size_t i = 0; i < output_intent_obj_ids.size(); ++i) {
+      if (i > 0) {
+        impl_->output << " ";
+      }
+      impl_->output << output_intent_obj_ids[i] << " 0 R";
+    }
+    impl_->output << "]\n";
+  }
+  if (!impl_->open_action_destination_name.empty()) {
+    if (impl_->named_destinations.find(impl_->open_action_destination_name) ==
+        impl_->named_destinations.end()) {
+      result.error = "OpenAction named destination was not found";
+      return result;
+    }
+    impl_->output << "/OpenAction "
+                  << impl_->format_pdf_string(
+                         impl_->open_action_destination_name)
+                  << "\n";
+  }
 
   impl_->output << ">>\n";
   impl_->write_obj_end();
@@ -7027,26 +8533,57 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
   impl_->write_obj_start(info_id);
   impl_->output << "<<\n";
   if (!impl_->title.empty()) {
-    impl_->output << "/Title (" << escape_pdf_string(impl_->title) << ")\n";
+    impl_->output << "/Title " << impl_->format_pdf_string(impl_->title) << "\n";
   }
   if (!impl_->author.empty()) {
-    impl_->output << "/Author (" << escape_pdf_string(impl_->author) << ")\n";
+    impl_->output << "/Author " << impl_->format_pdf_string(impl_->author) << "\n";
   }
   if (!impl_->subject.empty()) {
-    impl_->output << "/Subject (" << escape_pdf_string(impl_->subject) << ")\n";
+    impl_->output << "/Subject " << impl_->format_pdf_string(impl_->subject) << "\n";
   }
   if (!impl_->keywords.empty()) {
-    impl_->output << "/Keywords (" << escape_pdf_string(impl_->keywords)
-                  << ")\n";
+    impl_->output << "/Keywords " << impl_->format_pdf_string(impl_->keywords)
+                  << "\n";
   }
-  impl_->output << "/Creator (" << escape_pdf_string(impl_->creator) << ")\n";
-  impl_->output << "/Producer (nanopdf)\n";
+  impl_->output << "/Creator " << impl_->format_pdf_string(impl_->creator) << "\n";
+  impl_->output << "/Producer " << impl_->format_pdf_string(impl_->producer) << "\n";
+  for (const auto& entry : impl_->custom_info) {
+    if (entry.first.empty()) {
+      continue;
+    }
+    if (entry.first == "Title" || entry.first == "Author" ||
+        entry.first == "Subject" || entry.first == "Keywords" ||
+        entry.first == "Creator" || entry.first == "Producer" ||
+        entry.first == "CreationDate" || entry.first == "ModDate" ||
+        entry.first == "Trapped") {
+      continue;
+    }
+    impl_->output << "/" << entry.first << " "
+                  << impl_->format_pdf_string(entry.second) << "\n";
+  }
+  if (impl_->trapped != TrappedState::Unset) {
+    const char* trapped_name = "Unknown";
+    switch (impl_->trapped) {
+      case TrappedState::False:
+        trapped_name = "False";
+        break;
+      case TrappedState::True:
+        trapped_name = "True";
+        break;
+      case TrappedState::Unknown:
+        trapped_name = "Unknown";
+        break;
+      case TrappedState::Unset:
+        break;
+    }
+    impl_->output << "/Trapped /" << trapped_name << "\n";
+  }
   std::string creation_date = impl_->creation_date.empty() ?
       get_pdf_timestamp() : impl_->creation_date;
   std::string mod_date = impl_->modification_date.empty() ?
       get_pdf_timestamp() : impl_->modification_date;
-  impl_->output << "/CreationDate (" << creation_date << ")\n";
-  impl_->output << "/ModDate (" << mod_date << ")\n";
+  impl_->output << "/CreationDate " << impl_->format_pdf_string(creation_date) << "\n";
+  impl_->output << "/ModDate " << impl_->format_pdf_string(mod_date) << "\n";
   impl_->output << ">>\n";
   impl_->write_obj_end();
 
@@ -7058,9 +8595,9 @@ WriteResult PdfWriter::write_for_signing(std::vector<uint8_t>& output,
 
     EncryptionAlgorithm algo = impl_->encryption_config.algorithm;
     if (algo == EncryptionAlgorithm::AES_256) {
-      // AES-256 (PDF 2.0 / Extension Level 3)
+      // AES-256 (revision 5, AESV3 crypt filters)
       impl_->output << "/V 5\n";
-      impl_->output << "/R 6\n";
+      impl_->output << "/R 5\n";
       impl_->output << "/Length 256\n";
       impl_->output << "/CF << /StdCF << /CFM /AESV3 /AuthEvent /DocOpen /Length 32 >> >>\n";
       impl_->output << "/StmF /StdCF\n";
@@ -7198,6 +8735,17 @@ bool PdfWriter::add_highlight_to_existing_page(int page_index,
   update.update_type = Impl::AnnotationUpdateType::AddHighlight;
   update.page_index = page_index;
   update.highlight_config = config;
+  impl_->annotation_updates.push_back(update);
+  return true;
+}
+
+bool PdfWriter::add_text_markup_to_existing_page(int page_index,
+                                                  const TextMarkupConfig& config) {
+  if (!impl_->has_existing) return false;
+  Impl::AnnotationUpdate update;
+  update.update_type = Impl::AnnotationUpdateType::AddTextMarkup;
+  update.page_index = page_index;
+  update.text_markup_config = config;
   impl_->annotation_updates.push_back(update);
   return true;
 }
