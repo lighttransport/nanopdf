@@ -52,6 +52,8 @@ typedef struct {
     const lui_canvas_ops_t *_ops;     /* backend dispatch table (NULL=software) */
     void          *_backend_state;    /* backend-owned state (BLContext, …) */
     int            _aa_mode;          /* lui_canvas_aa_mode_t (software path) */
+    float         *_aa_cov;           /* reusable AA coverage scratch (owned, kept zeroed) */
+    int            _aa_cov_cap;       /* capacity of _aa_cov in floats          */
 } lui_canvas_t;
 
 /**

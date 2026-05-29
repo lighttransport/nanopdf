@@ -2126,20 +2126,15 @@ Result SwCanvas::draw(bool clear_first) {
   // expects ABGR byte order (R,G,B,A in memory) — lui_canvas writes ARGB
   // (B,G,R,A in memory). PDF backends pass ABGR8888 and read pixels back
   // expecting R,G,B,A byte order; swap R and B per pixel.
-  if (cs_ == ColorSpace::ABGR8888 || cs_ == ColorSpace::ABGR8888S) {
+  if (output_swizzle_enabled_ &&
+      (cs_ == ColorSpace::ABGR8888 || cs_ == ColorSpace::ABGR8888S)) {
     uint32_t* pix = surface_.pixels;
     int n = surface_.height * surface_.stride;
     for (int i = 0; i < n; ++i) {
       uint32_t p = pix[i];
-      uint8_t a = static_cast<uint8_t>((p >> 24) & 0xff);
-      uint8_t r = static_cast<uint8_t>((p >> 16) & 0xff);
-      uint8_t g = static_cast<uint8_t>((p >> 8) & 0xff);
-      uint8_t b = static_cast<uint8_t>(p & 0xff);
-      // Repack as 0xAA BB GG RR (ABGR8888 word).
-      pix[i] = (static_cast<uint32_t>(a) << 24) |
-               (static_cast<uint32_t>(b) << 16) |
-               (static_cast<uint32_t>(g) << 8) |
-               static_cast<uint32_t>(r);
+      // Repack ARGB word 0xAARRGGBB as ABGR word 0xAABBGGRR.
+      pix[i] = (p & 0xff00ff00u) | ((p & 0x00ff0000u) >> 16) |
+               ((p & 0x000000ffu) << 16);
     }
   }
   return Result::Success;

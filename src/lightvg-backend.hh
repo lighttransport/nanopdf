@@ -66,6 +66,9 @@ public:
   void set_render_result_pixels_enabled(bool enabled) override {
     result_pixels_enabled_ = enabled;
   }
+  void set_direct_bgra_output_enabled(bool enabled) override {
+    direct_bgra_output_enabled_ = enabled;
+  }
 
   BackendKind kind() const override { return BackendKind::LightVG; }
 
@@ -239,22 +242,32 @@ private:
     // ttf_parse context for kerning lookup (supports GPOS kerning)
     bool has_ttf_parse{false};
     ttf_font_t ttf{};                 // Zero-init POD; only read when has_ttf_parse is true
+
+    // Small integer id assigned at load time, used as the glyph-cache key
+    // instead of the font name so per-glyph cache probes avoid string hashing.
+    int font_id{0};
+
+    // Lazily-filled glyph advance memo (font units, indexed by glyph id).
+    // Sentinel -1 = not yet computed. Dedupes repeated ttf_hmtx_advance walks
+    // across the measure and draw passes for hot glyphs.
+    std::vector<int16_t> advance_cache;
   };
 
-  // Glyph outline cache key: font_name + glyph_id.
+  // Glyph outline cache key: font_id + glyph_id.
   // Caches decomposed vector outlines so rotated/stroked/clipped text
-  // reuses the outline without re-parsing the sfnt tables.
+  // reuses the outline without re-parsing the sfnt tables. Keyed on the
+  // interned integer font id (not the name) to keep per-glyph probes cheap.
   struct GlyphOutlineKey {
-    std::string font_name;
+    int font_id;
     int glyph_id;
     bool operator==(const GlyphOutlineKey& o) const {
-      return font_name == o.font_name && glyph_id == o.glyph_id;
+      return font_id == o.font_id && glyph_id == o.glyph_id;
     }
   };
 
   struct GlyphOutlineKeyHash {
     size_t operator()(const GlyphOutlineKey& k) const {
-      size_t h = std::hash<std::string>{}(k.font_name);
+      size_t h = std::hash<int>{}(k.font_id);
       h ^= std::hash<int>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
       return h;
     }
@@ -267,21 +280,21 @@ private:
     int16_t x_min{0}, y_min{0}, x_max{0}, y_max{0};
   };
 
-  // Glyph bitmap cache key: font_name + glyph_id + quantized_size + lcd flag
+  // Glyph bitmap cache key: font_id + glyph_id + quantized_size + lcd flag
   struct GlyphBitmapKey {
-    std::string font_name;
+    int font_id;
     int glyph_id;
     uint16_t size_q;  // size * 4, quantized to quarter-pixel
     bool lcd{false};  // LCD subpixel mode
     bool operator==(const GlyphBitmapKey& o) const {
-      return font_name == o.font_name && glyph_id == o.glyph_id &&
+      return font_id == o.font_id && glyph_id == o.glyph_id &&
              size_q == o.size_q && lcd == o.lcd;
     }
   };
 
   struct GlyphBitmapKeyHash {
     size_t operator()(const GlyphBitmapKey& k) const {
-      size_t h = std::hash<std::string>{}(k.font_name);
+      size_t h = std::hash<int>{}(k.font_id);
       h ^= std::hash<int>{}(k.glyph_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
       h ^= std::hash<uint16_t>{}(k.size_q) + 0x9e3779b9 + (h << 6) + (h >> 2);
       h ^= std::hash<bool>{}(k.lcd) + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -334,6 +347,18 @@ private:
 
   // Get font cache entry
   FontCache* get_font(const std::string& font_name);
+
+  // Stable per-document identity key for a font, used as the cache key instead
+  // of the page-local resource name (which collides across pages: the same
+  // name like "TT3" can refer to different embedded fonts on different pages).
+  // Returns "E<obj>_<gen>" for embedded fonts (the font-file stream object id),
+  // "F<base_font>" for non-embedded fonts, or "" when no stable identity is
+  // available (caller then falls back to the resource name).
+  std::string font_cache_key(const BaseFont* font) const;
+
+  // Memoized horizontal advance (font units) for a glyph, backed by
+  // FontCache::advance_cache. Falls back to ttf_hmtx_advance on a miss.
+  uint16_t glyph_advance_units(FontCache* font, uint16_t gid);
 
   // Calculate text width using font metrics (returns width in text space units)
   float calculate_text_width(const std::string& text, float font_size);
@@ -409,6 +434,16 @@ private:
   // Font cache - maps font names to loaded font data
   std::map<std::string, FontCache> font_cache_;
 
+  // Sequential id source for FontCache::font_id (0 is reserved/unset).
+  int next_font_id_{1};
+
+  // Single-slot memo for get_font(): the text hot path resolves the current
+  // font several times per glyph, so cache the last successful {name -> ptr}
+  // lookup. std::map node addresses are stable across inserts, so the pointer
+  // stays valid as later fonts load. Only successful lookups are memoized.
+  std::string memo_font_name_;
+  FontCache* memo_font_ptr_{nullptr};
+
   // Glyph outline vector cache for rotated/stroked/clipped text.
   // Avoids re-parsing sfnt tables and re-decomposing outlines per frame.
   std::unordered_map<GlyphOutlineKey, GlyphOutlineEntry, GlyphOutlineKeyHash>
@@ -431,6 +466,8 @@ private:
   RenderProgressConfig progress_config_;
   RenderProgressState progress_;
   bool result_pixels_enabled_{true};
+  bool clear_canvas_on_draw_{true};
+  bool direct_bgra_output_enabled_{false};
 
   // Form XObject resource stack for nested Form XObjects
   // Each entry contains resources from a Form XObject

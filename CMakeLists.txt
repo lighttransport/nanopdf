@@ -16,6 +16,9 @@ option(NANOPDF_USE_LIGHTVG "Use lightui VG software rasterizer (default backend)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
 option(NANOPDF_USE_LIBTIFF "Use libtiff for CCITT/Fax decoding" OFF)
+option(NANOPDF_USE_FPNGE "Use fpnge for fast PNG encoding when available (AVX2/SSE4.1/SSE2; SSE2->WASM SIMD)" ON)
+option(NANOPDF_WASM_SIMD "Enable WASM SIMD128 (lets the SSE2 fpnge path map onto wasm-simd)" OFF)
+option(NANOPDF_USE_LIBDEFLATE "Use libdeflate as the fast path for FlateDecode (zlib) decompression" ON)
 option(NANOPDF_C_USE_CPP_IMAGE_BRIDGE "Enable the C API stream decoder bridge to the C++ JPX/JBIG2 decoders" OFF)
 option(NANOPDF_EXTERNAL_FONTS "Load fonts from external files instead of embedding" OFF)
 option(NANOPDF_NO_EXCEPTIONS "Build without C++ exceptions (-fno-exceptions / /EHs-c-)" ON)
@@ -98,6 +101,14 @@ if(NANOPDF_BUILD_WASM)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s MODULARIZE=1 -s EXPORT_ES6=1")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','stringToNewUTF8','UTF8ToString'] -s EXPORTED_FUNCTIONS=['_malloc','_free']")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s USE_ZLIB=1")
+
+  # WASM SIMD128: enables the SSE2 fpnge path (Emscripten lowers SSE2 intrinsics
+  # to wasm-simd). Applied globally so the whole module can use SIMD.
+  if(NANOPDF_WASM_SIMD)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msimd128")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msimd128")
+    message(STATUS "WASM SIMD128 enabled")
+  endif()
 endif()
 
 # [ccache]
@@ -381,6 +392,70 @@ if (NANOPDF_USE_LIGHTVG)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightui_vg/src/internal
   )
   target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_LIGHTVG")
+endif ()
+
+# --- fpnge: fast PNG encoder with runtime ISA dispatch -----------------------
+# fpnge.cc is SIMD-abstracted; it is compiled once per ISA (AVX2 / SSE4.1 /
+# pure-SSE2) and a baseline dispatcher picks the best available path at runtime.
+# NANOPDF_FPNGE_HAVE_* tell the dispatcher which TUs exist.
+#  * Native GCC/Clang on x86: all three paths.
+#  * WASM with SIMD: only the SSE2 path — Emscripten lowers its SSE2 intrinsics
+#    to wasm-simd128; SSE4.1-specific ops and 256-bit AVX2 have no wasm mapping.
+# Elsewhere (or WASM without SIMD) fpnge is off and callers fall back to
+# stb_image_write+miniz.
+set(FPNGE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/fpnge)
+set(FPNGE_AVX2_SRC     ${FPNGE_DIR}/fpnge_avx2.cc)
+set(FPNGE_SSE41_SRC    ${FPNGE_DIR}/fpnge_sse41.cc)
+set(FPNGE_SSE2_SRC     ${FPNGE_DIR}/fpnge_sse2.cc)
+set(FPNGE_DISPATCH_SRC ${FPNGE_DIR}/fpnge_dispatch.cc)
+
+if(NANOPDF_USE_FPNGE AND NANOPDF_BUILD_WASM AND NANOPDF_WASM_SIMD)
+  # WASM SIMD: SSE2 path only.
+  target_sources(${BUILD_TARGET} PRIVATE ${FPNGE_SSE2_SRC} ${FPNGE_DISPATCH_SRC})
+  set_source_files_properties(${FPNGE_SSE2_SRC} PROPERTIES
+    COMPILE_OPTIONS "-msimd128;-msse2")
+  target_include_directories(${BUILD_TARGET} PRIVATE ${FPNGE_DIR})
+  target_compile_definitions(${BUILD_TARGET} PRIVATE
+    "NANOPDF_USE_FPNGE" "NANOPDF_FPNGE_HAVE_SSE2")
+  message(STATUS "fpnge PNG encoder enabled for WASM (SSE2 -> wasm-simd128)")
+elseif(NANOPDF_USE_FPNGE AND NOT NANOPDF_BUILD_WASM AND
+       (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang") AND
+       (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|i[3-6]86|x86"))
+  target_sources(${BUILD_TARGET} PRIVATE
+    ${FPNGE_AVX2_SRC} ${FPNGE_SSE41_SRC} ${FPNGE_SSE2_SRC} ${FPNGE_DISPATCH_SRC})
+  # Per-ISA flags: each encoder TU only ever runs after a matching CPU probe.
+  set_source_files_properties(${FPNGE_AVX2_SRC} PROPERTIES
+    COMPILE_OPTIONS "-mavx2;-mbmi2;-mpclmul")
+  set_source_files_properties(${FPNGE_SSE41_SRC} PROPERTIES
+    COMPILE_OPTIONS "-msse4.1;-mssse3;-mpclmul")
+  # Pure SSE2: explicitly disable everything above SSE2 so this object stays
+  # runnable on the oldest x86-64 hardware even under a global -march=native.
+  set_source_files_properties(${FPNGE_SSE2_SRC} PROPERTIES
+    COMPILE_OPTIONS "-msse2;-mno-ssse3;-mno-sse4.1;-mno-avx;-mno-avx2;-mno-pclmul")
+  target_include_directories(${BUILD_TARGET} PRIVATE ${FPNGE_DIR})
+  target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_FPNGE"
+    "NANOPDF_FPNGE_HAVE_AVX2" "NANOPDF_FPNGE_HAVE_SSE41" "NANOPDF_FPNGE_HAVE_SSE2")
+  message(STATUS "fpnge PNG encoder enabled (AVX2 + SSE4.1 + pure-SSE2 runtime dispatch)")
+endif ()
+
+# --- libdeflate: fast path for FlateDecode (zlib) decompression --------------
+# Only the decompression translation units are built; libdeflate does its own
+# runtime ISA dispatch internally. Portable C (incl. WASM), with a generic
+# scalar fallback, so no per-file ISA flags are needed. decode_flate() uses it
+# as a fast path and falls back to the existing miniz/zlib inflate on any
+# error (libdeflate is stricter about malformed/streaming zlib than zlib).
+if(NANOPDF_USE_LIBDEFLATE)
+  set(LIBDEFLATE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/libdeflate)
+  target_sources(${BUILD_TARGET} PRIVATE
+    ${LIBDEFLATE_DIR}/lib/zlib_decompress.c
+    ${LIBDEFLATE_DIR}/lib/deflate_decompress.c
+    ${LIBDEFLATE_DIR}/lib/adler32.c
+    ${LIBDEFLATE_DIR}/lib/utils.c
+    ${LIBDEFLATE_DIR}/lib/x86/cpu_features.c
+    ${LIBDEFLATE_DIR}/lib/arm/cpu_features.c)
+  target_include_directories(${BUILD_TARGET} PRIVATE ${LIBDEFLATE_DIR})
+  target_compile_definitions(${BUILD_TARGET} PRIVATE "NANOPDF_USE_LIBDEFLATE")
+  message(STATUS "libdeflate FlateDecode fast path enabled")
 endif ()
 
 if (NANOPDF_USE_THORVG)

@@ -453,6 +453,7 @@ class SwCanvas {
   Result add(Paint* p);
   Result draw(bool clear);
   Result sync();
+  void setOutputSwizzle(bool enabled) { output_swizzle_enabled_ = enabled; }
 
   // Returns the wrapped surface (for direct pixel access).
   lui_surface_t* surface() { return &surface_; }
@@ -466,6 +467,7 @@ class SwCanvas {
   lui_canvas_t  canvas_{};
   bool          have_canvas_{false};
   ColorSpace    cs_{ColorSpace::ABGR8888};
+  bool          output_swizzle_enabled_{true};
 };
 
 // ---------------------------------------------------------------------------

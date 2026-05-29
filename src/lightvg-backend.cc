@@ -5,7 +5,10 @@
 
 #include "lightvg-backend.hh"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string_view>
@@ -17,6 +20,9 @@
 #include "font-unicode-map.hh"
 #include "shared-font-cache.hh"
 #include "render-cache.hh"
+#ifdef NANOPDF_USE_FPNGE
+#include "fpnge/fpnge_dispatch.hh"
+#endif
 #include "pdf-function.hh"
 #include "string-parse.hh"
 
@@ -37,6 +43,144 @@ extern "C" int stbi_write_png_compression_level;
 namespace nanopdf {
 
 static constexpr size_t kMaxCachedArgbImageBytes = 16 * 1024 * 1024;
+
+// Glyph anti-aliasing gamma table: pow(i/255, 1.4) for i in [0,255].
+// Tabulates the transcendental used on every glyph coverage sample; callers
+// keep the surrounding `* a + 0.5f` / `* 255.0f + 0.5f` arithmetic so the
+// result is identical to the previous std::pow() code.
+static const std::array<float, 256>& glyph_gamma_lut() {
+  static const std::array<float, 256> kLut = [] {
+    std::array<float, 256> t{};
+    for (int i = 0; i < 256; ++i) {
+      t[i] = std::pow(static_cast<float>(i) / 255.0f, 1.4f);
+    }
+    return t;
+  }();
+  return kLut;
+}
+
+static uint32_t pack_argb32(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  return (static_cast<uint32_t>(a) << 24) |
+         (static_cast<uint32_t>(r) << 16) |
+         (static_cast<uint32_t>(g) << 8) |
+         static_cast<uint32_t>(b);
+}
+
+static bool bgra_pixels_equal(const uint8_t* a, const uint8_t* b) {
+  uint32_t pa, pb;
+  std::memcpy(&pa, a, sizeof(pa));
+  std::memcpy(&pb, b, sizeof(pb));
+  return pa == pb;
+}
+
+struct BufferedFileWriter {
+  explicit BufferedFileWriter(FILE* file) : file(file) {}
+
+  ~BufferedFileWriter() { flush(); }
+
+  bool write(const void* data, size_t size) {
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    while (size > 0) {
+      size_t avail = sizeof(buffer) - used;
+      if (avail == 0) {
+        if (!flush()) return false;
+        avail = sizeof(buffer);
+      }
+      size_t n = std::min(avail, size);
+      std::memcpy(buffer + used, src, n);
+      used += n;
+      src += n;
+      size -= n;
+    }
+    return true;
+  }
+
+  bool write1(uint8_t v) { return write(&v, 1); }
+  bool write4(const uint8_t* v) { return write(v, 4); }
+
+  bool flush() {
+    if (used == 0) return ok;
+    if (!ok || !file) return false;
+    ok = std::fwrite(buffer, 1, used, file) == used;
+    used = 0;
+    return ok;
+  }
+
+  FILE* file{nullptr};
+  uint8_t buffer[64 * 1024]{};
+  size_t used{0};
+  bool ok{true};
+};
+
+static bool write_tga_bgra_rle(const std::string& filename, int width,
+                               int height, const uint8_t* bgra) {
+  if (width <= 0 || height <= 0 || !bgra || width > 65535 ||
+      height > 65535) {
+    return false;
+  }
+
+  FILE* file = std::fopen(filename.c_str(), "wb");
+  if (!file) return false;
+  BufferedFileWriter writer(file);
+
+  uint8_t header[18] = {
+      0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      static_cast<uint8_t>(width & 0xff),
+      static_cast<uint8_t>((width >> 8) & 0xff),
+      static_cast<uint8_t>(height & 0xff),
+      static_cast<uint8_t>((height >> 8) & 0xff),
+      32, 8};
+
+  bool ok = writer.write(header, sizeof(header));
+  for (int y = height - 1; ok && y >= 0; --y) {
+    const uint8_t* row =
+        bgra + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+    for (int x = 0, len = 0; ok && x < width; x += len) {
+      const uint8_t* begin = row + static_cast<size_t>(x) * 4;
+      bool diff = true;
+      len = 1;
+
+      if (x < width - 1) {
+        ++len;
+        diff = !bgra_pixels_equal(begin, row + static_cast<size_t>(x + 1) * 4);
+        if (diff) {
+          const uint8_t* prev = begin;
+          for (int k = x + 2; k < width && len < 128; ++k) {
+            const uint8_t* px = row + static_cast<size_t>(k) * 4;
+            if (!bgra_pixels_equal(prev, px)) {
+              prev = px;
+              ++len;
+            } else {
+              --len;
+              break;
+            }
+          }
+        } else {
+          for (int k = x + 2; k < width && len < 128; ++k) {
+            if (bgra_pixels_equal(begin, row + static_cast<size_t>(k) * 4)) {
+              ++len;
+            } else {
+              break;
+            }
+          }
+        }
+      }
+
+      if (diff) {
+        ok = writer.write1(static_cast<uint8_t>(len - 1)) &&
+             writer.write(begin, static_cast<size_t>(len) * 4);
+      } else {
+        ok = writer.write1(static_cast<uint8_t>(len - 129)) &&
+             writer.write4(begin);
+      }
+    }
+  }
+
+  ok = writer.flush() && ok;
+  ok = (std::fclose(file) == 0) && ok;
+  writer.file = nullptr;
+  return ok;
+}
 
 static uint64_t fnv1a64(const void* data, size_t len) {
   const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -1502,10 +1646,16 @@ bool LightVGBackend::end_scene() {
   }
   scene_ = nullptr;
 
-  // Draw the canvas (with clear=true to clear the buffer first)
-  if (canvas_->draw(true) != lvg::Result::Success) {
+  // Draw the canvas. Opaque page backgrounds can pre-fill the target buffer
+  // and skip LightVG's transparent clear pass.
+  const bool clear_canvas = clear_canvas_on_draw_;
+  clear_canvas_on_draw_ = true;
+  canvas_->setOutputSwizzle(!direct_bgra_output_enabled_);
+  if (canvas_->draw(clear_canvas) != lvg::Result::Success) {
+    canvas_->setOutputSwizzle(true);
     return false;
   }
+  canvas_->setOutputSwizzle(true);
 
   // Sync drawing
   if (canvas_->sync() != lvg::Result::Success) {
@@ -1898,7 +2048,7 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
             if (fgid == 0 && lookup != char_code) {
               fgid = ttf_cmap_lookup(&font->ttf, char_code);
             }
-            uint16_t fadv_units = ttf_hmtx_advance(&font->ttf, fgid);
+            uint16_t fadv_units = glyph_advance_units(font, fgid);
             uint16_t upem = font->ttf.units_per_em ? font->ttf.units_per_em : 1000;
             adv = (static_cast<float>(fadv_units) / upem) * size + tc_canvas;
           } else {
@@ -1924,7 +2074,7 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
       int advance_width = 0;
       if (font->has_ttf_parse) {
         gid = ttf_cmap_lookup(&font->ttf, codepoint);
-        advance_width = ttf_hmtx_advance(&font->ttf, gid);
+        advance_width = glyph_advance_units(font, gid);
       } else {
         int lsb;
         stbtt_GetCodepointHMetrics(&font->font_info,
@@ -2687,11 +2837,76 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
 }
 
 LightVGBackend::FontCache* LightVGBackend::get_font(const std::string& font_name) {
+  // Hot path: the same font is resolved many times per glyph. Short-circuit
+  // on the last successful lookup to skip the std::map string-compare walk.
+  if (memo_font_ptr_ && font_name == memo_font_name_) {
+    return memo_font_ptr_;
+  }
   auto it = font_cache_.find(font_name);
   if (it != font_cache_.end() && it->second.initialized) {
+    // Assign a stable integer id on first resolution; used as the glyph-cache
+    // key so per-glyph probes never hash the font name string.
+    if (it->second.font_id == 0) {
+      it->second.font_id = next_font_id_++;
+    }
+    memo_font_name_ = font_name;
+    memo_font_ptr_ = &it->second;
     return &it->second;
   }
   return nullptr;
+}
+
+std::string LightVGBackend::font_cache_key(const BaseFont* font) const {
+  if (!font) return std::string();
+  // Type0 fonts carry the embedded program in the descendant CIDFont's
+  // descriptor, not on the Type0 font itself.
+  const FontDescriptor* desc = font->descriptor;
+  if (!desc) {
+    const Type0Font* t0 = as_type0_font(font);
+    if (t0 && t0->descendant_font && t0->descendant_font->descriptor) {
+      desc = t0->descendant_font->descriptor;
+    }
+  }
+  if (desc && desc->font_file.type != Value::UNDEFINED &&
+      desc->font_file.type != Value::NULL_OBJ) {
+    // Embedded font: the font-file stream's object id is a per-document stable,
+    // collision-free identity. (Indirect refs carry the object number; for the
+    // rare direct/inline stream, fall through to the program length + name.)
+    if (desc->font_file.ref_object_number != 0) {
+      return "E" + std::to_string(desc->font_file.ref_object_number) + "_" +
+             std::to_string(desc->font_file.ref_generation_number);
+    }
+    return "EL" + std::to_string(desc->font_file_length) + ":" + font->base_font;
+  }
+  // Non-embedded font: substitution is driven by the PostScript base name, so
+  // the same base name maps to the same substitute — a safe shared identity.
+  if (!font->base_font.empty()) return "F" + font->base_font;
+  return std::string();
+}
+
+uint16_t LightVGBackend::glyph_advance_units(FontCache* font, uint16_t gid) {
+  if (!font || !font->has_ttf_parse) {
+    return 0;
+  }
+  int n = font->ttf.num_glyphs;
+  // Only memoize when the glyph id is within the known glyph count; otherwise
+  // fall back to a direct lookup (defensive against malformed gids).
+  if (n <= 0 || gid >= static_cast<uint16_t>(n)) {
+    return ttf_hmtx_advance(&font->ttf, gid);
+  }
+  if (font->advance_cache.empty()) {
+    font->advance_cache.assign(static_cast<size_t>(n), -1);
+  }
+  int16_t cached = font->advance_cache[gid];
+  if (cached >= 0) {
+    return static_cast<uint16_t>(cached);
+  }
+  uint16_t adv = ttf_hmtx_advance(&font->ttf, gid);
+  // Advances comfortably fit in int16_t for any real font (units_per_em is
+  // typically 1000/2048); clamp the sentinel range just in case.
+  font->advance_cache[gid] =
+      static_cast<int16_t>(adv > 0x7FFF ? 0x7FFF : adv);
+  return adv;
 }
 
 float LightVGBackend::calculate_text_width(const std::string& text, float font_size) {
@@ -2736,7 +2951,7 @@ float LightVGBackend::calculate_text_width(const std::string& text, float font_s
             fgid = ttf_cmap_lookup(&fc->ttf, char_code);
           }
           if (fgid != 0) {
-            uint16_t fadv_units = ttf_hmtx_advance(&fc->ttf, fgid);
+            uint16_t fadv_units = glyph_advance_units(fc, fgid);
             uint16_t upem = fc->ttf.units_per_em ? fc->ttf.units_per_em : 1000;
             width += (static_cast<float>(fadv_units) / upem) * font_size;
             used_ttf = true;
@@ -2799,7 +3014,7 @@ float LightVGBackend::calculate_text_width(const std::string& text, float font_s
         int gid = type0_font->cid_to_gid_map[char_code];
         int advance_width = 0;
         if (font->has_ttf_parse) {
-          advance_width = ttf_hmtx_advance(&font->ttf, static_cast<uint16_t>(gid));
+          advance_width = glyph_advance_units(font, static_cast<uint16_t>(gid));
         } else {
           int lsb;
           stbtt_GetGlyphHMetrics(&font->font_info, gid, &advance_width, &lsb);
@@ -2818,7 +3033,7 @@ float LightVGBackend::calculate_text_width(const std::string& text, float font_s
     int advance_width = 0;
     if (font->has_ttf_parse) {
       uint16_t g = ttf_cmap_lookup(&font->ttf, codepoint);
-      advance_width = ttf_hmtx_advance(&font->ttf, g);
+      advance_width = glyph_advance_units(font, g);
     } else {
       int lsb;
       stbtt_GetCodepointHMetrics(&font->font_info,
@@ -2882,7 +3097,7 @@ float LightVGBackend::calculate_text_advance_draw_model(const std::string& text,
         if (fgid == 0 && lookup != char_code) {
           fgid = ttf_cmap_lookup(&font->ttf, char_code);
         }
-        uint16_t fadv_units = ttf_hmtx_advance(&font->ttf, fgid);
+        uint16_t fadv_units = glyph_advance_units(font, fgid);
         uint16_t upem = font->ttf.units_per_em ? font->ttf.units_per_em : 1000;
         adv = (static_cast<float>(fadv_units) / upem) * font_size;
       } else {
@@ -2915,7 +3130,7 @@ float LightVGBackend::calculate_text_advance_draw_model(const std::string& text,
       int adv_units = 0;
       if (font->has_ttf_parse) {
         uint16_t gid = ttf_cmap_lookup(&font->ttf, codepoint);
-        adv_units = ttf_hmtx_advance(&font->ttf, gid);
+        adv_units = glyph_advance_units(font, gid);
       } else {
         int lsb = 0;
         stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(codepoint),
@@ -5767,7 +5982,7 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   // --- Glyph outline vector cache ---
   // Caches deeply parsed ttf_outline_t data so that rotated / stroked / clipped
   // text reuses the outline without re-parsing sfnt tables (ttf_glyph_outline).
-  GlyphOutlineKey cache_key{current_font_name_, static_cast<int>(gid)};
+  GlyphOutlineKey cache_key{font->font_id, static_cast<int>(gid)};
   auto cache_it = glyph_outline_cache_.find(cache_key);
   bool outline_from_cache = (cache_it != glyph_outline_cache_.end());
 
@@ -6003,7 +6218,7 @@ bool LightVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, floa
   }
 
   // --- Glyph outline vector cache ---
-  GlyphOutlineKey cache_key{current_font_name_, glyph_index};
+  GlyphOutlineKey cache_key{font->font_id, glyph_index};
   auto cache_it = glyph_outline_cache_.find(cache_key);
   bool outline_from_cache = (cache_it != glyph_outline_cache_.end());
 
@@ -6208,7 +6423,7 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
 
   // Quantize size for cache lookup (quarter-pixel granularity)
   uint16_t size_q = static_cast<uint16_t>(size * 4.0f + 0.5f);
-  GlyphBitmapKey key{current_font_name_, glyph_index, size_q, enable_lcd_};
+  GlyphBitmapKey key{font->font_id, glyph_index, size_q, enable_lcd_};
 
   const GlyphBitmapEntry* entry = nullptr;
   auto cache_it = glyph_bitmap_cache_.find(key);
@@ -6426,11 +6641,12 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
           (static_cast<uint32_t>(b) * alpha_b / 255);
     }
   } else {
-    // Grayscale AA: single alpha per pixel, straight ARGB
+    // Grayscale AA: single alpha per pixel, straight ARGB. The 1.4 gamma curve
+    // comes from a 256-entry LUT (glyph_gamma_lut()), bit-identical to the
+    // previous std::pow(byte/255, 1.4f) but without the per-pixel transcendental.
+    const std::array<float, 256>& gamma = glyph_gamma_lut();
     for (int i = 0; i < gw * gh; i++) {
-      float normalized = entry->bitmap[i] / 255.0f;
-      float corrected = std::pow(normalized, 1.4f);
-      uint8_t alpha = static_cast<uint8_t>(corrected * a + 0.5f);
+      uint8_t alpha = static_cast<uint8_t>(gamma[entry->bitmap[i]] * a + 0.5f);
       glyph_argb_buf_[static_cast<size_t>(i)] =
           (static_cast<uint32_t>(alpha) << 24) |
           (static_cast<uint32_t>(r) << 16) |
@@ -6572,6 +6788,13 @@ bool LightVGBackend::save_to_file(const std::string& filename, const LightVGRend
   const uint8_t* pixels = nullptr;
   std::vector<uint8_t> converted_pixels;
 
+  if (options.format == LightVGRenderOptions::Format::TGA &&
+      direct_bgra_output_enabled_) {
+    return write_tga_bgra_rle(
+        filename, width, height,
+        reinterpret_cast<const uint8_t*>(buffer_.data()));
+  }
+
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
     __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
   pixels = reinterpret_cast<const uint8_t*>(buffer_.data());
@@ -6586,6 +6809,25 @@ bool LightVGBackend::save_to_file(const std::string& filename, const LightVGRend
 
   switch (options.format) {
     case LightVGRenderOptions::Format::PNG: {
+#ifdef NANOPDF_USE_FPNGE
+      // Fast path: fpnge (AVX2/SSE4.1) encodes RGBA8888 several times faster
+      // than stb's deflate. On little-endian the ABGR8888 buffer is already
+      // R,G,B,A byte order, matching fpnge's RGB channel order. Falls back to
+      // stb+miniz when no SIMD path is available or encoding fails.
+      if (nanopdf::fpnge_available()) {
+        std::vector<uint8_t> png_bytes;
+        if (nanopdf::fpnge_encode_png(pixels, width, height, /*channels=*/4,
+                                      stride, options.png_compression,
+                                      png_bytes)) {
+          std::ofstream out(filename, std::ios::binary);
+          if (out.write(reinterpret_cast<const char*>(png_bytes.data()),
+                        static_cast<std::streamsize>(png_bytes.size()))) {
+            ret = 1;
+            break;
+          }
+        }
+      }
+#endif
       stbi_write_png_compression_level = options.png_compression;
       ret = stbi_write_png(filename.c_str(), width, height, 4,
                            pixels, stride);
@@ -6795,8 +7037,19 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
                  has_explicit_progress ? options.progress_percent_step
                                        : progress_config_.percent_step);
 
-  // Draw background
-  draw_rectangle(0, 0, width_, height_, options.bg_r, options.bg_g, options.bg_b, options.bg_a);
+  // Draw background. Opaque backgrounds are a full-canvas fill, so seed the
+  // target buffer directly and skip both the transparent clear and a scene
+  // rectangle. Translucent backgrounds keep the old compositing path.
+  if (options.bg_a == 255) {
+    std::fill(buffer_.begin(), buffer_.end(),
+              pack_argb32(options.bg_r, options.bg_g, options.bg_b,
+                          options.bg_a));
+    clear_canvas_on_draw_ = false;
+  } else {
+    clear_canvas_on_draw_ = true;
+    draw_rectangle(0, 0, width_, height_, options.bg_r, options.bg_g,
+                   options.bg_b, options.bg_a);
+  }
 
   // Process content streams — concatenate per PDF §7.8.2 (streams in a
   // /Contents array are treated as one; state persists, operators can span).
@@ -6985,8 +7238,10 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
                  progress_config_.object_threshold,
                  progress_config_.percent_step);
 
-  // Draw white background
-  draw_rectangle(0, 0, width_, height_, 255, 255, 255, 255);
+  // Draw white background by seeding the target buffer directly. This avoids
+  // a transparent clear plus a full-canvas rectangle fill.
+  std::fill(buffer_.begin(), buffer_.end(), pack_argb32(255, 255, 255, 255));
+  clear_canvas_on_draw_ = false;
 
   // Parse and render page content.
   // Per PDF spec §7.8.2, when /Contents is an array, the streams must be
@@ -7996,7 +8251,12 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             auto font_it = current_page_->fonts.find(font_name);
             if (font_it != current_page_->fonts.end()) {
               current_font_ = font_it->second.get();
-              load_font(*current_pdf_, font_name, current_font_);
+              // Key the font/glyph caches by stable per-document font identity
+              // rather than the page-local resource name, which collides across
+              // pages (the same name can name different embedded fonts).
+              std::string key = font_cache_key(current_font_);
+              current_font_name_ = key.empty() ? font_name : key;
+              load_font(*current_pdf_, current_font_name_, current_font_);
             } else {
               const Value* font_value = lookup_resource("Font", font_name);
               Value resolved_font;
@@ -8012,12 +8272,15 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
               if (resolved_font.type == Value::DICTIONARY) {
                 auto parsed_font = Pdf::parse_font(*current_pdf_, resolved_font);
                 if (parsed_font) {
-                  std::string cache_name =
-                      font_name + "#resource" +
-                      std::to_string(lookup_font_owned_.size());
                   lookup_font_owned_.push_back(std::move(parsed_font));
-                  current_font_name_ = cache_name;
                   current_font_ = lookup_font_owned_.back().get();
+                  // Prefer stable font identity; fall back to a resource-scoped
+                  // name only when the font has no identifiable program/name.
+                  std::string key = font_cache_key(current_font_);
+                  current_font_name_ =
+                      key.empty() ? (font_name + "#resource" +
+                                     std::to_string(lookup_font_owned_.size()))
+                                  : key;
                   load_font(*current_pdf_, current_font_name_, current_font_);
                 }
               }

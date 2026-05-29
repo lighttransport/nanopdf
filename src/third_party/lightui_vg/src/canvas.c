@@ -325,6 +325,8 @@ void lui_canvas_init(lui_canvas_t *canvas, lui_surface_t *surface)
     canvas->_ops = NULL;           /* software fast path */
     canvas->_backend_state = NULL;
     canvas->_aa_mode = LUI_CANVAS_AA_NORMAL;
+    canvas->_aa_cov = NULL;
+    canvas->_aa_cov_cap = 0;
     lui_canvas_reset_clip(canvas);
 }
 
@@ -413,6 +415,9 @@ void lui_canvas_destroy(lui_canvas_t *canvas)
         lui__flush_polygon_batch(canvas);
     canvas->_ops = NULL;
     canvas->_backend_state = NULL;
+    free(canvas->_aa_cov);
+    canvas->_aa_cov = NULL;
+    canvas->_aa_cov_cap = 0;
 }
 
 void lui_canvas_set_clip(lui_canvas_t *canvas, const lui_rect_t *clip)
@@ -1150,8 +1155,19 @@ static void lui__fill_polygon_aa(lui_canvas_t *cv,
     if (xmax <= xmin || ymax <= ymin) return;
 
     int row_w = xmax - xmin;
-    float *cov = (float *)calloc((size_t)row_w, sizeof(float));
-    if (!cov) return;
+    /* Reuse a canvas-owned coverage buffer instead of calloc/free per fill.
+     * Text-heavy pages issue thousands of fills; the per-call allocation
+     * showed up as malloc churn + page faults in profiles. The composite
+     * loop below resets every touched cov cell to 0.0f, so the buffer stays
+     * fully zeroed between fills — only a freshly grown buffer needs zeroing. */
+    if (row_w > cv->_aa_cov_cap) {
+        float *grown = (float *)realloc(cv->_aa_cov, (size_t)row_w * sizeof(float));
+        if (!grown) return;
+        memset(grown, 0, (size_t)row_w * sizeof(float));
+        cv->_aa_cov = grown;
+        cv->_aa_cov_cap = row_w;
+    }
+    float *cov = cv->_aa_cov;
 
     /* ---- Build edge table once. Reject horizontal edges and edges
      *      fully outside the clipped y-range. ---------------------- */
@@ -1162,7 +1178,7 @@ static void lui__fill_polygon_aa(lui_canvas_t *cv,
     if (count > LUI__AA_EDGE_STACK) {
         edges_heap = (lui__edge_t *)malloc((size_t)count * sizeof(*edges));
         if (edges_heap) edges = edges_heap;
-        else { free(cov); return; }
+        else return;  /* cov is canvas-owned, freed in lui_canvas_destroy */
     }
 
     /* Forward-declare heaps so the early-out 'goto done' can free them. */
@@ -1405,7 +1421,8 @@ done:
     free(active_heap);
     free(cross_heap);
     free(edges_heap);
-    free(cov);
+    /* cov is the canvas-owned reusable buffer; it is freed in
+     * lui_canvas_destroy, not here. It is left fully zeroed by composite. */
 }
 
 

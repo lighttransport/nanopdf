@@ -24,6 +24,10 @@
 #include <zlib.h>
 #endif
 
+#ifdef NANOPDF_USE_LIBDEFLATE
+#include "libdeflate/libdeflate.h"
+#endif
+
 #include "common-macros.inc"
 #include "ccitt-decoder.hh"
 #include "crypto.hh"
@@ -1651,6 +1655,57 @@ DecodedStream decode_asciihex(const uint8_t *data, size_t size,
   return result;
 }
 
+#ifdef NANOPDF_USE_LIBDEFLATE
+namespace {
+// One reusable libdeflate decompressor per thread. libdeflate decompressors
+// are cheap to reuse across calls but not safe to share between threads, so a
+// thread_local instance fits decode_flate (which may run on multiple threads,
+// one Pdf per thread). Freed at thread exit.
+libdeflate_decompressor *get_tls_libdeflate_decompressor() {
+  struct Holder {
+    libdeflate_decompressor *d = nullptr;
+    ~Holder() {
+      if (d) libdeflate_free_decompressor(d);
+    }
+  };
+  static thread_local Holder holder;
+  if (!holder.d) holder.d = libdeflate_alloc_decompressor();
+  return holder.d;
+}
+
+// Fast path: decode a zlib stream with libdeflate, growing the output buffer
+// on INSUFFICIENT_SPACE. Returns true with the bytes in |out| on success;
+// returns false (so the caller falls back to the lenient zlib path) on any
+// libdeflate error, including streams that decompress past |max_size|.
+bool libdeflate_inflate_zlib(const uint8_t *data, size_t size, size_t max_size,
+                             std::vector<uint8_t> &out) {
+  libdeflate_decompressor *d = get_tls_libdeflate_decompressor();
+  if (!d) return false;
+  size_t cap = size * 4;
+  if (cap < 4096) cap = 4096;
+  if (cap > max_size) cap = max_size;
+  for (;;) {
+    out.resize(cap);
+    size_t actual = 0;
+    libdeflate_result r =
+        libdeflate_zlib_decompress(d, data, size, out.data(), cap, &actual);
+    if (r == LIBDEFLATE_SUCCESS) {
+      out.resize(actual);
+      return true;
+    }
+    if (r == LIBDEFLATE_INSUFFICIENT_SPACE && cap < max_size) {
+      size_t next = cap * 2;
+      if (next > max_size) next = max_size;
+      if (next == cap) return false;
+      cap = next;
+      continue;
+    }
+    return false;  // BAD_DATA, or output exceeds max_size -> use fallback
+  }
+}
+}  // namespace
+#endif  // NANOPDF_USE_LIBDEFLATE
+
 DecodedStream decode_flate(const uint8_t *data, size_t size,
                            const DecodeParams &params) {
   DecodedStream result;
@@ -1661,6 +1716,24 @@ DecodedStream decode_flate(const uint8_t *data, size_t size,
     result.kind = ErrorKind::Malformed;
     return result;
   }
+
+#ifdef NANOPDF_USE_LIBDEFLATE
+  // Fast path: libdeflate one-shot inflate. On any failure (malformed or
+  // streaming-only data that the strict decoder rejects, or output over the
+  // size cap) fall through to the lenient zlib streaming path below.
+  if (libdeflate_inflate_zlib(data, size, kMaxDecodedSize, output)) {
+    std::string predictor_error;
+    if (!apply_predictor(output, params, predictor_error)) {
+      result.error = "FlateDecode: " + predictor_error;
+      result.kind = ErrorKind::Malformed;
+      return result;
+    }
+    result.data = std::move(output);
+    result.success = true;
+    return result;
+  }
+  output.clear();
+#endif
 
   // Decompress using zlib
   z_stream strm;
@@ -6153,6 +6226,8 @@ bool Pdf::load_document_structure() {
         page.contents.push_back(contents_it->second);
       }
     }
+
+    parse_page_annotations(*this, page, dict);
 
     catalog.pages.push_back(std::move(page));
   };

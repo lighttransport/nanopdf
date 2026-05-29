@@ -415,6 +415,19 @@ static void stbiw__write3(stbi__write_context *s, unsigned char a, unsigned char
    s->buffer[n+2] = c;
 }
 
+static void stbiw__write4(stbi__write_context *s, unsigned char a, unsigned char b, unsigned char c, unsigned char d)
+{
+   int n;
+   if ((size_t)s->buf_used + 4 > sizeof(s->buffer))
+      stbiw__write_flush(s);
+   n = s->buf_used;
+   s->buf_used = n+4;
+   s->buffer[n+0] = a;
+   s->buffer[n+1] = b;
+   s->buffer[n+2] = c;
+   s->buffer[n+3] = d;
+}
+
 static void stbiw__write_pixel(stbi__write_context *s, int rgb_dir, int comp, int write_alpha, int expand_mono, unsigned char *d)
 {
    unsigned char bg[3] = { 255, 0, 255}, px[3];
@@ -463,6 +476,19 @@ static inline int stbiw__pixel_diff(const unsigned char *a, const unsigned char 
       default:
          return memcmp(a, b, comp);
    }
+}
+
+static inline int stbiw__pixel4_diff(const unsigned char *a, const unsigned char *b)
+{
+   stbiw_uint32 pa, pb;
+   memcpy(&pa, a, sizeof(pa));
+   memcpy(&pb, b, sizeof(pb));
+   return pa != pb;
+}
+
+static inline void stbiw__write_tga_pixel4(stbi__write_context *s, const unsigned char *d)
+{
+   stbiw__write4(s, d[2], d[1], d[0], d[3]);
 }
 
 static void stbiw__write_pixels(stbi__write_context *s, int rgb_dir, int vdir, int x, int y, int comp, void *data, int write_alpha, int scanline_pad, int expand_mono)
@@ -573,6 +599,59 @@ static int stbi_write_tga_core(stbi__write_context *s, int x, int y, int comp, v
          jend = -1;
          jdir = -1;
       }
+
+      if (comp == 4) {
+         for (; j != jend; j += jdir) {
+            unsigned char *row = (unsigned char *) data + j * x * 4;
+            int len;
+
+            for (i = 0; i < x; i += len) {
+               unsigned char *begin = row + (i << 2);
+               int diff = 1;
+               len = 1;
+
+               if (i < x - 1) {
+                  ++len;
+                  diff = stbiw__pixel4_diff(begin, row + ((i + 1) << 2));
+                  if (diff) {
+                     const unsigned char *prev = begin;
+                     for (k = i + 2; k < x && len < 128; ++k) {
+                        if (stbiw__pixel4_diff(prev, row + (k << 2))) {
+                           prev += 4;
+                           ++len;
+                        } else {
+                           --len;
+                           break;
+                        }
+                     }
+                  } else {
+                     for (k = i + 2; k < x && len < 128; ++k) {
+                        if (!stbiw__pixel4_diff(begin, row + (k << 2))) {
+                           ++len;
+                        } else {
+                           break;
+                        }
+                     }
+                  }
+               }
+
+               if (diff) {
+                  unsigned char header = STBIW_UCHAR(len - 1);
+                  stbiw__write1(s, header);
+                  for (k = 0; k < len; ++k) {
+                     stbiw__write_tga_pixel4(s, begin + (k << 2));
+                  }
+               } else {
+                  unsigned char header = STBIW_UCHAR(len - 129);
+                  stbiw__write1(s, header);
+                  stbiw__write_tga_pixel4(s, begin);
+               }
+            }
+         }
+         stbiw__write_flush(s);
+         return 1;
+      }
+
       for (; j != jend; j += jdir) {
          unsigned char *row = (unsigned char *) data + j * x * comp;
          int len;

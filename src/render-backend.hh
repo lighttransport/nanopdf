@@ -91,6 +91,12 @@ class RenderBackend {
     (void)enabled;
   }
 
+  // Allows a backend-specific direct-save path to keep its native BGRA byte
+  // layout when the caller will immediately save to a format that accepts it.
+  virtual void set_direct_bgra_output_enabled(bool enabled) {
+    (void)enabled;
+  }
+
   virtual void set_progress_callback(RenderProgressCallback callback,
                                      size_t object_threshold = 100,
                                      uint32_t percent_step = 1) = 0;

@@ -558,10 +558,15 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
   }
 
   const bool direct_backend_save = (options.rotation == 0 && !options.grayscale);
+  const bool direct_tga_save =
+      direct_backend_save &&
+      options.output_format == nanopdf::RenderOptions::Format::TGA;
   backend->set_render_result_pixels_enabled(!direct_backend_save);
+  backend->set_direct_bgra_output_enabled(direct_tga_save);
   auto result = backend->render_page(pdf, page);
   backend->set_render_result_pixels_enabled(true);
   if (!result.success) {
+    backend->set_direct_bgra_output_enabled(false);
     std::cerr << "Error: Failed to render page " << page_num << ": " << result.error << "\n";
     return false;
   }
@@ -613,11 +618,13 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
 
   // No post-processing needed, save directly through the selected backend.
   if (backend->save_to_file(output_file, save_options)) {
+    backend->set_direct_bgra_output_enabled(false);
     if (options.verbose) {
       std::cout << "  Saved to: " << output_file << "\n";
     }
     return true;
   } else {
+    backend->set_direct_bgra_output_enabled(false);
     std::cerr << "Error: Failed to save output file: " << output_file << "\n";
     return false;
   }
