@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <set>
 
 namespace nanopdf {
@@ -35,9 +36,83 @@ bool approx_equal(double a, double b, double tolerance) {
   return std::abs(a - b) <= tolerance;
 }
 
+TextQuad make_quad(double x, double y, double width, double height) {
+  TextQuad q;
+  q.x = x;
+  q.y = y;
+  q.width = std::max(0.0, width);
+  q.height = std::max(0.0, height);
+  q.x1 = q.x;
+  q.y1 = q.y;
+  q.x2 = q.x + q.width;
+  q.y2 = q.y;
+  q.x3 = q.x + q.width;
+  q.y3 = q.y + q.height;
+  q.x4 = q.x;
+  q.y4 = q.y + q.height;
+  return q;
+}
+
+TextQuad merge_quads(const TextQuad& a, const TextQuad& b) {
+  if (a.width <= 0.0 && a.height <= 0.0) return b;
+  if (b.width <= 0.0 && b.height <= 0.0) return a;
+
+  const double x1 = std::min(a.x, b.x);
+  const double y1 = std::min(a.y, b.y);
+  const double x2 = std::max(a.x + a.width, b.x + b.width);
+  const double y2 = std::max(a.y + a.height, b.y + b.height);
+  return make_quad(x1, y1, x2 - x1, y2 - y1);
+}
+
+bool quad_intersects_rect(const TextQuad& q, double x1, double y1, double x2, double y2) {
+  return q.x < x2 && (q.x + q.width) > x1 &&
+         q.y < y2 && (q.y + q.height) > y1;
+}
+
+std::string char_to_utf8(uint32_t unicode) {
+  std::string result;
+  if (unicode < 0x80) {
+    result += static_cast<char>(unicode);
+  } else if (unicode < 0x800) {
+    result += static_cast<char>(0xC0 | (unicode >> 6));
+    result += static_cast<char>(0x80 | (unicode & 0x3F));
+  } else if (unicode < 0x10000) {
+    result += static_cast<char>(0xE0 | (unicode >> 12));
+    result += static_cast<char>(0x80 | ((unicode >> 6) & 0x3F));
+    result += static_cast<char>(0x80 | (unicode & 0x3F));
+  } else {
+    result += static_cast<char>(0xF0 | (unicode >> 18));
+    result += static_cast<char>(0x80 | ((unicode >> 12) & 0x3F));
+    result += static_cast<char>(0x80 | ((unicode >> 6) & 0x3F));
+    result += static_cast<char>(0x80 | (unicode & 0x3F));
+  }
+  return result;
+}
+
+void apply_word_bounds(TextWord* word) {
+  if (!word || word->chars.empty()) return;
+
+  TextQuad bounds;
+  for (const auto& ch : word->chars) {
+    bounds = merge_quads(bounds, ch.quad);
+  }
+  word->x = bounds.x;
+  word->y = bounds.y;
+  word->width = bounds.width;
+  word->height = bounds.height;
+}
+
 // Sort characters by geometric position (top-to-bottom, left-to-right)
 void sort_chars_geometric(std::vector<TextChar>& chars) {
   std::sort(chars.begin(), chars.end(), [](const TextChar& a, const TextChar& b) {
+    if (a.writing_mode == TextWritingMode::Vertical &&
+        b.writing_mode == TextWritingMode::Vertical) {
+      if (!approx_equal(a.x, b.x, 2.0)) {
+        return a.x > b.x;  // CJK vertical columns usually read right to left.
+      }
+      return a.y > b.y;
+    }
+
     // First by Y (top to bottom - note PDF coords have Y increasing upward)
     if (!approx_equal(a.y, b.y, 2.0)) {
       return a.y > b.y;  // Higher Y comes first (top of page)
@@ -67,11 +142,12 @@ std::vector<std::vector<int>> group_into_lines(
     assigned[i] = true;
 
     const TextChar& seed = chars[i];
-    double baseline = seed.y;
+    double baseline = seed.writing_mode == TextWritingMode::Vertical ? seed.x : seed.y;
     double rotation = seed.rotation;
+    TextWritingMode writing_mode = seed.writing_mode;
 
     // Calculate maximum horizontal gap (use char width as reference)
-    double max_horizontal_gap = seed.width * 10.0;  // Allow up to 10 char widths gap
+    double max_gap = std::max(seed.width, seed.height) * 10.0;
 
     // Find all horizontally adjacent characters on the same baseline
     bool changed = true;
@@ -83,8 +159,14 @@ std::vector<std::vector<int>> group_into_lines(
 
         const TextChar& candidate = chars[j];
 
-        // Check baseline alignment (within tolerance)
-        if (!approx_equal(candidate.y, baseline, options.baseline_tolerance)) {
+        if (candidate.writing_mode != writing_mode) {
+          continue;
+        }
+
+        // Check baseline/column alignment (within tolerance)
+        double candidate_baseline =
+            writing_mode == TextWritingMode::Vertical ? candidate.x : candidate.y;
+        if (!approx_equal(candidate_baseline, baseline, options.baseline_tolerance)) {
           continue;
         }
 
@@ -97,11 +179,18 @@ std::vector<std::vector<int>> group_into_lines(
         bool is_adjacent = false;
         for (int idx : line) {
           const TextChar& existing = chars[idx];
-          double horizontal_gap = std::abs(candidate.x - (existing.x + existing.width));
-          double reverse_gap = std::abs(existing.x - (candidate.x + candidate.width));
-          double min_gap = std::min(horizontal_gap, reverse_gap);
+          double forward_gap = 0.0;
+          double reverse_gap = 0.0;
+          if (writing_mode == TextWritingMode::Vertical) {
+            forward_gap = std::abs(candidate.y - (existing.y - candidate.height));
+            reverse_gap = std::abs(existing.y - (candidate.y - existing.height));
+          } else {
+            forward_gap = std::abs(candidate.x - (existing.x + existing.width));
+            reverse_gap = std::abs(existing.x - (candidate.x + candidate.width));
+          }
+          double min_gap = std::min(forward_gap, reverse_gap);
 
-          if (min_gap < max_horizontal_gap) {
+          if (min_gap < max_gap) {
             is_adjacent = true;
             break;
           }
@@ -115,8 +204,12 @@ std::vector<std::vector<int>> group_into_lines(
       }
     }
 
-    // Sort line characters left-to-right (or right-to-left for RTL)
+    // Sort line characters in reading order.
     std::sort(line.begin(), line.end(), [&chars](int a, int b) {
+      if (chars[a].writing_mode == TextWritingMode::Vertical &&
+          chars[b].writing_mode == TextWritingMode::Vertical) {
+        return chars[a].y > chars[b].y;
+      }
       return chars[a].x < chars[b].x;
     });
 
@@ -137,6 +230,42 @@ int assign_reading_order(
   // Detect columns if enabled
   int num_columns = 1;
   std::vector<double> column_boundaries;
+
+  bool vertical_layout = false;
+  for (const auto& line : lines) {
+    if (line.writing_mode == TextWritingMode::Vertical) {
+      vertical_layout = true;
+      break;
+    }
+  }
+
+  if (vertical_layout) {
+    std::vector<size_t> indices(lines.size());
+    for (size_t i = 0; i < indices.size(); ++i) {
+      indices[i] = i;
+    }
+
+    std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+      if (lines[a].writing_mode != lines[b].writing_mode) {
+        return lines[a].writing_mode == TextWritingMode::Vertical;
+      }
+      if (lines[a].writing_mode == TextWritingMode::Vertical) {
+        if (!approx_equal(lines[a].x, lines[b].x, options.column_gap_threshold)) {
+          return lines[a].x > lines[b].x;
+        }
+        return lines[a].y > lines[b].y;
+      }
+      if (!approx_equal(lines[a].y, lines[b].y, options.baseline_tolerance)) {
+        return lines[a].y > lines[b].y;
+      }
+      return lines[a].x < lines[b].x;
+    });
+
+    for (size_t i = 0; i < indices.size(); ++i) {
+      lines[indices[i]].reading_order = static_cast<int>(i);
+    }
+    return static_cast<int>(indices.size());
+  }
 
   if (options.detect_columns && lines.size() > 1) {
     // Analyze horizontal gaps between lines
@@ -213,7 +342,9 @@ std::vector<TextWord> segment_into_words(
     int spacing_count = 0;
 
     for (size_t i = 1; i < line.chars.size(); ++i) {
-      double gap = line.chars[i].x - (line.chars[i-1].x + line.chars[i-1].width);
+      double gap = line.writing_mode == TextWritingMode::Vertical
+                       ? (line.chars[i - 1].y - (line.chars[i].y + line.chars[i].height))
+                       : (line.chars[i].x - (line.chars[i-1].x + line.chars[i-1].width));
       if (gap >= 0) {  // Only count positive gaps
         total_spacing += gap;
         spacing_count++;
@@ -226,6 +357,7 @@ std::vector<TextWord> segment_into_words(
     // Segment into words
     TextWord current_word;
     current_word.line_index = static_cast<int>(line_idx);
+    current_word.writing_mode = line.writing_mode;
 
     for (size_t i = 0; i < line.chars.size(); ++i) {
       const TextChar& ch = line.chars[i];
@@ -233,24 +365,21 @@ std::vector<TextWord> segment_into_words(
       // Check if we should start a new word
       if (!current_word.chars.empty()) {
         const TextChar& prev = current_word.chars.back();
-        double gap = ch.x - (prev.x + prev.width);
+        double gap = line.writing_mode == TextWritingMode::Vertical
+                         ? (prev.y - (ch.y + ch.height))
+                         : (ch.x - (prev.x + prev.width));
 
         if (gap > word_threshold || ch.unicode == ' ') {
           // Finish current word
           if (!current_word.chars.empty()) {
-            // Calculate word bounds
-            current_word.x = current_word.chars.front().x;
-            current_word.y = current_word.chars.front().y;
-            const TextChar& last = current_word.chars.back();
-            current_word.width = (last.x + last.width) - current_word.x;
-            current_word.height = current_word.chars.front().height;
-
+            apply_word_bounds(&current_word);
             words.push_back(current_word);
           }
 
           // Start new word
           current_word = TextWord();
           current_word.line_index = static_cast<int>(line_idx);
+          current_word.writing_mode = line.writing_mode;
 
           // Skip spaces
           if (ch.unicode == ' ') {
@@ -264,12 +393,7 @@ std::vector<TextWord> segment_into_words(
 
     // Add final word
     if (!current_word.chars.empty()) {
-      current_word.x = current_word.chars.front().x;
-      current_word.y = current_word.chars.front().y;
-      const TextChar& last = current_word.chars.back();
-      current_word.width = (last.x + last.width) - current_word.x;
-      current_word.height = current_word.chars.front().height;
-
+      apply_word_bounds(&current_word);
       words.push_back(current_word);
     }
   }
@@ -500,32 +624,13 @@ std::string TextPage::to_markdown() const {
 }
 
 std::string TextPage::get_text_in_rect(double x1, double y1, double x2, double y2) const {
-  std::string result;
-
-  // Ensure x1 <= x2 and y1 <= y2
-  if (x1 > x2) std::swap(x1, x2);
-  if (y1 > y2) std::swap(y1, y2);
-
-  for (const auto& ch : chars) {
-    if (ch.x >= x1 && ch.x <= x2 && ch.y >= y1 && ch.y <= y2) {
-      if (ch.unicode < 0x80) {
-        result += static_cast<char>(ch.unicode);
-      }
-    }
-  }
-
-  return result;
+  return select_text_in_rect(x1, y1, x2, y2).text;
 }
 
 std::vector<int> TextPage::find_text(const std::string& search_term) const {
   std::vector<int> results;
 
-  std::string page_text;
-  for (const auto& ch : chars) {
-    if (ch.unicode < 0x80) {
-      page_text += static_cast<char>(ch.unicode);
-    }
-  }
+  std::string page_text = get_text();
 
   // Simple substring search
   size_t pos = 0;
@@ -535,6 +640,134 @@ std::vector<int> TextPage::find_text(const std::string& search_term) const {
   }
 
   return results;
+}
+
+TextSelectionResult TextPage::select_text_range(size_t start, size_t length) const {
+  TextSelectionResult selection;
+  selection.start = start;
+  selection.length = length;
+  if (length == 0) {
+    return selection;
+  }
+
+  const size_t end = start + length;
+  TextSelectionSegment current;
+  bool have_current = false;
+
+  std::vector<const TextLine*> sorted_lines;
+  for (const auto& line : lines) sorted_lines.push_back(&line);
+  std::sort(sorted_lines.begin(), sorted_lines.end(), [](const TextLine* a, const TextLine* b) {
+    return a->reading_order < b->reading_order;
+  });
+
+  for (const auto* line_ptr : sorted_lines) {
+    const TextLine& line = *line_ptr;
+    for (const auto& ch : line.chars) {
+      const std::string utf8 = char_to_utf8(ch.unicode);
+      const size_t char_start = ch.char_index;
+      const size_t char_end = ch.char_index + utf8.size();
+      if (char_end <= start || char_start >= end) {
+        continue;
+      }
+
+      selection.text += utf8;
+      selection.bounds = merge_quads(selection.bounds, ch.quad);
+
+      const bool same_segment =
+          have_current &&
+          current.line_index == ch.line_index &&
+          current.writing_mode == ch.writing_mode;
+      if (!same_segment) {
+        if (have_current) {
+          selection.segments.push_back(current);
+        }
+        current = TextSelectionSegment();
+        current.start = char_start;
+        current.line_index = ch.line_index;
+        current.writing_mode = ch.writing_mode;
+        current.quad = ch.quad;
+        have_current = true;
+      } else {
+        current.quad = merge_quads(current.quad, ch.quad);
+      }
+
+      current.length = (char_end > current.start) ? (char_end - current.start) : current.length;
+      current.text += utf8;
+    }
+
+    if (have_current && !current.text.empty()) {
+      selection.segments.push_back(current);
+      current = TextSelectionSegment();
+      have_current = false;
+    }
+  }
+
+  if (have_current) {
+    selection.segments.push_back(current);
+  }
+  return selection;
+}
+
+TextSelectionResult TextPage::select_text_in_rect(double x1, double y1, double x2, double y2) const {
+  if (x1 > x2) std::swap(x1, x2);
+  if (y1 > y2) std::swap(y1, y2);
+
+  TextSelectionResult selection;
+  bool started = false;
+  size_t last_end = 0;
+
+  std::vector<const TextLine*> sorted_lines;
+  for (const auto& line : lines) sorted_lines.push_back(&line);
+  std::sort(sorted_lines.begin(), sorted_lines.end(), [](const TextLine* a, const TextLine* b) {
+    return a->reading_order < b->reading_order;
+  });
+
+  for (const auto* line_ptr : sorted_lines) {
+    const TextLine& line = *line_ptr;
+    TextSelectionSegment segment;
+    bool have_segment = false;
+
+    for (const auto& ch : line.chars) {
+      if (!quad_intersects_rect(ch.quad, x1, y1, x2, y2)) {
+        continue;
+      }
+
+      const std::string utf8 = char_to_utf8(ch.unicode);
+      if (!started) {
+        selection.start = ch.char_index;
+        started = true;
+      }
+      last_end = ch.char_index + utf8.size();
+      selection.text += utf8;
+      selection.bounds = merge_quads(selection.bounds, ch.quad);
+
+      if (!have_segment) {
+        segment.start = ch.char_index;
+        segment.line_index = ch.line_index;
+        segment.writing_mode = ch.writing_mode;
+        segment.quad = ch.quad;
+        have_segment = true;
+      } else {
+        segment.quad = merge_quads(segment.quad, ch.quad);
+      }
+      segment.length = last_end - segment.start;
+      segment.text += utf8;
+    }
+
+    if (have_segment) {
+      selection.segments.push_back(segment);
+      selection.text += '\n';
+      last_end += 1;
+    }
+  }
+
+  if (!selection.text.empty() && selection.text.back() == '\n') {
+    selection.text.pop_back();
+  }
+  if (started && last_end > selection.start) {
+    selection.length = last_end - selection.start;
+  }
+  return selection;
 }
 
 // Main API implementation
@@ -548,6 +781,12 @@ std::unique_ptr<TextPage> extract_text_layout_with_collector(
   page->chars = input_chars;
   page->page_width = page_width;
   page->page_height = page_height;
+
+  for (auto& ch : page->chars) {
+    if (ch.quad.width <= 0.0 && ch.quad.height <= 0.0) {
+      ch.quad = make_quad(ch.x, ch.y, ch.width, ch.height);
+    }
+  }
 
   if (page->chars.empty()) {
     return page;
@@ -572,21 +811,19 @@ std::unique_ptr<TextPage> extract_text_layout_with_collector(
 
     if (!line.chars.empty()) {
       // Calculate line bounds
-      line.x = line.chars.front().x;
-      line.y = line.chars.front().y;
-      line.baseline = line.y;
-      line.rotation = line.chars.front().rotation;
-
-      double max_x = line.x;
-      double max_height = 0.0;
-
+      TextQuad bounds;
       for (const auto& ch : line.chars) {
-        max_x = std::max(max_x, ch.x + ch.width);
-        max_height = std::max(max_height, ch.height);
+        bounds = merge_quads(bounds, ch.quad);
       }
-
-      line.width = max_x - line.x;
-      line.height = max_height;
+      line.x = bounds.x;
+      line.y = bounds.y;
+      line.baseline = line.chars.front().writing_mode == TextWritingMode::Vertical
+                          ? line.chars.front().x
+                          : line.chars.front().y;
+      line.rotation = line.chars.front().rotation;
+      line.writing_mode = line.chars.front().writing_mode;
+      line.width = bounds.width;
+      line.height = bounds.height;
 
       page->lines.push_back(line);
     }
@@ -598,18 +835,32 @@ std::unique_ptr<TextPage> extract_text_layout_with_collector(
   // Step 5: Segment into words
   page->words = segment_into_words(page->lines, options);
 
-  // Step 6: Update char indices with line and word assignments
+  // Step 6: Update char indices with line assignments.
   for (size_t line_idx = 0; line_idx < page->lines.size(); ++line_idx) {
     for (auto& ch : page->lines[line_idx].chars) {
       ch.line_index = static_cast<int>(line_idx);
     }
   }
 
-  for (size_t word_idx = 0; word_idx < page->words.size(); ++word_idx) {
-    for (auto& ch : page->words[word_idx].chars) {
-      ch.word_index = static_cast<int>(word_idx);
-    }
+  size_t text_index = 0;
+  std::vector<size_t> line_order(page->lines.size());
+  for (size_t i = 0; i < line_order.size(); ++i) {
+    line_order[i] = i;
   }
+  std::sort(line_order.begin(), line_order.end(), [&](size_t a, size_t b) {
+    return page->lines[a].reading_order < page->lines[b].reading_order;
+  });
+
+  std::vector<TextChar> reading_chars;
+  for (size_t li : line_order) {
+    for (auto& ch : page->lines[li].chars) {
+      ch.char_index = text_index;
+      text_index += char_to_utf8(ch.unicode).size();
+      reading_chars.push_back(ch);
+    }
+    text_index += 1;  // newline inserted by get_text()
+  }
+  page->chars = std::move(reading_chars);
 
   return page;
 }
@@ -810,36 +1061,78 @@ private:
 
       // Map to Unicode
       uint32_t unicode = map_to_unicode(char_code);
+      const Type0Font* type0_font = as_type0_font(text_state_.current_font);
+      const bool is_vertical = type0_font && type0_font->is_vertical;
 
       // Create TextChar
       TextChar ch;
       ch.unicode = unicode;
-      ch.x = text_state_.text_matrix[4];
-      ch.y = text_state_.text_matrix[5];
       ch.font_size = text_state_.font_size;
       ch.font_name = text_state_.font_name.empty() ? "Unknown" : text_state_.font_name.substr(1);
       ch.char_spacing = text_state_.char_spacing;
       ch.word_spacing = text_state_.word_spacing;
       std::copy(text_state_.text_matrix, text_state_.text_matrix + 6, ch.matrix);
       ch.rotation = calculate_rotation(ch.matrix);
+      ch.writing_mode = is_vertical ? TextWritingMode::Vertical : TextWritingMode::Horizontal;
 
       // Get character width from font
       double char_width = get_char_width(char_code);
-      ch.width = char_width * text_state_.font_size * 0.001;  // PDF units
-      ch.height = text_state_.font_size;
+      if (is_vertical) {
+        double v_x = 0.0;
+        double v_y = type0_font ? type0_font->default_v_y : 880.0;
+        double w1_y = type0_font ? type0_font->default_w1_y : -1000.0;
+        if (type0_font) {
+          auto vm_it = type0_font->cid_vertical_metrics.find(char_code);
+          if (vm_it != type0_font->cid_vertical_metrics.end()) {
+            w1_y = vm_it->second.w1_y;
+            v_x = vm_it->second.v_x;
+            v_y = vm_it->second.v_y;
+          }
+        }
 
-      // Apply horizontal scaling
-      ch.width *= text_state_.horizontal_scaling / 100.0;
+        const double glyph_w = text_state_.font_size;
+        const double glyph_h = std::max(text_state_.font_size,
+                                        std::abs(w1_y) * text_state_.font_size * 0.001);
+        const double origin_x = text_state_.text_matrix[4] + v_x * text_state_.font_size * 0.001;
+        const double origin_y = text_state_.text_matrix[5] + v_y * text_state_.font_size * 0.001;
+        ch.x = origin_x - glyph_w * 0.5;
+        ch.y = origin_y - glyph_h;
+        ch.width = glyph_w;
+        ch.height = glyph_h;
+        ch.quad = make_quad(ch.x, ch.y, ch.width, ch.height);
+      } else {
+        ch.x = text_state_.text_matrix[4];
+        ch.y = text_state_.text_matrix[5];
+        ch.width = char_width * text_state_.font_size * 0.001;  // PDF units
+        ch.height = text_state_.font_size;
+
+        // Apply horizontal scaling
+        ch.width *= text_state_.horizontal_scaling / 100.0;
+        ch.quad = make_quad(ch.x, ch.y, ch.width, ch.height);
+      }
 
       chars_.push_back(ch);
 
       // Advance text matrix
-      double tx = (char_width * text_state_.font_size + text_state_.char_spacing) * text_state_.horizontal_scaling / 100.0;
-      if (unicode == ' ') {
-        tx += text_state_.word_spacing;
+      if (is_vertical) {
+        double w1_y = type0_font ? type0_font->default_w1_y : -1000.0;
+        if (type0_font) {
+          auto vm_it = type0_font->cid_vertical_metrics.find(char_code);
+          if (vm_it != type0_font->cid_vertical_metrics.end()) {
+            w1_y = vm_it->second.w1_y;
+          }
+        }
+        double ty = w1_y * text_state_.font_size * 0.001;
+        text_state_.text_matrix[4] += ty * text_state_.text_matrix[2];
+        text_state_.text_matrix[5] += ty * text_state_.text_matrix[3];
+      } else {
+        double tx = (char_width * text_state_.font_size + text_state_.char_spacing) * text_state_.horizontal_scaling / 100.0;
+        if (unicode == ' ') {
+          tx += text_state_.word_spacing;
+        }
+        text_state_.text_matrix[4] += tx * text_state_.text_matrix[0] / 1000.0;
+        text_state_.text_matrix[5] += tx * text_state_.text_matrix[1] / 1000.0;
       }
-      text_state_.text_matrix[4] += tx * text_state_.text_matrix[0] / 1000.0;
-      text_state_.text_matrix[5] += tx * text_state_.text_matrix[1] / 1000.0;
 
       i += code_len;
     }
@@ -857,9 +1150,16 @@ private:
       } else {
         // Numeric adjustment - adjust text matrix
         double adjustment = parse_number(elem);
-        double tx = -adjustment * text_state_.font_size * text_state_.horizontal_scaling / 100000.0;
-        text_state_.text_matrix[4] += tx * text_state_.text_matrix[0];
-        text_state_.text_matrix[5] += tx * text_state_.text_matrix[1];
+        const Type0Font* type0_font = as_type0_font(text_state_.current_font);
+        if (type0_font && type0_font->is_vertical) {
+          double ty = adjustment * text_state_.font_size / 1000.0;
+          text_state_.text_matrix[4] += ty * text_state_.text_matrix[2] / 100.0;
+          text_state_.text_matrix[5] += ty * text_state_.text_matrix[3] / 100.0;
+        } else {
+          double tx = -adjustment * text_state_.font_size * text_state_.horizontal_scaling / 100000.0;
+          text_state_.text_matrix[4] += tx * text_state_.text_matrix[0];
+          text_state_.text_matrix[5] += tx * text_state_.text_matrix[1];
+        }
       }
     }
   }

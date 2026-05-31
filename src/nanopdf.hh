@@ -26,6 +26,7 @@ using namespace nanostl;
 #endif
 
 #include "stream-reader.hh"
+#include "text-geometry.hh"
 
 #if defined(NANOPDF_USE_STB_TRUETYPE)
 #include "stb_truetype.h"
@@ -1497,9 +1498,11 @@ struct TextSearchResult {
   size_t length{0};          // Length of match
   double x{0.0}, y{0.0};    // Position of first character
   double width{0.0}, height{0.0};  // Bounding box of match
+  std::vector<TextQuad> quads; // Per-line/per-column highlight geometry
   std::string context;       // Surrounding text context
   double score{1.0};         // 1.0 for exact match, lower for fuzzy
   bool fuzzy{false};         // Whether this result came from approximate match
+  TextWritingMode writing_mode{TextWritingMode::Horizontal};
 };
 
 // Search text across all pages

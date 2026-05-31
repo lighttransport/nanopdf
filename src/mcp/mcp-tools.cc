@@ -180,6 +180,13 @@ static JsonValue make_number_property(const std::string& description) {
   return prop;
 }
 
+static JsonValue make_bool_property(const std::string& description) {
+  JsonValue prop = JsonValue::object();
+  prop["type"] = JsonValue("boolean");
+  prop["description"] = JsonValue(description);
+  return prop;
+}
+
 static JsonValue make_object_schema(const std::string& description,
                                      const std::map<std::string, JsonValue>& properties,
                                      const std::vector<std::string>& required = {}) {
@@ -207,6 +214,77 @@ static JsonValue make_object_schema(const std::string& description,
 // ============================================================
 // Tool implementations
 // ============================================================
+
+static JsonValue quad_to_json(const TextQuad& q) {
+  JsonValue obj = JsonValue::object();
+  obj["x"] = JsonValue(q.x);
+  obj["y"] = JsonValue(q.y);
+  obj["width"] = JsonValue(q.width);
+  obj["height"] = JsonValue(q.height);
+  JsonValue points = JsonValue::array();
+  JsonValue p1 = JsonValue::object(); p1["x"] = JsonValue(q.x1); p1["y"] = JsonValue(q.y1);
+  JsonValue p2 = JsonValue::object(); p2["x"] = JsonValue(q.x2); p2["y"] = JsonValue(q.y2);
+  JsonValue p3 = JsonValue::object(); p3["x"] = JsonValue(q.x3); p3["y"] = JsonValue(q.y3);
+  JsonValue p4 = JsonValue::object(); p4["x"] = JsonValue(q.x4); p4["y"] = JsonValue(q.y4);
+  points.push_back(p1);
+  points.push_back(p2);
+  points.push_back(p3);
+  points.push_back(p4);
+  obj["points"] = points;
+  return obj;
+}
+
+static JsonValue search_result_to_json(const TextSearchResult& hit) {
+  JsonValue match = JsonValue::object();
+  match["page"] = JsonValue(static_cast<int>(hit.page_number));
+  match["position"] = JsonValue(static_cast<int>(hit.char_index));
+  match["start"] = JsonValue(static_cast<int>(hit.char_index));
+  match["end"] = JsonValue(static_cast<int>(hit.char_index + hit.length));
+  match["context"] = JsonValue(hit.context);
+  match["x"] = JsonValue(hit.x);
+  match["y"] = JsonValue(hit.y);
+  match["width"] = JsonValue(hit.width);
+  match["height"] = JsonValue(hit.height);
+  match["bbox"] = quad_to_json(TextQuad{hit.x, hit.y, hit.x + hit.width, hit.y,
+                                        hit.x + hit.width, hit.y + hit.height,
+                                        hit.x, hit.y + hit.height,
+                                        hit.x, hit.y, hit.width, hit.height});
+  match["score"] = JsonValue(hit.score);
+  match["fuzzy"] = JsonValue(hit.fuzzy);
+  match["writingMode"] = JsonValue(text_writing_mode_name(hit.writing_mode));
+
+  JsonValue quads = JsonValue::array();
+  for (const auto& q : hit.quads) {
+    quads.push_back(quad_to_json(q));
+  }
+  match["quads"] = quads;
+  return match;
+}
+
+static JsonValue selection_to_json(const TextSelectionResult& selection) {
+  JsonValue result = JsonValue::object();
+  result["page"] = JsonValue(static_cast<int>(selection.page_number));
+  result["start"] = JsonValue(static_cast<int>(selection.start));
+  result["end"] = JsonValue(static_cast<int>(selection.start + selection.length));
+  result["length"] = JsonValue(static_cast<int>(selection.length));
+  result["text"] = JsonValue(selection.text);
+  result["bbox"] = quad_to_json(selection.bounds);
+
+  JsonValue segments = JsonValue::array();
+  for (const auto& segment : selection.segments) {
+    JsonValue s = JsonValue::object();
+    s["start"] = JsonValue(static_cast<int>(segment.start));
+    s["end"] = JsonValue(static_cast<int>(segment.start + segment.length));
+    s["length"] = JsonValue(static_cast<int>(segment.length));
+    s["text"] = JsonValue(segment.text);
+    s["lineIndex"] = JsonValue(segment.line_index);
+    s["writingMode"] = JsonValue(text_writing_mode_name(segment.writing_mode));
+    s["quad"] = quad_to_json(segment.quad);
+    segments.push_back(s);
+  }
+  result["segments"] = segments;
+  return result;
+}
 
 ToolResult load_pdf_tool(const JsonValue& args) {
   if (!args.has("path") && !args.has("data")) {
@@ -433,6 +511,9 @@ ToolResult extract_text_layout_tool(const JsonValue& args) {
     char_obj["h"] = JsonValue(ch.height);
     char_obj["fontSize"] = JsonValue(ch.font_size);
     char_obj["fontName"] = JsonValue(ch.font_name);
+    char_obj["writingMode"] = JsonValue(text_writing_mode_name(ch.writing_mode));
+    char_obj["charIndex"] = JsonValue(static_cast<int>(ch.char_index));
+    char_obj["quad"] = quad_to_json(ch.quad);
     chars_array.push_back(char_obj);
   }
   result["chars"] = chars_array;
@@ -466,16 +547,7 @@ ToolResult find_text_tool(const JsonValue& args) {
 
   JsonValue matches = JsonValue::array();
   for (const auto& hit : found) {
-    JsonValue match = JsonValue::object();
-    match["position"] = JsonValue(static_cast<int>(hit.char_index));
-    match["context"] = JsonValue(hit.context);
-    match["x"] = JsonValue(hit.x);
-    match["y"] = JsonValue(hit.y);
-    match["width"] = JsonValue(hit.width);
-    match["height"] = JsonValue(hit.height);
-    match["score"] = JsonValue(hit.score);
-    match["fuzzy"] = JsonValue(hit.fuzzy);
-    matches.push_back(match);
+    matches.push_back(search_result_to_json(hit));
   }
 
   JsonValue result = JsonValue::object();
@@ -484,6 +556,112 @@ ToolResult find_text_tool(const JsonValue& args) {
   result["matchCount"] = JsonValue(static_cast<int>(matches.size()));
   result["matches"] = matches;
 
+  return ToolResult::ok(result);
+}
+
+ToolResult search_text_tool(const JsonValue& args) {
+  if (!g_pdf_state.pdf) {
+    return ToolResult::error("No PDF loaded. Call load_pdf first.");
+  }
+  if (!args.has("query")) {
+    return ToolResult::error("Missing required parameter: 'query'");
+  }
+
+  const std::string query = args["query"].get_string();
+  const bool case_sensitive = args.has("case_sensitive") && args["case_sensitive"].get_boolean();
+  const bool fuzzy = args.has("fuzzy") && args["fuzzy"].get_boolean();
+  const int max_results = args.has("max_results") ? args["max_results"].get_int() : -1;
+
+  int start_page = 0;
+  int end_page = static_cast<int>(g_pdf_state.pdf->catalog.pages.size()) - 1;
+  if (args.has("page")) {
+    start_page = end_page = args["page"].get_int();
+  } else {
+    if (args.has("start_page")) start_page = args["start_page"].get_int();
+    if (args.has("end_page")) end_page = args["end_page"].get_int();
+  }
+
+  int max_page = static_cast<int>(g_pdf_state.pdf->catalog.pages.size()) - 1;
+  if (start_page < 0 || end_page < 0 || start_page > end_page || end_page > max_page) {
+    return ToolResult::error("Invalid page range: 0-" + std::to_string(max_page) + " expected");
+  }
+
+  JsonValue results = JsonValue::array();
+  int total = 0;
+  for (int page_num = start_page; page_num <= end_page; ++page_num) {
+    const auto& page = g_pdf_state.pdf->catalog.pages[page_num];
+    std::vector<TextSearchResult> hits =
+        search_text_on_page(*g_pdf_state.pdf, page, query, case_sensitive);
+    for (auto& hit : hits) {
+      if (!fuzzy && hit.fuzzy) {
+        continue;
+      }
+      hit.page_number = static_cast<uint32_t>(page_num);
+      results.push_back(search_result_to_json(hit));
+      ++total;
+      if (max_results >= 0 && total >= max_results) {
+        break;
+      }
+    }
+    if (max_results >= 0 && total >= max_results) {
+      break;
+    }
+  }
+
+  JsonValue result = JsonValue::object();
+  result["query"] = JsonValue(query);
+  result["caseSensitive"] = JsonValue(case_sensitive);
+  result["fuzzy"] = JsonValue(fuzzy);
+  result["startPage"] = JsonValue(start_page);
+  result["endPage"] = JsonValue(end_page);
+  result["matchCount"] = JsonValue(total);
+  result["matches"] = results;
+  return ToolResult::ok(result);
+}
+
+ToolResult select_text_tool(const JsonValue& args) {
+  if (!g_pdf_state.pdf) {
+    return ToolResult::error("No PDF loaded. Call load_pdf first.");
+  }
+  if (!args.has("page")) {
+    return ToolResult::error("Missing required parameter: 'page'");
+  }
+
+  int page_num = args["page"].get_int();
+  if (page_num < 0 || page_num >= static_cast<int>(g_pdf_state.pdf->catalog.pages.size())) {
+    return ToolResult::error("Page index out of range: " + std::to_string(page_num));
+  }
+
+  const auto& page = g_pdf_state.pdf->catalog.pages[page_num];
+  auto text_page = extract_text_layout(*g_pdf_state.pdf, page);
+  if (!text_page) {
+    return ToolResult::error("Failed to extract text layout");
+  }
+
+  std::string mode = args.has("mode") ? args["mode"].get_string() : "rect";
+  TextSelectionResult selection;
+  if (mode == "range") {
+    if (!args.has("start") || !args.has("length")) {
+      return ToolResult::error("Range selection requires 'start' and 'length'");
+    }
+    selection = text_page->select_text_range(
+        static_cast<size_t>(args["start"].get_int()),
+        static_cast<size_t>(args["length"].get_int()));
+  } else if (mode == "rect") {
+    if (!args.has("x1") || !args.has("y1") || !args.has("x2") || !args.has("y2")) {
+      return ToolResult::error("Rectangle selection requires 'x1', 'y1', 'x2', and 'y2'");
+    }
+    selection = text_page->select_text_in_rect(args["x1"].get_number(),
+                                               args["y1"].get_number(),
+                                               args["x2"].get_number(),
+                                               args["y2"].get_number());
+  } else {
+    return ToolResult::error("Unsupported selection mode: " + mode);
+  }
+
+  selection.page_number = static_cast<uint32_t>(page_num);
+  JsonValue result = selection_to_json(selection);
+  result["mode"] = JsonValue(mode);
   return ToolResult::ok(result);
 }
 
@@ -850,6 +1028,7 @@ ToolResult get_page_structure_tool(const JsonValue& args) {
     lo["rotation"] = JsonValue(line.rotation);
     lo["isRtl"] = JsonValue(line.is_rtl);
     lo["baseline"] = JsonValue(line.baseline);
+    lo["writingMode"] = JsonValue(text_writing_mode_name(line.writing_mode));
     lines_arr.push_back(lo);
   }
   result["lines"] = lines_arr;
@@ -866,6 +1045,7 @@ ToolResult get_page_structure_tool(const JsonValue& args) {
     bbox["height"] = JsonValue(word.height);
     wo["bbox"] = bbox;
     wo["lineIndex"] = JsonValue(word.line_index);
+    wo["writingMode"] = JsonValue(text_writing_mode_name(word.writing_mode));
     words_arr.push_back(wo);
   }
   result["words"] = words_arr;
@@ -1340,6 +1520,43 @@ void register_all_tools() {
               "Search for text in a specific page",
               make_object_schema("Find text parameters", props, {"page", "query"}));
     registry.register_tool(tool, find_text_tool);
+  }
+
+  // search_text
+  {
+    std::map<std::string, JsonValue> props;
+    props["query"] = make_string_property("Text to search for");
+    props["page"] = make_number_property("Optional single page to search (0-indexed)");
+    props["start_page"] = make_number_property("Optional first page for range search (0-indexed)");
+    props["end_page"] = make_number_property("Optional last page for range search (0-indexed)");
+    props["case_sensitive"] = make_bool_property("Case-sensitive search when true");
+    props["fuzzy"] = make_bool_property("Include approximate matches when true");
+    props["max_results"] = make_number_property("Maximum number of matches to return");
+
+    Tool tool("search_text",
+              "Search text across a page range and return match context, bounding boxes, "
+              "highlight quads, score, fuzzy flag, and writing mode.",
+              make_object_schema("Search text parameters", props, {"query"}));
+    registry.register_tool(tool, search_text_tool);
+  }
+
+  // select_text
+  {
+    std::map<std::string, JsonValue> props;
+    props["page"] = make_number_property("Page number (0-indexed)");
+    props["mode"] = make_string_property("Selection mode: 'rect' or 'range'");
+    props["x1"] = make_number_property("Left X coordinate for rectangle selection");
+    props["y1"] = make_number_property("Bottom Y coordinate for rectangle selection");
+    props["x2"] = make_number_property("Right X coordinate for rectangle selection");
+    props["y2"] = make_number_property("Top Y coordinate for rectangle selection");
+    props["start"] = make_number_property("Reading-order text start offset for range selection");
+    props["length"] = make_number_property("Reading-order text length for range selection");
+
+    Tool tool("select_text",
+              "Select text by page rectangle or reading-order range. Returns selected text, "
+              "overall bounds, per-line/per-column quads, and writing mode metadata.",
+              make_object_schema("Select text parameters", props, {"page"}));
+    registry.register_tool(tool, select_text_tool);
   }
 
   // get_fonts

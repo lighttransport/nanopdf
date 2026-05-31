@@ -370,6 +370,69 @@ static std::string unicode_to_utf8(uint32_t codepoint) {
   return result;
 }
 
+static std::string quad_to_json(const nanopdf::TextQuad& q) {
+  std::string json = "{";
+  json += "\"x\":" + std::to_string(q.x) + ",";
+  json += "\"y\":" + std::to_string(q.y) + ",";
+  json += "\"width\":" + std::to_string(q.width) + ",";
+  json += "\"height\":" + std::to_string(q.height) + ",";
+  json += "\"points\":[";
+  json += "{\"x\":" + std::to_string(q.x1) + ",\"y\":" + std::to_string(q.y1) + "},";
+  json += "{\"x\":" + std::to_string(q.x2) + ",\"y\":" + std::to_string(q.y2) + "},";
+  json += "{\"x\":" + std::to_string(q.x3) + ",\"y\":" + std::to_string(q.y3) + "},";
+  json += "{\"x\":" + std::to_string(q.x4) + ",\"y\":" + std::to_string(q.y4) + "}";
+  json += "]}";
+  return json;
+}
+
+static std::string search_result_to_json(const nanopdf::TextSearchResult& match) {
+  std::string json = "{";
+  json += "\"page\":" + std::to_string(match.page_number);
+  json += ",\"start\":" + std::to_string(match.char_index);
+  json += ",\"end\":" + std::to_string(match.char_index + match.length);
+  json += ",\"x\":" + std::to_string(match.x);
+  json += ",\"y\":" + std::to_string(match.y);
+  json += ",\"width\":" + std::to_string(match.width);
+  json += ",\"height\":" + std::to_string(match.height);
+  json += ",\"score\":" + std::to_string(match.score);
+  json += ",\"fuzzy\":" + std::string(match.fuzzy ? "true" : "false");
+  json += ",\"writingMode\":\"" + std::string(nanopdf::text_writing_mode_name(match.writing_mode)) + "\"";
+  json += ",\"context\":\"" + json_escape(match.context) + "\"";
+  json += ",\"quads\":[";
+  for (size_t i = 0; i < match.quads.size(); ++i) {
+    if (i > 0) json += ",";
+    json += quad_to_json(match.quads[i]);
+  }
+  json += "]}";
+  return json;
+}
+
+static std::string selection_to_json(const nanopdf::TextSelectionResult& selection) {
+  std::string json = "{";
+  json += "\"page\":" + std::to_string(selection.page_number);
+  json += ",\"start\":" + std::to_string(selection.start);
+  json += ",\"end\":" + std::to_string(selection.start + selection.length);
+  json += ",\"length\":" + std::to_string(selection.length);
+  json += ",\"text\":\"" + json_escape(selection.text) + "\"";
+  json += ",\"bbox\":" + quad_to_json(selection.bounds);
+  json += ",\"segments\":[";
+  for (size_t i = 0; i < selection.segments.size(); ++i) {
+    const auto& segment = selection.segments[i];
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"start\":" + std::to_string(segment.start);
+    json += ",\"end\":" + std::to_string(segment.start + segment.length);
+    json += ",\"length\":" + std::to_string(segment.length);
+    json += ",\"text\":\"" + json_escape(segment.text) + "\"";
+    json += ",\"lineIndex\":" + std::to_string(segment.line_index);
+    json += ",\"writingMode\":\"" + std::string(nanopdf::text_writing_mode_name(segment.writing_mode)) + "\"";
+    json += ",\"quad\":" + quad_to_json(segment.quad);
+    json += "}";
+  }
+  json += "]}";
+  return json;
+}
+
 // Extract text with position info as JSON
 // Returns: {"pageWidth":W,"pageHeight":H,"chars":[{"c":"X","x":0,"y":0,"w":10,"h":12,"fs":12,"fn":"Arial"},...],
 //           "lines":[{"text":"...","x":0,"y":0,"w":100,"h":12,"baseline":10},...],
@@ -413,6 +476,9 @@ const char* nanopdf_extract_text_layout(int page_index) {
     json += "\"fs\":" + std::to_string(ch.font_size) + ",";
     json += "\"fn\":\"" + json_escape(ch.font_name) + "\",";
     json += "\"rot\":" + std::to_string(ch.rotation) + ",";
+    json += "\"writingMode\":\"" + std::string(nanopdf::text_writing_mode_name(ch.writing_mode)) + "\",";
+    json += "\"quad\":" + quad_to_json(ch.quad) + ",";
+    json += "\"charIndex\":" + std::to_string(ch.char_index) + ",";
     json += "\"li\":" + std::to_string(ch.line_index) + ",";
     json += "\"wi\":" + std::to_string(ch.word_index);
     json += "}";
@@ -432,6 +498,7 @@ const char* nanopdf_extract_text_layout(int page_index) {
     json += "\"h\":" + std::to_string(line.height) + ",";
     json += "\"baseline\":" + std::to_string(line.baseline) + ",";
     json += "\"rotation\":" + std::to_string(line.rotation) + ",";
+    json += "\"writingMode\":\"" + std::string(nanopdf::text_writing_mode_name(line.writing_mode)) + "\",";
     json += "\"readingOrder\":" + std::to_string(line.reading_order) + ",";
     json += "\"isRtl\":" + std::string(line.is_rtl ? "true" : "false");
     json += "}";
@@ -449,6 +516,7 @@ const char* nanopdf_extract_text_layout(int page_index) {
     json += "\"y\":" + std::to_string(word.y) + ",";
     json += "\"w\":" + std::to_string(word.width) + ",";
     json += "\"h\":" + std::to_string(word.height) + ",";
+    json += "\"writingMode\":\"" + std::string(nanopdf::text_writing_mode_name(word.writing_mode)) + "\",";
     json += "\"lineIndex\":" + std::to_string(word.line_index);
     json += "}";
   }
@@ -501,6 +569,106 @@ const char* nanopdf_find_text(int page_index, const char* search_term) {
   json += "]";
 
   g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Search text on selected pages. fuzzy=0 returns exact matches only.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_search_text(const char* search_term, const char* page_indices,
+                                int case_sensitive, int fuzzy, int max_results) {
+  if (!g_pdf) {
+    g_text_buffer = "{\"error\":\"No PDF loaded\"}";
+    return g_text_buffer.c_str();
+  }
+  if (!search_term || strlen(search_term) == 0) {
+    g_text_buffer = "{\"error\":\"Empty search term\"}";
+    return g_text_buffer.c_str();
+  }
+
+  std::vector<int> pages;
+  std::string indices_str(page_indices ? page_indices : "all");
+  if (indices_str == "all") {
+    for (size_t i = 0; i < g_pdf->catalog.pages.size(); ++i) {
+      pages.push_back(static_cast<int>(i));
+    }
+  } else {
+    size_t pos = 0;
+    while ((pos = indices_str.find(',')) != std::string::npos) {
+      int idx = nanopdf::stoi_or(indices_str.substr(0, pos).c_str());
+      if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) pages.push_back(idx);
+      indices_str.erase(0, pos + 1);
+    }
+    if (!indices_str.empty()) {
+      int idx = nanopdf::stoi_or(indices_str.c_str());
+      if (idx >= 0 && idx < static_cast<int>(g_pdf->catalog.pages.size())) pages.push_back(idx);
+    }
+  }
+
+  std::string search(search_term);
+  std::string json = "{\"searchTerm\":\"" + json_escape(search) + "\",\"results\":[";
+  bool first = true;
+  int total = 0;
+  for (int page_idx : pages) {
+    const auto& page = g_pdf->catalog.pages[page_idx];
+    auto matches = nanopdf::search_text_on_page(*g_pdf, page, search, case_sensitive != 0);
+    for (auto& match : matches) {
+      if (!fuzzy && match.fuzzy) continue;
+      if (!first) json += ",";
+      first = false;
+      match.page_number = static_cast<uint32_t>(page_idx);
+      json += search_result_to_json(match);
+      total++;
+      if (max_results >= 0 && total >= max_results) break;
+    }
+    if (max_results >= 0 && total >= max_results) break;
+  }
+  json += "],\"totalMatches\":" + std::to_string(total) + "}";
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_select_text_range(int page_index, int start, int length) {
+  if (!g_pdf || page_index < 0 ||
+      page_index >= static_cast<int>(g_pdf->catalog.pages.size()) ||
+      start < 0 || length < 0) {
+    g_text_buffer = "{\"error\":\"Invalid range selection\"}";
+    return g_text_buffer.c_str();
+  }
+
+  const auto& page = g_pdf->catalog.pages[page_index];
+  auto text_page = nanopdf::extract_text_layout(*g_pdf, page);
+  if (!text_page) {
+    g_text_buffer = "{\"error\":\"Failed to extract text layout\"}";
+    return g_text_buffer.c_str();
+  }
+
+  auto selection = text_page->select_text_range(static_cast<size_t>(start),
+                                                static_cast<size_t>(length));
+  selection.page_number = static_cast<uint32_t>(page_index);
+  g_text_buffer = selection_to_json(selection);
+  return g_text_buffer.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_select_text_rect(int page_index, double x1, double y1,
+                                    double x2, double y2) {
+  if (!g_pdf || page_index < 0 ||
+      page_index >= static_cast<int>(g_pdf->catalog.pages.size())) {
+    g_text_buffer = "{\"error\":\"Invalid rectangle selection\"}";
+    return g_text_buffer.c_str();
+  }
+
+  const auto& page = g_pdf->catalog.pages[page_index];
+  auto text_page = nanopdf::extract_text_layout(*g_pdf, page);
+  if (!text_page) {
+    g_text_buffer = "{\"error\":\"Failed to extract text layout\"}";
+    return g_text_buffer.c_str();
+  }
+
+  auto selection = text_page->select_text_in_rect(x1, y1, x2, y2);
+  selection.page_number = static_cast<uint32_t>(page_index);
+  g_text_buffer = selection_to_json(selection);
   return g_text_buffer.c_str();
 }
 
@@ -1564,16 +1732,9 @@ const char* nanopdf_batch_find_text(const char* search_term, const char* page_in
       for (const auto& match : matches) {
         if (!first_match) json += ",";
         first_match = false;
-
-        json += "{\"start\":" + std::to_string(match.char_index);
-        json += ",\"end\":" + std::to_string(match.char_index + match.length);
-        json += ",\"x\":" + std::to_string(match.x);
-        json += ",\"y\":" + std::to_string(match.y);
-        json += ",\"width\":" + std::to_string(match.width);
-        json += ",\"height\":" + std::to_string(match.height);
-        json += ",\"score\":" + std::to_string(match.score);
-        json += ",\"fuzzy\":" + std::string(match.fuzzy ? "true" : "false");
-        json += ",\"context\":\"" + json_escape(match.context) + "\"}";
+        auto match_copy = match;
+        match_copy.page_number = static_cast<uint32_t>(page_idx);
+        json += search_result_to_json(match_copy);
       }
       json += "]}";
       total_matches += static_cast<int>(matches.size());
@@ -1869,7 +2030,8 @@ const char* nanopdf_get_form_fields() {
     switch (field->type) {
       case nanopdf::FieldType::Text:
         json += ",\"type\":\"text\"";
-        if (auto* tf = dynamic_cast<const nanopdf::TextField*>(field.get())) {
+        {
+          const auto* tf = static_cast<const nanopdf::TextField*>(field.get());
           json += ",\"maxLength\":" + std::to_string(tf->max_length);
           // Check multiline/password via field flags
           bool multiline = (tf->flags & static_cast<uint32_t>(nanopdf::FormFieldFlags::Multiline)) != 0;
@@ -1880,7 +2042,8 @@ const char* nanopdf_get_form_fields() {
         break;
       case nanopdf::FieldType::Button:
         json += ",\"type\":\"button\"";
-        if (auto* bf = dynamic_cast<const nanopdf::ButtonField*>(field.get())) {
+        {
+          const auto* bf = static_cast<const nanopdf::ButtonField*>(field.get());
           json += ",\"buttonType\":\"";
           switch (bf->button_type) {
             case nanopdf::ButtonField::PushButton: json += "push"; break;
@@ -1892,7 +2055,8 @@ const char* nanopdf_get_form_fields() {
         break;
       case nanopdf::FieldType::Choice:
         json += ",\"type\":\"choice\"";
-        if (auto* cf = dynamic_cast<const nanopdf::ChoiceField*>(field.get())) {
+        {
+          const auto* cf = static_cast<const nanopdf::ChoiceField*>(field.get());
           json += ",\"options\":[";
           bool first_opt = true;
           for (const auto& opt : cf->options) {

@@ -5,9 +5,12 @@
 #define NANOPDF_TEXT_LAYOUT_HH_
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <memory>
+
+#include "text-geometry.hh"
 
 namespace nanopdf {
 
@@ -32,11 +35,15 @@ struct TextChar {
 
   // Rotation angle in degrees (derived from matrix)
   double rotation;
+  TextWritingMode writing_mode;  // Horizontal or vertical writing mode
+  TextQuad quad;                 // Glyph bounds in page coordinates
+  size_t char_index;             // Character index in reading-order text
 
   TextChar()
       : unicode(0), x(0), y(0), width(0), height(0),
         font_size(0), char_spacing(0), word_spacing(0),
-        line_index(-1), word_index(-1), rotation(0) {
+        line_index(-1), word_index(-1), rotation(0),
+        writing_mode(TextWritingMode::Horizontal), char_index(0) {
     matrix[0] = 1; matrix[1] = 0;
     matrix[2] = 0; matrix[3] = 1;
     matrix[4] = 0; matrix[5] = 0;
@@ -52,11 +59,12 @@ struct TextLine {
   bool is_rtl;                  // Right-to-left text (Arabic, Hebrew)
   double baseline;              // Y-coordinate of baseline
   double rotation;              // Line rotation angle in degrees
+  TextWritingMode writing_mode; // Dominant writing mode
 
   TextLine()
       : x(0), y(0), width(0), height(0),
         reading_order(-1), is_rtl(false),
-        baseline(0), rotation(0) {}
+        baseline(0), rotation(0), writing_mode(TextWritingMode::Horizontal) {}
 
   // Get text content of this line
   std::string get_text() const;
@@ -71,8 +79,11 @@ struct TextWord {
   double x, y;                  // Word position
   double width, height;         // Word bounding box
   int line_index;               // Which line this word belongs to
+  TextWritingMode writing_mode; // Dominant writing mode
 
-  TextWord() : x(0), y(0), width(0), height(0), line_index(-1) {}
+  TextWord()
+      : x(0), y(0), width(0), height(0), line_index(-1),
+        writing_mode(TextWritingMode::Horizontal) {}
 
   // Get text content of this word
   std::string get_text() const;
@@ -102,6 +113,10 @@ struct TextPage {
 
   // Find text (returns character indices)
   std::vector<int> find_text(const std::string& search_term) const;
+
+  // Text selection helpers. Ranges use positions in get_text() reading order.
+  TextSelectionResult select_text_range(size_t start, size_t length) const;
+  TextSelectionResult select_text_in_rect(double x1, double y1, double x2, double y2) const;
 
   // Character access
   int count_chars() const { return static_cast<int>(chars.size()); }

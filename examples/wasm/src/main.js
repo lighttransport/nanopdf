@@ -14,6 +14,10 @@ let outlineData = null;
 let searchResults = [];
 let currentSearchIndex = -1;
 let currentSearchTerm = '';
+let currentSelection = null;
+let isSelectingText = false;
+let selectionStartPoint = null;
+let selectionDragBox = null;
 let isPageJumpMode = false;
 let activeSidebarTab = 'outline';
 
@@ -43,6 +47,7 @@ const prevBtn = document.getElementById('prev-btn');
 const nextBtn = document.getElementById('next-btn');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const canvas = document.getElementById('pdf-canvas');
+const textOverlay = document.getElementById('text-overlay');
 const canvasWrapper = document.getElementById('canvas-wrapper');
 const pageDisplay = document.getElementById('page-display');
 const statusText = document.getElementById('status-text');
@@ -487,6 +492,7 @@ function rotateClockwise() {
 
 function applyRotation() {
   canvas.style.transform = rotation === 0 ? '' : `rotate(${rotation}deg)`;
+  textOverlay.style.transform = canvas.style.transform;
 
   // Adjust wrapper dimensions for 90/270 so scrolling works correctly
   if (rotation === 90 || rotation === 270) {
@@ -496,6 +502,7 @@ function applyRotation() {
     canvasWrapper.style.width = '';
     canvasWrapper.style.height = '';
   }
+  renderTextOverlay();
 }
 
 // ---- Fit Mode ----
@@ -520,6 +527,93 @@ function computeBaseScale(pageWidth, pageHeight) {
     const scaleW = availWidth / pageWidth;
     const scaleH = availHeight / pageHeight;
     return Math.min(scaleW, scaleH);
+  }
+}
+
+function getPageScale() {
+  if (!Module || totalPages <= 0 || canvas.width === 0) return 1;
+  const pageWidth = Module._nanopdf_get_page_width(currentPage);
+  return canvas.width / pageWidth;
+}
+
+function pdfRectToScreen(rect) {
+  const pageHeight = Module._nanopdf_get_page_height(currentPage);
+  const scale = getPageScale();
+  const x = rect.x * scale;
+  const y = (pageHeight - rect.y - rect.height) * scale;
+  return {
+    x,
+    y,
+    width: rect.width * scale,
+    height: rect.height * scale
+  };
+}
+
+function overlayPointToPdf(clientX, clientY) {
+  const rect = textOverlay.getBoundingClientRect();
+  const scale = getPageScale();
+  const pageHeight = Module._nanopdf_get_page_height(currentPage);
+  const x = Math.max(0, Math.min(canvas.width, clientX - rect.left));
+  const y = Math.max(0, Math.min(canvas.height, clientY - rect.top));
+  return {
+    screenX: x,
+    screenY: y,
+    pdfX: x / scale,
+    pdfY: pageHeight - (y / scale)
+  };
+}
+
+function appendOverlayRect(rect, className) {
+  if (!rect || rect.width <= 0 || rect.height <= 0) return;
+  const screen = pdfRectToScreen(rect);
+  const el = document.createElement('div');
+  el.className = className;
+  el.style.left = `${screen.x}px`;
+  el.style.top = `${screen.y}px`;
+  el.style.width = `${Math.max(1, screen.width)}px`;
+  el.style.height = `${Math.max(1, screen.height)}px`;
+  textOverlay.appendChild(el);
+}
+
+function resizeTextOverlay() {
+  textOverlay.style.width = `${canvas.width}px`;
+  textOverlay.style.height = `${canvas.height}px`;
+  textOverlay.style.display = canvas.style.display === 'block' ? 'block' : 'none';
+  textOverlay.style.transform = canvas.style.transform || '';
+}
+
+function renderTextOverlay() {
+  if (!textOverlay) return;
+  textOverlay.innerHTML = '';
+  resizeTextOverlay();
+
+  if (!Module || totalPages <= 0 || canvas.style.display !== 'block') return;
+
+  const pageMatches = searchResults.filter(result => result.page === currentPage);
+  for (const result of pageMatches) {
+    const isCurrent = searchResults[currentSearchIndex] === result;
+    const quads = result.quads && result.quads.length > 0
+      ? result.quads
+      : [{ x: result.x, y: result.y, width: result.width, height: result.height }];
+    for (const quad of quads) {
+      appendOverlayRect(quad, `text-highlight${isCurrent ? ' current' : ''}`);
+    }
+  }
+
+  if (currentSelection && currentSelection.page === currentPage) {
+    for (const segment of currentSelection.segments || []) {
+      appendOverlayRect(segment.quad, 'selection-highlight');
+    }
+  }
+
+  if (selectionDragBox) {
+    const el = document.createElement('div');
+    el.className = 'drag-selection-box';
+    el.style.left = `${selectionDragBox.x}px`;
+    el.style.top = `${selectionDragBox.y}px`;
+    el.style.width = `${selectionDragBox.width}px`;
+    el.style.height = `${selectionDragBox.height}px`;
+    textOverlay.appendChild(el);
   }
 }
 
@@ -577,9 +671,11 @@ function renderCurrentPage() {
 
   emptyState.style.display = 'none';
   canvas.style.display = 'block';
+  resizeTextOverlay();
 
   // Apply rotation
   applyRotation();
+  renderTextOverlay();
 
   const zoomPct = Math.round(zoomLevel * 100);
   setStatus(`Page ${currentPage + 1} / ${totalPages} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}`);
@@ -613,26 +709,50 @@ function performSearch(term) {
     searchInfo.textContent = '';
     searchPrevBtn.disabled = true;
     searchNextBtn.disabled = true;
+    renderTextOverlay();
     return;
   }
 
   const termPtr = Module.stringToNewUTF8(term);
   const pagesPtr = Module.stringToNewUTF8('all');
-  const resultPtr = Module._nanopdf_batch_find_text(termPtr, pagesPtr);
+  const resultPtr = Module._nanopdf_search_text
+    ? Module._nanopdf_search_text(termPtr, pagesPtr, 0, 0, -1)
+    : Module._nanopdf_batch_find_text(termPtr, pagesPtr);
   const resultStr = Module.UTF8ToString(resultPtr);
   Module._free(termPtr);
   Module._free(pagesPtr);
 
   try {
     const data = JSON.parse(resultStr);
-    if (data.results) {
+    if (Module._nanopdf_search_text && data.results) {
+      for (const match of data.results) {
+        searchResults.push({
+          page: match.page,
+          start: match.start,
+          end: match.end,
+          context: match.context,
+          x: match.x,
+          y: match.y,
+          width: match.width,
+          height: match.height,
+          quads: match.quads || [],
+          writingMode: match.writingMode || 'horizontal'
+        });
+      }
+    } else if (data.results) {
       for (const pageResult of data.results) {
         for (const match of pageResult.matches) {
           searchResults.push({
             page: pageResult.page,
             start: match.start,
             end: match.end,
-            context: match.context
+            context: match.context,
+            x: match.x,
+            y: match.y,
+            width: match.width,
+            height: match.height,
+            quads: match.quads || [],
+            writingMode: match.writingMode || 'horizontal'
           });
         }
       }
@@ -650,10 +770,12 @@ function performSearch(term) {
     updateSearchInfo();
     searchPrevBtn.disabled = false;
     searchNextBtn.disabled = false;
+    renderTextOverlay();
   } else {
     searchInfo.textContent = 'No matches';
     searchPrevBtn.disabled = true;
     searchNextBtn.disabled = true;
+    renderTextOverlay();
   }
 }
 
@@ -673,6 +795,7 @@ function nextSearchResult() {
     goToPage(result.page);
   }
   updateSearchInfo();
+  renderTextOverlay();
 }
 
 function prevSearchResult() {
@@ -683,10 +806,84 @@ function prevSearchResult() {
     goToPage(result.page);
   }
   updateSearchInfo();
+  renderTextOverlay();
 }
 
 function clearSearch() {
   // Don't clear input or results, just reset current match tracking
+}
+
+// ---- Text Selection ----
+
+function beginTextSelection(e) {
+  if (!Module || totalPages <= 0 || canvas.style.display !== 'block') return;
+  if (e.button !== 0) return;
+  isSelectingText = true;
+  currentSelection = null;
+  selectionStartPoint = overlayPointToPdf(e.clientX, e.clientY);
+  selectionDragBox = { x: selectionStartPoint.screenX, y: selectionStartPoint.screenY, width: 0, height: 0 };
+  textOverlay.setPointerCapture(e.pointerId);
+  renderTextOverlay();
+  e.preventDefault();
+}
+
+function updateTextSelection(e) {
+  if (!isSelectingText || !selectionStartPoint) return;
+  const point = overlayPointToPdf(e.clientX, e.clientY);
+  const x = Math.min(selectionStartPoint.screenX, point.screenX);
+  const y = Math.min(selectionStartPoint.screenY, point.screenY);
+  selectionDragBox = {
+    x,
+    y,
+    width: Math.abs(point.screenX - selectionStartPoint.screenX),
+    height: Math.abs(point.screenY - selectionStartPoint.screenY)
+  };
+  renderTextOverlay();
+  e.preventDefault();
+}
+
+function finishTextSelection(e) {
+  if (!isSelectingText || !selectionStartPoint) return;
+  const endPoint = overlayPointToPdf(e.clientX, e.clientY);
+  isSelectingText = false;
+  selectionDragBox = null;
+
+  const x1 = Math.min(selectionStartPoint.pdfX, endPoint.pdfX);
+  const x2 = Math.max(selectionStartPoint.pdfX, endPoint.pdfX);
+  const y1 = Math.min(selectionStartPoint.pdfY, endPoint.pdfY);
+  const y2 = Math.max(selectionStartPoint.pdfY, endPoint.pdfY);
+  selectionStartPoint = null;
+
+  if (Math.abs(x2 - x1) < 1 || Math.abs(y2 - y1) < 1) {
+    currentSelection = null;
+    renderTextOverlay();
+    return;
+  }
+
+  if (Module._nanopdf_select_text_rect) {
+    const ptr = Module._nanopdf_select_text_rect(currentPage, x1, y1, x2, y2);
+    const resultStr = Module.UTF8ToString(ptr);
+    try {
+      const selection = JSON.parse(resultStr);
+      currentSelection = selection.error ? null : selection;
+    } catch (err) {
+      console.error('Selection parse error:', err);
+      currentSelection = null;
+    }
+  }
+
+  renderTextOverlay();
+  if (currentSelection && currentSelection.text) {
+    setStatus(`Selected ${currentSelection.text.length} characters`);
+  }
+  e.preventDefault();
+}
+
+function copyCurrentSelection(e) {
+  if (!currentSelection || !currentSelection.text) return;
+  e.clipboardData.setData('text/plain', currentSelection.text);
+  e.preventDefault();
+  setStatus('Selection copied');
 }
 
 // ---- PDF Loading ----
@@ -722,6 +919,14 @@ async function loadPDF(arrayBuffer, name) {
     isThumbnailRendering = false;
     selectedPages = new Set();
     lastClickedPage = 0;
+    searchResults = [];
+    currentSearchIndex = -1;
+    currentSearchTerm = '';
+    currentSelection = null;
+    selectionStartPoint = null;
+    selectionDragBox = null;
+    searchInput.value = '';
+    searchInfo.textContent = '';
     updateZoomDisplay();
     updateExportButton();
     fitModeBtn.textContent = 'Fit Width';
@@ -1157,6 +1362,13 @@ searchInput.addEventListener('keydown', (e) => {
 });
 searchPrevBtn.addEventListener('click', prevSearchResult);
 searchNextBtn.addEventListener('click', nextSearchResult);
+
+// Text selection overlay
+textOverlay.addEventListener('pointerdown', beginTextSelection);
+textOverlay.addEventListener('pointermove', updateTextSelection);
+textOverlay.addEventListener('pointerup', finishTextSelection);
+textOverlay.addEventListener('pointercancel', finishTextSelection);
+document.addEventListener('copy', copyCurrentSelection);
 
 // Window resize
 window.addEventListener('resize', onResize);

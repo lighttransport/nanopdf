@@ -34,6 +34,19 @@ std::vector<TextChar> make_text_at(const char* text, double x, double y) {
   return chars;
 }
 
+std::vector<TextChar> make_vertical_text_at(const char* text, double x, double y) {
+  std::vector<TextChar> chars;
+  for (size_t i = 0; text[i]; ++i) {
+    TextChar ch = make_char(text[i], x, y);
+    ch.writing_mode = TextWritingMode::Vertical;
+    ch.width = 12.0;
+    ch.height = 12.0;
+    chars.push_back(ch);
+    y -= 12.0;
+  }
+  return chars;
+}
+
 } // namespace
 
 TEST_SUITE("TextLayout") {
@@ -142,6 +155,37 @@ TEST_CASE("Spatial query") {
 
   std::string not_found = page->get_text_in_rect(500.0, 500.0, 600.0, 600.0);
   CHECK(not_found.empty());
+}
+
+TEST_CASE("Vertical text groups top-to-bottom and columns right-to-left") {
+  std::vector<TextChar> chars;
+  auto right = make_vertical_text_at("ABC", 400.0, 700.0);
+  auto left = make_vertical_text_at("DEF", 360.0, 700.0);
+  chars.insert(chars.end(), left.begin(), left.end());
+  chars.insert(chars.end(), right.begin(), right.end());
+
+  auto page = extract_text_layout_with_collector(chars, 612.0, 792.0);
+
+  REQUIRE(page != nullptr);
+  CHECK_EQ(page->lines.size(), size_t(2));
+  CHECK_EQ(page->get_text(), std::string("ABC\nDEF\n"));
+  CHECK_EQ(static_cast<int>(page->lines[0].writing_mode),
+           static_cast<int>(TextWritingMode::Vertical));
+}
+
+TEST_CASE("Selection range and rectangle return text and quads") {
+  auto chars = make_text_at("Select me", 100.0, 700.0);
+  auto page = extract_text_layout_with_collector(chars, 612.0, 792.0);
+
+  REQUIRE(page != nullptr);
+  auto range = page->select_text_range(0, 6);
+  CHECK_EQ(range.text, std::string("Select"));
+  CHECK_FALSE(range.segments.empty());
+  CHECK(range.bounds.width > 0.0);
+
+  auto rect = page->select_text_in_rect(95.0, 695.0, 145.0, 720.0);
+  CHECK(rect.text.find("Select") != std::string::npos);
+  CHECK_FALSE(rect.segments.empty());
 }
 
 } // TEST_SUITE

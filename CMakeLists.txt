@@ -12,6 +12,7 @@ option(NANOPDF_USE_NANOSTL "Use nanostl." OFF)
 option(NANOPDF_USE_STB_TRUETYPE "Use stb_truetype to load fonts." ON)
 option(NANOPDF_BUILD_TESTS "Build test executables" ${BUILD_TESTING})
 option(NANOPDF_BUILD_WASM "Build for WebAssembly with Emscripten" OFF)
+option(NANOPDF_BUILD_MCP "Build the MCP server target for native builds" ON)
 option(NANOPDF_USE_LIGHTVG "Use lightui VG software rasterizer (default backend)" ON)
 option(NANOPDF_USE_THORVG "Use ThorVG for rendering backend" OFF)
 option(NANOPDF_USE_BLEND2D "Use Blend2D for rendering backend" OFF)
@@ -250,28 +251,49 @@ if(NANOPDF_EMBED_FONTS)
   if(FONT_FILES)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-    # Generate compressed .bin files + .hh/.S/.cc (ELF .incbin approach) —
-    # dramatically faster to compile than a single multi-megabyte hex array.
-    add_custom_command(
-      OUTPUT ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
-        ${FONTS_DIR} ${CMAKE_BINARY_DIR} embedded-fonts
-        --exclude-dirs=noto-sans-jp,noto-serif-jp
-      DEPENDS ${FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
-      COMMENT "Generating embedded fonts (incbin)"
-      VERBATIM
-    )
+    if(NANOPDF_BUILD_WASM)
+      # Emscripten's wasm assembler cannot consume ELF-style .incbin sections,
+      # so use the portable C++ array generator for WASM builds.
+      add_custom_command(
+        OUTPUT ${EMBEDDED_FONTS_HEADER}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.py
+          ${FONTS_DIR} ${EMBEDDED_FONTS_HEADER}
+          --exclude-dirs=noto-sans-jp,noto-serif-jp
+        DEPENDS ${FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.py
+        COMMENT "Generating embedded fonts (C++ header)"
+        VERBATIM
+      )
 
-    add_custom_target(generate_embedded_fonts
-      DEPENDS ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
-    )
+      add_custom_target(generate_embedded_fonts
+        DEPENDS ${EMBEDDED_FONTS_HEADER}
+      )
 
-    set_source_files_properties(${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM}
-                                ${EMBEDDED_FONTS_CC} PROPERTIES GENERATED TRUE)
-    enable_language(ASM)
-    list(APPEND NANOPDF_SOURCES ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC})
+      set_source_files_properties(${EMBEDDED_FONTS_HEADER} PROPERTIES GENERATED TRUE)
+      message(STATUS "Font embedding enabled (${FONTS_DIR}, C++ header)")
+    else()
+      # Generate compressed .bin files + .hh/.S/.cc (ELF .incbin approach) —
+      # dramatically faster to compile than a single multi-megabyte hex array.
+      add_custom_command(
+        OUTPUT ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+          ${FONTS_DIR} ${CMAKE_BINARY_DIR} embedded-fonts
+          --exclude-dirs=noto-sans-jp,noto-serif-jp
+        DEPENDS ${FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+        COMMENT "Generating embedded fonts (incbin)"
+        VERBATIM
+      )
 
-    message(STATUS "Font embedding enabled (${FONTS_DIR}, incbin)")
+      add_custom_target(generate_embedded_fonts
+        DEPENDS ${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC}
+      )
+
+      set_source_files_properties(${EMBEDDED_FONTS_HEADER} ${EMBEDDED_FONTS_ASM}
+                                  ${EMBEDDED_FONTS_CC} PROPERTIES GENERATED TRUE)
+      enable_language(ASM)
+      list(APPEND NANOPDF_SOURCES ${EMBEDDED_FONTS_ASM} ${EMBEDDED_FONTS_CC})
+
+      message(STATUS "Font embedding enabled (${FONTS_DIR}, incbin)")
+    endif()
   else()
     message(WARNING "Font embedding enabled but no fonts found in ${FONTS_DIR}")
     set(NANOPDF_EMBED_FONTS OFF)
@@ -280,6 +302,12 @@ endif()
 
 # Separate CJK font embedding (Noto Sans/Serif JP, ~61 MB compressed)
 option(NANOPDF_EMBED_CJK_FONTS "Embed CJK fonts (Noto Sans/Serif JP) as binary data" OFF)
+option(NANOPDF_WASM_EMBED_CJK_FONTS "Allow CJK font embedding in WASM builds despite very high compile cost" OFF)
+
+if(NANOPDF_BUILD_WASM AND NANOPDF_EMBED_CJK_FONTS AND NOT NANOPDF_WASM_EMBED_CJK_FONTS)
+  message(WARNING "Disabling NANOPDF_EMBED_CJK_FONTS for WASM. Use external fonts, or set NANOPDF_WASM_EMBED_CJK_FONTS=ON to opt into the slow large-header build.")
+  set(NANOPDF_EMBED_CJK_FONTS OFF CACHE BOOL "Embed CJK fonts (Noto Sans/Serif JP) as binary data" FORCE)
+endif()
 
 if(NANOPDF_EMBED_CJK_FONTS)
   # CJK embedding requires base font embedding
@@ -297,25 +325,45 @@ if(NANOPDF_EMBED_CJK_FONTS)
 
   if(CJK_FONT_FILES)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    add_custom_command(
-      OUTPUT ${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC}
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
-        ${FONTS_DIR} ${CMAKE_BINARY_DIR} embedded-cjk-fonts
-        --include-only-dirs=noto-sans-jp,noto-serif-jp
-        --header-guard=NANOPDF_EMBEDDED_CJK_FONTS_HH
-        --namespace=embedded_cjk_fonts
-        --symbol-prefix=nanopdf_cjkfont_
-        --skip-pdf-mapping
-      DEPENDS ${CJK_FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
-      COMMENT "Generating embedded CJK fonts (incbin)"
-    )
-    add_custom_target(generate_embedded_cjk_fonts
-      DEPENDS ${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC})
-    set_source_files_properties(${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM}
-                                ${EMBEDDED_CJK_FONTS_CC} PROPERTIES GENERATED TRUE)
-    enable_language(ASM)
-    list(APPEND NANOPDF_SOURCES ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC})
-    message(STATUS "CJK font embedding enabled (incbin)")
+    if(NANOPDF_BUILD_WASM)
+      add_custom_command(
+        OUTPUT ${EMBEDDED_CJK_FONTS_HEADER}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.py
+          ${FONTS_DIR} ${EMBEDDED_CJK_FONTS_HEADER}
+          --include-only-dirs=noto-sans-jp,noto-serif-jp
+          --header-guard=NANOPDF_EMBEDDED_CJK_FONTS_HH
+          --namespace=embedded_cjk_fonts
+          --skip-pdf-mapping
+        DEPENDS ${CJK_FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts.py
+        COMMENT "Generating embedded CJK fonts (C++ header)"
+        VERBATIM
+      )
+      add_custom_target(generate_embedded_cjk_fonts
+        DEPENDS ${EMBEDDED_CJK_FONTS_HEADER})
+      set_source_files_properties(${EMBEDDED_CJK_FONTS_HEADER} PROPERTIES GENERATED TRUE)
+      message(STATUS "CJK font embedding enabled (C++ header)")
+    else()
+      add_custom_command(
+        OUTPUT ${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+          ${FONTS_DIR} ${CMAKE_BINARY_DIR} embedded-cjk-fonts
+          --include-only-dirs=noto-sans-jp,noto-serif-jp
+          --header-guard=NANOPDF_EMBEDDED_CJK_FONTS_HH
+          --namespace=embedded_cjk_fonts
+          --symbol-prefix=nanopdf_cjkfont_
+          --skip-pdf-mapping
+        DEPENDS ${CJK_FONT_FILES} ${CMAKE_SOURCE_DIR}/cmake/embed_fonts_binary.py
+        COMMENT "Generating embedded CJK fonts (incbin)"
+        VERBATIM
+      )
+      add_custom_target(generate_embedded_cjk_fonts
+        DEPENDS ${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC})
+      set_source_files_properties(${EMBEDDED_CJK_FONTS_HEADER} ${EMBEDDED_CJK_FONTS_ASM}
+                                  ${EMBEDDED_CJK_FONTS_CC} PROPERTIES GENERATED TRUE)
+      enable_language(ASM)
+      list(APPEND NANOPDF_SOURCES ${EMBEDDED_CJK_FONTS_ASM} ${EMBEDDED_CJK_FONTS_CC})
+      message(STATUS "CJK font embedding enabled (incbin)")
+    endif()
   else()
     message(WARNING "CJK font embedding enabled but no CJK fonts found in ${FONTS_DIR}/noto-sans-jp or ${FONTS_DIR}/noto-serif-jp")
     set(NANOPDF_EMBED_CJK_FONTS OFF)
@@ -368,6 +416,9 @@ if(NANOPDF_BUILD_WASM)
   # For Emscripten, USE_ZLIB must be specified for both compilation and linking
   target_compile_options(${BUILD_TARGET} PRIVATE "SHELL:-s USE_ZLIB=1")
   target_link_options(${BUILD_TARGET} PRIVATE "SHELL:-s USE_ZLIB=1")
+  # stb_image_write_impl.cc routes PNG compression through the bundled miniz
+  # prefixed mz_* APIs even in WASM builds.
+  target_sources(${BUILD_TARGET} PRIVATE src/third_party/miniz.c)
 else()
   # Always use embedded miniz as zlib replacement (no external dependencies)
   target_sources(${BUILD_TARGET} PRIVATE src/third_party/miniz.c)
@@ -679,6 +730,7 @@ if(NOT NANOPDF_BUILD_WASM)
   add_sanitizers(${BUILD_TARGET})
 endif()
 
+if(NOT NANOPDF_BUILD_WASM)
 set(NANOPDF_C_API_HEADERS
   src/c/nanopdf_types.h
   src/c/nanopdf_c.h
@@ -758,17 +810,16 @@ if(NOT NANOPDF_C_USE_CPP_IMAGE_BRIDGE)
   endif()
   target_compile_definitions(nanopdf-c PRIVATE ${NANOPDF_CXX_DEFINES})
 endif()
-if(NOT NANOPDF_BUILD_WASM)
-  add_sanitizers(nanopdf-c)
-endif()
+add_sanitizers(nanopdf-c)
 
 install(TARGETS nanopdf-c DESTINATION lib)
 install(FILES ${NANOPDF_C_API_HEADERS} DESTINATION include/nanopdf-c)
+endif()
 
 # ============================================================
 # MCP (Model Context Protocol) server
 # ============================================================
-if(NOT NANOPDF_BUILD_WASM)
+if(NANOPDF_BUILD_MCP AND NOT NANOPDF_BUILD_WASM)
   # MCP library
   add_library(nanopdf_mcp
     src/mcp/mcp-json.cc

@@ -176,6 +176,7 @@ TEST_CASE("Page dimensions are reasonable for all tracked PDFs") {
       "test_curves.pdf",
       "test_linestyles.pdf",
       "test_softmask.pdf",
+      "synthetic_text_search_selection.pdf",
       "test_transforms.pdf",
       "test_winding.pdf",
   };
@@ -433,6 +434,59 @@ TEST_CASE("search_text respects max_results") {
   CHECK_EQ(matches.size(), size_t(1));
   if (!matches.empty()) {
     CHECK(matches[0].page_number < pdf.catalog.pages.size());
+  }
+}
+
+TEST_CASE("synthetic PDF supports search and selection geometry") {
+  std::vector<uint8_t> data;
+  Pdf pdf;
+  SKIP_IF(!open_pdf("synthetic_text_search_selection.pdf", data, pdf),
+          "synthetic_text_search_selection.pdf not available");
+
+  const Page* page = pdf.get_page(0);
+  REQUIRE(page != nullptr);
+
+  auto text_page = extract_text_layout(pdf, *page);
+  REQUIRE(text_page != nullptr);
+
+  std::string text = text_page->get_text();
+  CHECK(text.find("SEARCHABLE HORIZONTAL TEXT") != std::string::npos);
+  CHECK(text.find("縦書き日本語") != std::string::npos);
+
+  std::vector<TextSearchResult> horizontal =
+      search_text_on_page(pdf, *page, "HORIZONTAL", true);
+  REQUIRE(!horizontal.empty());
+  CHECK_FALSE(horizontal[0].fuzzy);
+  CHECK(horizontal[0].writing_mode == TextWritingMode::Horizontal);
+  CHECK(!horizontal[0].quads.empty());
+  CHECK(horizontal[0].width > 0.0);
+  CHECK(horizontal[0].height > 0.0);
+
+  TextSelectionResult horizontal_selection =
+      text_page->select_text_range(horizontal[0].char_index, horizontal[0].length);
+  CHECK(horizontal_selection.text.find("HORIZONTAL") != std::string::npos);
+  CHECK(!horizontal_selection.segments.empty());
+
+  std::vector<TextSearchResult> vertical =
+      search_text_on_page(pdf, *page, "縦書き", true);
+  REQUIRE(!vertical.empty());
+  CHECK_FALSE(vertical[0].fuzzy);
+  CHECK(vertical[0].writing_mode == TextWritingMode::Vertical);
+  CHECK(!vertical[0].quads.empty());
+  CHECK(vertical[0].height > vertical[0].width);
+
+  TextSelectionResult vertical_range =
+      text_page->select_text_range(vertical[0].char_index, vertical[0].length);
+  CHECK(vertical_range.text.find("縦書き") != std::string::npos);
+  REQUIRE(!vertical_range.segments.empty());
+  CHECK(vertical_range.segments[0].writing_mode == TextWritingMode::Vertical);
+
+  TextSelectionResult vertical_rect =
+      text_page->select_text_in_rect(405.0, 520.0, 455.0, 725.0);
+  CHECK(vertical_rect.text.find("縦書き日本語") != std::string::npos);
+  CHECK(!vertical_rect.segments.empty());
+  if (!vertical_rect.segments.empty()) {
+    CHECK(vertical_rect.segments[0].writing_mode == TextWritingMode::Vertical);
   }
 }
 

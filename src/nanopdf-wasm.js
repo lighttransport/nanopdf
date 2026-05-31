@@ -264,6 +264,63 @@ class NanoPDF {
   }
 
   /**
+   * Search text with highlight geometry.
+   * @param {string} searchTerm - Text to search for
+   * @param {Object} [options]
+   * @param {string} [options.pageIndices="all"] - Comma-separated page indices or "all"
+   * @param {boolean} [options.caseSensitive=false] - Case-sensitive search
+   * @param {boolean} [options.fuzzy=false] - Include approximate matches
+   * @param {number} [options.maxResults=-1] - Maximum result count
+   * @returns {Object} Search results with quads and writing-mode metadata
+   */
+  searchText(searchTerm, options = {}) {
+    const pageIndices = options.pageIndices || "all";
+    const termPtr = this._module.stringToNewUTF8(searchTerm);
+    const indicesPtr = this._module.stringToNewUTF8(pageIndices);
+    const ptr = this._module._nanopdf_search_text(
+      termPtr,
+      indicesPtr,
+      options.caseSensitive ? 1 : 0,
+      options.fuzzy ? 1 : 0,
+      options.maxResults ?? -1
+    );
+    this._module._free(termPtr);
+    this._module._free(indicesPtr);
+    const jsonStr = this._module.UTF8ToString(ptr);
+    try {
+      return JSON.parse(jsonStr);
+    } catch (e) {
+      return { error: 'Failed to parse search JSON' };
+    }
+  }
+
+  /**
+   * Select text by reading-order range.
+   */
+  selectTextRange(pageIndex, start, length) {
+    const ptr = this._module._nanopdf_select_text_range(pageIndex, start, length);
+    const jsonStr = this._module.UTF8ToString(ptr);
+    try {
+      return JSON.parse(jsonStr);
+    } catch (e) {
+      return { error: 'Failed to parse selection JSON' };
+    }
+  }
+
+  /**
+   * Select text by rectangle in PDF page coordinates.
+   */
+  selectTextRect(pageIndex, x1, y1, x2, y2) {
+    const ptr = this._module._nanopdf_select_text_rect(pageIndex, x1, y1, x2, y2);
+    const jsonStr = this._module.UTF8ToString(ptr);
+    try {
+      return JSON.parse(jsonStr);
+    } catch (e) {
+      return { error: 'Failed to parse selection JSON' };
+    }
+  }
+
+  /**
    * Batch extract text with layout info from multiple pages
    * @param {string} [pageIndices="all"] - Comma-separated page indices or "all"
    * @returns {Object} Object with pages array containing layout info

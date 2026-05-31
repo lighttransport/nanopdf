@@ -107,6 +107,8 @@ ToolResult get_page_info_tool(const JsonValue& args);
 ToolResult get_metadata_tool(const JsonValue& args);
 ToolResult extract_text_layout_tool(const JsonValue& args);
 ToolResult find_text_tool(const JsonValue& args);
+ToolResult search_text_tool(const JsonValue& args);
+ToolResult select_text_tool(const JsonValue& args);
 ToolResult get_fonts_tool(const JsonValue& args);
 ToolResult get_images_tool(const JsonValue& args);
 ToolResult close_pdf_tool(const JsonValue& args);

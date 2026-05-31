@@ -225,12 +225,45 @@ body {
   align-items: center;
   justify-content: center;
   transition: width 0.3s, height 0.3s;
+  position: relative;
 }
 #pdf-canvas {
   box-shadow: 0 2px 8px rgba(0,0,0,0.15);
   background: #fff;
   display: none;
   transition: transform 0.3s ease;
+}
+.text-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  overflow: hidden;
+  transform-origin: center center;
+  transition: transform 0.3s ease;
+  user-select: none;
+  cursor: text;
+}
+.text-highlight,
+.selection-highlight,
+.drag-selection-box {
+  position: absolute;
+  pointer-events: none;
+}
+.text-highlight {
+  background: rgba(255, 214, 64, 0.42);
+  border-radius: 2px;
+}
+.text-highlight.current {
+  background: rgba(0, 123, 255, 0.30);
+  outline: 2px solid rgba(0, 86, 179, 0.75);
+}
+.selection-highlight {
+  background: rgba(0, 123, 255, 0.26);
+  border-radius: 2px;
+}
+.drag-selection-box {
+  border: 1px solid rgba(0, 86, 179, 0.9);
+  background: rgba(0, 123, 255, 0.10);
 }
 
 /* Text output panel */

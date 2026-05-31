@@ -12156,6 +12156,7 @@ void populate_search_result_geometry(const SearchablePageText& searchable_page,
   result->x = first_ch.x;
   result->y = first_ch.y;
   result->height = first_ch.height;
+  result->writing_mode = first_ch.writing_mode;
 
   const size_t end_pos = start + match_length - 1;
   if (end_pos >= searchable_page.char_refs.size()) {
@@ -12171,8 +12172,81 @@ void populate_search_result_geometry(const SearchablePageText& searchable_page,
 
   const TextChar& last_ch =
       text_page.lines[last_ref.line_idx].chars[last_ref.char_in_line];
-  result->width = (last_ch.x + last_ch.width) - result->x;
-  result->height = std::max(result->height, last_ch.height);
+
+  bool have_bounds = false;
+  double min_x = 0.0;
+  double min_y = 0.0;
+  double max_x = 0.0;
+  double max_y = 0.0;
+  size_t current_line = std::numeric_limits<size_t>::max();
+  TextQuad current_quad;
+  bool have_quad = false;
+
+  auto merge_char = [&](const TextChar& ch) {
+    if (!have_bounds) {
+      min_x = ch.quad.x;
+      min_y = ch.quad.y;
+      max_x = ch.quad.x + ch.quad.width;
+      max_y = ch.quad.y + ch.quad.height;
+      have_bounds = true;
+    } else {
+      min_x = std::min(min_x, ch.quad.x);
+      min_y = std::min(min_y, ch.quad.y);
+      max_x = std::max(max_x, ch.quad.x + ch.quad.width);
+      max_y = std::max(max_y, ch.quad.y + ch.quad.height);
+    }
+
+    if (!have_quad || current_line != ch.line_index) {
+      if (have_quad) {
+        result->quads.push_back(current_quad);
+      }
+      current_quad = ch.quad;
+      current_line = static_cast<size_t>(std::max(ch.line_index, 0));
+      have_quad = true;
+    } else {
+      const double qx1 = std::min(current_quad.x, ch.quad.x);
+      const double qy1 = std::min(current_quad.y, ch.quad.y);
+      const double qx2 = std::max(current_quad.x + current_quad.width,
+                                  ch.quad.x + ch.quad.width);
+      const double qy2 = std::max(current_quad.y + current_quad.height,
+                                  ch.quad.y + ch.quad.height);
+      current_quad.x = qx1;
+      current_quad.y = qy1;
+      current_quad.width = qx2 - qx1;
+      current_quad.height = qy2 - qy1;
+      current_quad.x1 = qx1;
+      current_quad.y1 = qy1;
+      current_quad.x2 = qx2;
+      current_quad.y2 = qy1;
+      current_quad.x3 = qx2;
+      current_quad.y3 = qy2;
+      current_quad.x4 = qx1;
+      current_quad.y4 = qy2;
+    }
+  };
+
+  for (size_t pos = start; pos <= end_pos && pos < searchable_page.char_refs.size(); ++pos) {
+    const SearchCharRef& ref = searchable_page.char_refs[pos];
+    if (!ref.is_text_char ||
+        ref.line_idx >= text_page.lines.size() ||
+        ref.char_in_line >= text_page.lines[ref.line_idx].chars.size()) {
+      continue;
+    }
+    merge_char(text_page.lines[ref.line_idx].chars[ref.char_in_line]);
+  }
+  if (have_quad) {
+    result->quads.push_back(current_quad);
+  }
+
+  if (have_bounds) {
+    result->x = min_x;
+    result->y = min_y;
+    result->width = max_x - min_x;
+    result->height = max_y - min_y;
+  } else {
+    result->width = (last_ch.x + last_ch.width) - result->x;
+    result->height = std::max(result->height, last_ch.height);
+  }
 }
 
 std::vector<TextSearchResult> build_results_from_candidates(
