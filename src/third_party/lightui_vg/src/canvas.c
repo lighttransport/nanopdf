@@ -1122,10 +1122,18 @@ typedef struct {
 
 typedef struct { float x; int8_t w; } lui__cross_t;
 
+/* `clens`/`nclen` optionally describe multiple closed sub-contours packed
+ * back-to-back in `pts` (clens[k] points each, summing to `count`). When
+ * `clens` is NULL the whole array is treated as one contour. Multi-contour
+ * fills build every contour's edges into a single edge table so the fill
+ * rule (non-zero / even-odd) is evaluated across ALL contours in one pass —
+ * this is what makes glyph counters (the hole in 'o', 'O', '0') and other
+ * holed shapes carve out instead of filling solid. */
 static void lui__fill_polygon_aa(lui_canvas_t *cv,
                                   const lui_pointf_t *pts, int count,
                                   lui_color_t color,
-                                  lui_fill_rule_t rule)
+                                  lui_fill_rule_t rule,
+                                  const int *clens, int nclen)
 {
     if (!cv || !pts || count < 3) return;
 
@@ -1188,8 +1196,16 @@ static void lui__fill_polygon_aa(lui_canvas_t *cv,
     int n_edges = 0;
     float fy_clip_lo = (float)ymin;
     float fy_clip_hi = (float)ymax;
-    for (int i = 0; i < count; i++) {
-        int j = (i + 1) == count ? 0 : i + 1;
+    /* Walk each closed contour independently so the wrap-around edge connects
+     * a contour's last vertex to its OWN first vertex (not the next
+     * contour's), keeping the winding of every contour self-balanced. */
+    int n_contours = (clens && nclen > 0) ? nclen : 1;
+    int cbase = 0;
+    for (int ci = 0; ci < n_contours; ci++) {
+        int clen = (clens && nclen > 0) ? clens[ci] : count;
+        for (int k = 0; k < clen; k++) {
+        int i = cbase + k;
+        int j = cbase + ((k + 1) == clen ? 0 : k + 1);
         float y0 = pts[i].y, y1 = pts[j].y;
         if (y0 == y1) continue;                                /* horizontal */
         float x0 = pts[i].x, x1 = pts[j].x;
@@ -1217,6 +1233,8 @@ static void lui__fill_polygon_aa(lui_canvas_t *cv,
          * the canvas lose all their fill. Same reasoning we already
          * apply to left-of-clip edges. */
         n_edges++;
+        }
+        cbase += clen;
     }
     if (n_edges == 0) goto done;
 
@@ -3819,7 +3837,7 @@ void lui_canvas_draw_styled_polyline(lui_canvas_t *canvas,
                                   LUI_FILL_RULE_NONZERO);
         else
             lui__fill_polygon_aa(canvas, outline, oi, color,
-                                 LUI_FILL_RULE_NONZERO);
+                                 LUI_FILL_RULE_NONZERO, NULL, 0);
 
         free(outline_heap);
         free(off_heap);
@@ -3971,7 +3989,22 @@ void lui_canvas_fill_polygonf_ex(lui_canvas_t *canvas,
     if (canvas->_aa_mode == LUI_CANVAS_AA_AGG)
         lui__fill_polygon_dense(canvas, points, count, color, rule);
     else
-        lui__fill_polygon_aa(canvas, points, count, color, rule);
+        lui__fill_polygon_aa(canvas, points, count, color, rule, NULL, 0);
+}
+
+void lui_canvas_fill_polygonsf_ex(lui_canvas_t *canvas,
+                                     const lui_pointf_t *points, int count,
+                                     const int *contour_lengths, int n_contours,
+                                     lui_color_t color,
+                                     lui_fill_rule_t rule)
+{
+    if (!canvas || !points || count < 3) return;
+    /* Multi-contour fill always uses the analytic-AA software rasteriser so a
+     * single edge table spans every contour (required for correct hole/winding
+     * evaluation). The integer backend / AGG paths only fill one contour at a
+     * time, which fills holes solid. */
+    lui__fill_polygon_aa(canvas, points, count, color, rule,
+                         contour_lengths, n_contours);
 }
 
 void lui_canvas_fill_polygon_ex(lui_canvas_t *canvas,

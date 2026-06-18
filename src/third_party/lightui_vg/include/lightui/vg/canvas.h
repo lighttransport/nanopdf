@@ -577,6 +577,25 @@ void lui_canvas_fill_polygonf_ex(lui_canvas_t *canvas,
                                     lui_color_t color,
                                     lui_fill_rule_t rule);
 
+/**
+ * Fill multiple closed sub-contours packed back-to-back in @points
+ * (@contour_lengths[k] vertices each, summing to @count) as a SINGLE shape:
+ * every contour's edges feed one rasteriser pass so the fill rule is applied
+ * across all of them. This is what carves out holes (glyph counters, donut
+ * shapes); filling each contour separately would fill the holes solid.
+ *
+ * @points           Concatenated vertices of all contours.
+ * @count             Total vertex count (>= 3).
+ * @contour_lengths  Per-contour vertex counts (summing to @count). NULL = one
+ *                    contour spanning all @count points.
+ * @n_contours       Number of entries in @contour_lengths.
+ */
+void lui_canvas_fill_polygonsf_ex(lui_canvas_t *canvas,
+                                     const lui_pointf_t *points, int count,
+                                     const int *contour_lengths, int n_contours,
+                                     lui_color_t color,
+                                     lui_fill_rule_t rule);
+
 /* ---- Blit / composite --------------------------------------------------- */
 
 /**

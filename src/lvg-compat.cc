@@ -624,15 +624,22 @@ std::vector<uint8_t> rasterize_contours_to_mask(
   lui_surface_t s = lui_surface_wrap(pixels.data(), bbox_w, bbox_h, bbox_w);
   lui_canvas_t  c;
   lui_canvas_init(&c, &s);
+  std::vector<lui_pointf_t> flat;
+  std::vector<int> lens;
   for (Contour contour : contours) {
     if (contour.pts.size() < 3) continue;
     for (lui_pointf_t& p : contour.pts) {
       p.x -= static_cast<float>(bbox_x);
       p.y -= static_cast<float>(bbox_y);
     }
-    lui_canvas_fill_polygonf_ex(&c, contour.pts.data(),
-                                static_cast<int>(contour.pts.size()),
-                                0xFFFFFFFFu, to_lui_fill_rule(rule));
+    flat.insert(flat.end(), contour.pts.begin(), contour.pts.end());
+    lens.push_back(static_cast<int>(contour.pts.size()));
+  }
+  if (!lens.empty()) {
+    // Single multi-contour pass so the fill rule carves holes.
+    lui_canvas_fill_polygonsf_ex(&c, flat.data(), static_cast<int>(flat.size()),
+                                 lens.data(), static_cast<int>(lens.size()),
+                                 0xFFFFFFFFu, to_lui_fill_rule(rule));
   }
   lui_canvas_destroy(&c);
   for (size_t i = 0; i < mask.size(); ++i) {
@@ -791,15 +798,22 @@ std::vector<uint8_t> rasterize_path_to_mask(
 
   std::vector<Contour> contours;
   flatten_path(cmds, pts, contours);
+  std::vector<lui_pointf_t> flat;
+  std::vector<int> lens;
   for (Contour& contour : contours) {
     if (contour.pts.size() < 3) continue;
     for (lui_pointf_t& p : contour.pts) {
       p.x -= static_cast<float>(bbox_x);
       p.y -= static_cast<float>(bbox_y);
     }
-    lui_canvas_fill_polygonf_ex(&c, contour.pts.data(),
-                                static_cast<int>(contour.pts.size()),
-                                0xFFFFFFFFu, to_lui_fill_rule(rule));
+    flat.insert(flat.end(), contour.pts.begin(), contour.pts.end());
+    lens.push_back(static_cast<int>(contour.pts.size()));
+  }
+  if (!lens.empty()) {
+    // Single multi-contour pass so the fill rule carves holes.
+    lui_canvas_fill_polygonsf_ex(&c, flat.data(), static_cast<int>(flat.size()),
+                                 lens.data(), static_cast<int>(lens.size()),
+                                 0xFFFFFFFFu, to_lui_fill_rule(rule));
   }
   lui_canvas_destroy(&c);
 
@@ -1247,12 +1261,22 @@ void Shape::draw_on(lui_canvas_t* canvas) {
       if (opacity_ < 255) fa = static_cast<uint8_t>((fa * opacity_) / 255);
       if (fa > 0) {
         uint32_t color = pack_argb(fill_r_, fill_g_, fill_b_, fa);
+        // Fill all contours in ONE pass so the fill rule carves holes (glyph
+        // counters, donut shapes) instead of filling each contour solid.
+        std::vector<lui_pointf_t> flat;
+        std::vector<int> lens;
         for (const Contour& c : contours) {
           if (c.pts.size() >= 3) {
-            lui_canvas_fill_polygonf_ex(canvas, c.pts.data(),
-                                        static_cast<int>(c.pts.size()), color,
-                                        to_lui_fill_rule(fill_rule_));
+            flat.insert(flat.end(), c.pts.begin(), c.pts.end());
+            lens.push_back(static_cast<int>(c.pts.size()));
           }
+        }
+        if (!lens.empty()) {
+          lui_canvas_fill_polygonsf_ex(canvas, flat.data(),
+                                       static_cast<int>(flat.size()),
+                                       lens.data(),
+                                       static_cast<int>(lens.size()), color,
+                                       to_lui_fill_rule(fill_rule_));
         }
       }
     }
