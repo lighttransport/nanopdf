@@ -46,6 +46,7 @@ Thumbs.db
 # Test/temp data
 *.pdf
 !data/standardencoding/*.pdf
+!tests/fixtures/signature_docmdp.pdf
 !tests/fixtures/visual/*.pdf
 canvas_output.*
 svg_output.*

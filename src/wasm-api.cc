@@ -55,6 +55,8 @@ static std::string g_text_buffer;
 
 // Export settings
 static int g_export_render_scale = 2;  // Default 2x for good quality
+static bool g_export_encryption_enabled = false;
+static nanopdf::EncryptionConfig g_export_encryption_config;
 
 // Font buffer (for embedded fonts)
 static std::vector<uint8_t> g_font_buffer;
@@ -1236,6 +1238,56 @@ int nanopdf_export_get_quality() {
   return g_export_render_scale;
 }
 
+// Configure password protection for writer-backed PDF export.
+// algorithm: 1=RC4-40, 2=RC4-128, 3=AES-128, 4=AES-256.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_export_set_passwords(const char* user_password,
+                                 const char* owner_password,
+                                 int algorithm) {
+  std::string user = user_password ? user_password : "";
+  std::string owner = owner_password ? owner_password : "";
+  if (user.empty() && owner.empty()) {
+    g_export_encryption_enabled = false;
+    g_export_encryption_config = nanopdf::EncryptionConfig();
+    return 1;
+  }
+
+  if (owner.empty()) {
+    owner = user;
+  }
+  if (owner.empty()) {
+    g_last_error = "Owner password is required for encryption";
+    return 0;
+  }
+
+  nanopdf::EncryptionConfig config;
+  switch (algorithm) {
+    case 1:
+      config.algorithm = nanopdf::EncryptionAlgorithm::RC4_40;
+      break;
+    case 2:
+      config.algorithm = nanopdf::EncryptionAlgorithm::RC4_128;
+      break;
+    case 4:
+      config.algorithm = nanopdf::EncryptionAlgorithm::AES_256;
+      break;
+    case 3:
+    default:
+      config.algorithm = nanopdf::EncryptionAlgorithm::AES_128;
+      break;
+  }
+  config.user_password = user;
+  config.owner_password = owner;
+  config.permissions = nanopdf::UserPermissions::view_only();
+  config.permissions.allow_print = true;
+  config.permissions.allow_copy = false;
+  config.encrypt_metadata = true;
+
+  g_export_encryption_config = config;
+  g_export_encryption_enabled = true;
+  return 1;
+}
+
 static std::vector<uint8_t> g_output_buffer;
 
 // Helper: Render a source page and add it to the writer
@@ -1357,6 +1409,13 @@ int nanopdf_export_pdf() {
   g_writer = new nanopdf::PdfWriter();
   g_writer->set_title("nanopdf Document");
   g_writer->set_creator("nanopdf WASM");
+  if (g_export_encryption_enabled) {
+    g_writer->set_encryption(g_export_encryption_config);
+    if (!g_writer->is_encrypted()) {
+      g_last_error = "Failed to enable PDF encryption";
+      return 0;
+    }
+  }
 
   std::string std_font = g_writer->add_standard_font(nanopdf::StandardFont::Helvetica);
 
@@ -2791,6 +2850,18 @@ const char* nanopdf_get_signatures() {
     json += "\"name\":\"" + json_escape(sig.name) + "\"";
     json += ",\"signed\":" + std::string(sig.is_signed ? "true" : "false");
     json += ",\"signaturePresent\":" + std::string(sig.signature_present ? "true" : "false");
+    json += ",\"byteRangeValid\":" + std::string(sig.byte_range_valid ? "true" : "false");
+    json += ",\"contentsLength\":" + std::to_string(sig.signature_contents.size());
+    if (!sig.byte_range.empty()) {
+      json += ",\"byteRange\":[";
+      for (size_t j = 0; j < sig.byte_range.size(); ++j) {
+        if (j > 0) json += ",";
+        json += std::to_string(sig.byte_range[j]);
+      }
+      json += "]";
+    }
+    if (!sig.digest_algorithm.empty())
+      json += ",\"digestAlgorithm\":\"" + json_escape(sig.digest_algorithm) + "\"";
     if (!sig.signing_reason.empty())
       json += ",\"reason\":\"" + json_escape(sig.signing_reason) + "\"";
     if (!sig.signing_location.empty())
@@ -2804,9 +2875,29 @@ const char* nanopdf_get_signatures() {
     if (!sig.subfilter.empty())
       json += ",\"subFilter\":\"" + json_escape(sig.subfilter) + "\"";
     json += ",\"isCertification\":" + std::string(sig.is_certification_signature ? "true" : "false");
+    json += ",\"mdpPermissions\":" + std::to_string(sig.mdp_permissions);
+    if (!sig.transform_method.empty())
+      json += ",\"transformMethod\":\"" + json_escape(sig.transform_method) + "\"";
+    if (!sig.locked_fields.empty()) {
+      json += ",\"lockedFields\":[";
+      for (size_t j = 0; j < sig.locked_fields.size(); ++j) {
+        if (j > 0) json += ",";
+        json += "\"" + json_escape(sig.locked_fields[j]) + "\"";
+      }
+      json += "]";
+    }
     json += ",\"hasTimestamp\":" + std::string(sig.has_timestamp ? "true" : "false");
+    json += ",\"isDocumentTimestamp\":" + std::string(sig.is_document_timestamp ? "true" : "false");
+    if (sig.has_timestamp)
+      json += ",\"timestampType\":\"" + std::string(sig.is_document_timestamp ? "document_timestamp" : "embedded") + "\"";
     if (sig.has_timestamp && !sig.timestamp_date.empty())
       json += ",\"timestampDate\":\"" + json_escape(sig.timestamp_date) + "\"";
+    if (sig.has_timestamp && !sig.timestamp_authority.empty())
+      json += ",\"timestampAuthority\":\"" + json_escape(sig.timestamp_authority) + "\"";
+    if (sig.has_timestamp && !sig.timestamp_hash_algorithm.empty())
+      json += ",\"timestampHashAlgorithm\":\"" + json_escape(sig.timestamp_hash_algorithm) + "\"";
+    if (sig.has_timestamp && !sig.timestamp_token.empty())
+      json += ",\"timestampTokenLength\":" + std::to_string(sig.timestamp_token.size());
     if (sig.rect.size() >= 4) {
       json += ",\"rect\":[" + std::to_string(sig.rect[0]) + ","
               + std::to_string(sig.rect[1]) + ","
@@ -2815,7 +2906,7 @@ const char* nanopdf_get_signatures() {
     }
     json += "}";
   }
-  json += "]}";
+  json += "],\"count\":" + std::to_string(g_pdf->catalog.signature_fields.size()) + "}";
 
   g_text_buffer = json;
   return g_text_buffer.c_str();

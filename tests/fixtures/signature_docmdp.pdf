@@ -1,0 +1,56 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R /Perms << /DocMDP 5 0 R >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Annots [6 0 R] /Contents 7 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 0000000511 0000001281 0000000863] /Contents <4e616e6f50444620446f634d43502073796e74686574696320504b43533720706c616365686f6c6465720a060b2a864886f70d010910020e0a06096086480165030402010a000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000> /M (D:20260618120000+09'00') /Reason (DocMDP viewer test) /Location (nanopdf tests) /ContactInfo (docmcp@example.test) /Reference [<< /Type /SigRef /TransformMethod /DocMDP /TransformParams << /Type /TransformParams /P 2 /V /1.2 >> >>] >>
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Sig /T (DocMCP Test Signature) /Rect [72 610 300 650] /F 4 /P 3 0 R /V 5 0 R >>
+endobj
+7 0 obj
+<< /Length 140 >>
+stream
+BT /F1 18 Tf 72 700 Td (DocMDP signature fixture) Tj /F1 11 Tf 72 676 Td (Synthetic signature data for wasm viewer metadata display.) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Fields [6 0 R] /SigFlags 3 >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000015 00000 n 
+0000000107 00000 n 
+0000000164 00000 n 
+0000000306 00000 n 
+0000000376 00000 n 
+0000001528 00000 n 
+0000001661 00000 n 
+0000001851 00000 n 
+trailer
+<< /Size 9 /Root 1 0 R >>
+startxref
+1900
+%%EOF
+9 0 obj
+<< /Producer (nanopdf edit history fixture) /ModDate (D:20260618120500+09'00') >>
+endobj
+xref
+9 1
+0000002144 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R /Prev 1900 >>
+startxref
+2241
+%%EOF

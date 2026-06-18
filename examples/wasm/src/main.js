@@ -10,7 +10,10 @@ let totalPages = 0;
 let hasRendering = false;
 let fileName = '';
 let fileSize = 0;
+let currentPdfBytes = null;
 let outlineData = null;
+let signatureData = null;
+let editHistoryData = null;
 let searchResults = [];
 let currentSearchIndex = -1;
 let currentSearchTerm = '';
@@ -41,6 +44,7 @@ const loadingOverlay = document.getElementById('loading-overlay');
 const loadingText = document.getElementById('loading-text');
 const dropOverlay = document.getElementById('drop-overlay');
 const pdfInput = document.getElementById('pdf-input');
+const openPdfBtn = document.getElementById('open-pdf-btn');
 const renderBtn = document.getElementById('render-btn');
 const extractBtn = document.getElementById('extract-btn');
 const prevBtn = document.getElementById('prev-btn');
@@ -69,6 +73,9 @@ const fitModeBtn = document.getElementById('fit-mode-btn');
 const rotateBtn = document.getElementById('rotate-btn');
 const canvasScroll = document.getElementById('canvas-scroll');
 const exportBtn = document.getElementById('export-btn');
+const protectExport = document.getElementById('protect-export');
+const exportPassword = document.getElementById('export-password');
+const exportOwnerPassword = document.getElementById('export-owner-password');
 
 function setStatus(msg, isError = false) {
   statusText.textContent = msg;
@@ -155,11 +162,164 @@ function renderInfoTab() {
 
     const hasForms = Module._nanopdf_has_form_fields() === 1;
     info.push({ label: 'Form Fields', value: hasForms ? `${Module._nanopdf_get_form_field_count()} fields` : 'None' });
+
+    const signatureCount = signatureData && Array.isArray(signatureData.signatures)
+      ? signatureData.signatures.length
+      : 0;
+    info.push({ label: 'Signatures', value: signatureCount > 0 ? `${signatureCount} field${signatureCount === 1 ? '' : 's'}` : 'None' });
+
+    const revisionCount = editHistoryData && Array.isArray(editHistoryData.revisions)
+      ? editHistoryData.revisions.length
+      : 0;
+    info.push({ label: 'Revisions', value: revisionCount > 0 ? `${revisionCount}` : 'None' });
   }
 
   for (const item of info) {
     html += `<div class="doc-info-item"><div class="label">${item.label}</div><div class="value">${item.value}</div></div>`;
   }
+  sidebarContent.innerHTML = html;
+}
+
+function getMdpPermissionLabel(value) {
+  switch (value) {
+    case 1: return 'No changes allowed';
+    case 2: return 'Form fill and sign only';
+    case 3: return 'Form fill, sign, annotate';
+    default: return value ? `Unknown (${value})` : 'Not specified';
+  }
+}
+
+function formatPdfDate(value) {
+  if (!value) return '';
+  const match = /^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?/.exec(value);
+  if (!match) return value;
+  const [, year, month = '01', day = '01', hour = '00', minute = '00', second = '00'] = match;
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+}
+
+function signatureStatusText(sig) {
+  if (!sig.signed && !sig.signaturePresent) return 'Unsigned field';
+  if (!sig.byteRangeValid) return 'Signed, ByteRange missing or invalid';
+  return sig.isCertification ? 'Certification signature' : 'Approval signature';
+}
+
+function renderSignatureDetail(label, value) {
+  if (value === undefined || value === null || value === '') return '';
+  return `<div class="signature-detail"><span>${label}</span><strong>${escapeHtml(String(value))}</strong></div>`;
+}
+
+function renderSignaturesTab() {
+  if (!Module || totalPages <= 0) {
+    sidebarContent.innerHTML = '<div class="empty-sidebar-message">No document loaded.</div>';
+    return;
+  }
+
+  const signatures = signatureData && Array.isArray(signatureData.signatures)
+    ? signatureData.signatures
+    : [];
+
+  if (signatures.length === 0) {
+    sidebarContent.innerHTML = '<div class="empty-sidebar-message">No signature fields in this document.</div>';
+    return;
+  }
+
+  let html = '<div class="signature-list">';
+  signatures.forEach((sig, index) => {
+    const name = sig.name || `Signature ${index + 1}`;
+    const status = signatureStatusText(sig);
+    const statusClass = sig.isCertification ? ' certification' : (sig.signed || sig.signaturePresent ? ' signed' : '');
+    const rect = Array.isArray(sig.rect) && sig.rect.length === 4
+      ? sig.rect.map(n => Number(n).toFixed(1)).join(', ')
+      : '';
+    const byteRange = Array.isArray(sig.byteRange)
+      ? sig.byteRange.join(', ')
+      : '';
+    const signedDate = formatPdfDate(sig.date);
+
+    html += `<section class="signature-card" data-signature-index="${index}">`;
+    html += '<div class="signature-card-header">';
+    html += `<div><div class="signature-name">${escapeHtml(name)}</div><div class="signature-status${statusClass}">${escapeHtml(status)}</div></div>`;
+    html += `<button type="button" class="validate-signature-btn" data-signature-index="${index}" ${sig.signaturePresent ? '' : 'disabled'}>Validate</button>`;
+    html += '</div>';
+    html += '<div class="signature-details">';
+    html += renderSignatureDetail('Type', sig.isCertification ? 'Certification (DocMDP)' : 'Approval');
+    html += renderSignatureDetail('MDP', sig.isCertification ? getMdpPermissionLabel(sig.mdpPermissions) : '');
+    html += renderSignatureDetail('Transform', sig.transformMethod);
+    html += renderSignatureDetail('Filter', sig.filter);
+    html += renderSignatureDetail('SubFilter', sig.subFilter);
+    html += renderSignatureDetail('Reason', sig.reason);
+    html += renderSignatureDetail('Location', sig.location);
+    html += renderSignatureDetail('Contact', sig.contact);
+    html += renderSignatureDetail('Date', signedDate);
+    html += renderSignatureDetail('Timestamp', sig.hasTimestamp ? (sig.timestampType || 'embedded') : 'None');
+    html += renderSignatureDetail('Timestamp Date', formatPdfDate(sig.timestampDate));
+    html += renderSignatureDetail('TSA', sig.timestampAuthority);
+    html += renderSignatureDetail('Timestamp Hash', sig.timestampHashAlgorithm);
+    html += renderSignatureDetail('Timestamp Token', sig.timestampTokenLength ? `${sig.timestampTokenLength} bytes` : '');
+    html += renderSignatureDetail('ByteRange', byteRange);
+    html += renderSignatureDetail('Digest', sig.digestAlgorithm);
+    html += renderSignatureDetail('Contents', sig.contentsLength ? `${sig.contentsLength} bytes` : '');
+    html += renderSignatureDetail('Rect', rect);
+    if (Array.isArray(sig.lockedFields) && sig.lockedFields.length > 0) {
+      html += renderSignatureDetail('Locked Fields', sig.lockedFields.join(', '));
+    }
+    html += '</div>';
+    html += `<div class="signature-validation" id="signature-validation-${index}"></div>`;
+    html += '</section>';
+  });
+  html += '</div>';
+
+  sidebarContent.innerHTML = html;
+  sidebarContent.querySelectorAll('.validate-signature-btn').forEach(btn => {
+    btn.addEventListener('click', () => validateSignature(parseInt(btn.dataset.signatureIndex, 10)));
+  });
+}
+
+function renderHistoryTab() {
+  if (!Module || totalPages <= 0) {
+    sidebarContent.innerHTML = '<div class="empty-sidebar-message">No document loaded.</div>';
+    return;
+  }
+
+  const revisions = editHistoryData && Array.isArray(editHistoryData.revisions)
+    ? editHistoryData.revisions
+    : [];
+
+  if (revisions.length === 0) {
+    sidebarContent.innerHTML = '<div class="empty-sidebar-message">No edit history detected.</div>';
+    return;
+  }
+
+  let html = '<div class="history-summary">';
+  html += `<div>${revisions.length} revision${revisions.length === 1 ? '' : 's'}</div>`;
+  html += `<div>${formatFileSize(editHistoryData.fileSize || 0)}</div>`;
+  html += '</div>';
+  html += '<div class="history-list">';
+
+  revisions.forEach(rev => {
+    const associated = rev.associatedSignature || '';
+    const className = associated ? 'history-card signed' : 'history-card';
+    html += `<section class="${className}">`;
+    html += '<div class="history-card-header">';
+    html += `<div class="history-title">Revision ${rev.revision}</div>`;
+    html += `<div class="history-size">${formatFileSize(rev.sizeBytes)}</div>`;
+    html += '</div>';
+    html += '<div class="history-details">';
+    html += renderSignatureDetail('Bytes', `${rev.startOffset} - ${rev.endOffset}`);
+    html += renderSignatureDetail('startxref', rev.xrefOffset || 'Unknown');
+    html += renderSignatureDetail('Prev', rev.prevXrefOffset || '');
+    html += renderSignatureDetail('SHA-256', rev.sha256 ? rev.sha256.slice(0, 24) : '');
+    html += renderSignatureDetail('Objects', rev.objects && rev.objects.length > 0 ? rev.objects.join(', ') : '');
+    html += renderSignatureDetail('Signed By', associated);
+    html += renderSignatureDetail('Sign Time', formatPdfDate(rev.signingTime));
+    if (associated) {
+      html += renderSignatureDetail('After Signing', rev.modifiedAfterSigning ? 'Additional bytes appended' : 'No appended bytes');
+    }
+    html += '</div>';
+    html += '</section>';
+  });
+
+  html += '</div>';
   sidebarContent.innerHTML = html;
 }
 
@@ -272,6 +432,10 @@ function updateSelectionUI() {
 function updateExportButton() {
   const hasSelection = selectedPages.size > 0 && hasRendering;
   exportBtn.disabled = !hasSelection;
+  protectExport.disabled = !hasSelection;
+  const passwordEnabled = hasSelection && protectExport.checked;
+  exportPassword.disabled = !passwordEnabled;
+  exportOwnerPassword.disabled = !passwordEnabled;
   exportBtn.classList.toggle('has-selection', hasSelection);
   exportBtn.textContent = hasSelection
     ? `Export (${selectedPages.size})`
@@ -401,6 +565,10 @@ function updateSidebar() {
     renderOutlineTab();
   } else if (activeSidebarTab === 'thumbs') {
     renderThumbnailsTab();
+  } else if (activeSidebarTab === 'signatures') {
+    renderSignaturesTab();
+  } else if (activeSidebarTab === 'history') {
+    renderHistoryTab();
   } else {
     renderInfoTab();
   }
@@ -908,7 +1076,10 @@ async function loadPDF(arrayBuffer, name) {
 
     fileName = name;
     fileSize = bytes.length;
+    currentPdfBytes = new Uint8Array(bytes);
     currentPage = 0;
+    signatureData = null;
+    editHistoryData = null;
 
     // Reset view state
     zoomLevel = 1.0;
@@ -919,6 +1090,9 @@ async function loadPDF(arrayBuffer, name) {
     isThumbnailRendering = false;
     selectedPages = new Set();
     lastClickedPage = 0;
+    protectExport.checked = false;
+    exportPassword.value = '';
+    exportOwnerPassword.value = '';
     searchResults = [];
     currentSearchIndex = -1;
     currentSearchTerm = '';
@@ -945,15 +1119,27 @@ async function loadPDF(arrayBuffer, name) {
     zoomOutBtn.disabled = !hasRendering;
     fitModeBtn.disabled = !hasRendering;
     rotateBtn.disabled = !hasRendering;
+    updateExportButton();
 
     updatePageDisplay();
 
     // Load outline
     loadOutline();
+    loadSignatureInfo();
+    editHistoryData = await buildEditHistory(currentPdfBytes, signatureData?.signatures || []);
 
-    // Auto-show sidebar if there are bookmarks
-    if (outlineData && outlineData.outline && outlineData.outline.length > 0) {
+    const hasSignatures = signatureData && Array.isArray(signatureData.signatures) &&
+      signatureData.signatures.length > 0;
+
+    // Auto-show sidebar if there are bookmarks or signatures
+    if ((outlineData && outlineData.outline && outlineData.outline.length > 0) || hasSignatures) {
       sidebar.classList.remove('hidden');
+      if (hasSignatures && (!outlineData || !outlineData.outline || outlineData.outline.length === 0)) {
+        activeSidebarTab = 'signatures';
+        document.querySelectorAll('.sidebar-tabs button').forEach(b => {
+          b.classList.toggle('active', b.dataset.tab === activeSidebarTab);
+        });
+      }
       updateSidebar();
     }
 
@@ -991,6 +1177,164 @@ function loadOutline() {
   } catch (e) {
     console.error('Outline parse error:', e);
     outlineData = null;
+  }
+}
+
+function loadSignatureInfo() {
+  signatureData = null;
+  if (!Module || !Module._nanopdf_get_signatures) return;
+  try {
+    const sigPtr = Module._nanopdf_get_signatures();
+    const sigStr = Module.UTF8ToString(sigPtr);
+    const data = JSON.parse(sigStr);
+    signatureData = data.error ? null : data;
+  } catch (e) {
+    console.error('Signature parse error:', e);
+    signatureData = null;
+  }
+}
+
+function parseStartXrefBefore(pdfText, eofIndex) {
+  const marker = 'startxref';
+  const pos = pdfText.lastIndexOf(marker, eofIndex);
+  if (pos < 0) return 0;
+  const match = /^\s*(\d+)/.exec(pdfText.slice(pos + marker.length, eofIndex));
+  return match ? parseInt(match[1], 10) : 0;
+}
+
+function parsePrevXref(pdfText, xrefOffset, eofIndex) {
+  if (!xrefOffset || xrefOffset >= eofIndex) return 0;
+  const chunk = pdfText.slice(xrefOffset, eofIndex);
+  const match = /\/Prev\s+(\d+)/.exec(chunk);
+  return match ? parseInt(match[1], 10) : 0;
+}
+
+function parseTraditionalXrefObjects(pdfText, xrefOffset, eofIndex) {
+  if (!xrefOffset || pdfText.slice(xrefOffset, xrefOffset + 4) !== 'xref') return [];
+  const objects = [];
+  const lines = pdfText.slice(xrefOffset + 4, eofIndex).split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || line === 'trailer') break;
+    const header = /^(\d+)\s+(\d+)$/.exec(line);
+    if (!header) continue;
+
+    const startObj = parseInt(header[1], 10);
+    const count = parseInt(header[2], 10);
+    for (let j = 0; j < count && i + 1 + j < lines.length; j++) {
+      const entry = lines[i + 1 + j].trim();
+      if (/^\d{10}\s+\d{5}\s+n/.test(entry)) {
+        objects.push(startObj + j);
+      }
+    }
+    i += count;
+  }
+
+  return objects.filter(obj => obj !== 0);
+}
+
+async function sha256Hex(bytes) {
+  if (!globalThis.crypto || !globalThis.crypto.subtle) return '';
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map(value => value.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function buildEditHistory(bytes, signatures) {
+  const pdfText = new TextDecoder('latin1').decode(bytes);
+  const eofOffsets = [];
+  let searchFrom = 0;
+
+  while (true) {
+    const pos = pdfText.indexOf('%%EOF', searchFrom);
+    if (pos < 0) break;
+    let end = pos + 5;
+    if (pdfText[end] === '\r') end++;
+    if (pdfText[end] === '\n') end++;
+    eofOffsets.push(end);
+    searchFrom = end;
+  }
+
+  if (eofOffsets.length === 0) {
+    return { fileSize: bytes.length, revisions: [] };
+  }
+
+  const revisions = [];
+  let previousEnd = 0;
+  for (let i = 0; i < eofOffsets.length; i++) {
+    const endOffset = eofOffsets[i];
+    const xrefOffset = parseStartXrefBefore(pdfText, endOffset);
+    revisions.push({
+      revision: i + 1,
+      startOffset: previousEnd,
+      endOffset,
+      sizeBytes: endOffset - previousEnd,
+      xrefOffset,
+      prevXrefOffset: parsePrevXref(pdfText, xrefOffset, endOffset),
+      objects: parseTraditionalXrefObjects(pdfText, xrefOffset, endOffset),
+      sha256: await sha256Hex(bytes.slice(0, endOffset)),
+      associatedSignature: '',
+      signingTime: '',
+      modifiedAfterSigning: false
+    });
+    previousEnd = endOffset;
+  }
+
+  for (const sig of signatures || []) {
+    if (!Array.isArray(sig.byteRange) || sig.byteRange.length !== 4) continue;
+    const coverageEnd = sig.byteRange[2] + sig.byteRange[3];
+    let best = null;
+    for (const rev of revisions) {
+      if (rev.endOffset >= coverageEnd && (!best || rev.endOffset < best.endOffset)) {
+        best = rev;
+      }
+    }
+    if (best) {
+      best.associatedSignature = sig.name || 'Signature';
+      best.signingTime = sig.date || sig.timestampDate || '';
+      best.modifiedAfterSigning = coverageEnd < bytes.length;
+    }
+  }
+
+  return { fileSize: bytes.length, revisions };
+}
+
+function validateSignature(index) {
+  if (!Module || !Module._nanopdf_validate_signature) return;
+  const target = document.getElementById(`signature-validation-${index}`);
+  if (target) {
+    target.textContent = 'Validating...';
+    target.className = 'signature-validation pending';
+  }
+
+  try {
+    const resultPtr = Module._nanopdf_validate_signature(index);
+    const resultStr = Module.UTF8ToString(resultPtr);
+    const result = JSON.parse(resultStr);
+    if (!target) return;
+
+    if (result.error) {
+      target.textContent = result.error;
+      target.className = 'signature-validation error';
+      return;
+    }
+
+    const parts = [
+      result.integrityValid ? 'Integrity OK' : 'Integrity failed',
+      result.signatureValid ? 'PKCS#7 parsed' : 'PKCS#7 not verified'
+    ];
+    if (result.signerName) parts.push(`Signer: ${result.signerName}`);
+    if (result.signingTime) parts.push(`Time: ${result.signingTime}`);
+    if (result.digestAlgorithm) parts.push(`Digest: ${result.digestAlgorithm}`);
+    target.textContent = parts.join(' | ');
+    target.className = `signature-validation ${result.success ? 'success' : 'error'}`;
+  } catch (e) {
+    if (target) {
+      target.textContent = e.message;
+      target.className = 'signature-validation error';
+    }
   }
 }
 
@@ -1098,10 +1442,108 @@ function buildPdf(pageImages) {
   return result;
 }
 
+function downloadPdfBytes(pdfBytes, suffix, pages) {
+  const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const baseName = fileName.replace(/\.pdf$/i, '');
+  a.download = `${baseName}_${suffix}_${pages.map(p => p + 1).join('-')}.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+async function exportSelectedPagesProtected(pages) {
+  const userPassword = exportPassword.value;
+  const ownerPassword = exportOwnerPassword.value || userPassword;
+  if (!userPassword) {
+    setStatus('Protected export requires a user password', true);
+    exportPassword.focus();
+    return false;
+  }
+  if (!currentPdfBytes || currentPdfBytes.length === 0) {
+    setStatus('Protected export failed: no source PDF loaded', true);
+    return false;
+  }
+  if (!Module._nanopdf_export_set_passwords) {
+    setStatus('Protected export requires rebuilding the nanopdf WASM module', true);
+    return false;
+  }
+
+  showLoading(`Exporting protected PDF (${pages.length} page(s))...`);
+  await new Promise(r => setTimeout(r, 50));
+
+  let docId = -1;
+  try {
+    const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
+    Module.HEAPU8.set(currentPdfBytes, ptr);
+    docId = Module._nanopdf_doc_load(ptr, currentPdfBytes.length);
+    Module._nanopdf_free(ptr);
+    if (docId < 0) {
+      const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+      throw new Error(error || 'Failed to load source document for export');
+    }
+
+    Module._nanopdf_work_clear();
+    for (const pageIdx of pages) {
+      const workIndex = Module._nanopdf_work_add_page(docId, pageIdx);
+      if (workIndex < 0) {
+        const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+        throw new Error(error || `Failed to add page ${pageIdx + 1}`);
+      }
+    }
+
+    const userPtr = Module.stringToNewUTF8(userPassword);
+    const ownerPtr = Module.stringToNewUTF8(ownerPassword);
+    const passwordResult = Module._nanopdf_export_set_passwords(userPtr, ownerPtr, 3);
+    Module._free(userPtr);
+    Module._free(ownerPtr);
+    if (passwordResult !== 1) {
+      const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+      throw new Error(error || 'Failed to configure password protection');
+    }
+
+    const exportResult = Module._nanopdf_export_pdf();
+    if (exportResult !== 1) {
+      const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+      throw new Error(error || 'Protected export failed');
+    }
+
+    const outPtr = Module._nanopdf_export_get_buffer();
+    const outSize = Module._nanopdf_export_get_size();
+    const pdfBytes = new Uint8Array(Module.HEAPU8.buffer, outPtr, outSize).slice();
+    downloadPdfBytes(pdfBytes, 'protected_pages', pages);
+    setStatus(`Exported ${pages.length} protected page(s) as PDF`);
+    return true;
+  } catch (err) {
+    setStatus('Protected export error: ' + err.message, true);
+    console.error(err);
+    return false;
+  } finally {
+    const emptyPtr = Module.stringToNewUTF8('');
+    Module._nanopdf_export_set_passwords(emptyPtr, emptyPtr, 3);
+    Module._free(emptyPtr);
+    if (docId >= 0) {
+      Module._nanopdf_doc_close(docId);
+    }
+    Module._nanopdf_work_clear();
+    hideLoading();
+  }
+}
+
 async function exportSelectedPages() {
   if (selectedPages.size === 0 || !hasRendering || !Module) return;
 
   const pages = [...selectedPages].sort((a, b) => a - b);
+
+  if (protectExport.checked) {
+    await exportSelectedPagesProtected(pages);
+    renderCurrentPage();
+    return;
+  }
+
   showLoading(`Exporting ${pages.length} page(s)...`);
 
   // Small delay so loading overlay can render
@@ -1169,17 +1611,7 @@ async function exportSelectedPages() {
 
   const pdfBytes = buildPdf(pageImages);
 
-  // Trigger download
-  const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  const baseName = fileName.replace(/\.pdf$/i, '');
-  a.download = `${baseName}_pages_${pages.map(p => p + 1).join('-')}.pdf`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadPdfBytes(pdfBytes, 'pages', pages);
 
   hideLoading();
 
@@ -1204,6 +1636,7 @@ function onResize() {
 // ---- Event Handlers ----
 
 // File input
+openPdfBtn.addEventListener('click', () => pdfInput.click());
 pdfInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -1316,6 +1749,7 @@ document.addEventListener('keydown', (e) => {
 renderBtn.addEventListener('click', renderCurrentPage);
 extractBtn.addEventListener('click', extractText);
 exportBtn.addEventListener('click', exportSelectedPages);
+protectExport.addEventListener('change', updateExportButton);
 
 // Close text panel
 document.getElementById('text-panel-close').addEventListener('click', () => {
