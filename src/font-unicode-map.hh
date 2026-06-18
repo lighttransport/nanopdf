@@ -522,6 +522,71 @@ inline uint32_t glyph_name_to_unicode(const std::string& name) {
     if (ok && cp) return cp;
   }
 
+  // TeX / CMEX large and extensible-delimiter glyph names — e.g.
+  // "parenleftbig", "bracketrightBigg", "radicalBig", "summationdisplay",
+  // "bracelefttp". None have an AGL entry, so without this they render as
+  // tofu. Map each to its base symbol (the size/piece suffix is dropped); a
+  // substitute font then draws an ordinary-size delimiter instead of nothing.
+  {
+    struct DelimPrefix { const char* prefix; uint32_t cp; };
+    static const DelimPrefix kDelims[] = {
+      {"parenleft", 0x0028},    {"parenright", 0x0029},
+      {"bracketleft", 0x005B},  {"bracketright", 0x005D},
+      {"braceleft", 0x007B},    {"braceright", 0x007D},
+      {"angbracketleft", 0x27E8}, {"angbracketright", 0x27E9},
+      {"ceilingleft", 0x2308},  {"ceilingright", 0x2309},
+      {"floorleft", 0x230A},    {"floorright", 0x230B},
+      {"radical", 0x221A},      {"summation", 0x2211},
+      {"integral", 0x222B},     {"product", 0x220F},
+      {"arrowvert", 0x2223},    {"bracevert", 0x007C},
+    };
+    for (const auto& d : kDelims) {
+      size_t plen = 0;
+      while (d.prefix[plen]) ++plen;
+      // Require a trailing size/piece suffix so exact AGL names (already
+      // handled above) are never reinterpreted here.
+      if (name.size() > plen && name.compare(0, plen, d.prefix) == 0) {
+        return d.cp;
+      }
+    }
+  }
+
+  // Common TeX/Computer-Modern math glyph names absent from the compact AGL
+  // table above. These appear throughout CMSY/CMMI/CMR/CMEX content; without
+  // a mapping they render as tofu. The symbol substitute font (STIX) carries
+  // these code points, so mapping them yields the right glyph.
+  {
+    struct NamedSym { const char* name; uint32_t cp; };
+    static const NamedSym kSyms[] = {
+      {"prime", 0x2032}, {"minute", 0x2032}, {"second", 0x2033},
+      {"dblprime", 0x2033}, {"primereversed", 0x2035},
+      {"asteriskmath", 0x2217}, {"dotmath", 0x22C5}, {"periodcentered", 0x00B7},
+      {"minus", 0x2212}, {"multiply", 0x00D7}, {"divide", 0x00F7},
+      {"plusminus", 0x00B1}, {"minusplus", 0x2213},
+      {"element", 0x2208}, {"notelement", 0x2209}, {"owner", 0x220B},
+      {"infinity", 0x221E}, {"partialdiff", 0x2202}, {"gradient", 0x2207},
+      {"nabla", 0x2207}, {"emptyset", 0x2205}, {"aleph", 0x2135},
+      {"existential", 0x2203}, {"universal", 0x2200},
+      {"arrowright", 0x2192}, {"arrowleft", 0x2190}, {"arrowup", 0x2191},
+      {"arrowdown", 0x2193}, {"arrowboth", 0x2194}, {"arrowdblright", 0x21D2},
+      {"arrowdblleft", 0x21D0}, {"arrowdblboth", 0x21D4},
+      {"lessequal", 0x2264}, {"greaterequal", 0x2265}, {"notequal", 0x2260},
+      {"approxequal", 0x2248}, {"equivalence", 0x2261}, {"similar", 0x223C},
+      {"congruent", 0x2245}, {"proportional", 0x221D}, {"propersubset", 0x2282},
+      {"propersuperset", 0x2283}, {"reflexsubset", 0x2286},
+      {"reflexsuperset", 0x2287}, {"angle", 0x2220}, {"perpendicular", 0x22A5},
+      {"circlemultiply", 0x2297}, {"circleplus", 0x2295},
+      {"union", 0x222A}, {"intersection", 0x2229},
+      {"logicaland", 0x2227}, {"logicalor", 0x2228}, {"logicalnot", 0x00AC},
+      {"therefore", 0x2234}, {"latticetop", 0x22A4}, {"perpendicular", 0x22A5},
+      {"circledot", 0x2299}, {"circleminus", 0x2296},
+      {"dagger", 0x2020}, {"daggerdbl", 0x2021},
+    };
+    for (const auto& s : kSyms) {
+      if (name == s.name) return s.cp;
+    }
+  }
+
   return 0;
 }
 
