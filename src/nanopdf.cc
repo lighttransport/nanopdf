@@ -9735,9 +9735,14 @@ std::unique_ptr<BaseFont> Pdf::parse_font(const Pdf& pdf, const Value& font_val)
     resolve_int("LastChar",  font->last_char);
 
     // For Type1 fonts with embedded font program, try to extract encoding
-    // if no explicit encoding was provided in the PDF
+    // ONLY when the PDF provides no encoding information of its own. Per
+    // PDF spec 9.6.6.1, an explicit /Encoding (a base-encoding name such as
+    // WinAnsiEncoding, or a dict with Differences) takes precedence over the
+    // font program's built-in encoding. Overriding it here corrupts fonts
+    // whose embedded CFF/Type1 program carries a re-ordered built-in encoding
+    // (e.g. subset Courier where the CFF encoding is offset from WinAnsi).
     if (subtype == "Type1" && font->descriptor &&
-        font->encoding_differences.empty()) {
+        font->encoding_differences.empty() && font->encoding.empty()) {
       // Try CFF (FontFile3) first, then Type1 (FontFile)
       if (font->descriptor->font_file_type == FontFileType::FontFile3) {
         parse_cff_font_encoding(pdf, font.get());
