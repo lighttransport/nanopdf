@@ -64,12 +64,13 @@ struct ThorVGRect {
 // quadratic-only and cubic-only glyphs both round-trip losslessly (quads are
 // converted to cubics via the standard 2/3 control-point rule so ThorVG's
 // cubicTo path is sufficient).
-template <typename MoveFn, typename LineFn, typename CubicFn>
+template <typename MoveFn, typename LineFn, typename CubicFn, typename CloseFn>
 static void decompose_ttf_outline_to_path(const ttf_outline_t& outline,
                                           float scale, float x0, float y0,
                                           float cos_theta, float sin_theta,
                                           MoveFn emit_move, LineFn emit_line,
-                                          CubicFn emit_cubic) {
+                                          CubicFn emit_cubic,
+                                          CloseFn emit_close) {
   auto map = [&](float gx, float gy, float& cx, float& cy) {
     float fx = gx * scale;
     float fy = gy * scale;
@@ -168,6 +169,7 @@ static void decompose_ttf_outline_to_path(const ttf_outline_t& outline,
         ++pt_idx;
       }
     }
+    emit_close();
     pt_idx = end + 1;
   }
 }
@@ -5490,12 +5492,19 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
       state_.text_clip_points.push_back({ex, ey});
     }
   };
+  auto emit_close = [&]() {
+    shape->close();
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::Close);
+    }
+  };
 
   if (add_to_clip) state_.text_clip_active = true;
 
   if (have_ttf_outline) {
     decompose_ttf_outline_to_path(outline, scale, x, y, cos_theta, sin_theta,
-                                  emit_move, emit_line, emit_cubic);
+                                  emit_move, emit_line, emit_cubic,
+                                  emit_close);
   } else {
     // Legacy stbtt path — only reached when ttf_parse couldn't load the font.
     auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
@@ -5511,6 +5520,7 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
       transform_vertex(v->x, v->y, vx, vy);
       switch (v->type) {
         case STBTT_vmove:
+          if (i > 0) emit_close();
           emit_move(vx, vy);
           curr_x = vx; curr_y = vy; break;
         case STBTT_vline:
@@ -5534,10 +5544,8 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
         }
       }
     }
+    emit_close();
   }
-
-  shape->close();
-  if (add_to_clip) state_.text_clip_commands.push_back(tvg::PathCommand::Close);
 
   if (have_ttf_outline && !outline_from_cache) {
     ttf_outline_free(&outline);
@@ -5709,12 +5717,19 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
       state_.text_clip_points.push_back({ex, ey});
     }
   };
+  auto emit_close = [&]() {
+    shape->close();
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(tvg::PathCommand::Close);
+    }
+  };
 
   if (add_to_clip) state_.text_clip_active = true;
 
   if (have_ttf_outline) {
     decompose_ttf_outline_to_path(outline, scale, x, y, cos_theta, sin_theta,
-                                  emit_move, emit_line, emit_cubic);
+                                  emit_move, emit_line, emit_cubic,
+                                  emit_close);
   } else {
     auto transform_vertex = [&](float gx_raw, float gy_raw, float& out_x, float& out_y) {
       float gx = gx_raw * scale;
@@ -5728,7 +5743,9 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
       float vx, vy;
       transform_vertex(v->x, v->y, vx, vy);
       switch (v->type) {
-        case STBTT_vmove: emit_move(vx, vy); curr_x = vx; curr_y = vy; break;
+        case STBTT_vmove:
+          if (i > 0) emit_close();
+          emit_move(vx, vy); curr_x = vx; curr_y = vy; break;
         case STBTT_vline: emit_line(vx, vy); curr_x = vx; curr_y = vy; break;
         case STBTT_vcurve: {
           float cx, cy; transform_vertex(v->cx, v->cy, cx, cy);
@@ -5748,10 +5765,8 @@ bool ThorVGBackend::draw_glyph_by_index(int glyph_index, float x, float y, float
         }
       }
     }
+    emit_close();
   }
-
-  shape->close();
-  if (add_to_clip) state_.text_clip_commands.push_back(tvg::PathCommand::Close);
 
   if (have_ttf_outline && !outline_from_cache) {
     ttf_outline_free(&outline);
