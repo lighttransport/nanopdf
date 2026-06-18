@@ -587,6 +587,34 @@ inline uint32_t glyph_name_to_unicode(const std::string& name) {
     }
   }
 
+  // Greek letter glyph names (TeX/Computer-Modern math: "alpha", "Delta",
+  // "omega", and the "var" variants "epsilon1"/"theta1"/"phi1"/...). Mapping
+  // them to the Greek block lets embedded CMMI/CMR glyphs resolve through the
+  // synthesized cmap (and improves text extraction); without it formula Greek
+  // falls back to a substitute font with the wrong shape and spacing.
+  {
+    struct NamedSym { const char* name; uint32_t cp; };
+    static const NamedSym kGreek[] = {
+      {"alpha", 0x03B1}, {"beta", 0x03B2}, {"gamma", 0x03B3},
+      {"delta", 0x03B4}, {"epsilon", 0x03B5}, {"epsilon1", 0x03B5},
+      {"zeta", 0x03B6}, {"eta", 0x03B7}, {"theta", 0x03B8},
+      {"theta1", 0x03D1}, {"iota", 0x03B9}, {"kappa", 0x03BA},
+      {"lambda", 0x03BB}, {"mu", 0x03BC}, {"nu", 0x03BD}, {"xi", 0x03BE},
+      {"omicron", 0x03BF}, {"pi", 0x03C0}, {"pi1", 0x03D6},
+      {"rho", 0x03C1}, {"rho1", 0x03F1}, {"sigma", 0x03C3},
+      {"sigma1", 0x03C2}, {"tau", 0x03C4}, {"upsilon", 0x03C5},
+      {"phi", 0x03C6}, {"phi1", 0x03D5}, {"chi", 0x03C7},
+      {"psi", 0x03C8}, {"omega", 0x03C9},
+      {"Gamma", 0x0393}, {"Delta", 0x0394}, {"Theta", 0x0398},
+      {"Lambda", 0x039B}, {"Xi", 0x039E}, {"Pi", 0x03A0},
+      {"Sigma", 0x03A3}, {"Upsilon", 0x03A5}, {"Phi", 0x03A6},
+      {"Psi", 0x03A8}, {"Omega", 0x03A9},
+    };
+    for (const auto& s : kGreek) {
+      if (name == s.name) return s.cp;
+    }
+  }
+
   return 0;
 }
 
