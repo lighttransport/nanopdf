@@ -4575,6 +4575,553 @@ SignatureField Pdf::parse_signature_field(const Pdf& pdf, const Dictionary& fiel
   return sig_field;
 }
 
+namespace {
+
+std::string revision_bytes_to_hex(const uint8_t* data, size_t len) {
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.resize(len * 2);
+  for (size_t i = 0; i < len; ++i) {
+    out[i * 2] = kHex[(data[i] >> 4) & 0x0f];
+    out[i * 2 + 1] = kHex[data[i] & 0x0f];
+  }
+  return out;
+}
+
+std::string revision_md5(const uint8_t* data, size_t len) {
+  uint8_t digest[16];
+  crypto::MD5::hash(data, len, digest);
+  return revision_bytes_to_hex(digest, sizeof(digest));
+}
+
+std::string revision_sha256(const uint8_t* data, size_t len) {
+  uint8_t digest[32];
+  crypto::SHA256::hash(data, len, digest);
+  return revision_bytes_to_hex(digest, sizeof(digest));
+}
+
+std::vector<size_t> find_revision_eof_markers(const uint8_t* data, size_t size) {
+  std::vector<size_t> markers;
+  const char eof_marker[] = "%%EOF";
+  const size_t marker_len = sizeof(eof_marker) - 1;
+
+  for (size_t i = 0; i + marker_len <= size; ++i) {
+    if (std::memcmp(data + i, eof_marker, marker_len) == 0) {
+      size_t end = i + marker_len;
+      while (end < size && (data[end] == '\r' || data[end] == '\n')) {
+        ++end;
+      }
+      markers.push_back(end);
+      i = end;
+    }
+  }
+
+  return markers;
+}
+
+size_t find_revision_startxref_before(const uint8_t* data, size_t eof_offset) {
+  const char startxref[] = "startxref";
+  const size_t startxref_len = sizeof(startxref) - 1;
+  if (eof_offset < startxref_len) return 0;
+
+  const size_t search_start = eof_offset > 1024 ? eof_offset - 1024 : 0;
+  const size_t search_end = eof_offset - startxref_len;
+  for (size_t i = search_end;; --i) {
+    if (std::memcmp(data + i, startxref, startxref_len) == 0) {
+      size_t pos = i + startxref_len;
+      while (pos < eof_offset &&
+             (data[pos] == ' ' || data[pos] == '\r' ||
+              data[pos] == '\n' || data[pos] == '\t')) {
+        ++pos;
+      }
+
+      size_t xref_offset = 0;
+      while (pos < eof_offset && data[pos] >= '0' && data[pos] <= '9') {
+        xref_offset = xref_offset * 10 + static_cast<size_t>(data[pos] - '0');
+        ++pos;
+      }
+      return xref_offset;
+    }
+    if (i == search_start) break;
+  }
+
+  return 0;
+}
+
+std::map<uint32_t, std::pair<uint64_t, bool>> parse_revision_xref_entries(
+    const Pdf& pdf, const uint8_t* data, size_t size, size_t xref_offset) {
+  std::map<uint32_t, std::pair<uint64_t, bool>> entries;
+  if (xref_offset >= size) return entries;
+
+  const char xref_keyword[] = "xref";
+  if (xref_offset + 4 <= size &&
+      std::memcmp(data + xref_offset, xref_keyword, 4) == 0) {
+    size_t pos = xref_offset + 4;
+    while (pos < size && (data[pos] == ' ' || data[pos] == '\r' ||
+                          data[pos] == '\n' || data[pos] == '\t')) {
+      ++pos;
+    }
+
+    while (pos < size) {
+      if (pos + 7 <= size && std::memcmp(data + pos, "trailer", 7) == 0) {
+        break;
+      }
+
+      uint32_t start_obj = 0;
+      while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+        start_obj = start_obj * 10u + static_cast<uint32_t>(data[pos] - '0');
+        ++pos;
+      }
+      while (pos < size && (data[pos] == ' ' || data[pos] == '\t')) ++pos;
+
+      uint32_t count = 0;
+      while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+        count = count * 10u + static_cast<uint32_t>(data[pos] - '0');
+        ++pos;
+      }
+      while (pos < size && data[pos] != '\n') ++pos;
+      if (pos < size) ++pos;
+
+      for (uint32_t i = 0; i < count && pos + 20 <= size; ++i) {
+        uint64_t offset = 0;
+        for (int j = 0; j < 10 && pos < size; ++j, ++pos) {
+          if (data[pos] >= '0' && data[pos] <= '9') {
+            offset = offset * 10 + static_cast<uint64_t>(data[pos] - '0');
+          }
+        }
+        if (pos + 7 >= size) break;
+        pos += 7;
+
+        bool in_use = false;
+        if (pos < size) {
+          in_use = data[pos] == 'n';
+          ++pos;
+        }
+        while (pos < size && data[pos] != '\n') ++pos;
+        if (pos < size) ++pos;
+
+        entries[start_obj + i] = std::make_pair(offset, in_use);
+      }
+    }
+  } else if (data[xref_offset] >= '0' && data[xref_offset] <= '9') {
+    size_t pos = xref_offset;
+    uint32_t obj_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      obj_num = obj_num * 10u + static_cast<uint32_t>(data[pos] - '0');
+      ++pos;
+    }
+    while (pos < size && (data[pos] == ' ' || data[pos] == '\t')) ++pos;
+    uint16_t gen_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      gen_num = static_cast<uint16_t>(gen_num * 10u +
+                                      static_cast<uint16_t>(data[pos] - '0'));
+      ++pos;
+    }
+
+    ResolvedObject resolved = resolve_reference(pdf, obj_num, gen_num);
+    if (!resolved.success || resolved.value.type != Value::STREAM) {
+      return entries;
+    }
+
+    auto type_it = resolved.value.stream.dict.find("Type");
+    if (type_it != resolved.value.stream.dict.end() &&
+        (type_it->second.type != Value::NAME || type_it->second.name != "XRef")) {
+      return entries;
+    }
+
+    auto w_it = resolved.value.stream.dict.find("W");
+    if (w_it == resolved.value.stream.dict.end() ||
+        w_it->second.type != Value::ARRAY ||
+        w_it->second.array.size() != 3) {
+      return entries;
+    }
+
+    int widths[3] = {0, 0, 0};
+    for (size_t i = 0; i < 3; ++i) {
+      const Value& item = w_it->second.array[i];
+      if (item.type != Value::NUMBER) return entries;
+      int width = static_cast<int>(item.number);
+      if (width < 0 || width > 8) return entries;
+      widths[i] = width;
+    }
+
+    auto size_it = resolved.value.stream.dict.find("Size");
+    if (size_it == resolved.value.stream.dict.end() ||
+        size_it->second.type != Value::NUMBER) {
+      return entries;
+    }
+    uint64_t doc_size = static_cast<uint64_t>(size_it->second.number);
+
+    std::vector<uint64_t> index_pairs;
+    auto index_it = resolved.value.stream.dict.find("Index");
+    if (index_it != resolved.value.stream.dict.end() &&
+        index_it->second.type == Value::ARRAY) {
+      const auto& arr = index_it->second.array;
+      if (arr.size() % 2 != 0) return entries;
+      for (const Value& v : arr) {
+        if (v.type != Value::NUMBER) return entries;
+        index_pairs.push_back(static_cast<uint64_t>(v.number));
+      }
+    } else {
+      index_pairs = {0, doc_size};
+    }
+
+    DecodedStream decoded = decode_stream(pdf, resolved.value);
+    if (!decoded.success) return entries;
+
+    size_t spos = 0;
+    const std::vector<uint8_t>& bytes = decoded.data;
+    auto read_field = [&](int width) -> uint64_t {
+      uint64_t value = 0;
+      for (int i = 0; i < width; ++i) {
+        if (spos >= bytes.size()) return uint64_t{0};
+        value = (value << 8) | static_cast<uint64_t>(bytes[spos++]);
+      }
+      return value;
+    };
+
+    for (size_t i = 0; i + 1 < index_pairs.size(); i += 2) {
+      uint64_t obj = index_pairs[i];
+      uint64_t count = index_pairs[i + 1];
+      if (count > doc_size) break;
+
+      for (uint64_t j = 0; j < count; ++j, ++obj) {
+        uint64_t type_field = widths[0] ? read_field(widths[0]) : 1;
+        uint64_t field2 = widths[1] ? read_field(widths[1]) : 0;
+        uint64_t field3 = widths[2] ? read_field(widths[2]) : 0;
+
+        if (type_field == 0) {
+          entries[static_cast<uint32_t>(obj)] = std::make_pair(field2, false);
+        } else if (type_field == 1) {
+          entries[static_cast<uint32_t>(obj)] = std::make_pair(field2, true);
+        } else if (type_field == 2) {
+          entries[static_cast<uint32_t>(obj)] =
+              std::make_pair((field2 << 16) | field3, true);
+        }
+      }
+    }
+  }
+
+  return entries;
+}
+
+size_t find_revision_prev_in_trailer(const Pdf& pdf, const uint8_t* data,
+                                     size_t size, size_t xref_offset) {
+  if (xref_offset >= size) return 0;
+
+  if (data[xref_offset] >= '0' && data[xref_offset] <= '9') {
+    size_t pos = xref_offset;
+    uint32_t obj_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      obj_num = obj_num * 10u + static_cast<uint32_t>(data[pos] - '0');
+      ++pos;
+    }
+    while (pos < size && (data[pos] == ' ' || data[pos] == '\t')) ++pos;
+    uint16_t gen_num = 0;
+    while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+      gen_num = static_cast<uint16_t>(gen_num * 10u +
+                                      static_cast<uint16_t>(data[pos] - '0'));
+      ++pos;
+    }
+
+    ResolvedObject resolved = resolve_reference(pdf, obj_num, gen_num);
+    if (resolved.success && resolved.value.type == Value::STREAM) {
+      auto prev_it = resolved.value.stream.dict.find("Prev");
+      if (prev_it != resolved.value.stream.dict.end() &&
+          prev_it->second.type == Value::NUMBER) {
+        return static_cast<size_t>(prev_it->second.number);
+      }
+    }
+    return 0;
+  }
+
+  size_t trailer_pos = 0;
+  for (size_t i = xref_offset; i + 7 < size; ++i) {
+    if (std::memcmp(data + i, "trailer", 7) == 0) {
+      trailer_pos = i;
+      break;
+    }
+  }
+  if (trailer_pos == 0) return 0;
+
+  for (size_t i = trailer_pos; i + 5 < size && i < trailer_pos + 1024; ++i) {
+    if (std::memcmp(data + i, "/Prev", 5) == 0) {
+      size_t pos = i + 5;
+      while (pos < size && (data[pos] == ' ' || data[pos] == '\r' ||
+                            data[pos] == '\n' || data[pos] == '\t')) {
+        ++pos;
+      }
+
+      size_t prev_offset = 0;
+      while (pos < size && data[pos] >= '0' && data[pos] <= '9') {
+        prev_offset = prev_offset * 10 + static_cast<size_t>(data[pos] - '0');
+        ++pos;
+      }
+      return prev_offset;
+    }
+
+    if (data[i] == '>' && i + 1 < size && data[i + 1] == '>') break;
+  }
+
+  return 0;
+}
+
+std::vector<uint32_t> set_to_sorted_vector(const std::set<uint32_t>& values) {
+  return std::vector<uint32_t>(values.begin(), values.end());
+}
+
+std::string classify_revision_object(const Pdf& pdf, uint32_t obj_num) {
+  ResolvedObject resolved = resolve_reference(pdf, obj_num, 0);
+  if (!resolved.success) return "unknown";
+
+  const Dictionary* dict = nullptr;
+  if (resolved.value.type == Value::DICTIONARY) {
+    dict = &resolved.value.dict;
+  } else if (resolved.value.type == Value::STREAM) {
+    dict = &resolved.value.stream.dict;
+  } else {
+    return "other";
+  }
+
+  auto ft_it = dict->find("FT");
+  if (ft_it != dict->end() && ft_it->second.type == Value::NAME) {
+    if (ft_it->second.name == "Sig") return "signature";
+    return "form";
+  }
+
+  auto type_it = dict->find("Type");
+  if (type_it != dict->end() && type_it->second.type == Value::NAME) {
+    if (type_it->second.name == "Sig") return "signature";
+    if (type_it->second.name == "Annot") return "annotation";
+    if (type_it->second.name == "Metadata" || type_it->second.name == "Catalog" ||
+        type_it->second.name == "Page" || type_it->second.name == "Pages") {
+      return "document";
+    }
+  }
+
+  auto subtype_it = dict->find("Subtype");
+  if (subtype_it != dict->end() && subtype_it->second.type == Value::NAME) {
+    if (subtype_it->second.name == "Widget") return "form";
+    if (!subtype_it->second.name.empty()) return "annotation";
+  }
+
+  if (dict->find("Producer") != dict->end() ||
+      dict->find("ModDate") != dict->end() ||
+      dict->find("CreationDate") != dict->end() ||
+      dict->find("Title") != dict->end() ||
+      dict->find("Author") != dict->end()) {
+    return "metadata";
+  }
+
+  return "unknown";
+}
+
+bool object_class_allowed_by_docmdp(const std::string& cls, int permissions) {
+  if (permissions == 1) return false;
+  if (permissions == 2) return cls == "form" || cls == "signature";
+  if (permissions == 3) {
+    return cls == "form" || cls == "signature" || cls == "annotation";
+  }
+  return false;
+}
+
+std::string docmdp_permission_label(int permissions) {
+  switch (permissions) {
+    case 1: return "no_changes";
+    case 2: return "form_fill_and_sign";
+    case 3: return "form_fill_sign_annotate";
+    default: return "unknown";
+  }
+}
+
+void analyze_docmdp_revision(const Pdf& pdf, RevisionHistoryEntry& rev,
+                             const SignatureField& cert_sig) {
+  rev.has_docmdp = true;
+  rev.mdp_permissions = cert_sig.mdp_permissions;
+  rev.docmdp_allowed = true;
+  rev.docmdp_status = "allowed";
+
+  if (rev.added_objects.empty() && rev.modified_objects.empty() &&
+      rev.deleted_objects.empty()) {
+    rev.docmdp_status = "no_object_changes";
+    return;
+  }
+
+  if (cert_sig.mdp_permissions <= 0) {
+    rev.docmdp_allowed = false;
+    rev.docmdp_status = "unknown_permissions";
+    rev.docmdp_violations.push_back("DocMDP permission level is missing");
+    return;
+  }
+
+  if (cert_sig.mdp_permissions == 1) {
+    rev.docmdp_allowed = false;
+    rev.docmdp_status = "disallowed";
+    rev.docmdp_violations.push_back(
+        "DocMDP P=1 allows no changes after certification");
+    return;
+  }
+
+  auto check_obj = [&](uint32_t obj_num, const char* action) {
+    std::string cls = classify_revision_object(pdf, obj_num);
+    if (!object_class_allowed_by_docmdp(cls, cert_sig.mdp_permissions)) {
+      rev.docmdp_allowed = false;
+      std::ostringstream ss;
+      ss << "object " << obj_num << " " << action << " classified as "
+         << cls << " is not allowed by DocMDP P=" << cert_sig.mdp_permissions
+         << " (" << docmdp_permission_label(cert_sig.mdp_permissions) << ")";
+      rev.docmdp_violations.push_back(ss.str());
+    }
+  };
+
+  for (uint32_t obj : rev.added_objects) check_obj(obj, "added");
+  for (uint32_t obj : rev.modified_objects) check_obj(obj, "modified");
+  for (uint32_t obj : rev.deleted_objects) {
+    rev.docmdp_allowed = false;
+    std::ostringstream ss;
+    ss << "object " << obj << " deleted after certification";
+    rev.docmdp_violations.push_back(ss.str());
+  }
+
+  if (!rev.docmdp_allowed) {
+    rev.docmdp_status = "disallowed";
+  }
+}
+
+}  // namespace
+
+RevisionHistory detect_revision_history(const Pdf& pdf) {
+  RevisionHistory history;
+  const uint8_t* data = pdf.data;
+  size_t size = pdf.data_size;
+  if (!data || size == 0) return history;
+
+  std::vector<size_t> eof_markers = find_revision_eof_markers(data, size);
+  if (eof_markers.empty()) return history;
+
+  size_t prev_end = 0;
+  std::map<uint32_t, std::pair<uint64_t, bool>> cumulative_objects;
+
+  for (size_t i = 0; i < eof_markers.size(); ++i) {
+    RevisionHistoryEntry rev;
+    rev.revision_number = i + 1;
+    rev.start_offset = prev_end;
+    rev.end_offset = eof_markers[i];
+    rev.size_bytes = rev.end_offset - rev.start_offset;
+
+    if (rev.end_offset > 0 && rev.end_offset <= size) {
+      rev.md5_hash = revision_md5(data, rev.end_offset);
+      rev.sha256_hash = revision_sha256(data, rev.end_offset);
+    }
+
+    if (eof_markers[i] >= 10) {
+      rev.xref_offset = find_revision_startxref_before(data, eof_markers[i]);
+    }
+
+    if (rev.xref_offset > 0 && rev.xref_offset < size) {
+      rev.prev_xref_offset =
+          find_revision_prev_in_trailer(pdf, data, size, rev.xref_offset);
+      auto entries = parse_revision_xref_entries(pdf, data, size, rev.xref_offset);
+
+      std::set<uint32_t> added;
+      std::set<uint32_t> modified;
+      std::set<uint32_t> deleted;
+      for (const auto& entry : entries) {
+        uint32_t obj_num = entry.first;
+        bool in_use = entry.second.second;
+        auto prev_it = cumulative_objects.find(obj_num);
+        if (prev_it == cumulative_objects.end()) {
+          if (in_use && obj_num != 0) added.insert(obj_num);
+        } else {
+          bool was_in_use = prev_it->second.second;
+          uint64_t old_offset = prev_it->second.first;
+          uint64_t new_offset = entry.second.first;
+
+          if (in_use && !was_in_use) {
+            added.insert(obj_num);
+          } else if (!in_use && was_in_use) {
+            deleted.insert(obj_num);
+          } else if (in_use && was_in_use && old_offset != new_offset) {
+            modified.insert(obj_num);
+          }
+        }
+        cumulative_objects[obj_num] = entry.second;
+      }
+
+      rev.added_objects = set_to_sorted_vector(added);
+      rev.modified_objects = set_to_sorted_vector(modified);
+      rev.deleted_objects = set_to_sorted_vector(deleted);
+    }
+
+    history.revisions.push_back(std::move(rev));
+    prev_end = eof_markers[i];
+  }
+
+  if (!history.revisions.empty()) {
+    history.current_md5 = history.revisions.back().md5_hash;
+    history.current_sha256 = history.revisions.back().sha256_hash;
+  }
+
+  std::vector<SignatureField> signatures = pdf.catalog.signature_fields;
+  if (signatures.empty()) {
+    Pdf& mutable_pdf = const_cast<Pdf&>(pdf);
+    mutable_pdf.parse_signature_fields();
+    signatures = mutable_pdf.catalog.signature_fields;
+  }
+
+  const SignatureField* certification = nullptr;
+  size_t certification_coverage_end = 0;
+  for (const auto& sig : signatures) {
+    if ((!sig.is_signed && !sig.signature_present) || sig.byte_range.size() != 4) {
+      continue;
+    }
+
+    uint64_t coverage_end64 = sig.byte_range[2] + sig.byte_range[3];
+    size_t coverage_end =
+        coverage_end64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+            ? size
+            : static_cast<size_t>(coverage_end64);
+
+    RevisionHistoryEntry* best = nullptr;
+    for (auto& rev : history.revisions) {
+      if (rev.end_offset >= coverage_end) {
+        if (!best || rev.end_offset < best->end_offset) {
+          best = &rev;
+        }
+      }
+    }
+
+    if (best) {
+      best->associated_signature = sig.name;
+      best->modified_after_signature = coverage_end < size;
+      SignatureValidationResult validation = validate_signature(pdf, sig);
+      if (!validation.signer_name.empty()) best->signer_name = validation.signer_name;
+      if (!validation.signing_time.empty()) {
+        best->signing_time = validation.signing_time;
+      } else if (!sig.signing_date.empty()) {
+        best->signing_time = sig.signing_date;
+      }
+    }
+
+    if (sig.is_certification_signature &&
+        (!certification || coverage_end > certification_coverage_end)) {
+      certification = &sig;
+      certification_coverage_end = coverage_end;
+    }
+  }
+
+  if (certification) {
+    for (auto& rev : history.revisions) {
+      if (rev.start_offset >= certification_coverage_end) {
+        rev.modified_after_signature = true;
+        analyze_docmdp_revision(pdf, rev, *certification);
+      }
+    }
+  }
+
+  return history;
+}
+
 // Stub implementations for missing functions
 bool parse_string(StreamReader& sr, Parser& parser, std::string* out_str) {
   (void)parser;

@@ -2950,6 +2950,79 @@ const char* nanopdf_validate_signature(int sig_index) {
   return g_text_buffer.c_str();
 }
 
+// Get document revision history and DocMDP analysis as JSON.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_get_revision_history() {
+  if (!g_pdf) {
+    g_text_buffer = "{\"error\":\"No PDF loaded\"}";
+    return g_text_buffer.c_str();
+  }
+
+  nanopdf::RevisionHistory history = nanopdf::detect_revision_history(*g_pdf);
+
+  auto append_object_array = [](std::string& json,
+                                const char* name,
+                                const std::vector<uint32_t>& objects) {
+    json += ",\"" + std::string(name) + "\":[";
+    for (size_t i = 0; i < objects.size(); ++i) {
+      if (i > 0) json += ",";
+      json += std::to_string(objects[i]);
+    }
+    json += "]";
+  };
+
+  std::string json = "{";
+  json += "\"count\":" + std::to_string(history.revisions.size());
+  if (!history.current_md5.empty())
+    json += ",\"currentMd5\":\"" + json_escape(history.current_md5) + "\"";
+  if (!history.current_sha256.empty())
+    json += ",\"currentSha256\":\"" + json_escape(history.current_sha256) + "\"";
+
+  json += ",\"revisions\":[";
+  for (size_t i = 0; i < history.revisions.size(); ++i) {
+    const auto& rev = history.revisions[i];
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"revision\":" + std::to_string(rev.revision_number);
+    json += ",\"startOffset\":" + std::to_string(rev.start_offset);
+    json += ",\"endOffset\":" + std::to_string(rev.end_offset);
+    json += ",\"sizeBytes\":" + std::to_string(rev.size_bytes);
+    json += ",\"xrefOffset\":" + std::to_string(rev.xref_offset);
+    json += ",\"prevXrefOffset\":" + std::to_string(rev.prev_xref_offset);
+    if (!rev.md5_hash.empty())
+      json += ",\"md5\":\"" + json_escape(rev.md5_hash) + "\"";
+    if (!rev.sha256_hash.empty())
+      json += ",\"sha256\":\"" + json_escape(rev.sha256_hash) + "\"";
+    append_object_array(json, "addedObjects", rev.added_objects);
+    append_object_array(json, "modifiedObjects", rev.modified_objects);
+    append_object_array(json, "deletedObjects", rev.deleted_objects);
+    if (!rev.associated_signature.empty())
+      json += ",\"associatedSignature\":\"" + json_escape(rev.associated_signature) + "\"";
+    if (!rev.signer_name.empty())
+      json += ",\"signerName\":\"" + json_escape(rev.signer_name) + "\"";
+    if (!rev.signing_time.empty())
+      json += ",\"signingTime\":\"" + json_escape(rev.signing_time) + "\"";
+    json += ",\"modifiedAfterSignature\":" + std::string(rev.modified_after_signature ? "true" : "false");
+    json += ",\"hasDocMDP\":" + std::string(rev.has_docmdp ? "true" : "false");
+    if (rev.has_docmdp) {
+      json += ",\"mdpPermissions\":" + std::to_string(rev.mdp_permissions);
+      json += ",\"docMDPAllowed\":" + std::string(rev.docmdp_allowed ? "true" : "false");
+      json += ",\"docMDPStatus\":\"" + json_escape(rev.docmdp_status) + "\"";
+      json += ",\"docMDPViolations\":[";
+      for (size_t j = 0; j < rev.docmdp_violations.size(); ++j) {
+        if (j > 0) json += ",";
+        json += "\"" + json_escape(rev.docmdp_violations[j]) + "\"";
+      }
+      json += "]";
+    }
+    json += "}";
+  }
+  json += "]}";
+
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
 // ============================================================
 // Markdown Conversion API
 // ============================================================

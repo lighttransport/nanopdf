@@ -707,6 +707,40 @@ struct SignatureValidationResult {
   std::string error;              // Error message if validation failed
 };
 
+// Per-revision information for incremental-update PDFs.
+struct RevisionHistoryEntry {
+  size_t revision_number{0};
+  size_t start_offset{0};
+  size_t end_offset{0};
+  size_t size_bytes{0};
+  std::string md5_hash;
+  std::string sha256_hash;
+
+  size_t xref_offset{0};
+  size_t prev_xref_offset{0};
+
+  std::vector<uint32_t> added_objects;
+  std::vector<uint32_t> modified_objects;
+  std::vector<uint32_t> deleted_objects;
+
+  std::string associated_signature;
+  std::string signer_name;
+  std::string signing_time;
+  bool modified_after_signature{false};
+
+  bool has_docmdp{false};
+  int mdp_permissions{0};
+  bool docmdp_allowed{true};
+  std::string docmdp_status;
+  std::vector<std::string> docmdp_violations;
+};
+
+struct RevisionHistory {
+  std::vector<RevisionHistoryEntry> revisions;
+  std::string current_md5;
+  std::string current_sha256;
+};
+
 // Font descriptor containing metrics and font file data
 struct FontDescriptor {
   std::string font_name;
@@ -1923,6 +1957,12 @@ StructureElement* find_structure_element_by_mcid(StructureElement* root, int mci
 // structure. Does not perform RSA/ECDSA cryptographic verification.
 SignatureValidationResult validate_signature(const Pdf& pdf,
                                              const SignatureField& field);
+
+// Detect PDF incremental-update revisions and correlate them with digital
+// signatures. DocMDP permission analysis is conservative: disallowed changes
+// are reported when an appended revision clearly violates the certification
+// signature permissions; otherwise the result is marked allowed or unknown.
+RevisionHistory detect_revision_history(const Pdf& pdf);
 
 // Stream filter processing namespace declaration remains the same
 namespace filters {

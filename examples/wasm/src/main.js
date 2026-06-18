@@ -298,7 +298,13 @@ function renderHistoryTab() {
 
   revisions.forEach(rev => {
     const associated = rev.associatedSignature || '';
-    const className = associated ? 'history-card signed' : 'history-card';
+    const docMDPClass = rev.hasDocMDP && rev.docMDPAllowed === false ? ' violation' : '';
+    const className = (associated ? 'history-card signed' : 'history-card') + docMDPClass;
+    const objectSummary = [
+      rev.addedObjects && rev.addedObjects.length > 0 ? `+${rev.addedObjects.join(',')}` : '',
+      rev.modifiedObjects && rev.modifiedObjects.length > 0 ? `~${rev.modifiedObjects.join(',')}` : '',
+      rev.deletedObjects && rev.deletedObjects.length > 0 ? `-${rev.deletedObjects.join(',')}` : ''
+    ].filter(Boolean).join(' ');
     html += `<section class="${className}">`;
     html += '<div class="history-card-header">';
     html += `<div class="history-title">Revision ${rev.revision}</div>`;
@@ -309,11 +315,20 @@ function renderHistoryTab() {
     html += renderSignatureDetail('startxref', rev.xrefOffset || 'Unknown');
     html += renderSignatureDetail('Prev', rev.prevXrefOffset || '');
     html += renderSignatureDetail('SHA-256', rev.sha256 ? rev.sha256.slice(0, 24) : '');
-    html += renderSignatureDetail('Objects', rev.objects && rev.objects.length > 0 ? rev.objects.join(', ') : '');
+    html += renderSignatureDetail('Objects', objectSummary);
     html += renderSignatureDetail('Signed By', associated);
     html += renderSignatureDetail('Sign Time', formatPdfDate(rev.signingTime));
     if (associated) {
-      html += renderSignatureDetail('After Signing', rev.modifiedAfterSigning ? 'Additional bytes appended' : 'No appended bytes');
+      html += renderSignatureDetail('After Signing', rev.modifiedAfterSignature ? 'Additional bytes appended' : 'No appended bytes');
+    }
+    if (rev.hasDocMDP) {
+      html += renderSignatureDetail('DocMDP', rev.docMDPAllowed ? 'Allowed' : 'Disallowed');
+      html += renderSignatureDetail('MDP', getMdpPermissionLabel(rev.mdpPermissions));
+      if (Array.isArray(rev.docMDPViolations) && rev.docMDPViolations.length > 0) {
+        html += renderSignatureDetail('Violation', rev.docMDPViolations.join(' | '));
+      } else {
+        html += renderSignatureDetail('Status', rev.docMDPStatus);
+      }
     }
     html += '</div>';
     html += '</section>';
@@ -1126,7 +1141,7 @@ async function loadPDF(arrayBuffer, name) {
     // Load outline
     loadOutline();
     loadSignatureInfo();
-    editHistoryData = await buildEditHistory(currentPdfBytes, signatureData?.signatures || []);
+    editHistoryData = await loadRevisionHistory(currentPdfBytes, signatureData?.signatures || []);
 
     const hasSignatures = signatureData && Array.isArray(signatureData.signatures) &&
       signatureData.signatures.length > 0;
@@ -1192,6 +1207,24 @@ function loadSignatureInfo() {
     console.error('Signature parse error:', e);
     signatureData = null;
   }
+}
+
+async function loadRevisionHistory(bytes, signatures) {
+  if (Module && Module._nanopdf_get_revision_history) {
+    try {
+      const historyPtr = Module._nanopdf_get_revision_history();
+      const historyStr = Module.UTF8ToString(historyPtr);
+      const data = JSON.parse(historyStr);
+      if (!data.error) {
+        data.fileSize = bytes.length;
+        return data;
+      }
+    } catch (e) {
+      console.error('Revision history parse error:', e);
+    }
+  }
+
+  return buildEditHistory(bytes, signatures);
 }
 
 function parseStartXrefBefore(pdfText, eofIndex) {
@@ -1273,11 +1306,16 @@ async function buildEditHistory(bytes, signatures) {
       sizeBytes: endOffset - previousEnd,
       xrefOffset,
       prevXrefOffset: parsePrevXref(pdfText, xrefOffset, endOffset),
-      objects: parseTraditionalXrefObjects(pdfText, xrefOffset, endOffset),
+      addedObjects: parseTraditionalXrefObjects(pdfText, xrefOffset, endOffset),
+      modifiedObjects: [],
+      deletedObjects: [],
       sha256: await sha256Hex(bytes.slice(0, endOffset)),
       associatedSignature: '',
       signingTime: '',
-      modifiedAfterSigning: false
+      modifiedAfterSignature: false,
+      hasDocMDP: false,
+      docMDPAllowed: true,
+      docMDPStatus: ''
     });
     previousEnd = endOffset;
   }
@@ -1294,7 +1332,7 @@ async function buildEditHistory(bytes, signatures) {
     if (best) {
       best.associatedSignature = sig.name || 'Signature';
       best.signingTime = sig.date || sig.timestampDate || '';
-      best.modifiedAfterSigning = coverageEnd < bytes.length;
+      best.modifiedAfterSignature = coverageEnd < bytes.length;
     }
   }
 

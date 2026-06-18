@@ -368,6 +368,10 @@ body {
   border-color: #a9c7f5;
   background: #fbfdff;
 }
+.history-card.violation {
+  border-color: #f0b4ad;
+  background: #fffafa;
+}
 .history-card-header {
   display: flex;
   align-items: center;
