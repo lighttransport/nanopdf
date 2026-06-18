@@ -8209,6 +8209,20 @@ private:
       return true;
     }
 
+    // Subset-font convention "G<hex>" / "g<hex>": <hex> is the 2- or 4-digit
+    // hex character code (e.g. "G53" -> 0x53 'S'). Checked after the AGL table
+    // so a real name like "Gamma" is never misread as hex.
+    if ((name[0] == 'G' || name[0] == 'g') &&
+        (name.size() == 3 || name.size() == 5)) {
+      std::string hex = name.substr(1);
+      char* end = nullptr;
+      long value = std::strtol(hex.c_str(), &end, 16);
+      if (end && *end == '\0' && value > 0) {
+        append_utf8(static_cast<uint32_t>(value), utf8_out);
+        return true;
+      }
+    }
+
     return false;
   }
   const std::unordered_map<std::string, std::string>& glyph_name_map() {

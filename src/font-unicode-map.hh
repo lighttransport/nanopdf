@@ -501,6 +501,27 @@ inline uint32_t glyph_name_to_unicode(const std::string& name) {
     if (cp) return cp;
   }
 
+  // Subset-font convention "G<hex>" / "g<hex>" where <hex> is the 2- or
+  // 4-digit hex character code (e.g. "G53" -> 0x53 'S', "G2B" -> '+'). Emitted
+  // by some PDF producers for re-encoded subset fonts; without this the codes
+  // map to nothing and render as tofu boxes. The binary search above already
+  // claimed every real AGL glyph name, so this only fires for the synthetic
+  // form (a real name like "Gamma" contains non-hex letters and is rejected).
+  if ((name[0] == 'G' || name[0] == 'g') &&
+      (name.size() == 3 || name.size() == 5)) {
+    uint32_t cp = 0;
+    bool ok = true;
+    for (size_t j = 1; j < name.size(); ++j) {
+      char c = name[j];
+      cp <<= 4;
+      if (c >= '0' && c <= '9') cp |= static_cast<uint32_t>(c - '0');
+      else if (c >= 'a' && c <= 'f') cp |= static_cast<uint32_t>(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
+      else { ok = false; break; }
+    }
+    if (ok && cp) return cp;
+  }
+
   return 0;
 }
 
