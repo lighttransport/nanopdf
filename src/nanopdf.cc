@@ -5813,7 +5813,13 @@ bool Pdf::build_object_offset_cache() const {
       uint64_t key = (static_cast<uint64_t>(object_number) << 32) |
                      static_cast<uint64_t>(generation);
       std::lock_guard<std::mutex> lock(cache_mutex);
-      object_offsets[key] = body_offset;
+      // The xref chain is walked newest-first (startxref, then each /Prev), so
+      // the first offset seen for an object is the most recent one. Incremental
+      // updates redefine objects in later sections that appear EARLIER in this
+      // walk; keep the first (newest) and never let an older /Prev section
+      // overwrite it. Otherwise filled form fields, signatures and other
+      // incremental edits silently revert to their pre-update objects.
+      object_offsets.emplace(key, body_offset);
     }
   };
 
