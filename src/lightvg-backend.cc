@@ -7515,9 +7515,17 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       size_t start = pos;
       pos++;
       while (pos < content.size() && depth > 0) {
-        if (content[pos] == '(' && (pos == 0 || content[pos-1] != '\\')) {
+        // Honor escapes by skipping the char after a backslash. A naive
+        // "previous char != backslash" test mis-handles an escaped backslash
+        // "\\" before a ")" (e.g. the string "(\\)" for a path separator),
+        // treating the ")" as escaped and swallowing the rest of the stream.
+        if (content[pos] == '\\') {
+          pos += 2;
+          continue;
+        }
+        if (content[pos] == '(') {
           depth++;
-        } else if (content[pos] == ')' && (pos == 0 || content[pos-1] != '\\')) {
+        } else if (content[pos] == ')') {
           depth--;
         }
         pos++;
