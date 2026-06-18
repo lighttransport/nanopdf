@@ -368,7 +368,7 @@ function renderHistoryTab() {
   html += '</div>';
   html += '<div class="history-list">';
 
-  revisions.forEach(rev => {
+  revisions.forEach((rev, idx) => {
     const associated = rev.associatedSignature || '';
     const docMDPClass = rev.hasDocMDP && rev.docMDPAllowed === false ? ' violation' : '';
     const className = (associated ? 'history-card signed' : 'history-card') + docMDPClass;
@@ -403,11 +403,292 @@ function renderHistoryTab() {
       }
     }
     html += '</div>';
+    // Visual diff vs the previous revision. The first revision is the base
+    // document (nothing to diff against), so only offer it from revision 2 on.
+    if (idx > 0 && hasRendering) {
+      html += `<button class="history-diff-btn" data-rev-index="${idx}" title="Visually highlight what this revision changed">Visualize changes</button>`;
+    }
     html += '</section>';
   });
 
   html += '</div>';
   sidebarContent.innerHTML = html;
+
+  sidebarContent.querySelectorAll('.history-diff-btn').forEach(btn => {
+    btn.addEventListener('click', () => openRevisionDiff(parseInt(btn.dataset.revIndex, 10)));
+  });
+}
+
+// ---- Revision visual diff ----
+//
+// Highlights what an incremental-update revision changed by rendering the page
+// as it existed *before* the revision and *after* it, then compositing the two:
+// content added by the revision is green, removed content is red, and unchanged
+// content fades to light gray for context. Before/After/Swipe modes show the
+// raw renders for comparison.
+
+const diffState = {
+  open: false,
+  revIndex: 0,
+  page: 0,
+  pageCount: 0,
+  mode: 'diff',          // 'diff' | 'before' | 'after' | 'swipe'
+  swipe: 0.5,
+  before: null,          // { data, w, h } or null (page absent in prev revision)
+  after: null,
+  byteAfter: 0,
+  byteBefore: 0,
+};
+
+// Render one revision snapshot of a page into a detached pixel buffer.
+function renderRevisionPixels(byteLen, pageIdx, width, height, dpi) {
+  if (!Module._nanopdf_render_revision_page) return null;
+  let ok = 0;
+  try {
+    ok = Module._nanopdf_render_revision_page(byteLen, pageIdx, width, height, dpi);
+  } catch (e) {
+    console.warn('revision render crashed', e);
+    return null;
+  }
+  if (ok !== 1) return null;
+  const ptr = Module._nanopdf_get_render_buffer();
+  const size = Module._nanopdf_get_render_buffer_size();
+  const w = Module._nanopdf_get_render_width();
+  const h = Module._nanopdf_get_render_height();
+  if (!ptr || size <= 0) return null;
+  // Copy out — the buffer is reused by the next render call.
+  const data = new Uint8ClampedArray(size);
+  data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size));
+  return { data, w, h };
+}
+
+function lum(d, i) {
+  // Rec.601 luma of an RGBA pixel at byte offset i.
+  return 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+}
+
+// Build an ImageData for the current mode from cached before/after buffers.
+function composeDiffImage(ctx) {
+  const after = diffState.after;
+  const before = diffState.before;
+  if (!after) return null;
+  const w = after.w, h = after.h;
+  const out = ctx.createImageData(w, h);
+  const o = out.data, A = before && before.w === w && before.h === h ? before.data : null;
+  const B = after.data;
+
+  if (diffState.mode === 'after' || diffState.mode === 'before') {
+    const src = diffState.mode === 'before' ? (A || null) : B;
+    if (!src) { o.fill(255); for (let i = 3; i < o.length; i += 4) o[i] = 255; }
+    else o.set(src);
+    return out;
+  }
+
+  if (diffState.mode === 'swipe') {
+    const splitX = Math.round(w * diffState.swipe);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const src = (x < splitX && A) ? A : B;
+        o[i] = src[i]; o[i + 1] = src[i + 1]; o[i + 2] = src[i + 2]; o[i + 3] = 255;
+      }
+    }
+    // divider line
+    for (let y = 0; y < h; y++) {
+      const i = (y * w + splitX) * 4;
+      if (splitX < w) { o[i] = 0; o[i + 1] = 123; o[i + 2] = 255; o[i + 3] = 255; }
+    }
+    return out;
+  }
+
+  // 'diff' mode — signed luminance difference.
+  const T = 28;          // ignore sub-threshold AA noise
+  for (let i = 0; i < B.length; i += 4) {
+    const bL = lum(B, i);
+    const aL = A ? lum(A, i) : 255;  // no prior page => everything is "added"
+    const d = aL - bL;               // >0: darker now (added ink); <0: removed
+    let rr, gg, bb;
+    if (d > T) {
+      const k = Math.min(1, d / 170);
+      rr = Math.round(255 - 239 * k); gg = Math.round(255 - 95 * k); bb = Math.round(255 - 183 * k); // -> #10A248
+    } else if (d < -T) {
+      const k = Math.min(1, -d / 170);
+      rr = Math.round(255 - 47 * k); gg = Math.round(255 - 215 * k); bb = Math.round(255 - 215 * k);  // -> #C82828
+    } else {
+      const ink = (255 - bL) / 255;             // unchanged: fade to light gray
+      const g = Math.round(255 - ink * 105);
+      rr = gg = bb = g;
+    }
+    o[i] = rr; o[i + 1] = gg; o[i + 2] = bb; o[i + 3] = 255;
+  }
+  return out;
+}
+
+function ensureDiffOverlay() {
+  let el = document.getElementById('rev-diff-overlay');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'rev-diff-overlay';
+  el.className = 'rev-diff-overlay hidden';
+  el.innerHTML = `
+    <div class="rev-diff-panel">
+      <div class="rev-diff-header">
+        <div class="rev-diff-title" id="rev-diff-title">Revision changes</div>
+        <div class="rev-diff-modes">
+          <button data-mode="diff" class="active">Diff</button>
+          <button data-mode="before">Before</button>
+          <button data-mode="after">After</button>
+          <button data-mode="swipe">Swipe</button>
+        </div>
+        <button class="rev-diff-close" id="rev-diff-close" title="Close">&times;</button>
+      </div>
+      <div class="rev-diff-body">
+        <canvas id="rev-diff-canvas"></canvas>
+        <div class="rev-diff-empty hidden" id="rev-diff-empty"></div>
+      </div>
+      <div class="rev-diff-footer">
+        <div class="rev-diff-pagenav">
+          <button id="rev-diff-prev" title="Previous page">&larr;</button>
+          <span id="rev-diff-pageinfo">Page 1 / 1</span>
+          <button id="rev-diff-next" title="Next page">&rarr;</button>
+        </div>
+        <input type="range" id="rev-diff-swipe" min="0" max="100" value="50" class="hidden" />
+        <div class="rev-diff-legend">
+          <span><i class="swatch added"></i>Added</span>
+          <span><i class="swatch removed"></i>Removed</span>
+          <span><i class="swatch same"></i>Unchanged</span>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+
+  el.querySelector('#rev-diff-close').addEventListener('click', closeRevisionDiff);
+  el.addEventListener('click', (e) => { if (e.target === el) closeRevisionDiff(); });
+  el.querySelectorAll('.rev-diff-modes button').forEach(b => {
+    b.addEventListener('click', () => {
+      diffState.mode = b.dataset.mode;
+      el.querySelectorAll('.rev-diff-modes button').forEach(x => x.classList.toggle('active', x === b));
+      el.querySelector('#rev-diff-swipe').classList.toggle('hidden', diffState.mode !== 'swipe');
+      el.querySelector('.rev-diff-legend').classList.toggle('hidden', diffState.mode !== 'diff');
+      paintDiffCanvas();
+    });
+  });
+  el.querySelector('#rev-diff-prev').addEventListener('click', () => stepDiffPage(-1));
+  el.querySelector('#rev-diff-next').addEventListener('click', () => stepDiffPage(1));
+  el.querySelector('#rev-diff-swipe').addEventListener('input', (e) => {
+    diffState.swipe = e.target.value / 100;
+    paintDiffCanvas();
+  });
+  return el;
+}
+
+function diffRenderSize(pageIdx) {
+  const pw = Module._nanopdf_get_page_width(pageIdx) || 612;
+  const ph = Module._nanopdf_get_page_height(pageIdx) || 792;
+  const maxW = 1000;
+  const scale = Math.min(maxW / pw, 2.0);
+  const w = Math.max(1, Math.round(pw * scale));
+  const h = Math.max(1, Math.round(ph * scale));
+  return { w, h, dpi: 72 * (w / pw) };
+}
+
+// Load before/after buffers for the current diff page (cached on diffState).
+function loadDiffPage() {
+  const { w, h, dpi } = diffRenderSize(diffState.page);
+  diffState.after = renderRevisionPixels(diffState.byteAfter, diffState.page, w, h, dpi);
+  diffState.before = renderRevisionPixels(diffState.byteBefore, diffState.page, w, h, dpi);
+}
+
+// True if the page has any visible change between before/after.
+function diffPageChanged() {
+  const A = diffState.before, B = diffState.after;
+  if (!B) return false;
+  if (!A || A.w !== B.w || A.h !== B.h) return true;  // page added / size change
+  const a = A.data, b = B.data;
+  let changed = 0;
+  for (let i = 0; i < b.length; i += 4) {
+    if (Math.abs(lum(a, i) - lum(b, i)) > 28) {
+      if (++changed > 40) return true;
+    }
+  }
+  return false;
+}
+
+function paintDiffCanvas() {
+  const overlay = document.getElementById('rev-diff-overlay');
+  const canvas = document.getElementById('rev-diff-canvas');
+  const empty = document.getElementById('rev-diff-empty');
+  const ctx = canvas.getContext('2d');
+  const img = composeDiffImage(ctx);
+  if (!img) {
+    canvas.classList.add('hidden');
+    empty.classList.remove('hidden');
+    empty.textContent = 'This page is not present in the selected revision.';
+    return;
+  }
+  canvas.width = img.width;
+  canvas.height = img.height;
+  ctx.putImageData(img, 0, 0);
+  const noChange = diffState.mode === 'diff' && !diffPageChanged();
+  empty.classList.toggle('hidden', !noChange);
+  if (noChange) empty.textContent = 'No visual changes on this page.';
+  canvas.classList.toggle('dimmed', noChange);
+  canvas.classList.remove('hidden');
+  document.getElementById('rev-diff-pageinfo').textContent =
+    `Page ${diffState.page + 1} / ${diffState.pageCount}`;
+  overlay.querySelector('#rev-diff-prev').disabled = diffState.page <= 0;
+  overlay.querySelector('#rev-diff-next').disabled = diffState.page >= diffState.pageCount - 1;
+}
+
+function stepDiffPage(delta) {
+  const next = diffState.page + delta;
+  if (next < 0 || next >= diffState.pageCount) return;
+  diffState.page = next;
+  loadDiffPage();
+  paintDiffCanvas();
+}
+
+function openRevisionDiff(revIndex) {
+  const revisions = (editHistoryData && editHistoryData.revisions) || [];
+  if (revIndex <= 0 || revIndex >= revisions.length) return;
+  const rev = revisions[revIndex];
+  const prev = revisions[revIndex - 1];
+  diffState.revIndex = revIndex;
+  diffState.byteAfter = rev.endOffset;
+  diffState.byteBefore = prev.endOffset;
+  diffState.mode = 'diff';
+  diffState.pageCount = Module._nanopdf_get_revision_page_count
+    ? (Module._nanopdf_get_revision_page_count(rev.endOffset) || totalPages)
+    : totalPages;
+
+  const overlay = ensureDiffOverlay();
+  overlay.querySelectorAll('.rev-diff-modes button').forEach(x => x.classList.toggle('active', x.dataset.mode === 'diff'));
+  overlay.querySelector('#rev-diff-swipe').classList.add('hidden');
+  overlay.querySelector('.rev-diff-legend').classList.remove('hidden');
+  const signer = rev.signerName || rev.associatedSignature;
+  overlay.querySelector('#rev-diff-title').textContent =
+    `Revision ${rev.revision} changes` + (signer ? ` — signed by ${signer}` : '');
+  overlay.classList.remove('hidden');
+  diffState.open = true;
+
+  // Jump to the first page that actually changed (cap the scan for big docs).
+  diffState.page = Math.min(currentPage, diffState.pageCount - 1);
+  const scanLimit = diffState.pageCount <= 30 ? diffState.pageCount : 0;
+  let landed = false;
+  for (let p = 0; p < scanLimit; p++) {
+    diffState.page = p;
+    loadDiffPage();
+    if (diffPageChanged()) { landed = true; break; }
+  }
+  if (!landed) { diffState.page = Math.min(currentPage, diffState.pageCount - 1); loadDiffPage(); }
+  paintDiffCanvas();
+}
+
+function closeRevisionDiff() {
+  const overlay = document.getElementById('rev-diff-overlay');
+  if (overlay) overlay.classList.add('hidden');
+  diffState.open = false;
+  diffState.before = diffState.after = null;
 }
 
 // ---- Thumbnails ----
@@ -1824,6 +2105,14 @@ canvasScroll.addEventListener('wheel', (e) => {
 // Keyboard navigation
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+  // Revision diff overlay captures navigation keys while open.
+  if (diffState.open) {
+    if (e.key === 'Escape') { e.preventDefault(); closeRevisionDiff(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); stepDiffPage(-1); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); stepDiffPage(1); }
+    return;
+  }
 
   if (e.key === 'ArrowLeft') {
     e.preventDefault();

@@ -330,6 +330,61 @@ int nanopdf_render_page(int page_index, int width, int height, float dpi) {
   return render_page_with_selected_backend(*g_pdf, page, width, height, dpi) ? 1 : 0;
 }
 
+// Render a page as the document existed at a given incremental-update
+// revision. `byte_len` is that revision's end offset (see
+// nanopdf_get_revision_history -> revisions[].endOffset); the document is
+// re-parsed from just the first `byte_len` bytes, which reconstructs the file
+// state before any later incremental update. Output lands in the same render
+// buffer as nanopdf_render_page. Used by the viewer's per-revision visual diff.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_render_revision_page(unsigned int byte_len, int page_index,
+                                 int width, int height, float dpi) {
+  if (!g_pdf || g_pdf_data.empty()) {
+    g_last_error = "No PDF loaded";
+    return 0;
+  }
+  if (byte_len == 0 || byte_len > g_pdf_data.size()) {
+    g_last_error = "Invalid revision byte length";
+    return 0;
+  }
+  if (width <= 0 || height <= 0) {
+    g_last_error = "Invalid dimensions";
+    return 0;
+  }
+
+  // Re-parse the truncated byte range as a standalone document snapshot.
+  nanopdf::Pdf rev_pdf;
+  if (!nanopdf::parse_from_memory(g_pdf_data.data(), byte_len, &rev_pdf) ||
+      !rev_pdf.load_document_structure()) {
+    g_last_error = "Failed to parse revision snapshot";
+    return 0;
+  }
+  if (page_index < 0 ||
+      page_index >= static_cast<int>(rev_pdf.catalog.pages.size())) {
+    g_last_error = "Page not present in this revision";
+    return 0;
+  }
+
+  const auto& page = rev_pdf.catalog.pages[page_index];
+  return render_page_with_selected_backend(rev_pdf, page, width, height, dpi)
+             ? 1
+             : 0;
+}
+
+// Page count for a given revision snapshot (pages can be added across
+// revisions, so the diff UI needs the per-revision count).
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_get_revision_page_count(unsigned int byte_len) {
+  if (!g_pdf || g_pdf_data.empty()) return 0;
+  if (byte_len == 0 || byte_len > g_pdf_data.size()) return 0;
+  nanopdf::Pdf rev_pdf;
+  if (!nanopdf::parse_from_memory(g_pdf_data.data(), byte_len, &rev_pdf) ||
+      !rev_pdf.load_document_structure()) {
+    return 0;
+  }
+  return static_cast<int>(rev_pdf.catalog.pages.size());
+}
+
 EMSCRIPTEN_KEEPALIVE
 uint8_t* nanopdf_get_render_buffer() {
   if (g_render_buffer.empty()) return nullptr;
