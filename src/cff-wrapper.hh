@@ -4,10 +4,12 @@
 // CFF (Compact Font Format) wrapper utilities
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace cff_wrapper {
@@ -326,6 +328,162 @@ inline std::vector<uint8_t> wrap_cff_in_opentype(
 
   // Copy CFF data
   std::copy(cff_data.begin(), cff_data.end(), otf.begin() + header_size);
+
+  return otf;
+}
+
+// Build a FULLY LOADABLE OpenType-CFF font for a SIMPLE (non-CID) CFF font.
+//
+// Raw CFF carries only glyph outlines; stb_truetype and ttf_parse both refuse
+// to initialise a font without the sfnt `head`/`hhea`/`maxp`/`hmtx` (and, for
+// stbtt, `cmap`) tables. The minimal wrap_cff_in_opentype() above therefore
+// fails to load and the caller falls back to a substitute font. This function
+// synthesises those tables so the embedded glyphs render directly.
+//
+// `uni_to_gid` maps Unicode code point -> glyph index (built by the caller from
+// the CFF charset glyph names). It becomes a format-12 cmap so the normal
+// code -> glyph-name -> Unicode -> cmap -> GID selection path resolves to the
+// embedded glyph. hmtx advances are dummy (1000); callers drive spacing from
+// the PDF /Widths array, falling back to hmtx only when absent.
+//
+// Returns the assembled sfnt, or empty on invalid input (caller should fall
+// back to wrap_cff_in_opentype()).
+inline std::vector<uint8_t> build_simple_cff_opentype(
+    const std::vector<uint8_t>& cff_data,
+    std::vector<std::pair<uint32_t, uint16_t>> uni_to_gid,
+    uint16_t num_glyphs, uint16_t units_per_em) {
+  if (cff_data.empty() || num_glyphs == 0 || uni_to_gid.empty()) return {};
+  if (units_per_em == 0) units_per_em = 1000;
+
+  auto put16 = [](std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back(static_cast<uint8_t>(x >> 8));
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
+  };
+  auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>(x >> 24));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
+  };
+
+  // Sort by code point and drop duplicate code points (keep first GID).
+  std::sort(uni_to_gid.begin(), uni_to_gid.end());
+  uni_to_gid.erase(
+      std::unique(uni_to_gid.begin(), uni_to_gid.end(),
+                  [](const std::pair<uint32_t, uint16_t>& a,
+                     const std::pair<uint32_t, uint16_t>& b) {
+                    return a.first == b.first;
+                  }),
+      uni_to_gid.end());
+
+  // Merge into contiguous format-12 groups (code+1 and gid+1 in lockstep).
+  struct Group { uint32_t start, end, start_gid; };
+  std::vector<Group> groups;
+  for (const auto& [u, g] : uni_to_gid) {
+    if (!groups.empty() && u == groups.back().end + 1 &&
+        g == groups.back().start_gid + (groups.back().end - groups.back().start) + 1) {
+      groups.back().end = u;
+    } else {
+      groups.push_back({u, u, g});
+    }
+  }
+
+  // ---- cmap (format 12, platform 3 / encoding 10) ----
+  std::vector<uint8_t> cmap;
+  put16(cmap, 0);   // version
+  put16(cmap, 1);   // numTables
+  put16(cmap, 3);   // platformID (Windows)
+  put16(cmap, 10);  // encodingID (UCS-4)
+  put32(cmap, 12);  // offset to subtable (4-byte header + 8-byte record)
+  put16(cmap, 12);  // format
+  put16(cmap, 0);   // reserved
+  put32(cmap, static_cast<uint32_t>(16 + groups.size() * 12));  // length
+  put32(cmap, 0);   // language
+  put32(cmap, static_cast<uint32_t>(groups.size()));            // nGroups
+  for (const auto& gr : groups) {
+    put32(cmap, gr.start);
+    put32(cmap, gr.end);
+    put32(cmap, gr.start_gid);
+  }
+
+  // ---- head (54 bytes) ----
+  std::vector<uint8_t> head(54, 0);
+  head[1] = 1;                                   // version 1.0
+  head[12] = 0x5F; head[13] = 0x0F;              // magicNumber 0x5F0F3CF5
+  head[14] = 0x3C; head[15] = 0xF5;
+  head[18] = static_cast<uint8_t>(units_per_em >> 8);   // unitsPerEm
+  head[19] = static_cast<uint8_t>(units_per_em & 0xFF);
+  head[49] = 2;                                  // fontDirectionHint = 2
+  // indexToLocFormat (@50) and glyphDataFormat (@52) stay 0.
+
+  // ---- maxp (version 0.5 for CFF, 6 bytes) ----
+  std::vector<uint8_t> maxp(6, 0);
+  maxp[2] = 0x50;                                // version 0x00005000
+  maxp[4] = static_cast<uint8_t>(num_glyphs >> 8);
+  maxp[5] = static_cast<uint8_t>(num_glyphs & 0xFF);
+
+  // ---- hhea (36 bytes) ----
+  std::vector<uint8_t> hhea(36, 0);
+  hhea[1] = 1;                                   // version 1.0
+  hhea[4] = 0x03; hhea[5] = 0x20;                // ascent = 800
+  hhea[6] = 0xFF; hhea[7] = 0x38;                // descent = -200
+  hhea[34] = static_cast<uint8_t>(num_glyphs >> 8);  // numberOfHMetrics
+  hhea[35] = static_cast<uint8_t>(num_glyphs & 0xFF);
+
+  // ---- hmtx (num_glyphs * 4): dummy advance 1000, lsb 0 ----
+  std::vector<uint8_t> hmtx(static_cast<size_t>(num_glyphs) * 4, 0);
+  for (uint32_t i = 0; i < num_glyphs; ++i) {
+    hmtx[i * 4] = 0x03;
+    hmtx[i * 4 + 1] = 0xE8;
+  }
+
+  // ---- assemble sfnt (tables in ascending tag order) ----
+  struct Tbl { const char* tag; const std::vector<uint8_t>* data; };
+  const Tbl tbls[] = {
+    {"CFF ", &cff_data}, {"cmap", &cmap}, {"head", &head},
+    {"hhea", &hhea}, {"hmtx", &hmtx}, {"maxp", &maxp},
+  };
+  const int nt = 6;
+  size_t header_size = 12 + static_cast<size_t>(nt) * 16;
+
+  size_t offs[nt], lens[nt];
+  size_t pos = header_size;
+  for (int i = 0; i < nt; ++i) {
+    offs[i] = pos;
+    lens[i] = tbls[i].data->size();
+    pos += (lens[i] + 3) & ~static_cast<size_t>(3);  // 4-byte aligned
+  }
+
+  std::vector<uint8_t> otf(pos, 0);
+  auto w16 = [&](size_t o, uint16_t x) {
+    otf[o] = static_cast<uint8_t>(x >> 8);
+    otf[o + 1] = static_cast<uint8_t>(x & 0xFF);
+  };
+  auto w32 = [&](size_t o, uint32_t x) {
+    otf[o] = static_cast<uint8_t>(x >> 24);
+    otf[o + 1] = static_cast<uint8_t>((x >> 16) & 0xFF);
+    otf[o + 2] = static_cast<uint8_t>((x >> 8) & 0xFF);
+    otf[o + 3] = static_cast<uint8_t>(x & 0xFF);
+  };
+
+  otf[0] = 'O'; otf[1] = 'T'; otf[2] = 'T'; otf[3] = 'O';
+  w16(4, nt);
+  // searchRange = 16 * 2^floor(log2(nt)); entrySelector = floor(log2(nt))
+  uint16_t es = 0, sr = 16;
+  while ((sr << 1) <= nt * 16) { sr <<= 1; ++es; }
+  w16(6, sr);
+  w16(8, es);
+  w16(10, static_cast<uint16_t>(nt * 16 - sr));
+
+  for (int i = 0; i < nt; ++i) {
+    size_t rec = 12 + static_cast<size_t>(i) * 16;
+    otf[rec] = tbls[i].tag[0]; otf[rec + 1] = tbls[i].tag[1];
+    otf[rec + 2] = tbls[i].tag[2]; otf[rec + 3] = tbls[i].tag[3];
+    w32(rec + 4, 0);  // checksum (unverified by stbtt/ttf_parse)
+    w32(rec + 8, static_cast<uint32_t>(offs[i]));
+    w32(rec + 12, static_cast<uint32_t>(lens[i]));
+    std::copy(tbls[i].data->begin(), tbls[i].data->end(), otf.begin() + offs[i]);
+  }
 
   return otf;
 }

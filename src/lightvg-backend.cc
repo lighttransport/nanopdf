@@ -16,6 +16,7 @@
 #include "nanopdf-log.hh"
 #include "color-transform.hh"
 #include "cff-wrapper.hh"
+#include "cff-parser.hh"
 #include "font-provider.hh"
 #include "font-unicode-map.hh"
 #include "shared-font-cache.hh"
@@ -2780,10 +2781,40 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
   // but DOES support OpenType-CFF with OTTO header natively)
   std::vector<uint16_t> cff_cid_to_gid;
   if (cff_wrapper::is_raw_cff(decoded.data.data(), decoded.data.size())) {
-    // Parse CFF charset to build CID→GID mapping BEFORE wrapping
-    cff_cid_to_gid = cff_wrapper::build_cid_to_gid_map(
-        decoded.data.data(), decoded.data.size());
-    auto wrapped = cff_wrapper::wrap_cff_in_opentype(decoded.data);
+    std::vector<uint8_t> wrapped;
+    cff::CFFData cff_data;
+    cff::CFFParser cff_parser;
+    bool cff_ok =
+        cff_parser.parse(decoded.data.data(), decoded.data.size(), cff_data);
+    if (cff_ok && !cff_data.is_cid && !cff_data.charset.empty()) {
+      // Simple (non-CID) CFF: synthesize a fully loadable sfnt with a cmap
+      // built from the charset glyph names, so the embedded glyphs render
+      // directly instead of falling back to a substitute font.
+      std::vector<std::pair<uint32_t, uint16_t>> uni_to_gid;
+      uni_to_gid.reserve(cff_data.charset.size());
+      for (size_t gid = 0; gid < cff_data.charset.size(); ++gid) {
+        uint32_t u = glyph_name_to_unicode(cff_data.charset[gid]);
+        if (u) uni_to_gid.emplace_back(u, static_cast<uint16_t>(gid));
+      }
+      // The CFF coordinate space is 1/FontMatrix[0] units/em (1000 by default,
+      // but e.g. Courier-New subsets are 2048). ttf_parse/stbtt scale glyphs by
+      // head.unitsPerEm and ignore the CFF FontMatrix, so derive upem from it.
+      uint16_t upem = 1000;
+      if (cff_data.font_matrix.size() >= 1 && cff_data.font_matrix[0] > 0.0) {
+        double u = 1.0 / cff_data.font_matrix[0];
+        if (u >= 16.0 && u <= 65535.0) upem = static_cast<uint16_t>(u + 0.5);
+      }
+      wrapped = cff_wrapper::build_simple_cff_opentype(
+          decoded.data, std::move(uni_to_gid),
+          static_cast<uint16_t>(cff_data.num_glyphs), upem);
+    }
+    if (wrapped.empty()) {
+      // CID-keyed, parse failure, or no mappable names: minimal OTTO wrapper
+      // plus a CID->GID map (legacy behavior).
+      cff_cid_to_gid = cff_wrapper::build_cid_to_gid_map(
+          decoded.data.data(), decoded.data.size());
+      wrapped = cff_wrapper::wrap_cff_in_opentype(decoded.data);
+    }
     if (wrapped.empty()) {
       return load_fallback_font_with_hint(font_name, font);
     }
