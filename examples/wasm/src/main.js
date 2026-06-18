@@ -8,6 +8,8 @@ let Module = null;
 let currentPage = 0;
 let totalPages = 0;
 let hasRendering = false;
+let renderBackend = 1; // 0 = LightVG, 1 = ThorVG
+let renderBackends = { lightvg: false, thorvg: false };
 let fileName = '';
 let fileSize = 0;
 let currentPdfBytes = null;
@@ -38,6 +40,8 @@ let selectedPages = new Set();
 let lastClickedPage = 0;
 
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+const BACKEND_LIGHTVG = 0;
+const BACKEND_THORVG = 1;
 
 // DOM refs
 const loadingOverlay = document.getElementById('loading-overlay');
@@ -47,6 +51,7 @@ const pdfInput = document.getElementById('pdf-input');
 const openPdfBtn = document.getElementById('open-pdf-btn');
 const renderBtn = document.getElementById('render-btn');
 const extractBtn = document.getElementById('extract-btn');
+const backendToggleBtn = document.getElementById('backend-toggle-btn');
 const prevBtn = document.getElementById('prev-btn');
 const nextBtn = document.getElementById('next-btn');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
@@ -108,6 +113,72 @@ function updateZoomDisplay() {
   zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
 }
 
+function backendLabel(backendId) {
+  return backendId === BACKEND_LIGHTVG ? 'LightVG' : 'ThorVG';
+}
+
+function syncRenderBackendFromModule() {
+  if (!Module || !hasRendering) return;
+
+  renderBackends = {
+    lightvg: Module._nanopdf_render_backend_available
+      ? Module._nanopdf_render_backend_available(BACKEND_LIGHTVG) === 1
+      : false,
+    thorvg: Module._nanopdf_render_backend_available
+      ? Module._nanopdf_render_backend_available(BACKEND_THORVG) === 1
+      : true,
+  };
+
+  if (Module._nanopdf_get_render_backend) {
+    const current = Module._nanopdf_get_render_backend();
+    if (current === BACKEND_LIGHTVG || current === BACKEND_THORVG) {
+      renderBackend = current;
+    }
+  } else if (!renderBackends.thorvg && renderBackends.lightvg) {
+    renderBackend = BACKEND_LIGHTVG;
+  }
+
+  updateBackendToggle();
+}
+
+function updateBackendToggle() {
+  if (!backendToggleBtn) return;
+  const availableCount = (renderBackends.lightvg ? 1 : 0) + (renderBackends.thorvg ? 1 : 0);
+  backendToggleBtn.textContent = backendLabel(renderBackend);
+  backendToggleBtn.disabled = !hasRendering || availableCount < 2;
+  backendToggleBtn.hidden = !hasRendering || availableCount === 0;
+  backendToggleBtn.title = availableCount > 1
+    ? `Rendering backend: ${backendLabel(renderBackend)}`
+    : `Rendering backend: ${backendLabel(renderBackend)} (only backend available)`;
+}
+
+function switchRenderBackend() {
+  if (!Module || !hasRendering || !Module._nanopdf_set_render_backend) return;
+  const nextBackend = renderBackend === BACKEND_THORVG ? BACKEND_LIGHTVG : BACKEND_THORVG;
+  const nextAvailable = nextBackend === BACKEND_LIGHTVG
+    ? renderBackends.lightvg
+    : renderBackends.thorvg;
+  if (!nextAvailable) return;
+
+  const result = Module._nanopdf_set_render_backend(nextBackend);
+  if (result !== 1) {
+    const error = Module._nanopdf_get_last_error
+      ? Module.UTF8ToString(Module._nanopdf_get_last_error())
+      : 'backend unavailable';
+    setStatus('Backend switch failed: ' + error, true);
+    return;
+  }
+
+  renderBackend = nextBackend;
+  thumbnailCache = {};
+  thumbnailRenderQueue = [];
+  isThumbnailRendering = false;
+  updateBackendToggle();
+  if (activeSidebarTab === 'info') renderInfoTab();
+  if (activeSidebarTab === 'thumbs') updateSidebar();
+  if (totalPages > 0) renderCurrentPage();
+}
+
 // ---- Sidebar ----
 
 function escapeHtml(text) {
@@ -149,6 +220,7 @@ function renderInfoTab() {
     { label: 'File Size', value: fileSize ? formatFileSize(fileSize) : 'N/A' },
     { label: 'Pages', value: totalPages || 'N/A' },
     { label: 'Rendering', value: hasRendering ? 'Available' : 'Not available' },
+    { label: 'Backend', value: hasRendering ? backendLabel(renderBackend) : 'N/A' },
   ];
 
   if (totalPages > 0 && Module) {
@@ -861,7 +933,7 @@ function renderCurrentPage() {
   renderTextOverlay();
 
   const zoomPct = Math.round(zoomLevel * 100);
-  setStatus(`Page ${currentPage + 1} / ${totalPages} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}`);
+  setStatus(`Page ${currentPage + 1} / ${totalPages} | ${backendLabel(renderBackend)} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}`);
   statusRight.textContent = fileName;
 
   if (activeSidebarTab === 'info') renderInfoTab();
@@ -1125,6 +1197,7 @@ async function loadPDF(arrayBuffer, name) {
 
     // Enable controls
     renderBtn.disabled = !hasRendering;
+    updateBackendToggle();
     extractBtn.disabled = false;
     prevBtn.disabled = false;
     nextBtn.disabled = false;
@@ -1785,6 +1858,7 @@ document.addEventListener('keydown', (e) => {
 
 // Render / Extract / Export buttons
 renderBtn.addEventListener('click', renderCurrentPage);
+backendToggleBtn.addEventListener('click', switchRenderBackend);
 extractBtn.addEventListener('click', extractText);
 exportBtn.addEventListener('click', exportSelectedPages);
 protectExport.addEventListener('change', updateExportButton);
@@ -1863,6 +1937,7 @@ async function init() {
     }
 
     hasRendering = Module._nanopdf_has_rendering() === 1;
+    syncRenderBackendFromModule();
 
     // Load external fonts if embedded fonts are not available
     const embeddedFontsAvailable = Module._nanopdf_fonts_available() === 1;
@@ -1892,10 +1967,11 @@ async function init() {
     hideLoading();
 
     if (!hasRendering) {
-      setStatus('Ready (rendering not available - build with NANOPDF_USE_THORVG or NANOPDF_USE_BLEND2D for rendering)');
+      setStatus('Ready (rendering not available - build with NANOPDF_USE_LIGHTVG or NANOPDF_USE_THORVG for rendering)');
       renderBtn.style.display = 'none';
+      updateBackendToggle();
     } else {
-      setStatus('Ready - open a PDF file or drag and drop');
+      setStatus(`Ready - ${backendLabel(renderBackend)} backend`);
     }
 
     console.log('nanopdf WASM loaded. Rendering:', hasRendering);

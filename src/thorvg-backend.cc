@@ -5,6 +5,7 @@
 
 #include "thorvg-backend.hh"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -2857,6 +2858,80 @@ bool ThorVGBackend::draw_image(const ImageXObject& image, float x, float y, floa
 
   if (img_width <= 0 || img_height <= 0) {
     return false;
+  }
+
+  // PDF producers often draw table borders as a 1x1 ImageMask scaled by the
+  // CTM. Rendering it as a filtered picture can overrun sub-point rule extents;
+  // the mask semantically paints the transformed unit square in the current
+  // nonstroking color, so emit that directly as vector geometry.
+  if (image.image_mask && img_width == 1 && img_height == 1) {
+    bool bit_set = false;
+    if (!image.data.empty()) {
+      bit_set = (image.data[0] & 0x80u) != 0;
+    }
+    bool invert = false;
+    if (image.decode.size() >= 2 && image.decode[0] > image.decode[1]) {
+      invert = true;
+    }
+    bool should_paint = invert ? bit_set : !bit_set;
+    if (!should_paint) {
+      return true;
+    }
+
+    auto transform_point = [&](float u, float v) -> tvg::Point {
+      float px = state_.transform.a * u + state_.transform.c * v +
+                 state_.transform.e;
+      float py = state_.transform.b * u + state_.transform.d * v +
+                 state_.transform.f;
+      return {px * state_.scale, (state_.page_height - py) * state_.scale};
+    };
+
+    std::array<tvg::Point, 4> corners = {
+        transform_point(0.0f, 0.0f),
+        transform_point(1.0f, 0.0f),
+        transform_point(1.0f, 1.0f),
+        transform_point(0.0f, 1.0f),
+    };
+
+    auto shape = tvg::Shape::gen();
+    if (!shape) {
+      return false;
+    }
+
+    float min_x = corners[0].x;
+    float max_x = corners[0].x;
+    float min_y = corners[0].y;
+    float max_y = corners[0].y;
+    for (const auto& p : corners) {
+      min_x = std::min(min_x, p.x);
+      max_x = std::max(max_x, p.x);
+      min_y = std::min(min_y, p.y);
+      max_y = std::max(max_y, p.y);
+    }
+
+    const bool axis_aligned =
+        std::abs(corners[0].y - corners[1].y) < 0.01f &&
+        std::abs(corners[1].x - corners[2].x) < 0.01f &&
+        std::abs(corners[2].y - corners[3].y) < 0.01f &&
+        std::abs(corners[3].x - corners[0].x) < 0.01f;
+    if (axis_aligned) {
+      shape->appendRect(min_x, min_y, max_x - min_x, max_y - min_y);
+    } else {
+      std::array<tvg::PathCommand, 5> commands = {
+          tvg::PathCommand::MoveTo,
+          tvg::PathCommand::LineTo,
+          tvg::PathCommand::LineTo,
+          tvg::PathCommand::LineTo,
+          tvg::PathCommand::Close,
+      };
+      shape->appendPath(commands.data(), commands.size(), corners.data(),
+                        corners.size());
+    }
+
+    uint8_t alpha = static_cast<uint8_t>(
+        std::clamp(state_.fill_a * state_.fill_opacity, 0.0f, 255.0f));
+    shape->fill(fill_r, fill_g, fill_b, alpha);
+    return push_with_clip(shape);
   }
 
   // Fast path: cached ARGB from render cache.

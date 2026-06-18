@@ -16,6 +16,7 @@
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
+#include "render-backend.hh"
 #include "string-parse.hh"
 #include "text-layout.hh"
 #include "table-extraction.hh"
@@ -49,6 +50,13 @@ static std::string g_last_error;
 static std::vector<uint8_t> g_render_buffer;
 static uint32_t g_render_width = 0;
 static uint32_t g_render_height = 0;
+static nanopdf::BackendKind g_render_backend =
+#ifdef NANOPDF_USE_THORVG
+    nanopdf::BackendKind::ThorVG;
+#else
+    nanopdf::BackendKind::LightVG;
+#endif
+;
 
 // Text buffer
 static std::string g_text_buffer;
@@ -218,11 +226,91 @@ float nanopdf_get_page_height(int page_index) {
 
 EMSCRIPTEN_KEEPALIVE
 int nanopdf_has_rendering() {
-#if defined(NANOPDF_USE_BLEND2D) || defined(NANOPDF_USE_THORVG)
+#if defined(NANOPDF_USE_LIGHTVG) || defined(NANOPDF_USE_THORVG) || defined(NANOPDF_USE_BLEND2D)
   return 1;
 #else
   return 0;
 #endif
+}
+
+static bool render_page_with_selected_backend(const nanopdf::Pdf& pdf,
+                                              const nanopdf::Page& page,
+                                              int width, int height,
+                                              float dpi) {
+  auto backend = nanopdf::make_backend(g_render_backend);
+  if (!backend) {
+    g_last_error = std::string("Rendering backend not available: ") +
+                   nanopdf::backend_kind_name(g_render_backend);
+    return false;
+  }
+
+  if (!backend->initialize(static_cast<uint32_t>(width),
+                           static_cast<uint32_t>(height))) {
+    g_last_error = std::string("Failed to initialize ") +
+                   nanopdf::backend_kind_name(g_render_backend) + " backend";
+    return false;
+  }
+
+  nanopdf::RenderOptions options;
+  options.dpi = dpi > 0 ? dpi : 72.0f;
+
+  auto result = backend->render_page(pdf, page, options);
+  if (!result.success) {
+    g_last_error = result.error;
+    return false;
+  }
+
+  g_render_buffer = std::move(result.pixels);
+  g_render_width = result.width;
+  g_render_height = result.height;
+  return true;
+}
+
+static bool backend_kind_from_wasm_id(int backend_id,
+                                      nanopdf::BackendKind* out) {
+  if (!out) return false;
+  switch (backend_id) {
+    case 0:
+      *out = nanopdf::BackendKind::LightVG;
+      return true;
+    case 1:
+      *out = nanopdf::BackendKind::ThorVG;
+      return true;
+    default:
+      return false;
+  }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_render_backend_available(int backend_id) {
+  nanopdf::BackendKind kind;
+  if (!backend_kind_from_wasm_id(backend_id, &kind)) return 0;
+  return nanopdf::backend_available(kind) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_get_render_backend() {
+  switch (g_render_backend) {
+    case nanopdf::BackendKind::LightVG: return 0;
+    case nanopdf::BackendKind::ThorVG: return 1;
+  }
+  return -1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_set_render_backend(int backend_id) {
+  nanopdf::BackendKind kind;
+  if (!backend_kind_from_wasm_id(backend_id, &kind)) {
+    g_last_error = "Unknown rendering backend";
+    return 0;
+  }
+  if (!nanopdf::backend_available(kind)) {
+    g_last_error = std::string("Rendering backend not available: ") +
+                   nanopdf::backend_kind_name(kind);
+    return 0;
+  }
+  g_render_backend = kind;
+  return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -239,57 +327,7 @@ int nanopdf_render_page(int page_index, int width, int height, float dpi) {
   }
 
   const auto& page = g_pdf->catalog.pages[page_index];
-
-#ifdef NANOPDF_USE_BLEND2D
-  nanopdf::Blend2DBackend backend;
-  if (!backend.initialize(static_cast<uint32_t>(width),
-                          static_cast<uint32_t>(height))) {
-    g_last_error = "Failed to initialize Blend2D backend";
-    return 0;
-  }
-
-  nanopdf::RenderOptions options;
-  options.dpi = dpi > 0 ? dpi : 72.0f;
-
-  auto result = backend.render_page(*g_pdf, page, options);
-  if (!result.success) {
-    g_last_error = result.error;
-    return 0;
-  }
-
-  g_render_buffer = std::move(result.pixels);
-  g_render_width = result.width;
-  g_render_height = result.height;
-  return 1;
-
-#elif defined(NANOPDF_USE_THORVG)
-  nanopdf::ThorVGBackend backend;
-  if (!backend.initialize(static_cast<uint32_t>(width),
-                          static_cast<uint32_t>(height))) {
-    g_last_error = "Failed to initialize ThorVG backend";
-    return 0;
-  }
-
-  nanopdf::ThorVGRenderOptions options;
-  options.dpi = dpi > 0 ? dpi : 72.0f;
-
-  auto result = backend.render_page(*g_pdf, page, options);
-  if (!result.success) {
-    g_last_error = result.error;
-    return 0;
-  }
-
-  g_render_buffer = std::move(result.pixels);
-  g_render_width = result.width;
-  g_render_height = result.height;
-  return 1;
-
-#else
-  (void)page;
-  (void)dpi;
-  g_last_error = "No rendering backend available";
-  return 0;
-#endif
+  return render_page_with_selected_backend(*g_pdf, page, width, height, dpi) ? 1 : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -796,34 +834,7 @@ int nanopdf_doc_render_page(int doc_id, int page_index, int width, int height, f
   }
 
   const auto& page = it->second.pdf->catalog.pages[page_index];
-
-#ifdef NANOPDF_USE_THORVG
-  nanopdf::ThorVGBackend backend;
-  if (!backend.initialize(static_cast<uint32_t>(width),
-                          static_cast<uint32_t>(height))) {
-    g_last_error = "Failed to initialize ThorVG backend";
-    return 0;
-  }
-
-  nanopdf::ThorVGRenderOptions options;
-  options.dpi = dpi > 0 ? dpi : 72.0f;
-
-  auto result = backend.render_page(*it->second.pdf, page, options);
-  if (!result.success) {
-    g_last_error = result.error;
-    return 0;
-  }
-
-  g_render_buffer = std::move(result.pixels);
-  g_render_width = result.width;
-  g_render_height = result.height;
-  return 1;
-#else
-  (void)page;
-  (void)dpi;
-  g_last_error = "No rendering backend available";
-  return 0;
-#endif
+  return render_page_with_selected_backend(*it->second.pdf, page, width, height, dpi) ? 1 : 0;
 }
 
 // ============================================================
