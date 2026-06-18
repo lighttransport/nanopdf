@@ -5319,6 +5319,48 @@ bool ThorVGBackend::draw_missing_glyph_placeholder(float x, float y, float size,
   return true;
 }
 
+bool ThorVGBackend::try_draw_glyph_fallback(int codepoint, float x, float y,
+                                            float size, uint8_t r, uint8_t g,
+                                            uint8_t b, uint8_t a) {
+  // Fallback font names by priority. The first that has the codepoint wins;
+  // used for glyphs (Greek, math symbols) missing from an embedded subset.
+  static const char* kFallbackNames[] = {
+      "NotoSerifJP", "NotoSansJP",
+      "NotoSerif",   "NotoSans",
+      "Arimo",       "Tinos",
+      "Cousine",
+      "DejaVu Sans", "DejaVu Serif",
+      "Liberation Sans", "Liberation Serif",
+      "FreeSerif",   "FreeSans",
+  };
+
+  std::string saved_font = current_font_name_;
+  for (const char* fb_name : kFallbackNames) {
+    if (fb_name == saved_font) continue;
+    FontCache* fc = get_font(fb_name);
+    if (!fc) {
+      if (!load_fallback_font(fb_name)) continue;
+      fc = get_font(fb_name);
+      if (!fc) continue;
+    }
+    int gid = 0;
+    if (fc->has_ttf_parse) {
+      gid = ttf_cmap_lookup(&fc->ttf, static_cast<uint32_t>(codepoint));
+    }
+    if (gid == 0 && fc->initialized) {
+      gid = stbtt_FindGlyphIndex(&fc->font_info, codepoint);
+    }
+    if (gid != 0) {
+      current_font_name_ = fb_name;
+      bool ok = draw_glyph(codepoint, x, y, size, r, g, b, a);
+      current_font_name_ = saved_font;
+      if (ok) return true;
+    }
+  }
+  current_font_name_ = saved_font;
+  return false;
+}
+
 bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
                                uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   if (!scene_) {
@@ -5402,6 +5444,9 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
     }
     if (draw_bullet_fallback()) return true;
     if (draw_checkmark_fallback()) return true;
+    // Try a substitute font that covers this codepoint (Greek/math symbols
+    // missing from an embedded subset) before falling back to a tofu box.
+    if (try_draw_glyph_fallback(codepoint, x, y, size, r, g, b, a)) return true;
     draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
     return true;
   }
@@ -5459,6 +5504,7 @@ bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,
       }
       if (draw_bullet_fallback()) return true;
       if (draw_checkmark_fallback()) return true;
+      if (try_draw_glyph_fallback(codepoint, x, y, size, r, g, b, a)) return true;
       draw_missing_glyph_placeholder(x, y, size, r, g, b, a);
       return true;
     }

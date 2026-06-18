@@ -321,6 +321,11 @@ private:
   // Get font cache entry
   FontCache* get_font(const std::string& font_name);
 
+  // Try drawing a glyph the current font lacks using a substitute font that
+  // covers the codepoint (e.g. Greek/symbols missing from an embedded subset).
+  bool try_draw_glyph_fallback(int codepoint, float x, float y, float size,
+                               uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+
   // Calculate text width using font metrics (returns width in text space units)
   float calculate_text_width(const std::string& text, float font_size);
   // Calculate text advance using the same glyph-advance model as draw_text.
