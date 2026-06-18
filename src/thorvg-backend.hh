@@ -419,6 +419,10 @@ private:
   // Current font for text rendering
   std::string current_font_name_;
   const BaseFont* current_font_{nullptr};  // Pointer to current font for encoding lookup
+  // Guards try_draw_glyph_fallback against re-entry: a fallback font that has
+  // the codepoint in its cmap but whose outline can't be extracted could
+  // otherwise oscillate between fallback fonts.
+  bool in_glyph_fallback_{false};
 
   // Pointer to current PDF and Page for font access
   const Pdf* current_pdf_{nullptr};

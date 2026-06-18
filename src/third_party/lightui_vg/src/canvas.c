@@ -3999,6 +3999,21 @@ void lui_canvas_fill_polygonsf_ex(lui_canvas_t *canvas,
                                      lui_fill_rule_t rule)
 {
     if (!canvas || !points || count < 3) return;
+    /* Validate the contour partition: lengths must be positive and sum to
+     * exactly `count`, otherwise the edge builder would read past `points`.
+     * On any mismatch fall back to treating the whole array as one contour. */
+    if (contour_lengths && n_contours > 0) {
+        long total = 0;
+        int valid = 1;
+        for (int i = 0; i < n_contours; i++) {
+            if (contour_lengths[i] <= 0) { valid = 0; break; }
+            total += contour_lengths[i];
+        }
+        if (!valid || total != count) {
+            contour_lengths = NULL;
+            n_contours = 0;
+        }
+    }
     /* Multi-contour fill always uses the analytic-AA software rasteriser so a
      * single edge table spans every contour (required for correct hole/winding
      * evaluation). The integer backend / AGG paths only fill one contour at a

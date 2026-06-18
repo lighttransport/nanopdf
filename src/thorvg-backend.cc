@@ -5334,7 +5334,10 @@ bool ThorVGBackend::try_draw_glyph_fallback(int codepoint, float x, float y,
       "FreeSerif",   "FreeSans",
   };
 
+  if (in_glyph_fallback_) return false;  // never recurse into another fallback
+  in_glyph_fallback_ = true;
   std::string saved_font = current_font_name_;
+  bool drawn = false;
   for (const char* fb_name : kFallbackNames) {
     if (fb_name == saved_font) continue;
     FontCache* fc = get_font(fb_name);
@@ -5354,11 +5357,12 @@ bool ThorVGBackend::try_draw_glyph_fallback(int codepoint, float x, float y,
       current_font_name_ = fb_name;
       bool ok = draw_glyph(codepoint, x, y, size, r, g, b, a);
       current_font_name_ = saved_font;
-      if (ok) return true;
+      if (ok) { drawn = true; break; }
     }
   }
   current_font_name_ = saved_font;
-  return false;
+  in_glyph_fallback_ = false;
+  return drawn;
 }
 
 bool ThorVGBackend::draw_glyph(int codepoint, float x, float y, float size,

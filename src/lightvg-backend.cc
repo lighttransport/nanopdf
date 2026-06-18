@@ -5875,53 +5875,41 @@ bool LightVGBackend::try_draw_glyph_fallback(int codepoint, float x, float y,
       "FreeSerif",   "FreeSans",
   };
 
+  if (in_glyph_fallback_) return false;  // never recurse into another fallback
+  in_glyph_fallback_ = true;
   std::string saved_font = current_font_name_;
+  bool drawn = false;
 
   for (const char* fb_name : kFallbackNames) {
     // Skip if this is the same as the current font
     if (fb_name == saved_font) continue;
 
-    // Already cached? Check if it has the glyph.
+    // Use the cached font, or try to load it as a fallback.
     FontCache* fc = get_font(fb_name);
-    if (fc) {
-      int gid = 0;
-      if (fc->has_ttf_parse) {
-        gid = ttf_cmap_lookup(&fc->ttf, static_cast<uint32_t>(codepoint));
-      }
-      if (gid == 0 && fc->initialized) {
-        gid = stbtt_FindGlyphIndex(&fc->font_info, codepoint);
-      }
-      if (gid != 0) {
-        current_font_name_ = fb_name;
-        bool ok = draw_glyph(codepoint, x, y, size, r, g, b, a);
-        current_font_name_ = saved_font;
-        if (ok) return true;
-        continue;
-      }
-    } else {
-      // Not cached — try to load as a fallback font.
+    if (!fc) {
       if (!load_fallback_font(fb_name)) continue;
       fc = get_font(fb_name);
       if (!fc) continue;
+    }
 
-      int gid = 0;
-      if (fc->has_ttf_parse) {
-        gid = ttf_cmap_lookup(&fc->ttf, static_cast<uint32_t>(codepoint));
-      }
-      if (gid == 0 && fc->initialized) {
-        gid = stbtt_FindGlyphIndex(&fc->font_info, codepoint);
-      }
-      if (gid != 0) {
-        current_font_name_ = fb_name;
-        bool ok = draw_glyph(codepoint, x, y, size, r, g, b, a);
-        current_font_name_ = saved_font;
-        if (ok) return true;
-      }
+    int gid = 0;
+    if (fc->has_ttf_parse) {
+      gid = ttf_cmap_lookup(&fc->ttf, static_cast<uint32_t>(codepoint));
+    }
+    if (gid == 0 && fc->initialized) {
+      gid = stbtt_FindGlyphIndex(&fc->font_info, codepoint);
+    }
+    if (gid != 0) {
+      current_font_name_ = fb_name;
+      bool ok = draw_glyph(codepoint, x, y, size, r, g, b, a);
+      current_font_name_ = saved_font;
+      if (ok) { drawn = true; break; }
     }
   }
 
   current_font_name_ = saved_font;
-  return false;
+  in_glyph_fallback_ = false;
+  return drawn;
 }
 
 bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
