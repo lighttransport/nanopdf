@@ -42,6 +42,13 @@ set(LIGHTUI_SOURCES
   ${LUI}/lightvg/src/dirty.c
 )
 
+# --- Embedded MCP server (lightui MCP) for LLM/VLM-driven control + debug ----
+option(PDFVIEW_MCP "Build with the embedded MCP server" ON)
+if(PDFVIEW_MCP)
+  file(GLOB LIGHTUI_MCP_SOURCES CONFIGURE_DEPENDS ${LUI}/src/mcp/*.c)
+  list(APPEND LIGHTUI_SOURCES ${LIGHTUI_MCP_SOURCES})
+endif()
+
 # --- nativefiledialog-ng (Open/Save dialogs) ---------------------------------
 # Linux: the xdg-desktop-portal backend (dbus only — no hard GTK link). Wayland
 # parent-window association is omitted (X11 focus), so only libdbus-1 is needed.
@@ -62,6 +69,7 @@ endif()
 add_executable(pdfview
   pdfview.cc
   pdf_document.cc
+  pdf_debug.cc
   ${NFD_SOURCES}
   ${LIGHTUI_SOURCES}
 )
@@ -85,6 +93,7 @@ target_include_directories(pdfview PRIVATE
   ${LUI}/lighttype/include
   ${LUI}/lightvg/include
   ${LUI}/src
+  ${LUI}/src/mcp
   ${LUI}/src/platform
   ${LUI}/lighttype/src
   ${LUI}/third_party
@@ -98,6 +107,13 @@ target_include_directories(pdfview PRIVATE
 # Shared fonts: UI text reuses nanopdf's bundled fonts (no separate UI font set).
 target_compile_definitions(pdfview PRIVATE
   "PDFVIEW_FONTS_DIR=\"${NANOPDF_ROOT}/fonts\"")
+
+if(PDFVIEW_MCP)
+  target_compile_definitions(pdfview PRIVATE PDFVIEW_HAVE_MCP=1)
+  if(WIN32)
+    target_link_libraries(pdfview PRIVATE ws2_32)
+  endif()
+endif()
 
 target_link_libraries(pdfview PRIVATE ${NANOPDF_BUILD_DIR}/libnanopdf.a)
 

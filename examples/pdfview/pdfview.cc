@@ -24,11 +24,20 @@ extern "C" {
 #include <string>
 
 #include "pdf_document.hh"
+#include "pdf_debug.hh"
 
 #if PDFVIEW_HAVE_NFD
 extern "C" {
 #include <nfd.h>
 }
+#endif
+
+#if PDFVIEW_HAVE_MCP
+extern "C" {
+#include <lightui/mcp.h>
+#include "lui_json.h"
+}
+#include <unistd.h>  // usleep
 #endif
 
 namespace {
@@ -64,6 +73,8 @@ constexpr lvg_color_t kAccent = LVG_COLOR_RGB(0x4A, 0x9E, 0xFF);
 constexpr lvg_color_t kMatchHi = LVG_COLOR_ARGB(0x60, 0xFF, 0xE0, 0x00);   // search hit
 constexpr lvg_color_t kMatchCur = LVG_COLOR_ARGB(0x99, 0xFF, 0x8C, 0x00);  // focused hit
 constexpr lvg_color_t kSelHi = LVG_COLOR_ARGB(0x55, 0x4A, 0x9E, 0xFF);     // selection
+constexpr lvg_color_t kDbgHi = LVG_COLOR_ARGB(0x44, 0x2C, 0xE0, 0xC0);     // debug hit
+constexpr lvg_color_t kDbgSel = LVG_COLOR_ARGB(0x66, 0xFF, 0x40, 0xC0);    // selected hit
 
 // X11 keysyms not given a LUI_KEY_* alias.
 constexpr int kKeyPageUp = 0xFF55;
@@ -104,9 +115,16 @@ struct Viewer {
   std::string sel_text;
   std::vector<nanopdf::TextQuad> sel_quads;  // selected segment bboxes (page coords)
 
-  // Right-side panel: 0 = hidden, 1 = info, 2 = revisions.
+  // Right-side panel: 0 = hidden, 1 = info, 2 = revisions, 3 = debug.
   int right_panel = 0;
   int info_scroll = 0;
+
+  // Debug inspector (Phase: region -> PDF objects).
+  bool debug_mode = false;                    // drag selects a region to inspect
+  std::vector<pdfview::RegionHit> debug_hits;  // hits from the last inspect
+  int debug_page = -1;                        // page the hits belong to
+  int debug_sel = -1;                         // selected hit (drives dump)
+  std::string debug_dump;                     // serialized object for the selection
 
   // Revision history (Phase 6).
   bool revisions_loaded = false;
@@ -473,6 +491,54 @@ void draw_revisions_panel(Viewer& v, lvg_canvas_t* c, int x0, int H) {
   }
 }
 
+void draw_debug_panel(Viewer& v, lvg_canvas_t* c, int x0, int H) {
+  const int w = kRightW;
+  const int y0 = kToolbarH;
+  const int lh = v.font ? lui_font_line_height(v.font) : 14;
+  if (!v.font) return;
+  int y = y0 + 8 - v.info_scroll;
+  // Header.
+  const char* hdr = v.debug_hits.empty()
+                        ? "Debug: drag a region on the page"
+                        : "Debug: region hits (click to dump)";
+  lui_canvas_draw_text(c, x0 + 12, y, hdr, (int)std::strlen(hdr), v.font,
+                       kAccent);
+  y += lh + 8;
+  // Hit rows.
+  for (size_t i = 0; i < v.debug_hits.size(); ++i) {
+    int ry = y + (int)i * kRowH;
+    if (ry + kRowH > y0 && ry < H) {
+      if ((int)i == v.debug_sel)
+        lvg_canvas_fill_rect(c, x0, ry - 4, w, kRowH, kSidebarSel);
+      std::string t = fit_text(v.font, v.debug_hits[i].label, w - 24);
+      lui_canvas_draw_text(c, x0 + 12, ry, t.c_str(), (int)t.size(), v.font,
+                           (int)i == v.debug_sel ? kTextColor : kSidebarText);
+    }
+  }
+  y += (int)v.debug_hits.size() * kRowH + 10;
+  // Object dump for the selected hit.
+  if (!v.debug_dump.empty()) {
+    lvg_canvas_fill_rect(c, x0 + 8, y - 5, w - 16, 1, kToolbarLine);
+    size_t start = 0;
+    while (start <= v.debug_dump.size()) {
+      size_t nl = v.debug_dump.find('\n', start);
+      std::string line = v.debug_dump.substr(
+          start, nl == std::string::npos ? std::string::npos : nl - start);
+      if (y + lh > y0 && y < H) {
+        std::string t = fit_text(v.font, line, w - 20);
+        lui_canvas_draw_text(c, x0 + 10, y, t.c_str(), (int)t.size(), v.font,
+                             kTextDim);
+      }
+      y += lh + 1;
+      if (nl == std::string::npos) break;
+      start = nl + 1;
+    }
+  }
+  // Clamp scroll to content height.
+  int total = (y - (y0 + 8 - v.info_scroll));
+  v.info_scroll = clampi(v.info_scroll, 0, std::max(0, total - (H - y0)));
+}
+
 void draw_right_panel(Viewer& v, lvg_canvas_t* c, int W, int H) {
   const int w = kRightW;
   const int x0 = W - w;
@@ -484,6 +550,8 @@ void draw_right_panel(Viewer& v, lvg_canvas_t* c, int W, int H) {
     draw_info_panel(v, c, x0, H);
   else if (v.right_panel == 2)
     draw_revisions_panel(v, c, x0, H);
+  else if (v.right_panel == 3)
+    draw_debug_panel(v, c, x0, H);
   lvg_canvas_reset_clip(c);
   lvg_canvas_fill_rect(c, x0, y0, 1, std::max(0, H - y0), kToolbarLine);
 }
@@ -632,6 +700,15 @@ void draw(Viewer& v, lvg_surface_t* surf) {
           int w = std::abs(v.sel_x1 - v.sel_x0);
           int h = std::abs(v.sel_y1 - v.sel_y0);
           lvg_canvas_fill_rect(&c, x0, y0, w, h, kSelHi);
+        }
+        // Debug region-inspect highlights.
+        if (v.debug_page == v.page) {
+          for (size_t i = 0; i < v.debug_hits.size(); ++i) {
+            int sx, sy, sw, sh;
+            map_quad_to_screen(v, v.debug_hits[i].rect, &sx, &sy, &sw, &sh);
+            lvg_canvas_fill_rect(&c, sx, sy, sw, sh,
+                                 (int)i == v.debug_sel ? kDbgSel : kDbgHi);
+          }
         }
       }
       lvg_canvas_reset_clip(&c);
@@ -797,9 +874,282 @@ void open_via_dialog(Viewer& v, lui_window_t* win) {
 #endif
 }
 
+#if PDFVIEW_HAVE_MCP
+// ---- MCP server: let an LLM/agent drive + inspect the live viewer ----------
+// Tool handlers run on the main thread during lui_mcp_poll(), so they mutate
+// the Viewer directly and set *dirty to request a redraw.
+struct McpCtx {
+  Viewer* v = nullptr;
+  bool* dirty = nullptr;
+  int content_h = 700;  // approximate; draw() re-clamps scroll
+};
+
+std::string json_escape(const std::string& s) {
+  std::string o;
+  o.reserve(s.size() + 8);
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char b[8];
+          std::snprintf(b, sizeof(b), "\\u%04x", c);
+          o += b;
+        } else {
+          o += (char)c;
+        }
+    }
+  }
+  return o;
+}
+
+char* mcp_text(const std::string& text) {
+  std::string r = "[{\"type\":\"text\",\"text\":\"" + json_escape(text) + "\"}]";
+  char* out = (char*)std::malloc(r.size() + 1);
+  if (out) std::memcpy(out, r.c_str(), r.size() + 1);
+  return out;
+}
+
+std::string hits_to_text(const std::vector<pdfview::RegionHit>& hits) {
+  std::string t = std::to_string(hits.size()) + " hit(s):\n";
+  char b[256];
+  for (const auto& h : hits) {
+    const char* k = h.kind == pdfview::RegionHit::Text    ? "text"
+                    : h.kind == pdfview::RegionHit::Image  ? "image"
+                                                           : "annot";
+    std::snprintf(b, sizeof(b), "  [%s] %s  rect=%.0f,%.0f %.0fx%.0f obj=%d\n", k,
+                  h.label.c_str(), h.rect.x, h.rect.y, h.rect.width,
+                  h.rect.height, h.obj_num);
+    t += b;
+  }
+  return t;
+}
+
+void tool_viewer_state(const char*, int, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  Viewer& v = *m->v;
+  char buf[512];
+  std::snprintf(
+      buf, sizeof(buf),
+      "doc: %s\npage: %d / %d\nzoom: %d%%\nsidebar: %s\npanel: %s\ndebug_mode: %s",
+      v.title.empty() ? "(none)" : v.title.c_str(),
+      v.doc.loaded() ? v.page + 1 : 0, v.doc.page_count(),
+      (int)std::lround(v.zoom * 100.0f / (96.0f / 72.0f)),
+      v.show_sidebar ? (v.sidebar_mode == 0 ? "outline" : "pages") : "hidden",
+      v.right_panel == 1 ? "info" : v.right_panel == 2 ? "revisions"
+                           : v.right_panel == 3 ? "debug" : "none",
+      v.debug_mode ? "on" : "off");
+  *out = mcp_text(buf);
+  *olen = -1;
+}
+
+void tool_goto_page(const char* a, int al, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  lui_json_t* j = lui_json_parse(a, al);
+  int page = lui_json_int(lui_json_get(j, "page"));
+  lui_json_free(j);
+  go_to_page(*m->v, page - 1);
+  *m->dirty = true;
+  *out = mcp_text("now on page " + std::to_string(m->v->page + 1));
+  *olen = -1;
+}
+
+void tool_set_zoom(const char* a, int al, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  Viewer& v = *m->v;
+  lui_json_t* j = lui_json_parse(a, al);
+  const char* fit = lui_json_string(lui_json_get(j, "fit"));
+  lui_json_t* z = lui_json_get(j, "zoom");
+  if (fit && std::strcmp(fit, "width") == 0) {
+    v.fit_width = true;
+  } else if (fit && std::strcmp(fit, "page") == 0) {
+    v.fit_width = false;
+    v.zoom = fit_page_zoom(v, 760, m->content_h);
+  } else if (fit && std::strcmp(fit, "100") == 0) {
+    v.fit_width = false;
+    v.zoom = 96.0f / 72.0f;
+  } else if (z) {
+    v.fit_width = false;
+    v.zoom = clampf((float)(lui_json_number(z) / 100.0 * (96.0 / 72.0)), kMinZoom,
+                    kMaxZoom);
+  }
+  lui_json_free(j);
+  *m->dirty = true;
+  *out = mcp_text("zoom set");
+  *olen = -1;
+}
+
+void tool_open(const char* a, int al, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  lui_json_t* j = lui_json_parse(a, al);
+  const char* path = lui_json_string(lui_json_get(j, "path"));
+  std::string res;
+  if (path && load_document(*m->v, nullptr, path)) {
+    res = "opened " + std::string(path) + " (" +
+          std::to_string(m->v->doc.page_count()) + " pages)";
+    *m->dirty = true;
+  } else {
+    res = "failed to open: " + std::string(path ? path : "(no path)");
+  }
+  lui_json_free(j);
+  *out = mcp_text(res);
+  *olen = -1;
+}
+
+void tool_search(const char* a, int al, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  Viewer& v = *m->v;
+  lui_json_t* j = lui_json_parse(a, al);
+  const char* term = lui_json_string(lui_json_get(j, "term"));
+  v.query = term ? term : "";
+  lui_json_free(j);
+  run_search(v, 0, +1, m->content_h);
+  *m->dirty = true;
+  std::string res =
+      v.match_page >= 0
+          ? std::to_string(v.match_quads.size()) + " match(es); jumped to page " +
+                std::to_string(v.match_page + 1)
+          : "no matches for \"" + v.query + "\"";
+  *out = mcp_text(res);
+  *olen = -1;
+}
+
+void tool_inspect_region(const char* a, int al, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  Viewer& v = *m->v;
+  lui_json_t* j = lui_json_parse(a, al);
+  lui_json_t* pj = lui_json_get(j, "page");
+  int page = pj ? lui_json_int(pj) - 1 : v.page;
+  double x1 = lui_json_number(lui_json_get(j, "x1"));
+  double y1 = lui_json_number(lui_json_get(j, "y1"));
+  double x2 = lui_json_number(lui_json_get(j, "x2"));
+  double y2 = lui_json_number(lui_json_get(j, "y2"));
+  lui_json_free(j);
+  go_to_page(v, page);
+  v.debug_hits = pdfview::inspect_region(v.doc, page, x1, y1, x2, y2);
+  v.debug_page = page;
+  v.debug_sel = -1;
+  v.debug_dump.clear();
+  v.debug_mode = true;
+  v.right_panel = 3;
+  *m->dirty = true;
+  *out = mcp_text(hits_to_text(v.debug_hits));
+  *olen = -1;
+}
+
+void tool_dump_object(const char* a, int al, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  lui_json_t* j = lui_json_parse(a, al);
+  int obj = lui_json_int(lui_json_get(j, "obj"));
+  lui_json_t* gj = lui_json_get(j, "gen");
+  int gen = gj ? lui_json_int(gj) : 0;
+  lui_json_free(j);
+  *out = mcp_text(
+      pdfview::dump_object(m->v->doc, (uint32_t)obj, (uint16_t)gen));
+  *olen = -1;
+}
+
+void tool_highlight_object(const char* a, int al, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  Viewer& v = *m->v;
+  lui_json_t* j = lui_json_parse(a, al);
+  lui_json_t* pj = lui_json_get(j, "page");
+  int page = pj ? lui_json_int(pj) - 1 : v.page;
+  int obj = lui_json_int(lui_json_get(j, "obj"));
+  lui_json_free(j);
+  go_to_page(v, page);
+  v.debug_hits = pdfview::find_object_placements(v.doc, page, (uint32_t)obj);
+  v.debug_page = page;
+  v.debug_sel = -1;
+  v.debug_mode = true;
+  v.right_panel = 3;
+  *m->dirty = true;
+  *out = mcp_text("object " + std::to_string(obj) + ": " +
+                  hits_to_text(v.debug_hits));
+  *olen = -1;
+}
+
+void tool_clear_highlight(const char*, int, void* u, char** out, int* olen) {
+  McpCtx* m = (McpCtx*)u;
+  m->v->debug_hits.clear();
+  m->v->debug_page = -1;
+  m->v->debug_sel = -1;
+  m->v->debug_dump.clear();
+  m->v->match_quads.clear();
+  m->v->match_page = -1;
+  *m->dirty = true;
+  *out = mcp_text("cleared");
+  *olen = -1;
+}
+
+lui_mcp_t* mcp_start(Viewer& v, bool* dirty, int port, lvg_surface_t* surface) {
+  static McpCtx ctx;
+  ctx.v = &v;
+  ctx.dirty = dirty;
+  lui_mcp_config_t cfg;
+  cfg.transport = LUI_MCP_HTTP;
+  cfg.host = "127.0.0.1";
+  cfg.port = port;
+  lui_mcp_t* mcp = lui_mcp_create(&cfg);
+  if (!mcp) return nullptr;
+  lui_mcp_set_context(mcp, nullptr, (struct lui_surface*)surface);
+  auto reg = [&](const char* n, const char* d, const char* s,
+                 lui_mcp_tool_handler_fn h) {
+    lui_mcp_register_tool(mcp, n, d, s, h, &ctx);
+  };
+  const char* obj_only = "{\"type\":\"object\",\"properties\":{}}";
+  reg("viewer_state", "Current viewer state (doc, page, zoom, panels).",
+      obj_only, tool_viewer_state);
+  reg("goto_page", "Navigate to a 1-based page number.",
+      "{\"type\":\"object\",\"properties\":{\"page\":{\"type\":\"integer\"}},"
+      "\"required\":[\"page\"]}",
+      tool_goto_page);
+  reg("set_zoom",
+      "Set zoom: {zoom:percent} or {fit:\"width\"|\"page\"|\"100\"}.",
+      "{\"type\":\"object\",\"properties\":{\"zoom\":{\"type\":\"number\"},"
+      "\"fit\":{\"type\":\"string\"}}}",
+      tool_set_zoom);
+  reg("open", "Open a PDF by file path.",
+      "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},"
+      "\"required\":[\"path\"]}",
+      tool_open);
+  reg("search", "Search the document; jumps to + highlights the first match.",
+      "{\"type\":\"object\",\"properties\":{\"term\":{\"type\":\"string\"}},"
+      "\"required\":[\"term\"]}",
+      tool_search);
+  // Note: lightui registers built-in canvas tools (incl. "inspect_region"), so
+  // the PDF debug tools are prefixed "pdf_" to avoid name collisions.
+  reg("pdf_inspect_region",
+      "Report PDF objects (text+font+obj, images, annotations) in a page-space "
+      "rect and highlight them in the viewer.",
+      "{\"type\":\"object\",\"properties\":{\"page\":{\"type\":\"integer\"},"
+      "\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},"
+      "\"x2\":{\"type\":\"number\"},\"y2\":{\"type\":\"number\"}},"
+      "\"required\":[\"x1\",\"y1\",\"x2\",\"y2\"]}",
+      tool_inspect_region);
+  reg("pdf_dump_object", "Pretty-print an arbitrary PDF object by number.",
+      "{\"type\":\"object\",\"properties\":{\"obj\":{\"type\":\"integer\"},"
+      "\"gen\":{\"type\":\"integer\"}},\"required\":[\"obj\"]}",
+      tool_dump_object);
+  reg("pdf_highlight_object",
+      "Highlight where a PDF object (image XObject / font) is drawn on a page.",
+      "{\"type\":\"object\",\"properties\":{\"page\":{\"type\":\"integer\"},"
+      "\"obj\":{\"type\":\"integer\"}},\"required\":[\"obj\"]}",
+      tool_highlight_object);
+  reg("pdf_clear_highlight", "Clear all debug/search highlights.", obj_only,
+      tool_clear_highlight);
+  return mcp;
+}
+#endif  // PDFVIEW_HAVE_MCP
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: progress visible live
   // Register nanopdf's bundled substitute + CJK fonts so rendering resolves
   // Standard-14 and Japanese glyphs (shared fonts, no compile-time embedding).
   int nfonts = pdfview::register_bundled_fonts(PDFVIEW_FONTS_DIR);
@@ -976,7 +1326,150 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  const char* initial_path = (argc > 1) ? argv[1] : nullptr;
+  // Headless region inspector (debug data layer).
+  //   pdfview --inspect <pdf> <page1based> <x1> <y1> <x2> <y2>   (page-space pts)
+  if (argc > 1 && std::strcmp(argv[1], "--inspect") == 0) {
+    if (argc < 8) {
+      std::fprintf(stderr,
+                   "usage: pdfview --inspect <pdf> <page> <x1> <y1> <x2> <y2>\n");
+      return 2;
+    }
+    pdfview::PdfDocument doc;
+    if (!doc.load_file(argv[2])) {
+      std::fprintf(stderr, "load failed: %s\n", doc.error().c_str());
+      return 1;
+    }
+    int page = std::atoi(argv[3]) - 1;
+    double x1 = std::atof(argv[4]), y1 = std::atof(argv[5]);
+    double x2 = std::atof(argv[6]), y2 = std::atof(argv[7]);
+    std::vector<pdfview::RegionHit> hits =
+        pdfview::inspect_region(doc, page, x1, y1, x2, y2);
+    std::printf("region (%.0f,%.0f)-(%.0f,%.0f) on page %d: %zu hit(s)\n", x1, y1,
+                x2, y2, page + 1, hits.size());
+    for (const auto& h : hits) {
+      const char* k = h.kind == pdfview::RegionHit::Text      ? "TEXT"
+                      : h.kind == pdfview::RegionHit::Image    ? "IMG "
+                                                               : "ANNO";
+      std::printf("  [%s] %s  rect=%.0f,%.0f %.0fx%.0f%s%s\n", k,
+                  h.label.c_str(), h.rect.x, h.rect.y, h.rect.width,
+                  h.rect.height, h.detail.empty() ? "" : "  | ",
+                  h.detail.c_str());
+    }
+    // Dump the first object-bearing hit.
+    for (const auto& h : hits) {
+      if (h.obj_num >= 0) {
+        std::printf("\n--- dump object %d ---\n%s\n", h.obj_num,
+                    pdfview::dump_object(doc, (uint32_t)h.obj_num,
+                                         (uint16_t)h.gen_num)
+                        .c_str());
+        break;
+      }
+    }
+    return 0;
+  }
+
+  // Headless debug-overlay check: inspect a region and compose the frame with
+  // debug highlights + panel (first hit selected/dumped).
+  //   pdfview --debugview <pdf> <page> <x1> <y1> <x2> <y2> <out.ppm>
+  if (argc > 1 && std::strcmp(argv[1], "--debugview") == 0) {
+    if (argc < 9) {
+      std::fprintf(stderr,
+                   "usage: pdfview --debugview <pdf> <page> <x1> <y1> <x2> <y2> "
+                   "<out.ppm>\n");
+      return 2;
+    }
+    lvg_surface_t* s = lvg_surface_create(kInitialWidth, kInitialHeight);
+    if (!s) return 1;
+    Viewer v;
+    v.font = lui_font_create(PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf", 16);
+    if (!v.doc.load_file(argv[2])) {
+      std::fprintf(stderr, "load failed: %s\n", v.doc.error().c_str());
+      return 1;
+    }
+    const char* slash = std::strrchr(argv[2], '/');
+    v.title = slash ? slash + 1 : argv[2];
+    v.page = std::atoi(argv[3]) - 1;
+    v.sidebar_mode = v.doc.outline().empty() ? 1 : 0;
+    v.debug_mode = true;
+    v.right_panel = 3;
+    draw(v, s);  // establish placement
+    v.debug_hits = pdfview::inspect_region(v.doc, v.page, std::atof(argv[4]),
+                                           std::atof(argv[5]), std::atof(argv[6]),
+                                           std::atof(argv[7]));
+    v.debug_page = v.page;
+    if (!v.debug_hits.empty()) {
+      v.debug_sel = 0;
+      const auto& h = v.debug_hits[0];
+      if (h.obj_num >= 0)
+        v.debug_dump = pdfview::dump_object(v.doc, (uint32_t)h.obj_num,
+                                            (uint16_t)h.gen_num);
+    }
+    draw(v, s);
+    dump_surface_ppm(s, argv[8]);
+    std::fprintf(stderr, "debugview: %zu hit(s) -> %s\n", v.debug_hits.size(),
+                 argv[8]);
+    if (v.font) lui_font_destroy(v.font);
+    lvg_surface_destroy(s);
+    return 0;
+  }
+
+#if PDFVIEW_HAVE_MCP
+  // Headless MCP server (no window): render to an offscreen surface and serve
+  // the same tools over HTTP. Useful for LLM/VLM PDF inspection without a
+  // display (the screenshot tool returns the offscreen-rendered frame).
+  //   pdfview --mcp-serve <pdf> [port]
+  if (argc > 1 && std::strcmp(argv[1], "--mcp-serve") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "usage: pdfview --mcp-serve <pdf> [port]\n");
+      return 2;
+    }
+    int port = (argc > 3) ? std::atoi(argv[3]) : 3001;
+    lvg_surface_t* s = lvg_surface_create(kInitialWidth, kInitialHeight);
+    if (!s) return 1;
+    Viewer v;
+    v.font = lui_font_create(PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf", 16);
+    if (!load_document(v, nullptr, argv[2])) {
+      std::fprintf(stderr, "load failed: %s\n", v.doc.error().c_str());
+      return 1;
+    }
+    v.sidebar_mode = v.doc.outline().empty() ? 1 : 0;
+    bool dirty = true;
+    lui_mcp_t* mcp = mcp_start(v, &dirty, port, s);
+    if (!mcp) {
+      std::fprintf(stderr, "MCP server failed to start on port %d\n", port);
+      return 1;
+    }
+    std::fprintf(stderr,
+                 "pdfview: headless MCP server on http://127.0.0.1:%d "
+                 "(Ctrl-C to stop)\n",
+                 port);
+    for (;;) {
+      if (dirty) {
+        draw(v, s);
+        dirty = false;
+      }
+      lui_mcp_poll(mcp);
+      usleep(8000);
+    }
+  }
+#endif
+
+  const char* initial_path = nullptr;
+  bool mcp_enabled = false;
+  int mcp_port = 3001;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--mcp") == 0) {
+      mcp_enabled = true;
+      if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+        mcp_port = std::atoi(argv[++i]);
+    } else if (argv[i][0] != '-' && !initial_path) {
+      initial_path = argv[i];
+    }
+  }
+#if !PDFVIEW_HAVE_MCP
+  if (mcp_enabled)
+    std::fprintf(stderr, "pdfview: built without MCP (--mcp ignored)\n");
+#endif
 
   if (!lui_init()) {
     std::fprintf(stderr, "pdfview: lui_init() failed\n");
@@ -1008,6 +1501,20 @@ int main(int argc, char** argv) {
 
   bool running = true;
   bool dirty = true;
+
+#if PDFVIEW_HAVE_MCP
+  lui_mcp_t* mcp = nullptr;
+  if (mcp_enabled) {
+    mcp = mcp_start(viewer, &dirty, mcp_port, lui_window_get_surface(win));
+    if (mcp)
+      std::printf(
+          "pdfview: MCP server (Streamable HTTP) on http://127.0.0.1:%d\n",
+          mcp_port);
+    else
+      std::fprintf(stderr, "pdfview: MCP server failed to start\n");
+  }
+#endif
+
   while (running) {
     if (dirty) {
       lvg_surface_t* surface = lui_window_get_surface(win);
@@ -1018,7 +1525,20 @@ int main(int argc, char** argv) {
     }
 
     lui_event_t event;
-    if (!lui_window_wait_event(win, &event)) break;
+#if PDFVIEW_HAVE_MCP
+    if (mcp) {
+      // Non-blocking: service MCP, then drain input; idle-sleep when quiet so
+      // tool calls stay responsive without busy-spinning.
+      lui_mcp_poll(mcp);
+      if (!lui_window_poll_event(win, &event)) {
+        usleep(6000);
+        continue;
+      }
+    } else
+#endif
+        if (!lui_window_wait_event(win, &event)) {
+      break;
+    }
     do {
       int W = 0, H = 0;
       lui_window_get_physical_size(win, &W, &H);
@@ -1185,6 +1705,17 @@ int main(int argc, char** argv) {
               viewer.rev_mode = (viewer.rev_mode + 1) % 3;  // After/Before/Diff
               dirty = true;
             }
+          } else if (ch == 'g' || ch == 'G') {
+            viewer.debug_mode = !viewer.debug_mode;
+            viewer.right_panel = viewer.debug_mode ? 3 : 0;
+            viewer.info_scroll = 0;
+            if (!viewer.debug_mode) {
+              viewer.debug_hits.clear();
+              viewer.debug_page = -1;
+              viewer.debug_sel = -1;
+              viewer.debug_dump.clear();
+            }
+            dirty = true;
           }
           break;
         }
@@ -1238,6 +1769,21 @@ int main(int argc, char** argv) {
                 viewer.rev_mode = (idx < 0) ? 0 : 1;  // current=After, rev=Before
                 dirty = true;
               }
+            } else if (viewer.right_panel == 3 && my >= kToolbarH) {
+              int lh = viewer.font ? lui_font_line_height(viewer.font) : 14;
+              int first = kToolbarH + 8 + lh + 8 - viewer.info_scroll;
+              int idx = (my - first) / kRowH;
+              if (idx >= 0 && idx < (int)viewer.debug_hits.size()) {
+                viewer.debug_sel = idx;
+                const pdfview::RegionHit& h = viewer.debug_hits[idx];
+                if (h.obj_num >= 0)
+                  viewer.debug_dump = pdfview::dump_object(
+                      viewer.doc, (uint32_t)h.obj_num, (uint16_t)h.gen_num);
+                else
+                  viewer.debug_dump =
+                      h.detail.empty() ? "(no PDF object)" : h.detail;
+                dirty = true;
+              }
             }
             break;
           }
@@ -1263,6 +1809,23 @@ int main(int argc, char** argv) {
           // Tiny drag = click, not a selection.
           if (std::abs(viewer.sel_x1 - viewer.sel_x0) < 3 &&
               std::abs(viewer.sel_y1 - viewer.sel_y0) < 3) {
+            dirty = true;
+            break;
+          }
+          if (viewer.debug_mode) {
+            // Inspect the region: map to page space and find PDF objects there.
+            double gx0, gy0, gx1, gy1;
+            screen_to_page(viewer, viewer.sel_x0, viewer.sel_y0, &gx0, &gy0);
+            screen_to_page(viewer, viewer.sel_x1, viewer.sel_y1, &gx1, &gy1);
+            viewer.debug_hits =
+                pdfview::inspect_region(viewer.doc, viewer.page, gx0, gy0, gx1, gy1);
+            viewer.debug_page = viewer.page;
+            viewer.debug_sel = -1;
+            viewer.debug_dump.clear();
+            viewer.right_panel = 3;
+            viewer.info_scroll = 0;
+            std::printf("pdfview: inspect region: %zu hit(s)\n",
+                        viewer.debug_hits.size());
             dirty = true;
             break;
           }
@@ -1306,6 +1869,9 @@ int main(int argc, char** argv) {
     } while (running && lui_window_poll_event(win, &event));
   }
 
+#if PDFVIEW_HAVE_MCP
+  if (mcp) lui_mcp_destroy(mcp);
+#endif
   if (viewer.font) lui_font_destroy(viewer.font);
 #if PDFVIEW_HAVE_NFD
   NFD_Quit();

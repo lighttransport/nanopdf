@@ -75,11 +75,27 @@ cmake --build build -j
 | `↑` / `↓` / wheel | Scroll | `/` then type, `Enter` | Search; `n`/`N` next/prev |
 | drag on page | Select text (copies to stdout) | `i` | Info / signatures / forms panel |
 | click outline / thumbnail | Jump to page | `r` | Revisions panel; `d` cycles After/Before/Diff |
+| `g` | Toggle **debug** mode | drag (debug) | Inspect region → PDF objects |
 | `Esc` | Clear search/selection, else quit | | |
+
+## Debug mode + MCP (LLM/VLM-assisted inspection)
+
+**Debug mode** (`g`): drag a region on the page and the viewer reports the PDF objects
+under it — text runs with their font + object number, image XObjects with placement +
+object number, and annotations — highlighting them on the page. The right "Debug" panel
+lists the hits; click one to highlight it and dump the underlying PDF object.
+
+**MCP server** (`--mcp [port]`, default 3001): embeds lightui's MCP server so an LLM/agent
+can drive and inspect the live viewer over HTTP (JSON-RPC). Tools: `viewer_state`,
+`goto_page`, `set_zoom`, `open`, `search`, `pdf_inspect_region`, `pdf_dump_object`,
+`pdf_highlight_object`, `pdf_clear_highlight`, plus lightui's built-in `screenshot` (returns
+the live frame as a base64 PNG for VLMs) and canvas inspectors. `--mcp-serve <pdf> [port]`
+runs the same server **headless** (offscreen render, no display) for LLM PDF inspection.
 
 Headless self-test modes (no display): `--selftest`, `--renderpage <pdf> <page> <out.ppm>`,
 `--compose <pdf> <out.ppm>`, `--search <pdf> <term> <out.ppm>`, `--info <pdf> <out.ppm>`,
-`--rev <pdf> <out.ppm> [before|diff]`.
+`--rev <pdf> <out.ppm> [before|diff]`, `--inspect <pdf> <page> <x1> <y1> <x2> <y2>`,
+`--debugview <pdf> <page> <x1> <y1> <x2> <y2> <out.ppm>`.
 
 ## Status
 
@@ -91,6 +107,10 @@ Headless self-test modes (no display): `--selftest`, `--renderpage <pdf> <page> 
 - [x] Phase 4: text search (highlight, next/prev across pages) + drag text selection.
 - [x] Phase 5: document info / signatures / forms panel.
 - [x] Phase 6: revision-history list + Before/After/Diff visual diff.
+- [x] Debug mode: region → PDF objects (text/font/obj, images, annotations),
+      highlight + object dump.
+- [x] MCP server: drive/inspect the viewer from an LLM/agent over HTTP, incl.
+      VLM screenshots and the PDF debug tools (live `--mcp` and headless `--mcp-serve`).
 
 ### Text extraction / search / CJK
 nanopdf text extraction resolves Unicode via the full mapping chain (ToUnicode CMap,
