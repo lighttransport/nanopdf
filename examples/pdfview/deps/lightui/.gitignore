@@ -1,0 +1,85 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# debug information files
+*.dwo
+
+# Build directories
+build/
+build-*/
+builddir/
+_build/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+Testing/
+
+# xmake artifacts
+.xmake/
+.deps/
+
+# Wayland generated protocol glue (generated at build time)
+src/platform/wayland/xdg-shell-client-protocol.h
+src/platform/wayland/xdg-shell-client-protocol.c
+
+# Render test outputs (actual renders + diffs; golden/ is committed to git)
+tests/output/
+
+# Downloaded fonts (fetch with scripts/fetch-fonts.sh)
+fonts/*
+# ...except Hack, which is committed (embedded into widget_demo, not fetched)
+!fonts/hack/
