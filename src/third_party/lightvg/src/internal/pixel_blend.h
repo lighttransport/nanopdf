@@ -5,47 +5,47 @@
  * are NOT part of the public API and may change across minor versions.
  *
  * The bodies are the same SWAR-based formulas that lived previously inside
- * src/vg/canvas.c. They are factored here so the canvas rasterizer, scene
+ * lightvg/src/canvas.c. They are factored here so the canvas rasterizer, scene
  * compositor, and glyph-blending path can share one implementation.
  *
  * Pixel layout assumed throughout: 0xAARRGGBB, non-premultiplied.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-#ifndef LUI_INTERNAL_PIXEL_BLEND_H
-#define LUI_INTERNAL_PIXEL_BLEND_H
+#ifndef LVG_INTERNAL_PIXEL_BLEND_H
+#define LVG_INTERNAL_PIXEL_BLEND_H
 
 #include <stdint.h>
 
 /*
- * Optional SIMD, mirroring the knobs used by src/vg/canvas.c. Undefined here
+ * Optional SIMD, mirroring the knobs used by lightvg/src/canvas.c. Undefined here
  * means "scalar only"; when the including TU is built with
- * -DLUI_VG_USE_SSE2=1 or -DLUI_VG_USE_NEON=1 the SIMD fast paths compile in.
+ * -DLVG_USE_SSE2=1 or -DLVG_USE_NEON=1 the SIMD fast paths compile in.
  */
-#ifndef LUI_VG_USE_SSE2
-#define LUI_VG_USE_SSE2 0
+#ifndef LVG_USE_SSE2
+#define LVG_USE_SSE2 0
 #endif
-#ifndef LUI_VG_USE_NEON
-#define LUI_VG_USE_NEON 0
+#ifndef LVG_USE_NEON
+#define LVG_USE_NEON 0
 #endif
-#if LUI_VG_USE_SSE2
+#if LVG_USE_SSE2
 #include <emmintrin.h>
 #endif
-#if LUI_VG_USE_NEON
+#if LVG_USE_NEON
 #include <arm_neon.h>
 #endif
 
 /* SWAR byte-lane constants for ARGB pixels packed as 0xAARRGGBB:
- *   LUI_RB_MASK  keeps the red and blue bytes in a 32-bit word, leaving
+ *   LVG_RB_MASK  keeps the red and blue bytes in a 32-bit word, leaving
  *                8-bit headroom in the middle of each lane for multiply.
- *   LUI_RB_HALF  adds 128 into each lane, as rounding bias for div-by-255. */
-#define LUI_RB_MASK 0x00FF00FFu
-#define LUI_RB_HALF 0x00800080u
+ *   LVG_RB_HALF  adds 128 into each lane, as rounding bias for div-by-255. */
+#define LVG_RB_MASK 0x00FF00FFu
+#define LVG_RB_HALF 0x00800080u
 
 /* Fast, exact division by 255 for x in [0, 65535].
  *   (x + 128 + ((x + 128) >> 8)) >> 8
  * Equivalent to (x + 127.5) / 255 rounded, without any DIV instruction. */
-static inline uint32_t lui_px_div255(uint32_t x)
+static inline uint32_t lvg_px_div255(uint32_t x)
 {
     uint32_t t = x + 128u;
     return (t + (t >> 8)) >> 8;
@@ -60,7 +60,7 @@ static inline uint32_t lui_px_div255(uint32_t x)
  * display surface. For general translucent destinations the full Porter-Duff
  * formula is used.
  */
-static inline uint32_t lui_px_blend_over(uint32_t dst, uint32_t src)
+static inline uint32_t lvg_px_blend_over(uint32_t dst, uint32_t src)
 {
     uint32_t sa = src >> 24;
     if (sa == 0)   return dst;
@@ -76,20 +76,20 @@ static inline uint32_t lui_px_blend_over(uint32_t dst, uint32_t src)
         /* Fast path: opaque destination. SWAR R/B in one 32-bit op and
          * A/G in another — halves the per-pixel work vs four scalar
          * divides. */
-        uint32_t src_rb = src & LUI_RB_MASK;
-        uint32_t dst_rb = dst & LUI_RB_MASK;
-        uint32_t src_ag = (src >> 8) & LUI_RB_MASK;
-        uint32_t dst_ag = (dst >> 8) & LUI_RB_MASK;
+        uint32_t src_rb = src & LVG_RB_MASK;
+        uint32_t dst_rb = dst & LVG_RB_MASK;
+        uint32_t src_ag = (src >> 8) & LVG_RB_MASK;
+        uint32_t dst_ag = (dst >> 8) & LVG_RB_MASK;
 
-        uint32_t rb = src_rb * sa + dst_rb * inv_sa + LUI_RB_HALF;
-        uint32_t ag = src_ag * sa + dst_ag * inv_sa + LUI_RB_HALF;
-        rb = ((rb + ((rb >> 8) & LUI_RB_MASK)) >> 8) & LUI_RB_MASK;
-        ag = ((ag + ((ag >> 8) & LUI_RB_MASK)) >> 8) & LUI_RB_MASK;
+        uint32_t rb = src_rb * sa + dst_rb * inv_sa + LVG_RB_HALF;
+        uint32_t ag = src_ag * sa + dst_ag * inv_sa + LVG_RB_HALF;
+        rb = ((rb + ((rb >> 8) & LVG_RB_MASK)) >> 8) & LVG_RB_MASK;
+        ag = ((ag + ((ag >> 8) & LVG_RB_MASK)) >> 8) & LVG_RB_MASK;
         return 0xFF000000u | rb | (ag << 8);
     }
 
     /* General Porter-Duff SRC_OVER */
-    uint32_t da_inv_sa = lui_px_div255(da * inv_sa);
+    uint32_t da_inv_sa = lvg_px_div255(da * inv_sa);
     out_a = sa + da_inv_sa;
     if (out_a == 0) return 0;
     uint32_t half = out_a >> 1;
@@ -113,7 +113,7 @@ static inline uint32_t lui_px_blend_over(uint32_t dst, uint32_t src)
  *   - 0 < A < 255 : SWAR scalar, with an SSE2 4-at-a-time path that
  *                   engages when all four destination alphas are 0xFF.
  */
-static inline void lui_px_blend_over_constant_row(uint32_t *dst,
+static inline void lvg_px_blend_over_constant_row(uint32_t *dst,
                                                   uint32_t color,
                                                   int n)
 {
@@ -126,11 +126,11 @@ static inline void lui_px_blend_over_constant_row(uint32_t *dst,
     }
 
     const uint32_t inv_sa    = 255u - sa;
-    const uint32_t src_rb_sa = (color & LUI_RB_MASK) * sa + LUI_RB_HALF;
-    const uint32_t src_ag_sa = ((color >> 8) & LUI_RB_MASK) * sa + LUI_RB_HALF;
+    const uint32_t src_rb_sa = (color & LVG_RB_MASK) * sa + LVG_RB_HALF;
+    const uint32_t src_ag_sa = ((color >> 8) & LVG_RB_MASK) * sa + LVG_RB_HALF;
     int i = 0;
 
-#if LUI_VG_USE_SSE2
+#if LVG_USE_SSE2
     {
         const __m128i zero       = _mm_setzero_si128();
         const __m128i inv_sa_v16 = _mm_set1_epi16((short)inv_sa);
@@ -151,7 +151,7 @@ static inline void lui_px_blend_over_constant_row(uint32_t *dst,
             __m128i a_only = _mm_and_si128(px, alpha_ff);
             if (_mm_movemask_epi8(_mm_cmpeq_epi8(a_only, alpha_ff)) != 0xFFFF) {
                 for (int j = 0; j < 4; j++)
-                    dst[i + j] = lui_px_blend_over(dst[i + j], color);
+                    dst[i + j] = lvg_px_blend_over(dst[i + j], color);
                 continue;
             }
             __m128i lo = _mm_unpacklo_epi8(px, zero);
@@ -170,17 +170,17 @@ static inline void lui_px_blend_over_constant_row(uint32_t *dst,
     for (; i < n; i++) {
         uint32_t d = dst[i];
         if ((d >> 24) == 255u) {
-            uint32_t dst_rb = d & LUI_RB_MASK;
-            uint32_t dst_ag = (d >> 8) & LUI_RB_MASK;
+            uint32_t dst_rb = d & LVG_RB_MASK;
+            uint32_t dst_ag = (d >> 8) & LVG_RB_MASK;
             uint32_t rb = src_rb_sa + dst_rb * inv_sa;
             uint32_t ag = src_ag_sa + dst_ag * inv_sa;
-            rb = ((rb + ((rb >> 8) & LUI_RB_MASK)) >> 8) & LUI_RB_MASK;
-            ag = ((ag + ((ag >> 8) & LUI_RB_MASK)) >> 8) & LUI_RB_MASK;
+            rb = ((rb + ((rb >> 8) & LVG_RB_MASK)) >> 8) & LVG_RB_MASK;
+            ag = ((ag + ((ag >> 8) & LVG_RB_MASK)) >> 8) & LVG_RB_MASK;
             dst[i] = 0xFF000000u | rb | (ag << 8);
         } else {
-            dst[i] = lui_px_blend_over(d, color);
+            dst[i] = lvg_px_blend_over(d, color);
         }
     }
 }
 
-#endif /* LUI_INTERNAL_PIXEL_BLEND_H */
+#endif /* LVG_INTERNAL_PIXEL_BLEND_H */

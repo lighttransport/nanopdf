@@ -14,7 +14,7 @@ namespace lvg {
 
 namespace {
 
-// Pack an 0xAARRGGBB lui_color from straight RGBA.
+// Pack an 0xAARRGGBB lvg_color from straight RGBA.
 inline uint32_t pack_argb(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   return (static_cast<uint32_t>(a) << 24) |
          (static_cast<uint32_t>(r) << 16) |
@@ -26,7 +26,7 @@ inline uint32_t pack_argb(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 // recursion; the flatness test is the chordal distance of control points
 // from the chord.
 void flatten_cubic(float x0, float y0, float x1, float y1, float x2, float y2,
-                   float x3, float y3, std::vector<lui_pointf_t>& out,
+                   float x3, float y3, std::vector<lvg_pointf_t>& out,
                    int depth = 0) {
   // Flatness: max deviation of control points from line P0..P3.
   float dx = x3 - x0;
@@ -54,7 +54,7 @@ void flatten_cubic(float x0, float y0, float x1, float y1, float x2, float y2,
 // Convert a list of (cmd, point) into one-or-more closed contours, each a
 // run of polygon vertices in `out_contours`.
 struct Contour {
-  std::vector<lui_pointf_t> pts;
+  std::vector<lvg_pointf_t> pts;
 };
 
 void flatten_path(const std::vector<PathCommand>& cmds,
@@ -104,8 +104,8 @@ void flatten_path(const std::vector<PathCommand>& cmds,
         if (!cur.pts.empty()) {
           // Close the contour by appending the start point if not already
           // there.
-          const lui_pointf_t& first = cur.pts.front();
-          const lui_pointf_t& last  = cur.pts.back();
+          const lvg_pointf_t& first = cur.pts.front();
+          const lvg_pointf_t& last  = cur.pts.back();
           if (first.x != last.x || first.y != last.y) {
             cur.pts.push_back(first);
           }
@@ -124,38 +124,38 @@ void flatten_path(const std::vector<PathCommand>& cmds,
   }
 }
 
-lui_fill_rule_t to_lui_fill_rule(FillRule r) {
-  return r == FillRule::EvenOdd ? LUI_FILL_RULE_EVENODD
-                                : LUI_FILL_RULE_NONZERO;
+lvg_fill_rule_t to_lui_fill_rule(FillRule r) {
+  return r == FillRule::EvenOdd ? LVG_FILL_RULE_EVENODD
+                                : LVG_FILL_RULE_NONZERO;
 }
 
-lui_line_cap_t to_lui_cap(StrokeCap c) {
+lvg_line_cap_t to_lui_cap(StrokeCap c) {
   switch (c) {
-    case StrokeCap::Round:  return LUI_LINE_CAP_ROUND;
-    case StrokeCap::Square: return LUI_LINE_CAP_SQUARE;
-    case StrokeCap::Butt:   default: return LUI_LINE_CAP_BUTT;
+    case StrokeCap::Round:  return LVG_LINE_CAP_ROUND;
+    case StrokeCap::Square: return LVG_LINE_CAP_SQUARE;
+    case StrokeCap::Butt:   default: return LVG_LINE_CAP_BUTT;
   }
 }
 
-lui_line_join_t to_lui_join(StrokeJoin j) {
+lvg_line_join_t to_lui_join(StrokeJoin j) {
   switch (j) {
-    case StrokeJoin::Round: return LUI_LINE_JOIN_ROUND;
-    case StrokeJoin::Bevel: return LUI_LINE_JOIN_BEVEL;
-    case StrokeJoin::Miter: default: return LUI_LINE_JOIN_MITER;
+    case StrokeJoin::Round: return LVG_LINE_JOIN_ROUND;
+    case StrokeJoin::Bevel: return LVG_LINE_JOIN_BEVEL;
+    case StrokeJoin::Miter: default: return LVG_LINE_JOIN_MITER;
   }
 }
 
-lui_canvas_blend_mode_t to_lui_blend(BlendMethod m) {
+lvg_canvas_blend_mode_t to_lui_blend(BlendMethod m) {
   switch (m) {
-    case BlendMethod::Multiply:   return LUI_CANVAS_BLEND_MULTIPLY;
-    case BlendMethod::Screen:     return LUI_CANVAS_BLEND_SCREEN;
-    case BlendMethod::Overlay:    return LUI_CANVAS_BLEND_OVERLAY;
-    case BlendMethod::Darken:     return LUI_CANVAS_BLEND_DARKEN;
-    case BlendMethod::Lighten:    return LUI_CANVAS_BLEND_LIGHTEN;
-    case BlendMethod::Difference: return LUI_CANVAS_BLEND_DIFFERENCE;
-    case BlendMethod::Exclusion:  return LUI_CANVAS_BLEND_EXCLUSION;
+    case BlendMethod::Multiply:   return LVG_CANVAS_BLEND_MULTIPLY;
+    case BlendMethod::Screen:     return LVG_CANVAS_BLEND_SCREEN;
+    case BlendMethod::Overlay:    return LVG_CANVAS_BLEND_OVERLAY;
+    case BlendMethod::Darken:     return LVG_CANVAS_BLEND_DARKEN;
+    case BlendMethod::Lighten:    return LVG_CANVAS_BLEND_LIGHTEN;
+    case BlendMethod::Difference: return LVG_CANVAS_BLEND_DIFFERENCE;
+    case BlendMethod::Exclusion:  return LVG_CANVAS_BLEND_EXCLUSION;
     case BlendMethod::Normal:
-    default:                      return LUI_CANVAS_BLEND_SRC_OVER;
+    default:                      return LVG_CANVAS_BLEND_SRC_OVER;
   }
 }
 
@@ -224,16 +224,16 @@ bool detect_axis_aligned_rect(const std::vector<PathCommand>& cmds,
   return out_w > 0 && out_h > 0;
 }
 
-// Translate an lvg gradient to a lui_canvas_gradient_t. Returns false on
+// Translate an lvg gradient to a lvg_canvas_gradient_t. Returns false on
 // empty/invalid input.
-bool build_lui_gradient(Paint* grad, lui_canvas_gradient_t& out,
+bool build_lui_gradient(Paint* grad, lvg_canvas_gradient_t& out,
                         uint8_t opacity_mul) {
   if (!grad) return false;
   if (grad->kind() == Paint::kLinear) {
     auto* lg = static_cast<LinearGradient*>(grad);
-    int count = std::min<int>(lg->stop_count(), LUI_CANVAS_GRADIENT_MAX_STOPS);
+    int count = std::min<int>(lg->stop_count(), LVG_CANVAS_GRADIENT_MAX_STOPS);
     if (count == 0) return false;
-    out.type = LUI_CANVAS_GRADIENT_LINEAR;
+    out.type = LVG_CANVAS_GRADIENT_LINEAR;
     out.x0 = lg->x1(); out.y0 = lg->y1();
     out.x1 = lg->x2(); out.y1 = lg->y2();
     out.cx = 0; out.cy = 0; out.r = 0;
@@ -248,13 +248,13 @@ bool build_lui_gradient(Paint* grad, lui_canvas_gradient_t& out,
   }
   if (grad->kind() == Paint::kRadial) {
     auto* rg = static_cast<RadialGradient*>(grad);
-    // lui_canvas's radial gradient is concentric only (centre + radius).
+    // lvg_canvas's radial gradient is concentric only (centre + radius).
     // Focal-point radials must go through the per-pixel sample_gradient_at
     // path; signal that here by declining the fast-path build.
     if (rg->has_focal()) return false;
-    int count = std::min<int>(rg->stop_count(), LUI_CANVAS_GRADIENT_MAX_STOPS);
+    int count = std::min<int>(rg->stop_count(), LVG_CANVAS_GRADIENT_MAX_STOPS);
     if (count == 0) return false;
-    out.type = LUI_CANVAS_GRADIENT_RADIAL;
+    out.type = LVG_CANVAS_GRADIENT_RADIAL;
     out.cx = rg->cx(); out.cy = rg->cy(); out.r = rg->r();
     out.x0 = 0; out.y0 = 0; out.x1 = 0; out.y1 = 0;
     out.stop_count = count;
@@ -511,7 +511,7 @@ void contours_bbox(const std::vector<Contour>& contours, float& minx,
   minx = miny = std::numeric_limits<float>::infinity();
   maxx = maxy = -std::numeric_limits<float>::infinity();
   for (const Contour& c : contours) {
-    for (const lui_pointf_t& p : c.pts) {
+    for (const lvg_pointf_t& p : c.pts) {
       if (p.x < minx) minx = p.x;
       if (p.x > maxx) maxx = p.x;
       if (p.y < miny) miny = p.y;
@@ -575,8 +575,8 @@ std::vector<Contour> apply_dash(const Contour& contour,
   };
 
   for (size_t i = 0; i + 1 < contour.pts.size(); ++i) {
-    const lui_pointf_t& p0 = contour.pts[i];
-    const lui_pointf_t& p1 = contour.pts[i + 1];
+    const lvg_pointf_t& p0 = contour.pts[i];
+    const lvg_pointf_t& p1 = contour.pts[i + 1];
     float dx = p1.x - p0.x;
     float dy = p1.y - p0.y;
     float seg_len = std::sqrt(dx * dx + dy * dy);
@@ -589,7 +589,7 @@ std::vector<Contour> apply_dash(const Contour& contour,
     while (seg_remaining > 1e-6f) {
       float take = std::min(seg_remaining, remaining_in_dash);
       seg_consumed += take;
-      lui_pointf_t pt{p0.x + ux * seg_consumed, p0.y + uy * seg_consumed};
+      lvg_pointf_t pt{p0.x + ux * seg_consumed, p0.y + uy * seg_consumed};
 
       if (is_on) {
         current.pts.push_back(pt);
@@ -621,14 +621,14 @@ std::vector<uint8_t> rasterize_contours_to_mask(
   std::vector<uint8_t> mask(static_cast<size_t>(bbox_w) * bbox_h, 0u);
   if (bbox_w <= 0 || bbox_h <= 0) return mask;
   std::vector<uint32_t> pixels(static_cast<size_t>(bbox_w) * bbox_h, 0u);
-  lui_surface_t s = lui_surface_wrap(pixels.data(), bbox_w, bbox_h, bbox_w);
-  lui_canvas_t  c;
-  lui_canvas_init(&c, &s);
-  std::vector<lui_pointf_t> flat;
+  lvg_surface_t s = lvg_surface_wrap(pixels.data(), bbox_w, bbox_h, bbox_w);
+  lvg_canvas_t  c;
+  lvg_canvas_init(&c, &s);
+  std::vector<lvg_pointf_t> flat;
   std::vector<int> lens;
   for (Contour contour : contours) {
     if (contour.pts.size() < 3) continue;
-    for (lui_pointf_t& p : contour.pts) {
+    for (lvg_pointf_t& p : contour.pts) {
       p.x -= static_cast<float>(bbox_x);
       p.y -= static_cast<float>(bbox_y);
     }
@@ -637,11 +637,11 @@ std::vector<uint8_t> rasterize_contours_to_mask(
   }
   if (!lens.empty()) {
     // Single multi-contour pass so the fill rule carves holes.
-    lui_canvas_fill_polygonsf_ex(&c, flat.data(), static_cast<int>(flat.size()),
+    lvg_canvas_fill_polygonsf_ex(&c, flat.data(), static_cast<int>(flat.size()),
                                  lens.data(), static_cast<int>(lens.size()),
                                  0xFFFFFFFFu, to_lui_fill_rule(rule));
   }
-  lui_canvas_destroy(&c);
+  lvg_canvas_destroy(&c);
   for (size_t i = 0; i < mask.size(); ++i) {
     mask[i] = static_cast<uint8_t>((pixels[i] >> 24) & 0xff);
   }
@@ -654,18 +654,18 @@ std::vector<uint8_t> rasterize_contours_to_mask(
 //
 // @color_at returns the 0xAARRGGBB source colour at canvas pixel (x, y).
 template <typename ColorFn>
-void fill_polygon_with_source(lui_canvas_t* canvas,
+void fill_polygon_with_source(lvg_canvas_t* canvas,
                               const std::vector<Contour>& contours,
                               FillRule rule, ColorFn color_at,
                               BlendMethod blend_mode) {
   if (!canvas || contours.empty()) return;
-  lui_surface_t* dst = lui_canvas_get_surface(canvas);
+  lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
   if (!dst || !dst->pixels) return;
 
   // Compute bbox of all contours, clip to canvas clip rect.
   float minx, miny, maxx, maxy;
   contours_bbox(contours, minx, miny, maxx, maxy);
-  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  lvg_rect_t clip = lvg_canvas_get_clip(canvas);
   int x0 = std::max(static_cast<int>(std::floor(minx)), clip.x);
   int y0 = std::max(static_cast<int>(std::floor(miny)), clip.y);
   int x1 = std::min(static_cast<int>(std::ceil(maxx)),  clip.x + clip.width);
@@ -792,17 +792,17 @@ std::vector<uint8_t> rasterize_path_to_mask(
   if (bbox_w <= 0 || bbox_h <= 0) return mask;
 
   std::vector<uint32_t> pixels(static_cast<size_t>(bbox_w) * bbox_h, 0u);
-  lui_surface_t s = lui_surface_wrap(pixels.data(), bbox_w, bbox_h, bbox_w);
-  lui_canvas_t  c;
-  lui_canvas_init(&c, &s);
+  lvg_surface_t s = lvg_surface_wrap(pixels.data(), bbox_w, bbox_h, bbox_w);
+  lvg_canvas_t  c;
+  lvg_canvas_init(&c, &s);
 
   std::vector<Contour> contours;
   flatten_path(cmds, pts, contours);
-  std::vector<lui_pointf_t> flat;
+  std::vector<lvg_pointf_t> flat;
   std::vector<int> lens;
   for (Contour& contour : contours) {
     if (contour.pts.size() < 3) continue;
-    for (lui_pointf_t& p : contour.pts) {
+    for (lvg_pointf_t& p : contour.pts) {
       p.x -= static_cast<float>(bbox_x);
       p.y -= static_cast<float>(bbox_y);
     }
@@ -811,11 +811,11 @@ std::vector<uint8_t> rasterize_path_to_mask(
   }
   if (!lens.empty()) {
     // Single multi-contour pass so the fill rule carves holes.
-    lui_canvas_fill_polygonsf_ex(&c, flat.data(), static_cast<int>(flat.size()),
+    lvg_canvas_fill_polygonsf_ex(&c, flat.data(), static_cast<int>(flat.size()),
                                  lens.data(), static_cast<int>(lens.size()),
                                  0xFFFFFFFFu, to_lui_fill_rule(rule));
   }
-  lui_canvas_destroy(&c);
+  lvg_canvas_destroy(&c);
 
   // Extract alpha channel.
   for (size_t i = 0; i < mask.size(); ++i) {
@@ -867,11 +867,11 @@ Result Paint::bounds(float* x, float* y, float* w, float* h,
 // loose (e.g. full clip rect for scenes), since identity-lerping unmodified
 // pixels is a no-op.
 template <typename DrawFn>
-static void draw_with_soft_mask(lui_canvas_t* canvas,
+static void draw_with_soft_mask(lvg_canvas_t* canvas,
                                 const SoftMaskData& mask,
                                 int x0, int y0, int x1, int y1,
                                 DrawFn draw) {
-  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  lvg_rect_t clip = lvg_canvas_get_clip(canvas);
   x0 = std::max(x0, clip.x);
   y0 = std::max(y0, clip.y);
   x1 = std::min(x1, clip.x + clip.width);
@@ -880,7 +880,7 @@ static void draw_with_soft_mask(lui_canvas_t* canvas,
     draw(canvas);
     return;
   }
-  lui_surface_t* surf = lui_canvas_get_surface(canvas);
+  lvg_surface_t* surf = lvg_canvas_get_surface(canvas);
   if (!surf || !surf->pixels) {
     draw(canvas);
     return;
@@ -1094,7 +1094,7 @@ void Shape::compute_bbox(float* x, float* y, float* w, float* h) const {
   if (h) *h = maxy - miny;
 }
 
-void Shape::draw_on(lui_canvas_t* canvas) {
+void Shape::draw_on(lvg_canvas_t* canvas) {
   if (!canvas || cmds_.empty()) return;
 
   // Per-pixel soft mask: snapshot dest, draw without mask, lerp back through
@@ -1109,7 +1109,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
     int x1 = static_cast<int>(std::ceil(bx + bw));
     int y1 = static_cast<int>(std::ceil(by + bh));
     draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
-                        [this](lui_canvas_t* c) { draw_on(c); });
+                        [this](lvg_canvas_t* c) { draw_on(c); });
     soft_mask_ = mask;
     return;
   }
@@ -1119,9 +1119,9 @@ void Shape::draw_on(lui_canvas_t* canvas) {
   //    1 = exact rect clip (clipper is an axis-aligned rectangle)
   //    2 = mask-based clip (arbitrary clip path; rasterize to alpha mask,
   //        snapshot dest, draw, composite back)
-  lui_rect_t saved_clip = lui_canvas_get_clip(canvas);
+  lvg_rect_t saved_clip = lvg_canvas_get_clip(canvas);
   int clip_mode = 0;
-  lui_rect_t clip_bbox{0, 0, 0, 0};
+  lvg_rect_t clip_bbox{0, 0, 0, 0};
   if (clipper_) {
     float crx, cry, crw, crh;
     if (detect_axis_aligned_rect(clipper_->cmds_, clipper_->pts_, crx, cry,
@@ -1137,7 +1137,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
       clip_bbox.width  = std::max(0, x1 - x0);
       clip_bbox.height = std::max(0, y1 - y0);
       if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
-      lui_canvas_set_clip(canvas, &clip_bbox);
+      lvg_canvas_set_clip(canvas, &clip_bbox);
       clip_mode = 1;
     } else {
       float cx, cy, cw, ch;
@@ -1153,7 +1153,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
       clip_bbox.width  = std::max(0, x1 - x0);
       clip_bbox.height = std::max(0, y1 - y0);
       if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
-      lui_canvas_set_clip(canvas, &clip_bbox);
+      lvg_canvas_set_clip(canvas, &clip_bbox);
       clip_mode = 2;
     }
   }
@@ -1163,7 +1163,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
   std::vector<uint32_t> snapshot;
   std::vector<uint8_t>  mask;
   if (clip_mode == 2) {
-    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
     if (dst && dst->pixels) {
       snapshot.resize(static_cast<size_t>(clip_bbox.width) * clip_bbox.height);
       for (int y = 0; y < clip_bbox.height; ++y) {
@@ -1196,9 +1196,9 @@ void Shape::draw_on(lui_canvas_t* canvas) {
       // Gradient fast path is Normal-blend-only. Non-Normal blends with a
       // gradient fill on a rect fall through to the polygon-custom path.
       if (fill_gradient_ && blend_mode_ == BlendMethod::Normal) {
-        lui_canvas_gradient_t lg{};
+        lvg_canvas_gradient_t lg{};
         if (build_lui_gradient(fill_gradient_, lg, opacity_)) {
-          lui_canvas_fill_rect_gradient(canvas, ix, iy, iw, ih, &lg);
+          lvg_canvas_fill_rect_gradient(canvas, ix, iy, iw, ih, &lg);
           fill_handled = true;
         }
       } else if (has_solid_fill_) {
@@ -1207,10 +1207,10 @@ void Shape::draw_on(lui_canvas_t* canvas) {
         if (fa > 0) {
           uint32_t color = pack_argb(fill_r_, fill_g_, fill_b_, fa);
           if (blend_mode_ == BlendMethod::Normal) {
-            lui_canvas_fill_rect(canvas, ix, iy, iw, ih, color);
+            lvg_canvas_fill_rect(canvas, ix, iy, iw, ih, color);
             fill_handled = true;
           } else if (blend_mode_supported(blend_mode_)) {
-            lui_canvas_fill_rect_blended(canvas, ix, iy, iw, ih, color,
+            lvg_canvas_fill_rect_blended(canvas, ix, iy, iw, ih, color,
                                          to_lui_blend(blend_mode_));
             fill_handled = true;
           }
@@ -1229,7 +1229,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
 
     // Pick the right rendering path:
     //   * gradient OR non-Normal blend → per-pixel custom path
-    //   * solid + Normal               → lui_canvas_fill_polygonf_ex (fast)
+    //   * solid + Normal               → lvg_canvas_fill_polygonf_ex (fast)
     bool needs_custom = fill_gradient_ ||
                         (blend_mode_ != BlendMethod::Normal);
 
@@ -1263,7 +1263,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
         uint32_t color = pack_argb(fill_r_, fill_g_, fill_b_, fa);
         // Fill all contours in ONE pass so the fill rule carves holes (glyph
         // counters, donut shapes) instead of filling each contour solid.
-        std::vector<lui_pointf_t> flat;
+        std::vector<lvg_pointf_t> flat;
         std::vector<int> lens;
         for (const Contour& c : contours) {
           if (c.pts.size() >= 3) {
@@ -1272,7 +1272,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
           }
         }
         if (!lens.empty()) {
-          lui_canvas_fill_polygonsf_ex(canvas, flat.data(),
+          lvg_canvas_fill_polygonsf_ex(canvas, flat.data(),
                                        static_cast<int>(flat.size()),
                                        lens.data(),
                                        static_cast<int>(lens.size()), color,
@@ -1296,13 +1296,13 @@ void Shape::draw_on(lui_canvas_t* canvas) {
       // Per-pixel gradient stroke: rasterize the stroke into a temp ARGB
       // buffer (white-on-clear), then composite onto the canvas sampling
       // the gradient at each pixel's canvas position.
-      lui_rect_t clip = lui_canvas_get_clip(canvas);
+      lvg_rect_t clip = lvg_canvas_get_clip(canvas);
       float minx = std::numeric_limits<float>::infinity();
       float miny = std::numeric_limits<float>::infinity();
       float maxx = -std::numeric_limits<float>::infinity();
       float maxy = -std::numeric_limits<float>::infinity();
       for (const Contour& c : contours) {
-        for (const lui_pointf_t& p : c.pts) {
+        for (const lvg_pointf_t& p : c.pts) {
           if (p.x < minx) minx = p.x;
           if (p.x > maxx) maxx = p.x;
           if (p.y < miny) miny = p.y;
@@ -1321,12 +1321,12 @@ void Shape::draw_on(lui_canvas_t* canvas) {
         int th = y1 - y0;
         if (tw > 0 && th > 0) {
           std::vector<uint32_t> tmp(static_cast<size_t>(tw) * th, 0u);
-          lui_surface_t ts = lui_surface_wrap(tmp.data(), tw, th, tw);
-          lui_canvas_t  tc;
-          lui_canvas_init(&tc, &ts);
+          lvg_surface_t ts = lvg_surface_wrap(tmp.data(), tw, th, tw);
+          lvg_canvas_t  tc;
+          lvg_canvas_init(&tc, &ts);
           for (Contour c : contours) {
             if (c.pts.size() < 2) continue;
-            for (lui_pointf_t& p : c.pts) {
+            for (lvg_pointf_t& p : c.pts) {
               p.x -= static_cast<float>(x0);
               p.y -= static_cast<float>(y0);
             }
@@ -1334,7 +1334,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
               auto subs = apply_dash(c, stroke_dash_, stroke_dash_phase_);
               for (const Contour& sc : subs) {
                 if (sc.pts.size() < 2) continue;
-                lui_canvas_draw_styled_polyline(
+                lvg_canvas_draw_styled_polyline(
                     &tc, sc.pts.data(), static_cast<int>(sc.pts.size()),
                     0xFFFFFFFFu, sw, /*closed=*/false, to_cap, to_join);
               }
@@ -1342,16 +1342,16 @@ void Shape::draw_on(lui_canvas_t* canvas) {
             }
             bool closed = false;
             if (c.pts.size() >= 3) {
-              const lui_pointf_t& f = c.pts.front();
-              const lui_pointf_t& l = c.pts.back();
+              const lvg_pointf_t& f = c.pts.front();
+              const lvg_pointf_t& l = c.pts.back();
               closed = (f.x == l.x && f.y == l.y);
             }
-            lui_canvas_draw_styled_polyline(
+            lvg_canvas_draw_styled_polyline(
                 &tc, c.pts.data(), static_cast<int>(c.pts.size()),
                 0xFFFFFFFFu, sw, closed, to_cap, to_join);
           }
           // Composite temp onto canvas with per-pixel gradient color.
-          lui_surface_t* dst = lui_canvas_get_surface(canvas);
+          lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
           if (dst && dst->pixels) {
             for (int y = 0; y < th; ++y) {
               uint32_t* dst_row = dst->pixels + (y0 + y) * dst->stride + x0;
@@ -1375,7 +1375,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
               }
             }
           }
-          lui_canvas_destroy(&tc);
+          lvg_canvas_destroy(&tc);
         }
       }
     } else {
@@ -1391,7 +1391,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
             auto subs = apply_dash(c, stroke_dash_, stroke_dash_phase_);
             for (const Contour& sc : subs) {
               if (sc.pts.size() < 2) continue;
-              lui_canvas_draw_styled_polyline(
+              lvg_canvas_draw_styled_polyline(
                   canvas, sc.pts.data(), static_cast<int>(sc.pts.size()),
                   color, sw, /*closed=*/false, to_cap, to_join);
             }
@@ -1399,11 +1399,11 @@ void Shape::draw_on(lui_canvas_t* canvas) {
           }
           bool closed = false;
           if (c.pts.size() >= 3) {
-            const lui_pointf_t& f = c.pts.front();
-            const lui_pointf_t& l = c.pts.back();
+            const lvg_pointf_t& f = c.pts.front();
+            const lvg_pointf_t& l = c.pts.back();
             closed = (f.x == l.x && f.y == l.y);
           }
-          lui_canvas_draw_styled_polyline(
+          lvg_canvas_draw_styled_polyline(
               canvas, c.pts.data(), static_cast<int>(c.pts.size()), color,
               sw, closed, to_cap, to_join);
         }
@@ -1413,7 +1413,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
 
   // -- Mask-based clip: composite drawn pixels with snapshot via mask.
   if (clip_mode == 2 && !mask.empty() && !snapshot.empty()) {
-    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
     if (dst && dst->pixels) {
       for (int y = 0; y < clip_bbox.height; ++y) {
         uint32_t* dst_row = dst->pixels +
@@ -1451,7 +1451,7 @@ void Shape::draw_on(lui_canvas_t* canvas) {
   }
 
   if (clip_mode != 0) {
-    lui_canvas_set_clip(canvas, &saved_clip);
+    lvg_canvas_set_clip(canvas, &saved_clip);
   }
 }
 
@@ -1471,7 +1471,7 @@ static bool pixels_are_opaque(const uint32_t* pixels, size_t count) {
   return true;
 }
 
-static void draw_opaque_nearest_image(lui_canvas_t* canvas,
+static void draw_opaque_nearest_image(lvg_canvas_t* canvas,
                                       const uint32_t* pixels,
                                       int src_w, int src_h,
                                       int dst_x, int dst_y,
@@ -1481,14 +1481,14 @@ static void draw_opaque_nearest_image(lui_canvas_t* canvas,
     return;
   }
 
-  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  lvg_rect_t clip = lvg_canvas_get_clip(canvas);
   int x0 = std::max(dst_x, clip.x);
   int y0 = std::max(dst_y, clip.y);
   int x1 = std::min(dst_x + dst_w, clip.x + clip.width);
   int y1 = std::min(dst_y + dst_h, clip.y + clip.height);
   if (x0 >= x1 || y0 >= y1) return;
 
-  lui_surface_t* dst = lui_canvas_get_surface(canvas);
+  lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
   if (!dst || !dst->pixels) return;
 
   if (dst_w == src_w && dst_h == src_h) {
@@ -1540,7 +1540,7 @@ Result Picture::load(const uint32_t* data, uint32_t w, uint32_t h, ColorSpace cs
 
   pixels_.resize(static_cast<size_t>(w) * h);
 
-  // Convert source to lui_canvas's expected ARGB-packed
+  // Convert source to lvg_canvas's expected ARGB-packed
   // (0xAARRGGBB straight) layout.
   for (uint32_t i = 0; i < w * h; ++i) {
     uint32_t p = data[i];
@@ -1625,7 +1625,7 @@ void Picture::compute_bbox(float* x, float* y, float* w, float* h) const {
   *h = maxy - miny;
 }
 
-void Picture::draw_on(lui_canvas_t* canvas) {
+void Picture::draw_on(lvg_canvas_t* canvas) {
   if (!canvas || pixels_.empty() || width_ == 0 || height_ == 0) return;
 
   if (soft_mask_) {
@@ -1638,14 +1638,14 @@ void Picture::draw_on(lui_canvas_t* canvas) {
     int x1 = static_cast<int>(std::ceil(bx + bw));
     int y1 = static_cast<int>(std::ceil(by + bh));
     draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
-                        [this](lui_canvas_t* c) { draw_on(c); });
+                        [this](lvg_canvas_t* c) { draw_on(c); });
     soft_mask_ = mask;
     return;
   }
 
-  lui_rect_t saved_clip = lui_canvas_get_clip(canvas);
+  lvg_rect_t saved_clip = lvg_canvas_get_clip(canvas);
   int clip_mode = 0;
-  lui_rect_t clip_bbox{0, 0, 0, 0};
+  lvg_rect_t clip_bbox{0, 0, 0, 0};
 
   if (clipper_) {
     float crx, cry, crw, crh;
@@ -1662,7 +1662,7 @@ void Picture::draw_on(lui_canvas_t* canvas) {
       clip_bbox.width = std::max(0, x1 - x0);
       clip_bbox.height = std::max(0, y1 - y0);
       if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
-      lui_canvas_set_clip(canvas, &clip_bbox);
+      lvg_canvas_set_clip(canvas, &clip_bbox);
       clip_mode = 1;
     } else {
       float cx, cy, cw, ch;
@@ -1678,7 +1678,7 @@ void Picture::draw_on(lui_canvas_t* canvas) {
       clip_bbox.width = std::max(0, x1 - x0);
       clip_bbox.height = std::max(0, y1 - y0);
       if (clip_bbox.width == 0 || clip_bbox.height == 0) return;
-      lui_canvas_set_clip(canvas, &clip_bbox);
+      lvg_canvas_set_clip(canvas, &clip_bbox);
       clip_mode = 2;
     }
   }
@@ -1686,7 +1686,7 @@ void Picture::draw_on(lui_canvas_t* canvas) {
   std::vector<uint32_t> snapshot;
   std::vector<uint8_t> mask;
   if (clip_mode == 2) {
-    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
     if (dst && dst->pixels) {
       snapshot.resize(static_cast<size_t>(clip_bbox.width) * clip_bbox.height);
       for (int y = 0; y < clip_bbox.height; ++y) {
@@ -1705,7 +1705,7 @@ void Picture::draw_on(lui_canvas_t* canvas) {
   draw_pixels(canvas);
 
   if (clip_mode == 2 && !mask.empty() && !snapshot.empty()) {
-    lui_surface_t* dst = lui_canvas_get_surface(canvas);
+    lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
     if (dst && dst->pixels) {
       for (int y = 0; y < clip_bbox.height; ++y) {
         uint32_t* dst_row =
@@ -1743,15 +1743,15 @@ void Picture::draw_on(lui_canvas_t* canvas) {
   }
 
   if (clip_mode != 0) {
-    lui_canvas_set_clip(canvas, &saved_clip);
+    lvg_canvas_set_clip(canvas, &saved_clip);
   }
 }
 
-void Picture::draw_pixels(lui_canvas_t* canvas) {
+void Picture::draw_pixels(lvg_canvas_t* canvas) {
   if (!canvas || pixels_.empty() || width_ == 0 || height_ == 0) return;
 
-  // Axis-aligned scale + translate? Use fast path through lui_canvas.
-  // Note: lui_canvas_draw_image doesn't support mirroring, so negative
+  // Axis-aligned scale + translate? Use fast path through lvg_canvas.
+  // Note: lvg_canvas_draw_image doesn't support mirroring, so negative
   // scale (PDF horizontal/vertical text flip), opacity, and custom blend
   // modes must take the per-pixel path.
   if (std::fabs(transform_.e12) < 1e-4f &&
@@ -1760,7 +1760,7 @@ void Picture::draw_pixels(lui_canvas_t* canvas) {
       transform_.e22 > 0.0f &&
       opacity_ == 255 &&
       blend_mode_ == BlendMethod::Normal) {
-    lui_surface_t src = lui_surface_wrap(pixels_.data(),
+    lvg_surface_t src = lvg_surface_wrap(pixels_.data(),
                                          static_cast<int>(width_),
                                          static_cast<int>(height_),
                                          static_cast<int>(width_));
@@ -1771,16 +1771,16 @@ void Picture::draw_pixels(lui_canvas_t* canvas) {
     if (dst_w <= 0 || dst_h <= 0) return;
     int dst_x = static_cast<int>(std::round(transform_.e13));
     int dst_y = static_cast<int>(std::round(transform_.e23));
-    lui_image_filter_t filter =
-        interpolate_ ? LUI_IMAGE_FILTER_BILINEAR : LUI_IMAGE_FILTER_NEAREST;
-    if (opaque_ && filter == LUI_IMAGE_FILTER_NEAREST) {
+    lvg_image_filter_t filter =
+        interpolate_ ? LVG_IMAGE_FILTER_BILINEAR : LVG_IMAGE_FILTER_NEAREST;
+    if (opaque_ && filter == LVG_IMAGE_FILTER_NEAREST) {
       draw_opaque_nearest_image(canvas, pixels_.data(),
                                 static_cast<int>(width_),
                                 static_cast<int>(height_),
                                 dst_x, dst_y, dst_w, dst_h);
       return;
     }
-    lui_canvas_draw_image(canvas, dst_x, dst_y, dst_w, dst_h, &src, nullptr,
+    lvg_canvas_draw_image(canvas, dst_x, dst_y, dst_w, dst_h, &src, nullptr,
                           filter);
     return;
   }
@@ -1789,7 +1789,7 @@ void Picture::draw_pixels(lui_canvas_t* canvas) {
   draw_transformed(canvas);
 }
 
-void Picture::draw_transformed(lui_canvas_t* canvas) {
+void Picture::draw_transformed(lvg_canvas_t* canvas) {
   // Compute inverse of the 2x2 transform part.
   const Matrix& m = transform_;
   float det = m.e11 * m.e22 - m.e12 * m.e21;
@@ -1813,14 +1813,14 @@ void Picture::draw_transformed(lui_canvas_t* canvas) {
   float maxy = std::max({ys[0], ys[1], ys[2], ys[3]});
 
   // Clip to canvas clip rect.
-  lui_rect_t clip = lui_canvas_get_clip(canvas);
+  lvg_rect_t clip = lvg_canvas_get_clip(canvas);
   int ix0 = std::max(static_cast<int>(std::floor(minx)), clip.x);
   int iy0 = std::max(static_cast<int>(std::floor(miny)), clip.y);
   int ix1 = std::min(static_cast<int>(std::ceil(maxx)),  clip.x + clip.width);
   int iy1 = std::min(static_cast<int>(std::ceil(maxy)),  clip.y + clip.height);
   if (ix0 >= ix1 || iy0 >= iy1) return;
 
-  lui_surface_t* dst = lui_canvas_get_surface(canvas);
+  lvg_surface_t* dst = lvg_canvas_get_surface(canvas);
   if (!dst || !dst->pixels) return;
 
   int sw_int = static_cast<int>(width_);
@@ -2048,7 +2048,7 @@ void Scene::compute_bbox(float* x, float* y, float* w, float* h) const {
   *h = maxy - miny;
 }
 
-void Scene::draw_on(lui_canvas_t* canvas) {
+void Scene::draw_on(lvg_canvas_t* canvas) {
   if (!canvas) return;
 
   if (soft_mask_) {
@@ -2065,19 +2065,19 @@ void Scene::draw_on(lui_canvas_t* canvas) {
       x1 = static_cast<int>(std::ceil(bx + bw));
       y1 = static_cast<int>(std::ceil(by + bh));
     } else {
-      lui_rect_t clip = lui_canvas_get_clip(canvas);
+      lvg_rect_t clip = lvg_canvas_get_clip(canvas);
       x0 = clip.x;
       y0 = clip.y;
       x1 = clip.x + clip.width;
       y1 = clip.y + clip.height;
     }
     draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
-                        [this](lui_canvas_t* c) { draw_on(c); });
+                        [this](lvg_canvas_t* c) { draw_on(c); });
     soft_mask_ = mask;
     return;
   }
   // Apply scene-level clip (bbox of clipper) the same way Shape does.
-  lui_rect_t saved_clip = lui_canvas_get_clip(canvas);
+  lvg_rect_t saved_clip = lvg_canvas_get_clip(canvas);
   bool clip_changed = false;
   if (clipper_) {
     float cx, cy, cw, ch;
@@ -2088,17 +2088,17 @@ void Scene::draw_on(lui_canvas_t* canvas) {
                       saved_clip.x + saved_clip.width);
     int y1 = std::min(static_cast<int>(std::ceil(cy + ch)),
                       saved_clip.y + saved_clip.height);
-    lui_rect_t cr;
+    lvg_rect_t cr;
     cr.x = x0;
     cr.y = y0;
     cr.width  = std::max(0, x1 - x0);
     cr.height = std::max(0, y1 - y0);
-    lui_canvas_set_clip(canvas, &cr);
+    lvg_canvas_set_clip(canvas, &cr);
     clip_changed = true;
   }
   for (Paint* p : paints_) p->draw_on(canvas);
   if (clip_changed) {
-    lui_canvas_set_clip(canvas, &saved_clip);
+    lvg_canvas_set_clip(canvas, &saved_clip);
   }
 }
 
@@ -2110,7 +2110,7 @@ SwCanvas* SwCanvas::gen() { return new SwCanvas(); }
 SwCanvas::~SwCanvas() {
   for (Paint* p : paints_) delete p;
   if (have_canvas_) {
-    lui_canvas_destroy(&canvas_);
+    lvg_canvas_destroy(&canvas_);
   }
 }
 
@@ -2120,13 +2120,13 @@ Result SwCanvas::target(uint32_t* buffer, uint32_t stride, uint32_t width,
     return Result::InvalidArguments;
   }
   if (have_canvas_) {
-    lui_canvas_destroy(&canvas_);
+    lvg_canvas_destroy(&canvas_);
     have_canvas_ = false;
   }
-  surface_ = lui_surface_wrap(buffer, static_cast<int>(width),
+  surface_ = lvg_surface_wrap(buffer, static_cast<int>(width),
                               static_cast<int>(height),
                               static_cast<int>(stride));
-  lui_canvas_init(&canvas_, &surface_);
+  lvg_canvas_init(&canvas_, &surface_);
   have_canvas_ = true;
   cs_ = cs;
   return Result::Success;
@@ -2142,12 +2142,12 @@ Result SwCanvas::draw(bool clear_first) {
   if (!have_canvas_) return Result::InsufficientCondition;
   if (clear_first) {
     // Transparent black; the caller (backend) fills its own background.
-    lui_canvas_clear(&canvas_, 0u);
+    lvg_canvas_clear(&canvas_, 0u);
   }
   for (Paint* p : paints_) p->draw_on(&canvas_);
 
   // After draw, swizzle the surface in-place if the requested colorspace
-  // expects ABGR byte order (R,G,B,A in memory) — lui_canvas writes ARGB
+  // expects ABGR byte order (R,G,B,A in memory) — lvg_canvas writes ARGB
   // (B,G,R,A in memory). PDF backends pass ABGR8888 and read pixels back
   // expecting R,G,B,A byte order; swap R and B per pixel.
   if (output_swizzle_enabled_ &&

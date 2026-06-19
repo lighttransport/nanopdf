@@ -198,16 +198,16 @@ list(APPEND NANOPDF_SOURCES src/shared-font-cache.cc)
 list(APPEND NANOPDF_SOURCES src/render-cache.cc)
 
 if(NANOPDF_USE_LIGHTVG)
-  # scene.c depends on lightui/layer.h + dirty.h (UI-side compositor); not
-  # needed for raster output, so we skip it. nanopdf only uses lui_canvas
-  # directly.
+  # scene.c/dirty.c/layer.c are the UI-side compositor (not needed for raster
+  # output) so we skip them. nanopdf only uses the lvg_canvas software path.
+  # This vendored copy tracks lightui's current lightvg (lvg_* API); it carries
+  # no logging module, so there is no lui_log.c to compile.
   list(APPEND NANOPDF_SOURCES
     src/lightvg-backend.cc
     src/lvg-compat.cc
-    src/third_party/lightui_vg/src/canvas.c
-    src/third_party/lightui_vg/src/surface.c
-    src/third_party/lightui_vg/src/backend_registry.c
-    src/third_party/lightui_vg/src/internal/lui_log.c
+    src/third_party/lightvg/src/canvas.c
+    src/third_party/lightvg/src/surface.c
+    src/third_party/lightvg/src/backend_registry.c
   )
 endif()
 
@@ -438,9 +438,9 @@ endif ()
 
 if (NANOPDF_USE_LIGHTVG)
   target_include_directories(${BUILD_TARGET} PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightui_vg/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightui_vg/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightui_vg/src/internal
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightvg/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightvg/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/lightvg/src/internal
   )
   target_compile_definitions(${BUILD_TARGET} PUBLIC "NANOPDF_USE_LIGHTVG")
 endif ()

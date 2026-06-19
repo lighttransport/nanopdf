@@ -19,8 +19,8 @@ include_directories(${NANOPDF_ROOT}/src/third_party)
 option(USE_LIGHTVG "Enable lightui VG software backend (default)" ON)
 if(USE_LIGHTVG)
   add_compile_definitions(NANOPDF_USE_LIGHTVG)
-  include_directories(${NANOPDF_ROOT}/src/third_party/lightui_vg/include
-                      ${NANOPDF_ROOT}/src/third_party/lightui_vg/src)
+  include_directories(${NANOPDF_ROOT}/src/third_party/lightvg/include
+                      ${NANOPDF_ROOT}/src/third_party/lightvg/src)
 endif()
 
 # Find ThorVG if enabled. LightVG is the default rasterize backend; ThorVG is
