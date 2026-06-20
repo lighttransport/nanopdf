@@ -2292,6 +2292,7 @@ struct PdfWriter::Impl {
   int existing_page_count = 0;            // Number of pages in existing PDF
   int existing_pages_obj = 0;             // Pages object from existing PDF
   std::vector<int> existing_page_objs;    // Page objects from existing PDF
+  bool existing_encrypted = false;        // Existing PDF has an /Encrypt dict
 
   // Object tracking
   int next_obj_id = 1;
@@ -3548,11 +3549,16 @@ bool PdfWriter::load_existing(const std::vector<uint8_t>& data, std::string* err
     return false;
   }
 
-  // Find and parse trailer
+  // Find and parse trailer. Classic xref tables are followed by a "trailer"
+  // keyword; PDF 1.5+ cross-reference STREAMS have no trailer keyword — their
+  // trailer dictionary (Root/Info/Size/ID/Prev) is the xref-stream object's own
+  // dictionary at xref_offset. parse_trailer() locates the next "<<", so for an
+  // xref stream we point it at the object start.
   size_t trailer_pos = find_keyword(data, xref_offset, "trailer");
+  bool is_xref_stream = false;
   if (trailer_pos == std::string::npos) {
-    if (error) *error = "Could not find trailer";
-    return false;
+    trailer_pos = xref_offset;  // parse the xref-stream object's dictionary
+    is_xref_stream = true;
   }
 
   int root_obj = 0, root_gen = 0;
@@ -3561,9 +3567,39 @@ bool PdfWriter::load_existing(const std::vector<uint8_t>& data, std::string* err
   std::vector<uint8_t> id1, id2;
 
   if (!parse_trailer(data, trailer_pos, root_obj, root_gen, info_obj, info_gen,
-                     size_value, id1, id2)) {
-    if (error) *error = "Failed to parse trailer";
+                     size_value, id1, id2) ||
+      root_obj == 0) {
+    if (error)
+      *error = is_xref_stream ? "Could not parse xref-stream trailer dictionary"
+                              : "Failed to parse trailer";
     return false;
+  }
+
+  // Detect encryption: the trailer (classic or xref-stream) dictionary holds
+  // an /Encrypt reference. Incremental updates of encrypted PDFs require
+  // re-encrypting new objects and carrying /Encrypt forward, which is not yet
+  // implemented — write_incremental_* will reject such documents to avoid
+  // producing a file whose existing content can no longer be decrypted.
+  {
+    size_t d0 = find_keyword(data, trailer_pos, "<<");
+    if (d0 != std::string::npos) {
+      // Find the matching ">>" honoring nested dictionaries (/DecodeParms etc.).
+      int depth = 0;
+      size_t p = d0, end = std::string::npos;
+      while (p + 1 < data.size()) {
+        if (data[p] == '<' && data[p + 1] == '<') { depth++; p += 2; }
+        else if (data[p] == '>' && data[p + 1] == '>') {
+          depth--; p += 2;
+          if (depth == 0) { end = p; break; }
+        } else { ++p; }
+      }
+      if (end != std::string::npos) {
+        std::string dict(reinterpret_cast<const char*>(data.data()) + d0,
+                         end - d0);
+        if (dict.find("/Encrypt") != std::string::npos)
+          impl_->existing_encrypted = true;
+      }
+    }
   }
 
   // Store existing PDF data and metadata
@@ -3629,6 +3665,14 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
   if (!impl_->has_existing) {
     result.success = false;
     result.error = "No existing PDF loaded - use load_existing() first";
+    return result;
+  }
+
+  if (impl_->existing_encrypted) {
+    result.success = false;
+    result.error =
+        "incremental update of encrypted PDFs is not yet supported "
+        "(new objects would need re-encryption with the document key)";
     return result;
   }
 
