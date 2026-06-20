@@ -159,13 +159,21 @@ SHA-256 to a public OpenTimestamps calendar and writes a detached `.ots` proof
 (upgrade/verify later with the `ots` tool); also available as the MCP
 `pdf_opentimestamp` tool. Signatures verify with external
 tools (e.g. poppler `pdfsig`). An agent can drive signing via the MCP `pdf_sign`
-tool. Note: signing requires nanopdf's writer to load the input; PDFs that use
-cross-reference streams are not yet loadable for incremental update.
+tool.
 
-The **Info panel** (`i`) cryptographically verifies each signature via OpenSSL —
-showing VALID/INVALID, whether it covers the whole document, the signer, digest,
-signing time, and any embedded RFC 3161 timestamp (time + TSA) — rather than the
-digest-only integrity check.
+The **Info panel** (`i`) cryptographically verifies each signature (VALID/INVALID,
+whether it covers the whole document, signer, digest, signing time, and any
+embedded RFC 3161 timestamp + TSA).
+
+#### OpenSSL is optional
+The signing/verification crypto lives in libnanopdf as pure C++
+(`crypto-pk` bignum+RSA, `asn1-der`, `cms`, `rfc3161`, `pkcs12`, PBKDF2/PBES2):
+PEM and PKCS#12 signing (incl. encrypted PEM keys), **http** RFC 3161 timestamps,
+and verification all work with **no OpenSSL**. OpenSSL is only needed for **https**
+TSAs (TLS) and OpenTimestamps calendars. Build OpenSSL-free with
+`-DPDFVIEW_USE_OPENSSL=OFF` (or when OpenSSL isn't found); in that build, https
+TSAs and `--ots` report a clear "requires OpenSSL" error while everything else
+works. Signing requires nanopdf's writer to load the input.
 
 ### HiDPI / display scaling
 The viewer renders to a physical-resolution surface and scales all chrome (metrics,

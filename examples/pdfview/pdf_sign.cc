@@ -3,6 +3,14 @@
 
 #include "pdf_sign.hh"
 
+// OpenSSL is optional: it is only needed for https TSAs (TLS) and the legacy
+// signing path. Without it, the pure-C++ stack still handles PEM/PKCS#12
+// signing, http timestamps, and verification.
+#ifndef PDFVIEW_HAVE_OPENSSL
+#define PDFVIEW_HAVE_OPENSSL 0
+#endif
+
+#if PDFVIEW_HAVE_OPENSSL
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/err.h>
@@ -16,6 +24,7 @@
 #include <openssl/ts.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#endif
 
 #include <netdb.h>
 #include <sys/socket.h>
@@ -42,6 +51,7 @@ namespace pdfview {
 
 namespace {
 
+#if PDFVIEW_HAVE_OPENSSL
 std::string ossl_err() {
   unsigned long e = ERR_get_error();
   if (!e) return "unknown OpenSSL error";
@@ -298,6 +308,7 @@ std::vector<uint8_t> build_cms(const std::vector<uint8_t>& data,
   }
   return der;
 }
+#endif  // PDFVIEW_HAVE_OPENSSL
 
 // --- native (OpenSSL-free) signing path -------------------------------------
 
@@ -537,8 +548,10 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
   std::vector<uint8_t> nsigner;
   std::vector<std::vector<uint8_t>> nchain;
   std::string ntime;
-  // OpenSSL credentials (p12 / encrypted key / timestamp path).
+#if PDFVIEW_HAVE_OPENSSL
+  // OpenSSL credentials (legacy path: https timestamp).
   Credentials cred;
+#endif
 
   if (native) {
     std::vector<std::vector<uint8_t>> certs;
@@ -575,6 +588,7 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
     ntime = utc_now();
     std::fprintf(stderr, "pdf_sign: signing with native (OpenSSL-free) CMS\n");
   } else {
+#if PDFVIEW_HAVE_OPENSSL
     std::string err;
     if (!load_credentials(opt, &cred, &err)) {
       sr.error = err;
@@ -584,6 +598,12 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
     char cn[256] = {0};
     if (X509_NAME_get_text_by_NID(nm, NID_commonName, cn, sizeof(cn)) > 0)
       sr.signer_name = cn;
+#else
+    sr.error =
+        "this build has no OpenSSL: https TSAs require an http TSA preset or a "
+        "build with -DPDFVIEW_USE_OPENSSL=ON";
+    return sr;
+#endif
   }
 
   nanopdf::PdfWriter writer;
@@ -628,7 +648,11 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
     if (native)
       return nanopdf::cms::build_signed_data(data, nsigner, nchain, nkey, ntime,
                                              native_tsa);
+#if PDFVIEW_HAVE_OPENSSL
     return build_cms(data, cred, opt, &sr);
+#else
+    return {};
+#endif
   };
   nanopdf::WriteResult ar = nanopdf::apply_signature(bytes, phs[0], cb);
   if (!ar.success) {
@@ -641,7 +665,9 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
 }
 
 // --- OpenTimestamps ---------------------------------------------------------
+// OTS calendar servers are https-only, so this path needs TLS (OpenSSL).
 
+#if PDFVIEW_HAVE_OPENSSL
 namespace {
 
 // Minimal HTTP POST of a binary body via OSSL_HTTP (http + https). Returns the
@@ -739,6 +765,15 @@ std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
   ots.insert(ots.end(), cal.begin(), cal.end());
   return ots;
 }
+#else   // !PDFVIEW_HAVE_OPENSSL
+std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>&,
+                                          std::string* errp) {
+  if (errp)
+    *errp = "OpenTimestamps requires OpenSSL (https calendar TLS); build with "
+            "-DPDFVIEW_USE_OPENSSL=ON";
+  return {};
+}
+#endif  // PDFVIEW_HAVE_OPENSSL
 
 // --- verification (pure C++, no OpenSSL) ------------------------------------
 

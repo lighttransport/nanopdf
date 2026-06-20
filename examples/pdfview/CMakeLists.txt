@@ -75,9 +75,25 @@ add_executable(pdfview
   ${LIGHTUI_SOURCES}
 )
 
-# OpenSSL: digital signatures (PKCS#7/CMS) + RFC 3161 timestamps.
-find_package(OpenSSL REQUIRED)
-target_link_libraries(pdfview PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+# OpenSSL is OPTIONAL. The pure-C++ stack in libnanopdf (crypto-pk/asn1-der/cms/
+# rfc3161/pkcs12) signs, http-timestamps and verifies with no OpenSSL; OpenSSL is
+# only needed for https TSAs (TLS) and the legacy signing path. Disable with
+# -DPDFVIEW_USE_OPENSSL=OFF for an OpenSSL-free build.
+option(PDFVIEW_USE_OPENSSL "Link OpenSSL for https TSAs / legacy signing" ON)
+if(PDFVIEW_USE_OPENSSL)
+  find_package(OpenSSL)
+  if(OpenSSL_FOUND)
+    target_link_libraries(pdfview PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(pdfview PRIVATE PDFVIEW_HAVE_OPENSSL=1)
+    message(STATUS "pdfview: OpenSSL enabled (https TSAs available)")
+  else()
+    message(STATUS "pdfview: OpenSSL not found; building OpenSSL-free "
+                   "(http TSAs only)")
+  endif()
+else()
+  message(STATUS "pdfview: OpenSSL disabled; building OpenSSL-free "
+                 "(http TSAs only)")
+endif()
 if(NFD_SOURCES)
   set_source_files_properties(${NFD_SOURCES} PROPERTIES
     COMPILE_DEFINITIONS "${NFD_DEFINES}"
