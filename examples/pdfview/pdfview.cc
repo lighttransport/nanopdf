@@ -135,6 +135,10 @@ struct Viewer {
   int mouse_x = 0;         // last cursor position in physical px
   int mouse_y = 0;
 
+  // Go-to-page input.
+  bool goto_active = false;
+  std::string goto_buf;
+
   // Search.
   bool search_active = false;   // typing in the search box
   std::string query;
@@ -906,7 +910,12 @@ void draw(Viewer& v, lvg_surface_t* surf) {
   if (v.font) {
     int lh = lui_font_line_height(v.font);
     int ty = (kToolbarH - lh) / 2;
-    if (!v.toast.empty()) {
+    if (v.goto_active) {
+      char gb[96];
+      std::snprintf(gb, sizeof(gb), "Go to page: %s_   (1-%d)",
+                    v.goto_buf.c_str(), v.doc.page_count());
+      lui_canvas_draw_text(&c, 14, ty, gb, (int)std::strlen(gb), v.font, kAccent);
+    } else if (!v.toast.empty()) {
       lui_canvas_draw_text(&c, 14, ty, v.toast.c_str(), (int)v.toast.size(),
                            v.font, kAccent);
     } else if (v.search_active || !v.query.empty()) {
@@ -1987,6 +1996,21 @@ int main(int argc, char** argv) {
             viewer.toast.clear();
             dirty = true;
           }
+          if (viewer.goto_active) {
+            if (k == LUI_KEY_ESCAPE) {
+              viewer.goto_active = false;
+              viewer.goto_buf.clear();
+            } else if (k == LUI_KEY_RETURN) {
+              if (!viewer.goto_buf.empty())
+                go_to_page(viewer, std::atoi(viewer.goto_buf.c_str()) - 1);
+              viewer.goto_active = false;
+              viewer.goto_buf.clear();
+            } else if (k == LUI_KEY_BACKSPACE && !viewer.goto_buf.empty()) {
+              viewer.goto_buf.pop_back();
+            }
+            dirty = true;
+            break;  // consume keys while the goto box is focused
+          }
           if (viewer.search_active) {
             // While typing a query, keys edit/commit the search.
             if (k == LUI_KEY_ESCAPE) {
@@ -2060,6 +2084,13 @@ int main(int argc, char** argv) {
             viewer.toast.clear();
             dirty = true;
           }
+          if (viewer.goto_active) {
+            if (ch >= '0' && ch <= '9' && viewer.goto_buf.size() < 7) {
+              viewer.goto_buf += ch;
+              dirty = true;
+            }
+            break;
+          }
           if (viewer.search_active) {
             if ((unsigned char)ch >= 0x20) {  // printable (incl. UTF-8 lead)
               viewer.query += event.data.text.text;
@@ -2067,7 +2098,11 @@ int main(int argc, char** argv) {
             }
             break;
           }
-          if (ch == '/') {
+          if (ch == 'p' || ch == 'P') {
+            viewer.goto_active = true;
+            viewer.goto_buf.clear();
+            dirty = true;
+          } else if (ch == '/') {
             viewer.search_active = true;
             viewer.query.clear();
             viewer.match_page = -1;

@@ -89,6 +89,7 @@ different file.
 | `←` / `PgUp` / `k` | Previous page | `0` / `f` / `1` | Fit width / fit page / 100% |
 | `→` / `PgDn` / `j` | Next page | `b` | Toggle sidebar |
 | `Home` / `End` | First / last page | `t` | Sidebar → thumbnails (Pages) |
+| `p` then digits, `Enter` | Go to page number | | |
 | `↑` / `↓` / wheel | Scroll | `/` then type, `Enter` | Search; `n`/`N` next/prev |
 | drag on page | Select text (`Ctrl+C` to copy) | `i` | Info / signatures / forms panel |
 | click outline / thumbnail | Jump to page | `r` | Revisions panel; `d` cycles After/Before/Diff |
