@@ -153,9 +153,11 @@ set(NANOPDF_SOURCES
   src/canvas-exporter.cc
   src/crypto.cc
   src/crypto-pk.cc
+  src/ecc.cc
   src/tls-crypto.cc
   src/asn1-der.cc
   src/cms.cc
+  src/x509.cc
   src/pkcs12.cc
   src/rfc3161.cc
   src/pdf-security.cc

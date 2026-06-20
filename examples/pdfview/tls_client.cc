@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 - Present, Light Transport Entertainment Inc.
 //
-// Minimal TLS 1.3 client (TLS_AES_128_GCM_SHA256, X25519). Encryption only —
-// the server certificate is not validated. See tls_client.hh.
+// Minimal TLS 1.3 client (TLS_AES_128_GCM_SHA256, X25519). The server
+// certificate chain IS validated by default (CertificateVerify signature +
+// chain to a system trust anchor + validity + hostname); see tls_client.hh.
 
 #include "tls_client.hh"
 
@@ -11,10 +12,12 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <ctime>
 #include <random>
 
 #include "crypto.hh"
 #include "tls-crypto.hh"
+#include "x509.hh"
 
 namespace pdfview {
 
@@ -208,8 +211,9 @@ Bytes build_client_hello(const std::string& host, const uint8_t client_random[32
   { put16(ext, 10); put16(ext, 4); put16(ext, 2); put16(ext, 0x001d); }
   // signature_algorithms (13)
   {
-    static const uint16_t algs[] = {0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
-                                    0x0601, 0x0403, 0x0503, 0x0603};
+    // Only schemes we can verify: RSA-PSS (SHA-256/384/512) and ECDSA on
+    // P-256/P-384. (No P-521 / EdDSA / legacy PKCS#1-for-CertVerify.)
+    static const uint16_t algs[] = {0x0804, 0x0805, 0x0806, 0x0403, 0x0503};
     Bytes sa;
     put16(sa, (uint16_t)(sizeof(algs)));
     for (uint16_t a : algs) put16(sa, a);
@@ -277,6 +281,44 @@ bool parse_server_hello(const Bytes& sh, uint8_t server_pub[32],
   return false;
 }
 
+// Parse a TLS 1.3 Certificate message body into the DER certificate list.
+// body = certificate_request_context<1> || certificate_list<3>, each entry =
+// cert_data<3> || extensions<2>.
+bool parse_certificate_msg(const Bytes& body,
+                           std::vector<std::vector<uint8_t>>* certs) {
+  size_t i = 0;
+  if (i >= body.size()) return false;
+  size_t ctx_len = body[i++];
+  i += ctx_len;
+  if (i + 3 > body.size()) return false;
+  size_t list_len = (body[i] << 16) | (body[i + 1] << 8) | body[i + 2];
+  i += 3;
+  size_t list_end = i + list_len;
+  if (list_end > body.size()) return false;
+  while (i + 3 <= list_end) {
+    size_t clen = (body[i] << 16) | (body[i + 1] << 8) | body[i + 2];
+    i += 3;
+    if (i + clen > list_end) return false;
+    certs->emplace_back(body.begin() + i, body.begin() + i + clen);
+    i += clen;
+    if (i + 2 > list_end) return false;
+    size_t elen = (body[i] << 8) | body[i + 1];
+    i += 2 + elen;
+  }
+  return !certs->empty();
+}
+
+// Parse a CertificateVerify body: SignatureScheme(2) || signature<2>.
+bool parse_certificate_verify(const Bytes& body, uint16_t* scheme,
+                             Bytes* sig) {
+  if (body.size() < 4) return false;
+  *scheme = (body[0] << 8) | body[1];
+  size_t slen = (body[2] << 8) | body[3];
+  if (4 + slen > body.size()) return false;
+  sig->assign(body.begin() + 4, body.begin() + 4 + slen);
+  return true;
+}
+
 }  // namespace
 
 std::vector<uint8_t> tls_https_post(const std::string& host,
@@ -285,7 +327,7 @@ std::vector<uint8_t> tls_https_post(const std::string& host,
                                     const std::string& content_type,
                                     const std::string& accept,
                                     const std::vector<uint8_t>& body,
-                                    std::string* err) {
+                                    std::string* err, bool verify_cert) {
   std::vector<uint8_t> result;
 
   // ---- TCP connect ----
@@ -348,12 +390,76 @@ std::vector<uint8_t> tls_https_post(const std::string& host,
   Bytes master = hkdf_extract(derived2, zero32);
 
   // ---- read encrypted handshake flight until server Finished ----
+  // Capture Certificate + CertificateVerify for chain validation. The
+  // CertificateVerify signs the transcript hash through the Certificate message.
+  std::vector<std::vector<uint8_t>> cert_ders;
+  Bytes th_through_cert, cv_sig;
+  uint16_t cv_scheme = 0;
+  bool have_cert = false, have_cv = false;
   for (;;) {
     Bytes body_msg;
     if (!c.next_handshake(&htype, &body_msg, err)) { close(c.fd); return result; }
     if (htype == 20) break;  // server Finished (transcript already updated)
-    // 8=EncryptedExtensions, 11=Certificate, 15=CertificateVerify: ignore
-    // (no certificate validation).
+    if (htype == 11) {       // Certificate
+      if (!parse_certificate_msg(body_msg, &cert_ders)) {
+        *err = "malformed Certificate message";
+        close(c.fd);
+        return result;
+      }
+      th_through_cert = sha256(c.transcript);  // CH..Certificate
+      have_cert = true;
+    } else if (htype == 15) {  // CertificateVerify
+      if (!parse_certificate_verify(body_msg, &cv_scheme, &cv_sig)) {
+        *err = "malformed CertificateVerify message";
+        close(c.fd);
+        return result;
+      }
+      have_cv = true;
+    }
+    // 8=EncryptedExtensions ignored.
+  }
+
+  // ---- certificate chain validation ----
+  if (verify_cert) {
+    if (!have_cert || !have_cv) {
+      *err = "server did not present a certificate";
+      close(c.fd);
+      return result;
+    }
+    // 1) CertificateVerify: the server signs
+    //    (0x20 * 64) || "TLS 1.3, server CertificateVerify" || 0x00 || THash.
+    Bytes signed_content(64, 0x20);
+    static const char kCtx[] = "TLS 1.3, server CertificateVerify";
+    signed_content.insert(signed_content.end(), kCtx, kCtx + sizeof(kCtx) - 1);
+    signed_content.push_back(0x00);
+    signed_content.insert(signed_content.end(), th_through_cert.begin(),
+                          th_through_cert.end());
+    nanopdf::x509::Certificate leaf =
+        nanopdf::x509::parse(cert_ders[0].data(), cert_ders[0].size());
+    if (!leaf.parsed ||
+        !nanopdf::x509::verify_tls13_signature(
+            leaf, cv_scheme, signed_content.data(), signed_content.size(),
+            cv_sig.data(), cv_sig.size())) {
+      *err = "CertificateVerify signature is invalid";
+      close(c.fd);
+      return result;
+    }
+    // 2) Chain to a system trust anchor + validity + hostname.
+    static nanopdf::x509::TrustStore g_store =
+        nanopdf::x509::load_trust_store("");
+    if (!g_store.loaded) {
+      *err = "no system trust store found (set verify_cert=false to bypass)";
+      close(c.fd);
+      return result;
+    }
+    int64_t now = (int64_t)std::time(nullptr);
+    nanopdf::x509::VerifyResult vr =
+        nanopdf::x509::verify_chain(cert_ders, g_store, host, now);
+    if (!vr.ok) {
+      *err = "certificate chain validation failed: " + vr.error;
+      close(c.fd);
+      return result;
+    }
   }
 
   // ---- application traffic secrets (transcript = CH..server Finished) ----

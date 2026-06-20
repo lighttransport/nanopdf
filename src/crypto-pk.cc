@@ -463,5 +463,88 @@ bool rsa_verify_pkcs1v15(const RsaPublicKey& key, const uint8_t* sig,
          std::memcmp(em.data(), exp.data(), k) == 0;
 }
 
+namespace {
+
+// Hash @data with the algorithm selected by digest length (32/48/64).
+bool hash_by_len(const uint8_t* data, size_t len, size_t hlen, uint8_t* out) {
+  if (hlen == 32) { SHA256::hash(data, len, out); return true; }
+  if (hlen == 48) { SHA384::hash(data, len, out); return true; }
+  if (hlen == 64) { SHA512::hash(data, len, out); return true; }
+  return false;
+}
+
+// MGF1 mask generation function (RFC 8017 B.2.1) with the hlen-selected hash.
+std::vector<uint8_t> mgf1(const uint8_t* seed, size_t seed_len, size_t mask_len,
+                          size_t hlen) {
+  std::vector<uint8_t> mask;
+  mask.reserve(mask_len);
+  std::vector<uint8_t> buf(seed_len + 4);
+  std::memcpy(buf.data(), seed, seed_len);
+  uint8_t digest[64];
+  for (uint32_t counter = 0; mask.size() < mask_len; ++counter) {
+    buf[seed_len + 0] = (uint8_t)(counter >> 24);
+    buf[seed_len + 1] = (uint8_t)(counter >> 16);
+    buf[seed_len + 2] = (uint8_t)(counter >> 8);
+    buf[seed_len + 3] = (uint8_t)(counter);
+    hash_by_len(buf.data(), buf.size(), hlen, digest);
+    size_t take = std::min(hlen, mask_len - mask.size());
+    mask.insert(mask.end(), digest, digest + take);
+  }
+  return mask;
+}
+
+}  // namespace
+
+bool rsa_verify_pss(const RsaPublicKey& key, const uint8_t* sig, size_t sig_len,
+                    const uint8_t* mhash, size_t hlen) {
+  if (!key.valid || sig_len != key.modulus_bytes) return false;
+  if (hlen != 32 && hlen != 48 && hlen != 64) return false;
+
+  // RSA public op -> the encoded message EM (emLen = ceil((modBits-1)/8)).
+  size_t mod_bits = key.n.bit_length();
+  if (mod_bits == 0) return false;
+  size_t em_bits = mod_bits - 1;
+  size_t em_len = (em_bits + 7) / 8;
+  if (em_len < hlen + 2) return false;
+
+  BigInt s = BigInt::from_bytes(sig, sig_len);
+  if (BigInt::cmp(s, key.n) >= 0) return false;
+  BigInt m = BigInt::modexp(s, key.e, key.n);
+  std::vector<uint8_t> em = m.to_bytes(em_len);
+
+  // EM = maskedDB || H || 0xbc
+  if (em.back() != 0xbc) return false;
+  size_t db_len = em_len - hlen - 1;
+  const uint8_t* masked_db = em.data();
+  const uint8_t* H = em.data() + db_len;
+
+  // The leftmost (8*emLen - emBits) bits of maskedDB must be zero.
+  size_t zero_bits = 8 * em_len - em_bits;
+  if (zero_bits && (masked_db[0] & (uint8_t)~(0xFFu >> zero_bits))) return false;
+
+  // DB = maskedDB XOR MGF1(H, db_len)
+  std::vector<uint8_t> db_mask = mgf1(H, hlen, db_len, hlen);
+  std::vector<uint8_t> db(db_len);
+  for (size_t i = 0; i < db_len; ++i) db[i] = masked_db[i] ^ db_mask[i];
+  // Clear the leftmost zero_bits of DB[0].
+  if (zero_bits) db[0] &= (uint8_t)(0xFF >> zero_bits);
+
+  // DB = PS(0x00..) || 0x01 || salt -- find the 0x01 separator (auto salt len).
+  size_t i = 0;
+  while (i < db_len && db[i] == 0x00) ++i;
+  if (i == db_len || db[i] != 0x01) return false;
+  ++i;
+  const uint8_t* salt = db.data() + i;
+  size_t salt_len = db_len - i;
+
+  // M' = (0x00 * 8) || mHash || salt ; H' = Hash(M') ; compare to H.
+  std::vector<uint8_t> mprime(8, 0x00);
+  mprime.insert(mprime.end(), mhash, mhash + hlen);
+  mprime.insert(mprime.end(), salt, salt + salt_len);
+  uint8_t hprime[64];
+  if (!hash_by_len(mprime.data(), mprime.size(), hlen, hprime)) return false;
+  return std::memcmp(hprime, H, hlen) == 0;
+}
+
 }  // namespace crypto
 }  // namespace nanopdf

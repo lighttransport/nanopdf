@@ -106,6 +106,15 @@ bool rsa_verify_pkcs1v15(const RsaPublicKey& key, const uint8_t* sig,
                          size_t sig_len, const uint8_t* digest_info,
                          size_t digest_info_len);
 
+// Verify an RSASSA-PSS signature (EMSA-PSS-VERIFY with MGF1). @mhash is the
+// already-computed message hash of length @hlen; @hlen selects both the message
+// hash and the MGF1/H' hash (32 -> SHA-256, 48 -> SHA-384, 64 -> SHA-512). The
+// salt length is auto-detected from the encoded message, so this accepts the
+// TLS 1.3 rsa_pss_rsae_* schemes (salt == hash length) and PSS X.509 signatures
+// with any salt length.
+bool rsa_verify_pss(const RsaPublicKey& key, const uint8_t* sig, size_t sig_len,
+                    const uint8_t* mhash, size_t hlen);
+
 }  // namespace crypto
 }  // namespace nanopdf
 
