@@ -62,6 +62,12 @@ void lui_window_set_title(lui_window_t *window, const char *title)
         lui_platform_ops.window_set_title(window, title);
 }
 
+void lui_window_set_clipboard_text(lui_window_t *window, const char *utf8)
+{
+    if (window && lui_platform_ops.window_set_clipboard_text)
+        lui_platform_ops.window_set_clipboard_text(window, utf8);
+}
+
 void lui_window_get_size(const lui_window_t *window, int *width, int *height)
 {
     if (window)

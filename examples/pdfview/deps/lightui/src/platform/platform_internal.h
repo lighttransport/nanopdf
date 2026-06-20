@@ -46,6 +46,9 @@ typedef struct {
     void          (*window_show)(lui_window_t *win);
     void          (*window_hide)(lui_window_t *win);
     void          (*window_set_title)(lui_window_t *win, const char *title);
+    /** Optional: take ownership of the system clipboard with @utf8 text. */
+    void          (*window_set_clipboard_text)(lui_window_t *win,
+                                               const char *utf8);
     void          (*window_get_size)(const lui_window_t *win,
                                       int *w, int *h);
     void          (*window_get_physical_size)(const lui_window_t *win,

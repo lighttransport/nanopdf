@@ -60,6 +60,13 @@ void lui_window_hide(lui_window_t *window);
 void lui_window_set_title(lui_window_t *window, const char *title);
 
 /**
+ * Copy UTF-8 text to the system clipboard (the window takes ownership of the
+ * CLIPBOARD selection and serves it to other apps on paste). Pass NULL/empty
+ * to relinquish ownership. No-op on backends without clipboard support.
+ */
+void lui_window_set_clipboard_text(lui_window_t *window, const char *utf8);
+
+/**
  * Query the logical content-area size (in logical pixels, not physical
  * backing-store pixels).
  */

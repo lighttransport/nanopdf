@@ -1805,6 +1805,17 @@ int main(int argc, char** argv) {
             dirty = true;
             break;  // consume all keys while the search box is focused
           }
+          // Ctrl+C: copy the current text selection to the system clipboard.
+          if ((event.data.key.mods & LUI_MOD_CTRL) && (k == 'c' || k == 'C')) {
+            if (!viewer.sel_text.empty()) {
+              lui_window_set_clipboard_text(win, viewer.sel_text.c_str());
+              viewer.toast = "Copied " +
+                             std::to_string(utf8_char_count(viewer.sel_text)) +
+                             " chars to clipboard";
+              dirty = true;
+            }
+            break;
+          }
           if (k == LUI_KEY_ESCAPE) {
             // Clear search/selection first; quit only when nothing to clear.
             if (!viewer.query.empty() || viewer.sel_page >= 0) {
@@ -2086,8 +2097,12 @@ int main(int argc, char** argv) {
             viewer.sel_quads.clear();
             for (const auto& seg : sel.segments)
               viewer.sel_quads.push_back(seg.quad);
-            if (!sel.text.empty())
+            if (!sel.text.empty()) {
               std::printf("pdfview: selected: %s\n", sel.text.c_str());
+              viewer.toast = "Selected " +
+                             std::to_string(utf8_char_count(sel.text)) +
+                             " chars  ·  Ctrl+C to copy";
+            }
           }
           dirty = true;
           break;

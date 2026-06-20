@@ -46,6 +46,10 @@ typedef struct {
     Atom          xdnd_type;     /* negotiated data type (uri-list) or None */
     int           xdnd_version;  /* source's XDND protocol version          */
 
+    /* Clipboard (CLIPBOARD selection ownership) */
+    Atom          clipboard, utf8_string, targets_atom;
+    char         *clipboard_text;  /* owned copy served on SelectionRequest  */
+
     /* Previous mouse position for delta computation */
     int           last_mouse_x;
     int           last_mouse_y;
@@ -353,6 +357,48 @@ static bool x11_translate_event(lui_window_x11_t *xw,
         }
         return false;
 
+    case SelectionRequest: {
+        /* Serve the CLIPBOARD selection we own (set via set_clipboard_text). */
+        const XSelectionRequestEvent *rq = &xe->xselectionrequest;
+        XEvent note;
+        memset(&note, 0, sizeof(note));
+        note.xselection.type      = SelectionNotify;
+        note.xselection.display   = xw->display;
+        note.xselection.requestor = rq->requestor;
+        note.xselection.selection = rq->selection;
+        note.xselection.target    = rq->target;
+        note.xselection.property  = None;  /* None = refused, unless filled in */
+        note.xselection.time      = rq->time;
+        if (xw->clipboard_text && rq->selection == xw->clipboard) {
+            Atom prop = rq->property ? rq->property : rq->target;
+            if (rq->target == xw->targets_atom) {
+                Atom targets[3] = { xw->targets_atom, xw->utf8_string,
+                                    XA_STRING };
+                XChangeProperty(xw->display, rq->requestor, prop, XA_ATOM, 32,
+                                PropModeReplace, (unsigned char *)targets, 3);
+                note.xselection.property = prop;
+            } else if (rq->target == xw->utf8_string ||
+                       rq->target == XA_STRING) {
+                XChangeProperty(xw->display, rq->requestor, prop, rq->target, 8,
+                                PropModeReplace,
+                                (const unsigned char *)xw->clipboard_text,
+                                (int)strlen(xw->clipboard_text));
+                note.xselection.property = prop;
+            }
+        }
+        XSendEvent(xw->display, rq->requestor, False, 0, &note);
+        XFlush(xw->display);
+        return false;
+    }
+
+    case SelectionClear:
+        /* Lost CLIPBOARD ownership (another app copied something). */
+        if (xe->xselectionclear.selection == xw->clipboard) {
+            free(xw->clipboard_text);
+            xw->clipboard_text = NULL;
+        }
+        return false;
+
     case Expose:
         if (xe->xexpose.count == 0) {
             out->type = LUI_EVENT_WINDOW_EXPOSE;
@@ -649,6 +695,12 @@ static lui_window_t *x11_window_create(const char *title,
                         PropModeReplace, (const unsigned char *)&version, 1);
     }
 
+    /* Clipboard atoms */
+    xw->clipboard    = XInternAtom(g_display, "CLIPBOARD", False);
+    xw->utf8_string  = XInternAtom(g_display, "UTF8_STRING", False);
+    xw->targets_atom = XInternAtom(g_display, "TARGETS", False);
+    xw->clipboard_text = NULL;
+
     /* GC */
     xw->gc = XCreateGC(g_display, xw->xwindow, 0, NULL);
 
@@ -682,6 +734,7 @@ static void x11_window_destroy(lui_window_t *win)
     free(xw->base.surface.pixels);
     xw->base.surface.pixels = NULL;
 
+    free(xw->clipboard_text);
     if (xw->gc)      XFreeGC(xw->display, xw->gc);
     if (xw->xwindow) XDestroyWindow(xw->display, xw->xwindow);
     XFlush(xw->display);
@@ -706,6 +759,22 @@ static void x11_window_set_title(lui_window_t *win, const char *title)
 {
     lui_window_x11_t *xw = (lui_window_x11_t *)win;
     XStoreName(xw->display, xw->xwindow, title ? title : "");
+    XFlush(xw->display);
+}
+
+static void x11_window_set_clipboard_text(lui_window_t *win, const char *utf8)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    free(xw->clipboard_text);
+    xw->clipboard_text = NULL;
+    if (utf8 && *utf8) {
+        size_t n = strlen(utf8);
+        xw->clipboard_text = (char *)malloc(n + 1);
+        if (xw->clipboard_text) memcpy(xw->clipboard_text, utf8, n + 1);
+    }
+    /* Own the CLIPBOARD selection so other apps fetch our text on paste. */
+    XSetSelectionOwner(xw->display, xw->clipboard,
+                       xw->clipboard_text ? xw->xwindow : None, CurrentTime);
     XFlush(xw->display);
 }
 
@@ -824,6 +893,7 @@ const lui_platform_ops_t lui_platform_ops = {
     .window_show             = x11_window_show,
     .window_hide             = x11_window_hide,
     .window_set_title        = x11_window_set_title,
+    .window_set_clipboard_text = x11_window_set_clipboard_text,
     .window_get_size         = x11_window_get_size,
     .window_get_physical_size = x11_window_get_physical_size,
     .window_get_surface      = x11_window_get_surface,

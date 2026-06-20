@@ -90,7 +90,7 @@ different file.
 | `→` / `PgDn` / `j` | Next page | `b` | Toggle sidebar |
 | `Home` / `End` | First / last page | `t` | Sidebar → thumbnails (Pages) |
 | `↑` / `↓` / wheel | Scroll | `/` then type, `Enter` | Search; `n`/`N` next/prev |
-| drag on page | Select text (copies to stdout) | `i` | Info / signatures / forms panel |
+| drag on page | Select text (`Ctrl+C` to copy) | `i` | Info / signatures / forms panel |
 | click outline / thumbnail | Jump to page | `r` | Revisions panel; `d` cycles After/Before/Diff |
 | `g` | Toggle **debug** mode | drag (debug) | Inspect region → PDF objects |
 | `s` | Save screenshot (PNG) of the frame | `Esc` | Clear search/selection, else quit |

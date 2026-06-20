@@ -49,6 +49,7 @@ typedef struct lui_x11_loader_s {
                                  unsigned long *, unsigned char **);
     int    (*XConvertSelection)(Display *, Atom, Atom, Atom, Window, Time);
     Status (*XSendEvent)(Display *, Window, Bool, long, XEvent *);
+    int    (*XSetSelectionOwner)(Display *, Atom, Window, Time);
 
     XSizeHints *(*XAllocSizeHints)(void);
     int         (*XSetWMNormalHints)(Display *, Window, XSizeHints *);
@@ -127,6 +128,7 @@ static int lui_x11_load(lui_x11_loader_t *x11)
     LUI_X11_LOAD_SYM(x11, XGetWindowProperty);
     LUI_X11_LOAD_SYM(x11, XConvertSelection);
     LUI_X11_LOAD_SYM(x11, XSendEvent);
+    LUI_X11_LOAD_SYM(x11, XSetSelectionOwner);
     LUI_X11_LOAD_SYM(x11, XAllocSizeHints);
     LUI_X11_LOAD_SYM(x11, XSetWMNormalHints);
     LUI_X11_LOAD_SYM(x11, XFree);
@@ -181,6 +183,7 @@ static void lui_x11_unload(lui_x11_loader_t *x11)
 #define XGetWindowProperty g_lui_x11.XGetWindowProperty
 #define XConvertSelection g_lui_x11.XConvertSelection
 #define XSendEvent        g_lui_x11.XSendEvent
+#define XSetSelectionOwner g_lui_x11.XSetSelectionOwner
 #define XAllocSizeHints   g_lui_x11.XAllocSizeHints
 #define XSetWMNormalHints g_lui_x11.XSetWMNormalHints
 #define XFree             g_lui_x11.XFree

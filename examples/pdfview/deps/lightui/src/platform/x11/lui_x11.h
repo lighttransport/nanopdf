@@ -187,17 +187,42 @@ typedef struct {
     Time           time;
 } XSelectionEvent;
 
+typedef struct {
+    int            type;
+    unsigned long  serial;
+    Bool           send_event;
+    Display       *display;
+    Window         owner;
+    Window         requestor;
+    Atom           selection;
+    Atom           target;
+    Atom           property;
+    Time           time;
+} XSelectionRequestEvent;
+
+typedef struct {
+    int            type;
+    unsigned long  serial;
+    Bool           send_event;
+    Display       *display;
+    Window         window;
+    Atom           selection;
+    Time           time;
+} XSelectionClearEvent;
+
 typedef union _XEvent {
-    int                 type;
-    XAnyEvent           xany;
-    XKeyEvent           xkey;
-    XButtonEvent        xbutton;
-    XMotionEvent        xmotion;
-    XExposeEvent        xexpose;
-    XConfigureEvent     xconfigure;
-    XClientMessageEvent xclient;
-    XSelectionEvent     xselection;
-    long                pad[24];
+    int                    type;
+    XAnyEvent              xany;
+    XKeyEvent              xkey;
+    XButtonEvent           xbutton;
+    XMotionEvent           xmotion;
+    XExposeEvent           xexpose;
+    XConfigureEvent        xconfigure;
+    XClientMessageEvent    xclient;
+    XSelectionEvent        xselection;
+    XSelectionRequestEvent xselectionrequest;
+    XSelectionClearEvent   xselectionclear;
+    long                   pad[24];
 } XEvent;
 
 typedef struct {
@@ -248,17 +273,23 @@ typedef struct {
 #define FocusOut            10
 #define Expose              12
 #define ConfigureNotify     22
+#define SelectionClear      29
+#define SelectionRequest    30
 #define SelectionNotify     31
 #define ClientMessage       33
 
-/* Property / selection constants (for XDND) */
+/* Property / selection constants (for XDND + clipboard) */
 #ifndef None
 #  define None              0L
 #endif
 #ifndef Success
 #  define Success           0
 #endif
+#ifndef CurrentTime
+#  define CurrentTime       0L
+#endif
 #define XA_ATOM             ((Atom)4)
+#define XA_STRING           ((Atom)31)
 #define PropModeReplace     0
 #define AnyPropertyType     0L
 
