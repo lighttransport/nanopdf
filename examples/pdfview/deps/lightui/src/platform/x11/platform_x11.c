@@ -38,6 +38,14 @@ typedef struct {
     /* WM_DELETE_WINDOW atom for close-button detection */
     Atom          wm_delete_window;
 
+    /* XDND (drag-and-drop) atoms + per-drag state */
+    Atom          xdnd_aware, xdnd_enter, xdnd_position, xdnd_status,
+                  xdnd_leave, xdnd_drop, xdnd_finished, xdnd_selection,
+                  xdnd_action_copy, xdnd_type_list, xdnd_uri_list;
+    Window        xdnd_source;   /* source window of the current drag      */
+    Atom          xdnd_type;     /* negotiated data type (uri-list) or None */
+    int           xdnd_version;  /* source's XDND protocol version          */
+
     /* Previous mouse position for delta computation */
     int           last_mouse_x;
     int           last_mouse_y;
@@ -193,6 +201,70 @@ static int x11_keysym_to_text(KeySym ks, unsigned int state, char out[8])
     return 1;
 }
 
+/* ---- XDND (drag-and-drop) receiver helpers ----------------------------- */
+
+/* Decode one file:// URI from a text/uri-list into an absolute path.
+ * Returns 1 on success. Handles %XX percent-encoding and stops at CR/LF. */
+static int xdnd_uri_to_path(const char *uri, char *out, size_t out_sz)
+{
+    /* Skip a leading "file://host" prefix, keeping the path from the first
+     * '/'. Plain paths (no scheme) are accepted as-is. */
+    const char *p = uri;
+    if (strncmp(p, "file://", 7) == 0) {
+        p += 7;
+        const char *slash = strchr(p, '/');
+        if (slash) p = slash;  /* drop the optional host component */
+    }
+    size_t o = 0;
+    for (; *p && *p != '\r' && *p != '\n' && o + 1 < out_sz; ++p) {
+        if (*p == '%' && p[1] && p[2]) {
+            char hex[3] = { p[1], p[2], 0 };
+            char *end = NULL;
+            long v = strtol(hex, &end, 16);
+            if (end == hex + 2) { out[o++] = (char)v; p += 2; continue; }
+        }
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+    return o > 0;
+}
+
+/* Reply to an XdndPosition with an XdndStatus (accept iff we have a type). */
+static void xdnd_send_status(lui_window_x11_t *xw)
+{
+    XEvent e;
+    memset(&e, 0, sizeof(e));
+    e.xclient.type         = ClientMessage;
+    e.xclient.display      = xw->display;
+    e.xclient.window       = xw->xdnd_source;
+    e.xclient.message_type = xw->xdnd_status;
+    e.xclient.format       = 32;
+    e.xclient.data.l[0]    = (long)xw->xwindow;
+    e.xclient.data.l[1]    = (xw->xdnd_type != None) ? 1 : 0;  /* accept */
+    e.xclient.data.l[2]    = 0;  /* empty rect: keep sending XdndPosition */
+    e.xclient.data.l[3]    = 0;
+    e.xclient.data.l[4]    = (long)xw->xdnd_action_copy;
+    XSendEvent(xw->display, xw->xdnd_source, False, 0, &e);
+    XFlush(xw->display);
+}
+
+/* Tell the source the drop is complete (accepted = 1, rejected = 0). */
+static void xdnd_send_finished(lui_window_x11_t *xw, int accepted)
+{
+    XEvent e;
+    memset(&e, 0, sizeof(e));
+    e.xclient.type         = ClientMessage;
+    e.xclient.display      = xw->display;
+    e.xclient.window       = xw->xdnd_source;
+    e.xclient.message_type = xw->xdnd_finished;
+    e.xclient.format       = 32;
+    e.xclient.data.l[0]    = (long)xw->xwindow;
+    e.xclient.data.l[1]    = accepted ? 1 : 0;
+    e.xclient.data.l[2]    = accepted ? (long)xw->xdnd_action_copy : 0;
+    XSendEvent(xw->display, xw->xdnd_source, False, 0, &e);
+    XFlush(xw->display);
+}
+
 /* Translate a raw XEvent into a lui_event_t.
  * Returns false if the event should be discarded. */
 static bool x11_translate_event(lui_window_x11_t *xw,
@@ -207,6 +279,77 @@ static bool x11_translate_event(lui_window_x11_t *xw,
             out->type            = LUI_EVENT_QUIT;
             xw->base.should_close = true;
             return true;
+        }
+        /* --- XDND receiver protocol --- */
+        if ((Atom)xe->xclient.message_type == xw->xdnd_enter) {
+            xw->xdnd_source  = (Window)xe->xclient.data.l[0];
+            xw->xdnd_version = (int)((unsigned long)xe->xclient.data.l[1] >> 24);
+            xw->xdnd_type    = None;
+            if (!(xe->xclient.data.l[1] & 1)) {
+                /* Up to three types listed inline in data.l[2..4]. */
+                for (int i = 2; i <= 4; i++)
+                    if ((Atom)xe->xclient.data.l[i] == xw->xdnd_uri_list)
+                        xw->xdnd_type = xw->xdnd_uri_list;
+            } else {
+                /* More than three types: read the XdndTypeList property. */
+                Atom rtype; int rfmt;
+                unsigned long n, after; unsigned char *data = NULL;
+                if (XGetWindowProperty(xw->display, xw->xdnd_source,
+                        xw->xdnd_type_list, 0, 64, False, XA_ATOM, &rtype,
+                        &rfmt, &n, &after, &data) == Success && data) {
+                    Atom *types = (Atom *)data;
+                    for (unsigned long i = 0; i < n; i++)
+                        if (types[i] == xw->xdnd_uri_list)
+                            xw->xdnd_type = xw->xdnd_uri_list;
+                    XFree(data);
+                }
+            }
+            return false;
+        }
+        if ((Atom)xe->xclient.message_type == xw->xdnd_position) {
+            xw->xdnd_source = (Window)xe->xclient.data.l[0];
+            xdnd_send_status(xw);
+            return false;
+        }
+        if ((Atom)xe->xclient.message_type == xw->xdnd_leave) {
+            xw->xdnd_source = None;
+            xw->xdnd_type   = None;
+            return false;
+        }
+        if ((Atom)xe->xclient.message_type == xw->xdnd_drop) {
+            if (xw->xdnd_type != None) {
+                Time t = (Time)xe->xclient.data.l[2];
+                XConvertSelection(xw->display, xw->xdnd_selection,
+                                  xw->xdnd_type, xw->xdnd_selection,
+                                  xw->xwindow, t);
+                XFlush(xw->display);  /* path arrives via SelectionNotify */
+            } else {
+                xdnd_send_finished(xw, 0);
+            }
+            return false;
+        }
+        return false;
+
+    case SelectionNotify:
+        if (xe->xselection.property == xw->xdnd_selection) {
+            Atom rtype; int rfmt;
+            unsigned long n, after; unsigned char *data = NULL;
+            int got = 0;
+            if (XGetWindowProperty(xw->display, xw->xwindow, xw->xdnd_selection,
+                    0, 0x10000, False, AnyPropertyType, &rtype, &rfmt, &n,
+                    &after, &data) == Success && data) {
+                got = xdnd_uri_to_path((const char *)data, out->data.drop.path,
+                                       sizeof(out->data.drop.path));
+                XFree(data);
+            }
+            xdnd_send_finished(xw, got);
+            xw->xdnd_source = None;
+            xw->xdnd_type   = None;
+            if (got) {
+                out->type = LUI_EVENT_FILE_DROP;
+                return true;
+            }
+            return false;
         }
         return false;
 
@@ -485,6 +628,26 @@ static lui_window_t *x11_window_create(const char *title,
     /* WM_DELETE_WINDOW protocol */
     xw->wm_delete_window = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(g_display, xw->xwindow, &xw->wm_delete_window, 1);
+
+    /* XDND: advertise drop support (protocol version 5) and intern atoms. */
+    xw->xdnd_aware       = XInternAtom(g_display, "XdndAware", False);
+    xw->xdnd_enter       = XInternAtom(g_display, "XdndEnter", False);
+    xw->xdnd_position    = XInternAtom(g_display, "XdndPosition", False);
+    xw->xdnd_status      = XInternAtom(g_display, "XdndStatus", False);
+    xw->xdnd_leave       = XInternAtom(g_display, "XdndLeave", False);
+    xw->xdnd_drop        = XInternAtom(g_display, "XdndDrop", False);
+    xw->xdnd_finished    = XInternAtom(g_display, "XdndFinished", False);
+    xw->xdnd_selection   = XInternAtom(g_display, "XdndSelection", False);
+    xw->xdnd_action_copy = XInternAtom(g_display, "XdndActionCopy", False);
+    xw->xdnd_type_list   = XInternAtom(g_display, "XdndTypeList", False);
+    xw->xdnd_uri_list    = XInternAtom(g_display, "text/uri-list", False);
+    xw->xdnd_source      = None;
+    xw->xdnd_type        = None;
+    {
+        Atom version = 5;
+        XChangeProperty(g_display, xw->xwindow, xw->xdnd_aware, XA_ATOM, 32,
+                        PropModeReplace, (const unsigned char *)&version, 1);
+    }
 
     /* GC */
     xw->gc = XCreateGC(g_display, xw->xwindow, 0, NULL);

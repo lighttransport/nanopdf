@@ -178,6 +178,10 @@ struct Viewer {
   std::string toast;       // transient message (e.g. "Saved screenshot");
                            // shown in the toolbar until the next input
 
+  // "Open file" button rect (physical px), set by draw() in the empty state so
+  // MOUSE_DOWN can hit-test it. Zero-size when not shown.
+  int open_btn_x = 0, open_btn_y = 0, open_btn_w = 0, open_btn_h = 0;
+
   char status[256] = {0};
 };
 
@@ -327,6 +331,14 @@ int sidebar_panel_y() { return kToolbarH + kTabH; }
 void draw_outline_panel(Viewer& v, lvg_canvas_t* c, int panel_y, int H) {
   const int sb_w = kSidebarW;
   const std::vector<pdfview::Bookmark>& bm = v.doc.outline();
+  if (bm.empty()) {
+    if (v.font) {
+      const char* msg = "No bookmarks in this document";
+      lui_canvas_draw_text(c, 12, panel_y + 10, msg, (int)std::strlen(msg),
+                           v.font, kTextDim);
+    }
+    return;
+  }
   int avail = std::max(0, H - panel_y);
   v.sidebar_scroll =
       clampi(v.sidebar_scroll, 0, std::max(0, (int)bm.size() * kRowH - avail));
@@ -416,17 +428,16 @@ void draw_sidebar(Viewer& v, lvg_canvas_t* c, int H) {
   lvg_canvas_set_clip(c, &clip);
   lvg_canvas_fill_rect(c, 0, y0, sb_w, h, kSidebarBg);
 
-  // Tab bar: Outline | Pages.
-  const bool outline_ok = has_outline(v);
+  // Tab bar: Outline | Pages. Both tabs are always clickable; the Outline panel
+  // shows an empty-state when the document has no bookmarks.
   const int half = sb_w / 2;
-  draw_tab(v, c, 0, half, y0, "Outline", v.sidebar_mode == 0 && outline_ok,
-           outline_ok);
+  draw_tab(v, c, 0, half, y0, "Outline", v.sidebar_mode == 0, true);
   draw_tab(v, c, half, sb_w - half, y0, "Pages", v.sidebar_mode == 1, true);
 
   const int panel_y = sidebar_panel_y();
   lvg_rect_t pclip = lvg_rect_make(0, panel_y, sb_w, std::max(0, H - panel_y));
   lvg_canvas_set_clip(c, &pclip);
-  if (v.sidebar_mode == 0 && outline_ok)
+  if (v.sidebar_mode == 0)
     draw_outline_panel(v, c, panel_y, H);
   else
     draw_thumb_panel(v, c, panel_y, H);
@@ -852,9 +863,30 @@ void draw(Viewer& v, lvg_surface_t* surf) {
     }
   }
   if (!v.doc.loaded() && v.font) {
-    const char* hint = "Press 'o' to open a PDF, or pass a path on the CLI";
-    lui_canvas_draw_text(&c, 24, content_y + 24, hint, (int)std::strlen(hint),
+    // Centered "Open file" button + drag-and-drop hint.
+    const int lh = lui_font_line_height(v.font);
+    const char* label = "Open PDF…";
+    const int lw = lui_font_measure_text(v.font, label, (int)std::strlen(label));
+    const int padx = ui_px(20), pady = ui_px(10);
+    const int bw = lw + 2 * padx, bh = lh + 2 * pady;
+    const int bx = content_x + (std::max(0, W - content_x) - bw) / 2;
+    const int by = content_y + std::max(0, H - content_y) / 2 - bh;
+    v.open_btn_x = bx;
+    v.open_btn_y = by;
+    v.open_btn_w = bw;
+    v.open_btn_h = bh;
+    const bool hover = v.mouse_x >= bx && v.mouse_x < bx + bw &&
+                       v.mouse_y >= by && v.mouse_y < by + bh;
+    lvg_canvas_fill_rect(&c, bx, by, bw, bh, hover ? kAccent : kSidebarSel);
+    lui_canvas_draw_text(&c, bx + padx, by + pady, label, (int)std::strlen(label),
+                         v.font, kTextColor);
+    const char* hint = "or drag a PDF here  ·  press 'o' to browse";
+    const int hw = lui_font_measure_text(v.font, hint, (int)std::strlen(hint));
+    lui_canvas_draw_text(&c, content_x + (std::max(0, W - content_x) - hw) / 2,
+                         by + bh + ui_px(16), hint, (int)std::strlen(hint),
                          v.font, kTextDim);
+  } else {
+    v.open_btn_w = v.open_btn_h = 0;  // not shown
   }
 }
 
@@ -1738,6 +1770,11 @@ int main(int argc, char** argv) {
           dirty = true;
           break;
         }
+        case LUI_EVENT_FILE_DROP:
+          // A PDF was dragged onto the window.
+          load_document(viewer, win, event.data.drop.path);
+          dirty = true;
+          break;
         case LUI_EVENT_WINDOW_EXPOSE:
           dirty = true;
           break;
@@ -1924,6 +1961,8 @@ int main(int argc, char** argv) {
             viewer.sel_x1 = viewer.mouse_x;
             viewer.sel_y1 = viewer.mouse_y;
             dirty = true;
+          } else if (!viewer.doc.loaded()) {
+            dirty = true;  // refresh the Open-button hover state
           }
           break;
         }
@@ -1936,9 +1975,7 @@ int main(int argc, char** argv) {
           const int panel_y = sidebar_panel_y();
           if (content_x > 0 && mx < content_x) {  // sidebar
             if (my >= kToolbarH && my < panel_y) {
-              int mode = (mx < kSidebarW / 2) ? 0 : 1;
-              if (mode == 0 && !has_outline(viewer)) mode = 1;
-              viewer.sidebar_mode = mode;
+              viewer.sidebar_mode = (mx < kSidebarW / 2) ? 0 : 1;
               dirty = true;
             } else if (my >= panel_y) {
               if (viewer.sidebar_mode == 0 && has_outline(viewer)) {
@@ -1983,6 +2020,16 @@ int main(int argc, char** argv) {
                 dirty = true;
               }
             }
+            break;
+          }
+          // Empty state: click the "Open PDF…" button.
+          if (!viewer.doc.loaded() && viewer.open_btn_w > 0 &&
+              mx >= viewer.open_btn_x &&
+              mx < viewer.open_btn_x + viewer.open_btn_w &&
+              my >= viewer.open_btn_y &&
+              my < viewer.open_btn_y + viewer.open_btn_h) {
+            open_via_dialog(viewer, win);
+            dirty = true;
             break;
           }
           // Page area: begin a drag selection.

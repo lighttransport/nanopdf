@@ -77,6 +77,10 @@ cmake --build build -j     # -> ./build/pdfview
 `--selftest [out.ppm]` renders a reference frame to an in-memory surface and dumps a PPM
 (no window) — used for headless verification of the render path.
 
+With no document, the window shows an **Open PDF…** button (click it, press `o`, or
+**drag-and-drop** a PDF file onto the window). Drag-and-drop works any time to open a
+different file.
+
 ## Controls
 
 | Key | Action | Key | Action |

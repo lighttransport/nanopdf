@@ -35,6 +35,7 @@ typedef enum {
     LUI_EVENT_MOUSE_DOWN,            /* button pressed                    */
     LUI_EVENT_MOUSE_UP,              /* button released                   */
     LUI_EVENT_SCROLL,                /* mouse wheel / trackpad scroll     */
+    LUI_EVENT_FILE_DROP,             /* a file was dropped onto the window */
 } lui_event_type_t;
 
 /* -------------------------------------------------------------------------
@@ -119,6 +120,11 @@ typedef struct {
             int   width, height;  /* new logical size in pixels          */
             float dpi_scale;      /* new DPI scale factor                */
         } resize;
+
+        /** LUI_EVENT_FILE_DROP — absolute path of the dropped file (UTF-8) */
+        struct {
+            char path[1024];
+        } drop;
     } data;
 } lui_event_t;
 

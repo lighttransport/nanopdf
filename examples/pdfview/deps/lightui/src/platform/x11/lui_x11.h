@@ -175,6 +175,18 @@ typedef struct {
     } data;
 } XClientMessageEvent;
 
+typedef struct {
+    int            type;
+    unsigned long  serial;
+    Bool           send_event;
+    Display       *display;
+    Window         requestor;
+    Atom           selection;
+    Atom           target;
+    Atom           property;
+    Time           time;
+} XSelectionEvent;
+
 typedef union _XEvent {
     int                 type;
     XAnyEvent           xany;
@@ -184,6 +196,7 @@ typedef union _XEvent {
     XExposeEvent        xexpose;
     XConfigureEvent     xconfigure;
     XClientMessageEvent xclient;
+    XSelectionEvent     xselection;
     long                pad[24];
 } XEvent;
 
@@ -235,7 +248,19 @@ typedef struct {
 #define FocusOut            10
 #define Expose              12
 #define ConfigureNotify     22
+#define SelectionNotify     31
 #define ClientMessage       33
+
+/* Property / selection constants (for XDND) */
+#ifndef None
+#  define None              0L
+#endif
+#ifndef Success
+#  define Success           0
+#endif
+#define XA_ATOM             ((Atom)4)
+#define PropModeReplace     0
+#define AnyPropertyType     0L
 
 #define StaticGravity       10
 #define Always              2
