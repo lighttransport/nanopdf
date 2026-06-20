@@ -3,9 +3,17 @@
 
 #include "nanotest.hh"
 
+#include "crypto.hh"
 #include "crypto-pk.hh"
 
 using namespace nanopdf::crypto;
+
+static std::string hex(const std::vector<uint8_t>& v) {
+  static const char* H = "0123456789abcdef";
+  std::string s;
+  for (uint8_t b : v) { s += H[b >> 4]; s += H[b & 0xF]; }
+  return s;
+}
 
 // Embedded 1024-bit RSA test key (PKCS#8 PEM, unencrypted; test-only).
 static const char* kTestKeyPem =
@@ -51,6 +59,32 @@ TEST_SUITE("BigInt arithmetic") {
     auto out = v.to_bytes(5);
     CHECK_EQ((int)out.size(), 5);
     for (int i = 0; i < 5; ++i) CHECK_EQ((int)out[i], (int)in[i]);
+  }
+}
+
+TEST_SUITE("HMAC + PBKDF2") {
+  TEST_CASE("HMAC-SHA256 (RFC 4231 case 1)") {
+    std::vector<uint8_t> key(20, 0x0b);
+    const char* msg = "Hi There";
+    std::vector<uint8_t> h = hmac(Prf::Sha256, key.data(), key.size(),
+                                  (const uint8_t*)msg, 8);
+    CHECK_EQ(hex(h),
+             std::string("b0344c61d8db38535ca8afceaf0bf12b"
+                         "881dc200c9833da726e9376c2e32cff7"));
+  }
+
+  TEST_CASE("PBKDF2-HMAC-SHA1 (RFC 6070 c=1)") {
+    std::vector<uint8_t> dk =
+        pbkdf2(Prf::Sha1, (const uint8_t*)"password", 8, (const uint8_t*)"salt",
+               4, 1, 20);
+    CHECK_EQ(hex(dk), std::string("0c60c80f961f0e71f3a9b524af6012062fe037a6"));
+  }
+
+  TEST_CASE("PBKDF2-HMAC-SHA1 (RFC 6070 c=4096)") {
+    std::vector<uint8_t> dk =
+        pbkdf2(Prf::Sha1, (const uint8_t*)"password", 8, (const uint8_t*)"salt",
+               4, 4096, 20);
+    CHECK_EQ(hex(dk), std::string("4b007901b765489abead49d926f721d065a429c1"));
   }
 }
 

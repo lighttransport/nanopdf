@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "crypto.hh"
+
 namespace nanopdf {
 namespace crypto {
 
@@ -282,6 +284,130 @@ RsaPrivateKey rsa_parse_private_key_pem(const std::string& pem) {
   if (der.empty()) der = pem_to_der(pem, "PRIVATE KEY");
   if (der.empty()) return RsaPrivateKey{};
   return rsa_parse_private_key_der(der.data(), der.size());
+}
+
+std::vector<uint8_t> pbes2_decrypt(const uint8_t* alg_content, size_t alg_len,
+                                   const uint8_t* enc, size_t enclen,
+                                   const std::string& pw) {
+  Der alg{alg_content, alg_content + alg_len, true};
+  const uint8_t* oid;
+  size_t oidlen;
+  if (der_read_tl(alg, &oid, &oidlen) != 0x06) return {};
+  static const uint8_t PBES2[] = {0x2A, 0x86, 0x48, 0x86, 0xF7,
+                                  0x0D, 0x01, 0x05, 0x0D};
+  if (oidlen != sizeof(PBES2) || std::memcmp(oid, PBES2, oidlen) != 0) return {};
+
+  const uint8_t* pp;
+  size_t pplen;
+  if (der_read_tl(alg, &pp, &pplen) != 0x30) return {};  // PBES2-params
+  Der params{pp, pp + pplen, true};
+
+  // keyDerivationFunc: SEQUENCE { OID pbkdf2, PBKDF2-params }
+  const uint8_t* kdf;
+  size_t kdflen;
+  if (der_read_tl(params, &kdf, &kdflen) != 0x30) return {};
+  Der kd{kdf, kdf + kdflen, true};
+  const uint8_t* ko;
+  size_t kolen;
+  if (der_read_tl(kd, &ko, &kolen) != 0x06) return {};  // pbkdf2 OID
+  const uint8_t* kp;
+  size_t kplen;
+  if (der_read_tl(kd, &kp, &kplen) != 0x30) return {};  // PBKDF2-params
+  Der pk{kp, kp + kplen, true};
+  const uint8_t* salt;
+  size_t saltlen;
+  if (der_read_tl(pk, &salt, &saltlen) != 0x04) return {};  // salt
+  const uint8_t* itc;
+  size_t itclen;
+  if (der_read_tl(pk, &itc, &itclen) != 0x02) return {};  // iterationCount
+  int iters = 0;
+  for (size_t i = 0; i < itclen; ++i) iters = (iters << 8) | itc[i];
+  crypto::Prf prf = crypto::Prf::Sha1;  // PBKDF2 default PRF
+  while (pk.p < pk.end && pk.ok) {       // optional keyLength, prf
+    const uint8_t* x;
+    size_t xl;
+    uint8_t t = der_read_tl(pk, &x, &xl);
+    if (t == 0x30) {  // prf AlgorithmIdentifier
+      Der pd{x, x + xl, true};
+      const uint8_t* po;
+      size_t pol;
+      if (der_read_tl(pd, &po, &pol) == 0x06 && pol >= 1) {
+        uint8_t last = po[pol - 1];
+        if (last == 0x09) prf = crypto::Prf::Sha256;
+        else if (last == 0x0b) prf = crypto::Prf::Sha512;
+        else prf = crypto::Prf::Sha1;
+      }
+    }
+  }
+
+  // encryptionScheme: SEQUENCE { OID aesNNN-cbc, IV OCTET STRING }
+  const uint8_t* es;
+  size_t eslen;
+  if (der_read_tl(params, &es, &eslen) != 0x30) return {};
+  Der ed{es, es + eslen, true};
+  const uint8_t* eo;
+  size_t eol;
+  if (der_read_tl(ed, &eo, &eol) != 0x06) return {};
+  size_t keylen = 0;
+  if (eol >= 1) {
+    uint8_t last = eo[eol - 1];
+    if (last == 0x2A) keylen = 32;       // aes-256-cbc
+    else if (last == 0x16) keylen = 24;  // aes-192-cbc (unsupported below)
+    else if (last == 0x02) keylen = 16;  // aes-128-cbc
+  }
+  const uint8_t* iv;
+  size_t ivlen;
+  if (der_read_tl(ed, &iv, &ivlen) != 0x04 || ivlen != 16) return {};
+
+  std::vector<uint8_t> key = crypto::pbkdf2(
+      prf, reinterpret_cast<const uint8_t*>(pw.data()), pw.size(), salt,
+      saltlen, iters, keylen);
+  std::vector<uint8_t> pt(enclen);
+  if (keylen == 32) {
+    crypto::AES256 a;
+    a.set_key(key.data());
+    a.decrypt_cbc(enc, pt.data(), enclen, iv);
+  } else if (keylen == 16) {
+    crypto::AES128 a;
+    a.set_key(key.data());
+    a.decrypt_cbc(enc, pt.data(), enclen, iv);
+  } else {
+    return {};  // unsupported cipher (e.g. AES-192 / 3DES)
+  }
+  size_t unpadded = crypto::unpad_pkcs7(pt.data(), pt.size());
+  if (unpadded == 0 || unpadded > pt.size()) return {};
+  pt.resize(unpadded);
+  return pt;
+}
+
+// Decrypt a PKCS#8 EncryptedPrivateKeyInfo using PBES2.
+std::vector<uint8_t> decrypt_pkcs8_pbes2(const uint8_t* der, size_t len,
+                                         const std::string& pw) {
+  Der d{der, der + len, true};
+  const uint8_t* c;
+  size_t n;
+  if (der_read_tl(d, &c, &n) != 0x30) return {};  // EncryptedPrivateKeyInfo
+  Der epki{c, c + n, true};
+  const uint8_t* ea;
+  size_t ealen;
+  if (der_read_tl(epki, &ea, &ealen) != 0x30) return {};  // encryptionAlgorithm
+  const uint8_t* enc;
+  size_t enclen;
+  if (der_read_tl(epki, &enc, &enclen) != 0x04) return {};  // encryptedData
+  return pbes2_decrypt(ea, ealen, enc, enclen, pw);
+}
+
+RsaPrivateKey rsa_parse_private_key_pem(const std::string& pem,
+                                        const std::string& password) {
+  std::vector<uint8_t> der = pem_to_der(pem, "RSA PRIVATE KEY");
+  if (der.empty()) der = pem_to_der(pem, "PRIVATE KEY");
+  if (!der.empty()) return rsa_parse_private_key_der(der.data(), der.size());
+  der = pem_to_der(pem, "ENCRYPTED PRIVATE KEY");
+  if (der.empty()) return RsaPrivateKey{};
+  std::vector<uint8_t> dec =
+      decrypt_pkcs8_pbes2(der.data(), der.size(), password);
+  if (dec.empty()) return RsaPrivateKey{};
+  return rsa_parse_private_key_der(dec.data(), dec.size());
 }
 
 // ---- RSA PKCS#1 v1.5 -------------------------------------------------------

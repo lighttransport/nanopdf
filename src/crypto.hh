@@ -234,5 +234,15 @@ void xor_bytes(uint8_t* dest, const uint8_t* src, size_t len);
 void pad_pkcs7(std::vector<uint8_t>& data, size_t block_size);
 size_t unpad_pkcs7(uint8_t* data, size_t len);
 
+// HMAC + PBKDF2 (used by PKCS#8/PBES2 and PKCS#12). PRF selector: 1=SHA-1,
+// 2=SHA-256, 3=SHA-512.
+enum class Prf { Sha1 = 1, Sha256 = 2, Sha512 = 3 };
+
+std::vector<uint8_t> hmac(Prf prf, const uint8_t* key, size_t key_len,
+                          const uint8_t* msg, size_t msg_len);
+std::vector<uint8_t> pbkdf2(Prf prf, const uint8_t* password, size_t pw_len,
+                            const uint8_t* salt, size_t salt_len, int iterations,
+                            size_t dk_len);
+
 } // namespace crypto
 } // namespace nanopdf

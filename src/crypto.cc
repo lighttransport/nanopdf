@@ -1523,5 +1523,73 @@ size_t unpad_pkcs7(uint8_t* data, size_t len) {
   return len - padding_len;
 }
 
+// ---- HMAC + PBKDF2 ---------------------------------------------------------
+
+namespace {
+size_t prf_digest_size(Prf p) {
+  switch (p) {
+    case Prf::Sha1: return 20;
+    case Prf::Sha512: return 64;
+    default: return 32;  // Sha256
+  }
+}
+size_t prf_block_size(Prf p) { return p == Prf::Sha512 ? 128 : 64; }
+
+void prf_hash(Prf p, const uint8_t* data, size_t len, uint8_t* out) {
+  switch (p) {
+    case Prf::Sha1: SHA1::hash(data, len, out); break;
+    case Prf::Sha512: SHA512::hash(data, len, out); break;
+    default: SHA256::hash(data, len, out); break;
+  }
+}
+}  // namespace
+
+std::vector<uint8_t> hmac(Prf prf, const uint8_t* key, size_t key_len,
+                          const uint8_t* msg, size_t msg_len) {
+  const size_t B = prf_block_size(prf);
+  const size_t L = prf_digest_size(prf);
+  std::vector<uint8_t> k0(B, 0);
+  if (key_len > B)
+    prf_hash(prf, key, key_len, k0.data());  // K0 = H(key), zero-padded
+  else
+    std::memcpy(k0.data(), key, key_len);
+  std::vector<uint8_t> inner(B), outer(B);
+  for (size_t i = 0; i < B; ++i) {
+    inner[i] = k0[i] ^ 0x36;
+    outer[i] = k0[i] ^ 0x5c;
+  }
+  inner.insert(inner.end(), msg, msg + msg_len);
+  std::vector<uint8_t> ih(L);
+  prf_hash(prf, inner.data(), inner.size(), ih.data());
+  outer.insert(outer.end(), ih.begin(), ih.end());
+  std::vector<uint8_t> out(L);
+  prf_hash(prf, outer.data(), outer.size(), out.data());
+  return out;
+}
+
+std::vector<uint8_t> pbkdf2(Prf prf, const uint8_t* password, size_t pw_len,
+                            const uint8_t* salt, size_t salt_len, int iterations,
+                            size_t dk_len) {
+  std::vector<uint8_t> dk;
+  uint32_t block = 1;
+  while (dk.size() < dk_len) {
+    std::vector<uint8_t> t(salt, salt + salt_len);
+    t.push_back(static_cast<uint8_t>(block >> 24));
+    t.push_back(static_cast<uint8_t>(block >> 16));
+    t.push_back(static_cast<uint8_t>(block >> 8));
+    t.push_back(static_cast<uint8_t>(block));
+    std::vector<uint8_t> u = hmac(prf, password, pw_len, t.data(), t.size());
+    std::vector<uint8_t> f = u;
+    for (int i = 1; i < iterations; ++i) {
+      u = hmac(prf, password, pw_len, u.data(), u.size());
+      for (size_t j = 0; j < f.size(); ++j) f[j] ^= u[j];
+    }
+    dk.insert(dk.end(), f.begin(), f.end());
+    ++block;
+  }
+  dk.resize(dk_len);
+  return dk;
+}
+
 } // namespace crypto
 } // namespace nanopdf

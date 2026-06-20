@@ -72,6 +72,22 @@ struct RsaPublicKey {
 RsaPrivateKey rsa_parse_private_key_der(const uint8_t* der, size_t len);
 // Parse PEM (either RSA PRIVATE KEY or PRIVATE KEY). Unencrypted only.
 RsaPrivateKey rsa_parse_private_key_pem(const std::string& pem);
+// Parse PEM, decrypting an "ENCRYPTED PRIVATE KEY" (PKCS#8 PBES2: PBKDF2 +
+// AES-CBC) with @password; unencrypted PEM is accepted too.
+RsaPrivateKey rsa_parse_private_key_pem(const std::string& pem,
+                                        const std::string& password);
+
+// Decrypt a PKCS#8 EncryptedPrivateKeyInfo (PBES2: PBKDF2 + AES-128/256-CBC)
+// to the inner PrivateKeyInfo DER, or empty on failure / unsupported scheme.
+std::vector<uint8_t> decrypt_pkcs8_pbes2(const uint8_t* der, size_t len,
+                                         const std::string& password);
+
+// Decrypt PBES2 ciphertext given the AlgorithmIdentifier *content* (the OID +
+// params inside the AlgorithmIdentifier SEQUENCE) and @enc. Returns the
+// PKCS#7-unpadded plaintext, or empty. Shared by PKCS#8 and PKCS#12.
+std::vector<uint8_t> pbes2_decrypt(const uint8_t* alg_content, size_t alg_len,
+                                   const uint8_t* enc, size_t enc_len,
+                                   const std::string& password);
 
 // Sign @digest (a raw hash) with PKCS#1 v1.5 using the given DigestInfo ASN.1
 // prefix for the hash algorithm. Returns the signature (modulus_bytes long),

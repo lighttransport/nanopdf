@@ -35,6 +35,7 @@
 #include "cms.hh"
 #include "crypto.hh"
 #include "crypto-pk.hh"
+#include "pkcs12.hh"
 #include "rfc3161.hh"
 
 namespace pdfview {
@@ -304,13 +305,14 @@ std::vector<uint8_t> build_cms(const std::vector<uint8_t>& data,
 // credentials and no timestamp. p12, encrypted keys, and RFC 3161 still use
 // OpenSSL until those pieces are ported.
 bool native_eligible(const SignOptions& o) {
-  if (!o.p12_path.empty() || o.cert_pem_path.empty() ||
-      o.key_pem_path.empty() || !o.key_password.empty())
-    return false;
-  // Native timestamping works over http TSAs (no TLS yet); https falls back to
-  // the OpenSSL path.
-  if (o.tsa_url.empty()) return true;
-  return o.tsa_url.rfind("http://", 0) == 0;
+  // Need credentials: a PKCS#12 bundle, or a PEM cert + key.
+  bool have_creds = !o.p12_path.empty() ||
+                    (!o.cert_pem_path.empty() && !o.key_pem_path.empty());
+  if (!have_creds) return false;
+  // Native timestamping works over http TSAs (no TLS yet); https TSAs fall back
+  // to the OpenSSL path.
+  if (!o.tsa_url.empty() && o.tsa_url.rfind("http://", 0) != 0) return false;
+  return true;
 }
 
 std::string read_text_file(const std::string& path) {
@@ -539,18 +541,32 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
   Credentials cred;
 
   if (native) {
-    nkey = nanopdf::crypto::rsa_parse_private_key_pem(
-        read_text_file(opt.key_pem_path));
-    if (!nkey.valid) {
-      sr.error =
-          "could not parse PEM private key (native path supports unencrypted "
-          "RSA keys only)";
-      return sr;
+    std::vector<std::vector<uint8_t>> certs;
+    if (!opt.p12_path.empty()) {
+      // PKCS#12 bundle (PBES2/AES; OpenSSL-free).
+      std::string raw = read_text_file(opt.p12_path);
+      nanopdf::pkcs12::Bundle b = nanopdf::pkcs12::parse(
+          reinterpret_cast<const uint8_t*>(raw.data()), raw.size(),
+          opt.p12_password);
+      if (!b.valid) {
+        sr.error = "PKCS#12 load failed: " + b.error;
+        return sr;
+      }
+      nkey = b.key;
+      certs = b.certs;
+    } else {
+      // PEM cert + key (key may be PBES2-encrypted with key_password).
+      nkey = nanopdf::crypto::rsa_parse_private_key_pem(
+          read_text_file(opt.key_pem_path), opt.key_password);
+      if (!nkey.valid) {
+        sr.error = "could not parse PEM private key (wrong password or "
+                   "unsupported encryption?)";
+        return sr;
+      }
+      certs = nanopdf::cms::pem_to_certs(read_text_file(opt.cert_pem_path));
     }
-    std::vector<std::vector<uint8_t>> certs =
-        nanopdf::cms::pem_to_certs(read_text_file(opt.cert_pem_path));
     if (certs.empty()) {
-      sr.error = "no certificate found in " + opt.cert_pem_path;
+      sr.error = "no signer certificate found";
       return sr;
     }
     nsigner = certs[0];
