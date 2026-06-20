@@ -46,6 +46,7 @@
 #include "crypto-pk.hh"
 #include "pkcs12.hh"
 #include "rfc3161.hh"
+#include "tls_client.hh"
 
 namespace pdfview {
 
@@ -320,9 +321,11 @@ bool native_eligible(const SignOptions& o) {
   bool have_creds = !o.p12_path.empty() ||
                     (!o.cert_pem_path.empty() && !o.key_pem_path.empty());
   if (!have_creds) return false;
-  // Native timestamping works over http TSAs (no TLS yet); https TSAs fall back
-  // to the OpenSSL path.
-  if (!o.tsa_url.empty() && o.tsa_url.rfind("http://", 0) != 0) return false;
+  // Native timestamping works over both http and https TSAs (the latter via the
+  // hand-rolled TLS 1.3 client in tls_client.cc -- no OpenSSL needed).
+  if (!o.tsa_url.empty() && o.tsa_url.rfind("http://", 0) != 0 &&
+      o.tsa_url.rfind("https://", 0) != 0)
+    return false;
   return true;
 }
 
@@ -388,14 +391,22 @@ std::vector<uint8_t> http_post_raw(const std::string& url,
                                    const std::vector<uint8_t>& body,
                                    std::string* err) {
   std::vector<uint8_t> out;
-  if (url.rfind("http://", 0) != 0) { *err = "not an http:// URL: " + url; return out; }
-  std::string rest = url.substr(7);
+  bool https = url.rfind("https://", 0) == 0;
+  if (!https && url.rfind("http://", 0) != 0) {
+    *err = "not an http(s):// URL: " + url;
+    return out;
+  }
+  std::string rest = url.substr(https ? 8 : 7);
   std::string hostport = rest, path = "/";
   size_t slash = rest.find('/');
   if (slash != std::string::npos) { hostport = rest.substr(0, slash); path = rest.substr(slash); }
-  std::string host = hostport, port = "80";
+  std::string host = hostport, port = https ? "443" : "80";
   size_t colon = hostport.find(':');
   if (colon != std::string::npos) { host = hostport.substr(0, colon); port = hostport.substr(colon + 1); }
+
+  // https -> hand-rolled TLS 1.3 (no OpenSSL).
+  if (https)
+    return tls_https_post(host, port, path, content_type, accept, body, err);
 
   addrinfo hints{}, *res = nullptr;
   hints.ai_family = AF_UNSPEC;
@@ -667,83 +678,27 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
 // --- OpenTimestamps ---------------------------------------------------------
 // OTS calendar servers are https-only, so this path needs TLS (OpenSSL).
 
-#if PDFVIEW_HAVE_OPENSSL
-namespace {
-
-// Minimal HTTP POST of a binary body via OSSL_HTTP (http + https). Returns the
-// raw response bytes, or empty on failure.
-std::vector<uint8_t> http_post_binary(const std::string& url,
-                                      const std::string& content_type,
-                                      const std::string& accept,
-                                      const std::vector<uint8_t>& body,
-                                      std::string* err) {
-  std::vector<uint8_t> out;
-  char *host = nullptr, *port = nullptr, *path = nullptr;
-  int use_ssl = 0;
-  if (!OSSL_HTTP_parse_url(url.c_str(), &use_ssl, nullptr, &host, &port, nullptr,
-                           &path, nullptr, nullptr)) {
-    *err = "bad url: " + url;
-    return out;
-  }
-  SSL_CTX* tls = nullptr;
-  if (use_ssl) {
-    tls = SSL_CTX_new(TLS_client_method());
-    SSL_CTX_set_verify(tls, SSL_VERIFY_NONE, nullptr);
-  }
-  BIO* reqbio = BIO_new_mem_buf(body.data(), (int)body.size());
-  OSSL_HTTP_bio_cb_t tls_cb = use_ssl ? http_tls_cb : nullptr;
-  OSSL_HTTP_REQ_CTX* rctx = OSSL_HTTP_open(host, port, nullptr, nullptr, use_ssl,
-                                           nullptr, nullptr, tls_cb, tls, 0,
-                                           30000);
-  if (rctx) {
-    STACK_OF(CONF_VALUE)* hdrs = nullptr;
-    if (!accept.empty()) X509V3_add_value("Accept", accept.c_str(), &hdrs);
-    if (OSSL_HTTP_set1_request(rctx, path, hdrs, content_type.c_str(), reqbio,
-                               nullptr, /*expect_asn1=*/0, /*max_resp_len=*/0,
-                               30000, 0)) {
-      BIO* rbio = OSSL_HTTP_exchange(rctx, nullptr);
-      if (rbio) {
-        unsigned char buf[4096];
-        int n;
-        while ((n = BIO_read(rbio, buf, sizeof(buf))) > 0)
-          out.insert(out.end(), buf, buf + n);
-      }
-    }
-    if (hdrs) sk_CONF_VALUE_pop_free(hdrs, X509V3_conf_free);
-    OSSL_HTTP_close(rctx, 1);
-  }
-  BIO_free(reqbio);
-  OPENSSL_free(host);
-  OPENSSL_free(port);
-  OPENSSL_free(path);
-  if (tls) SSL_CTX_free(tls);
-  if (out.empty()) *err = "no response from " + url;
-  return out;
-}
-
-}  // namespace
-
 std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
                                           std::string* errp) {
   std::string err;
   std::vector<uint8_t> ots;
-  // 1) SHA-256 of the document.
-  unsigned char digest[32];
-  unsigned int dlen = 0;
-  EVP_Digest(data.data(), data.size(), digest, &dlen, EVP_sha256(), nullptr);
+  // 1) SHA-256 of the document (pure C++).
+  uint8_t digest[32];
+  nanopdf::crypto::SHA256::hash(data.data(), data.size(), digest);
 
   // 2) Submit the digest to a public calendar; take the first that answers.
+  //    The https POST goes through the hand-rolled TLS 1.3 client -- no OpenSSL.
   static const char* kCalendars[] = {
       "https://alice.btc.calendar.opentimestamps.org/digest",
       "https://bob.btc.calendar.opentimestamps.org/digest",
       "https://finney.calendar.eternitywall.com/digest",
       nullptr};
-  std::vector<uint8_t> body(digest, digest + dlen);
+  std::vector<uint8_t> body(digest, digest + 32);
   std::vector<uint8_t> cal;
   for (int i = 0; kCalendars[i]; ++i) {
     std::string e;
-    cal = http_post_binary(kCalendars[i], "application/x-www-form-urlencoded",
-                           "application/vnd.opentimestamps.v1", body, &e);
+    cal = http_post_raw(kCalendars[i], "application/x-www-form-urlencoded",
+                        "application/vnd.opentimestamps.v1", "", "", body, &e);
     if (!cal.empty()) break;
     err = e;
   }
@@ -761,19 +716,10 @@ std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
   ots.insert(ots.end(), kMagic, kMagic + sizeof(kMagic));
   ots.push_back(0x01);  // major version (varuint)
   ots.push_back(0x08);  // OpSHA256 tag (the op applied to the file)
-  ots.insert(ots.end(), digest, digest + dlen);
+  ots.insert(ots.end(), digest, digest + 32);
   ots.insert(ots.end(), cal.begin(), cal.end());
   return ots;
 }
-#else   // !PDFVIEW_HAVE_OPENSSL
-std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>&,
-                                          std::string* errp) {
-  if (errp)
-    *errp = "OpenTimestamps requires OpenSSL (https calendar TLS); build with "
-            "-DPDFVIEW_USE_OPENSSL=ON";
-  return {};
-}
-#endif  // PDFVIEW_HAVE_OPENSSL
 
 // --- verification (pure C++, no OpenSSL) ------------------------------------
 

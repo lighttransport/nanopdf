@@ -71,6 +71,7 @@ add_executable(pdfview
   pdf_document.cc
   pdf_debug.cc
   pdf_sign.cc
+  tls_client.cc
   ${NFD_SOURCES}
   ${LIGHTUI_SOURCES}
 )
