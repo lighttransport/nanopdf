@@ -130,7 +130,8 @@ static Bytes attribute(const char* oid, const Bytes& value) {
 Bytes build_signed_data(const Bytes& content, const Bytes& signer_cert,
                         const std::vector<Bytes>& chain,
                         const crypto::RsaPrivateKey& key,
-                        const std::string& signing_time_utc) {
+                        const std::string& signing_time_utc,
+                        const TsaCallback& tsa) {
   CertInfo ci = parse_certificate(signer_cert);
   if (!ci.valid || !key.valid) return {};
 
@@ -165,15 +166,25 @@ Bytes build_signed_data(const Bytes& content, const Bytes& signer_cert,
     signed_attrs_context[0] = 0xA0;
   }
 
-  // SignerInfo
-  Bytes signer_info = der_sequence({
+  // Optional RFC 3161 signature timestamp -> id-aa-timeStampToken unsigned attr.
+  std::vector<Bytes> signer_items = {
       der_integer_u32(1),                     // version
       issuer_and_serial(ci),                  // sid
       der_algorithm_id(kOidSha256),           // digestAlgorithm
       signed_attrs_context,                   // [0] signedAttrs
       der_algorithm_id(kOidRsaEncryption),    // signatureAlgorithm
       der_octet_string(signature),            // signature
-  });
+  };
+  if (tsa) {
+    Bytes token = tsa(signature);
+    if (!token.empty()) {
+      // id-aa-timeStampToken = 1.2.840.113549.1.9.16.2.14
+      Bytes attr = der_sequence(
+          {der_oid("1.2.840.113549.1.9.16.2.14"), der_set_raw({token})});
+      signer_items.push_back(der_context(1, true, attr));  // [1] unsignedAttrs
+    }
+  }
+  Bytes signer_info = der_sequence(signer_items);
 
   // certificates [0] IMPLICIT (signer first, then chain).
   Bytes certs_blob = signer_cert;

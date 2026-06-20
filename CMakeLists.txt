@@ -155,6 +155,7 @@ set(NANOPDF_SOURCES
   src/crypto-pk.cc
   src/asn1-der.cc
   src/cms.cc
+  src/rfc3161.cc
   src/pdf-security.cc
   src/pdf-attachments.cc
   src/color-transform.cc

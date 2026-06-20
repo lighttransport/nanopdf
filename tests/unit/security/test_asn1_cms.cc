@@ -8,6 +8,7 @@
 #include "asn1-der.hh"
 #include "cms.hh"
 #include "crypto-pk.hh"
+#include "rfc3161.hh"
 
 using namespace nanopdf;
 
@@ -147,5 +148,52 @@ TEST_SUITE("CMS SignedData") {
         break;
       }
     CHECK(found);
+  }
+}
+
+TEST_SUITE("RFC 3161 timestamp") {
+  TEST_CASE("build_request embeds the imprint + certReq") {
+    rfc3161::Bytes imprint(32, 0xAB);
+    rfc3161::Bytes req = rfc3161::build_request(
+        imprint, rfc3161::hash_oid("sha256"), 0x0102030405060708ULL, true);
+    CHECK_EQ((int)req[0], 0x30);  // TimeStampReq SEQUENCE
+    // The 32-byte imprint must appear verbatim.
+    bool found = false;
+    for (size_t i = 0; i + 32 <= req.size(); ++i) {
+      bool all = true;
+      for (int k = 0; k < 32; ++k)
+        if (req[i + k] != 0xAB) { all = false; break; }
+      if (all) { found = true; break; }
+    }
+    CHECK(found);
+    // certReq BOOLEAN TRUE (0x01 0x01 0xFF) present.
+    bool cert_req = false;
+    for (size_t i = 0; i + 3 <= req.size(); ++i)
+      if (req[i] == 0x01 && req[i + 1] == 0x01 && req[i + 2] == 0xFF)
+        cert_req = true;
+    CHECK(cert_req);
+  }
+
+  TEST_CASE("parse_response extracts the token when granted") {
+    // Synthetic TimeStampResp { PKIStatusInfo{status 0}, token SEQUENCE{...} }.
+    asn1::Bytes status_info = asn1::der_sequence({asn1::der_integer_u32(0)});
+    asn1::Bytes token = asn1::der_sequence(
+        {asn1::der_oid("1.2.840.113549.1.7.2"), asn1::der_null()});
+    asn1::Bytes resp = asn1::der_sequence({status_info, token});
+    int status = -1;
+    rfc3161::Bytes got = rfc3161::parse_response(resp, &status);
+    CHECK_EQ(status, 0);
+    REQUIRE(got.size() == token.size());
+    for (size_t i = 0; i < got.size(); ++i) CHECK_EQ((int)got[i], (int)token[i]);
+  }
+
+  TEST_CASE("parse_response rejects a non-granted status") {
+    asn1::Bytes status_info = asn1::der_sequence({asn1::der_integer_u32(2)});
+    asn1::Bytes resp = asn1::der_sequence(
+        {status_info, asn1::der_sequence({asn1::der_null()})});
+    int status = -1;
+    rfc3161::Bytes got = rfc3161::parse_response(resp, &status);
+    CHECK_EQ(status, 2);
+    CHECK(got.empty());
   }
 }

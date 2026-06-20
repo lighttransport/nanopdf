@@ -17,16 +17,25 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <random>
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
 #include "asn1-der.hh"
 #include "cms.hh"
+#include "crypto.hh"
 #include "crypto-pk.hh"
+#include "rfc3161.hh"
 
 namespace pdfview {
 
@@ -295,8 +304,13 @@ std::vector<uint8_t> build_cms(const std::vector<uint8_t>& data,
 // credentials and no timestamp. p12, encrypted keys, and RFC 3161 still use
 // OpenSSL until those pieces are ported.
 bool native_eligible(const SignOptions& o) {
-  return o.p12_path.empty() && !o.cert_pem_path.empty() &&
-         !o.key_pem_path.empty() && o.key_password.empty() && o.tsa_url.empty();
+  if (!o.p12_path.empty() || o.cert_pem_path.empty() ||
+      o.key_pem_path.empty() || !o.key_password.empty())
+    return false;
+  // Native timestamping works over http TSAs (no TLS yet); https falls back to
+  // the OpenSSL path.
+  if (o.tsa_url.empty()) return true;
+  return o.tsa_url.rfind("http://", 0) == 0;
 }
 
 std::string read_text_file(const std::string& path) {
@@ -334,6 +348,156 @@ std::string cert_cn(const std::vector<uint8_t>& der) {
     }
   }
   return "";
+}
+
+std::string base64(const std::string& in) {
+  static const char* T =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string o;
+  int val = 0, bits = -6;
+  for (unsigned char c : in) {
+    val = (val << 8) + c;
+    bits += 8;
+    while (bits >= 0) { o += T[(val >> bits) & 0x3F]; bits -= 6; }
+  }
+  if (bits > -6) o += T[((val << 8) >> (bits + 8)) & 0x3F];
+  while (o.size() % 4) o += '=';
+  return o;
+}
+
+// Minimal HTTP/1.1 POST over a raw TCP socket (http:// only — no TLS). Returns
+// the response body bytes, or empty (with @err set) on failure.
+std::vector<uint8_t> http_post_raw(const std::string& url,
+                                   const std::string& content_type,
+                                   const std::string& accept,
+                                   const std::string& user,
+                                   const std::string& pass,
+                                   const std::vector<uint8_t>& body,
+                                   std::string* err) {
+  std::vector<uint8_t> out;
+  if (url.rfind("http://", 0) != 0) { *err = "not an http:// URL: " + url; return out; }
+  std::string rest = url.substr(7);
+  std::string hostport = rest, path = "/";
+  size_t slash = rest.find('/');
+  if (slash != std::string::npos) { hostport = rest.substr(0, slash); path = rest.substr(slash); }
+  std::string host = hostport, port = "80";
+  size_t colon = hostport.find(':');
+  if (colon != std::string::npos) { host = hostport.substr(0, colon); port = hostport.substr(colon + 1); }
+
+  addrinfo hints{}, *res = nullptr;
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) {
+    *err = "DNS resolution failed for " + host;
+    return out;
+  }
+  int fd = -1;
+  for (addrinfo* p = res; p; p = p->ai_next) {
+    fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd < 0) continue;
+    if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+    close(fd);
+    fd = -1;
+  }
+  freeaddrinfo(res);
+  if (fd < 0) { *err = "connect failed to " + host + ":" + port; return out; }
+
+  std::string req = "POST " + path + " HTTP/1.1\r\n";
+  req += "Host: " + host + "\r\n";
+  req += "Content-Type: " + content_type + "\r\n";
+  if (!accept.empty()) req += "Accept: " + accept + "\r\n";
+  if (!user.empty())
+    req += "Authorization: Basic " + base64(user + ":" + pass) + "\r\n";
+  req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+  req += "Connection: close\r\n\r\n";
+
+  std::string wire = req;
+  wire.append(reinterpret_cast<const char*>(body.data()), body.size());
+  size_t sent = 0;
+  while (sent < wire.size()) {
+    ssize_t n = send(fd, wire.data() + sent, wire.size() - sent, 0);
+    if (n <= 0) { close(fd); *err = "send failed"; return out; }
+    sent += static_cast<size_t>(n);
+  }
+
+  std::string resp;
+  char buf[8192];
+  ssize_t n;
+  while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) resp.append(buf, n);
+  close(fd);
+
+  size_t hdr_end = resp.find("\r\n\r\n");
+  if (hdr_end == std::string::npos) { *err = "no HTTP header terminator"; return out; }
+  std::string headers = resp.substr(0, hdr_end);
+  std::string bodystr = resp.substr(hdr_end + 4);
+  if (headers.find(" 200") == std::string::npos) {
+    *err = "HTTP status not 200: " + headers.substr(0, headers.find("\r\n"));
+    return out;
+  }
+  // De-chunk if needed (Connection: close usually gives a plain body).
+  std::string lower = headers;
+  for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+  if (lower.find("transfer-encoding: chunked") != std::string::npos) {
+    std::string dec;
+    size_t i = 0;
+    while (i < bodystr.size()) {
+      size_t eol = bodystr.find("\r\n", i);
+      if (eol == std::string::npos) break;
+      size_t sz = std::strtoul(bodystr.substr(i, eol - i).c_str(), nullptr, 16);
+      i = eol + 2;
+      if (sz == 0 || i + sz > bodystr.size()) break;
+      dec.append(bodystr, i, sz);
+      i += sz + 2;
+    }
+    bodystr.swap(dec);
+  }
+  out.assign(bodystr.begin(), bodystr.end());
+  if (out.empty()) *err = "empty response body";
+  return out;
+}
+
+// Native (OpenSSL-free) RFC 3161 timestamp callback over http TSAs: hash the
+// signature value, request a token, and return it for embedding.
+nanopdf::cms::TsaCallback make_native_tsa(const SignOptions& opt,
+                                          SignResult* sr) {
+  return [opt, sr](const std::vector<uint8_t>& signature) -> std::vector<uint8_t> {
+    uint8_t digest[64];
+    size_t dlen = 32;
+    if (opt.tsa_digest == "sha512") {
+      nanopdf::crypto::SHA512::hash(signature.data(), signature.size(), digest);
+      dlen = 64;
+    } else if (opt.tsa_digest == "sha384") {
+      nanopdf::crypto::SHA384::hash(signature.data(), signature.size(), digest);
+      dlen = 48;
+    } else {
+      nanopdf::crypto::SHA256::hash(signature.data(), signature.size(), digest);
+      dlen = 32;
+    }
+    std::random_device rd;
+    uint64_t nonce = (uint64_t(rd()) << 32) ^ rd();
+    std::vector<uint8_t> req = nanopdf::rfc3161::build_request(
+        std::vector<uint8_t>(digest, digest + dlen),
+        nanopdf::rfc3161::hash_oid(opt.tsa_digest), nonce, true);
+    std::string e;
+    std::vector<uint8_t> resp =
+        http_post_raw(opt.tsa_url, "application/timestamp-query",
+                      "application/timestamp-reply", opt.tsa_username,
+                      opt.tsa_password, req, &e);
+    if (resp.empty()) {
+      std::fprintf(stderr, "pdf_sign: timestamp skipped: %s\n", e.c_str());
+      return {};
+    }
+    int status = 0;
+    std::vector<uint8_t> token = nanopdf::rfc3161::parse_response(resp, &status);
+    if (token.empty()) {
+      std::fprintf(stderr, "pdf_sign: TSA rejected request (status %d)\n",
+                   status);
+      return {};
+    }
+    sr->timestamped = true;
+    sr->timestamp_authority = opt.tsa_url;
+    return token;
+  };
 }
 
 }  // namespace
@@ -441,10 +605,13 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
     return sr;
   }
 
+  nanopdf::cms::TsaCallback native_tsa;
+  if (native && !opt.tsa_url.empty()) native_tsa = make_native_tsa(opt, &sr);
   nanopdf::SigningCallback cb =
       [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
     if (native)
-      return nanopdf::cms::build_signed_data(data, nsigner, nchain, nkey, ntime);
+      return nanopdf::cms::build_signed_data(data, nsigner, nchain, nkey, ntime,
+                                             native_tsa);
     return build_cms(data, cred, opt, &sr);
   };
   nanopdf::WriteResult ar = nanopdf::apply_signature(bytes, phs[0], cb);
