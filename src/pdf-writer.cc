@@ -2293,6 +2293,7 @@ struct PdfWriter::Impl {
   int existing_pages_obj = 0;             // Pages object from existing PDF
   std::vector<int> existing_page_objs;    // Page objects from existing PDF
   bool existing_encrypted = false;        // Existing PDF has an /Encrypt dict
+  std::string existing_encrypt_ref;       // "N G R" of the /Encrypt dictionary
 
   // Object tracking
   int next_obj_id = 1;
@@ -3596,9 +3597,39 @@ bool PdfWriter::load_existing(const std::vector<uint8_t>& data, std::string* err
       if (end != std::string::npos) {
         std::string dict(reinterpret_cast<const char*>(data.data()) + d0,
                          end - d0);
-        if (dict.find("/Encrypt") != std::string::npos)
+        size_t ep = dict.find("/Encrypt");
+        if (ep != std::string::npos) {
           impl_->existing_encrypted = true;
+          // Capture the "N G R" indirect reference to carry into our trailer.
+          int en = 0, eg = 0;
+          char r = 0;
+          if (std::sscanf(dict.c_str() + ep + 8, " %d %d %c", &en, &eg, &r) ==
+                  3 && r == 'R') {
+            impl_->existing_encrypt_ref =
+                std::to_string(en) + " " + std::to_string(eg) + " R";
+          }
+        }
       }
+    }
+  }
+
+  // For encrypted PDFs, derive the document key (empty user password) by
+  // parsing the document, so new objects' strings/streams are encrypted with
+  // the same key (the signature /Contents stays exempt). The /Encrypt dict is
+  // carried forward in the trailer.
+  if (impl_->existing_encrypted && !impl_->existing_encrypt_ref.empty()) {
+    Pdf enc_pdf;
+    if (parse_from_memory(data.data(), data.size(), &enc_pdf) &&
+        !enc_pdf.security.encryption_key.empty()) {
+      impl_->encryption_enabled = true;
+      impl_->encryption_key = enc_pdf.security.encryption_key;
+      impl_->encryption_config.algorithm = enc_pdf.security.algorithm;
+      impl_->encrypt_obj_id = std::atoi(impl_->existing_encrypt_ref.c_str());
+    } else {
+      // Could not derive the key (e.g. owner-only password): refuse rather
+      // than emit a file whose existing content can't be decrypted.
+      if (error) *error = "encrypted PDF: could not derive the document key";
+      return false;
     }
   }
 
@@ -3668,11 +3699,9 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
     return result;
   }
 
-  if (impl_->existing_encrypted) {
+  if (impl_->existing_encrypted && impl_->existing_encrypt_ref.empty()) {
     result.success = false;
-    result.error =
-        "incremental update of encrypted PDFs is not yet supported "
-        "(new objects would need re-encryption with the document key)";
+    result.error = "encrypted PDF: could not locate the /Encrypt reference";
     return result;
   }
 
@@ -3853,7 +3882,10 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
                            sig_field.sig_obj_id, config.contact_info)
                     << "\n";
     }
-    impl_->output << "/M (" << get_pdf_timestamp() << ")\n";
+    impl_->output << "/M "
+                  << impl_->format_pdf_string_for_object(sig_field.sig_obj_id,
+                                                         get_pdf_timestamp())
+                  << "\n";
 
     // ByteRange placeholder
     size_t byte_range_offset = base_offset + impl_->output.tellp();
@@ -4382,6 +4414,11 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
   if (impl_->existing_info_obj > 0) {
     impl_->output << "/Info " << impl_->existing_info_obj << " "
                   << impl_->existing_info_gen << " R\n";
+  }
+  // Carry the encryption dictionary forward so readers using this (newest)
+  // trailer still decrypt the existing content.
+  if (!impl_->existing_encrypt_ref.empty()) {
+    impl_->output << "/Encrypt " << impl_->existing_encrypt_ref << "\n";
   }
   impl_->output << "/Prev " << impl_->prev_xref_offset << "\n";
   // Document ID
