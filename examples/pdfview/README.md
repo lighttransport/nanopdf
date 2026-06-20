@@ -93,7 +93,7 @@ different file.
 | `↑` / `↓` / wheel | Scroll | `/` then type, `Enter` | Search; `n`/`N` next/prev |
 | drag on page | Select text (`Ctrl+C` to copy) | `i` | Info / signatures / forms panel |
 | `h` / `u` / `x` | Highlight / underline / strikethrough the selection | `w` | Save annotated copy (`*.annotated.pdf`) |
-| `m` then click, type, `Enter` | Add a sticky note | | |
+| `m` then click, type, `Enter` | Add a sticky note | `z` | Undo last annotation |
 | click outline / thumbnail | Jump to page | `r` | Revisions panel; `d` cycles After/Before/Diff |
 | `g` | Toggle **debug** mode | drag (debug) | Inspect region → PDF objects |
 | `s` | Save screenshot (PNG) of the frame | `[` / `]` | Rotate view CCW / CW |

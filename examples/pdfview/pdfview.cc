@@ -165,6 +165,7 @@ struct Viewer {
   std::vector<Note> notes;
   bool note_placing = false;  // waiting for a click to drop a note
   bool note_typing = false;   // editing notes.back().text
+  std::vector<char> anno_order;  // 'm'=markup / 'n'=note, in creation order (undo)
 
   // Drag selection.
   bool selecting = false;
@@ -1228,6 +1229,7 @@ bool load_document(Viewer& v, lui_window_t* win, const char* path) {
   v.doc_path = path;
   v.markups.clear();
   v.notes.clear();
+  v.anno_order.clear();
   v.note_placing = false;
   v.note_typing = false;
   v.page = 0;
@@ -2125,6 +2127,8 @@ int main(int argc, char** argv) {
             } else if (k == LUI_KEY_RETURN) {
               if (!viewer.notes.empty() && viewer.notes.back().text.empty())
                 viewer.notes.pop_back();
+              else
+                viewer.anno_order.push_back('n');  // confirmed note
               viewer.note_typing = false;
             } else if (k == LUI_KEY_BACKSPACE && !viewer.notes.empty() &&
                        !viewer.notes.back().text.empty()) {
@@ -2364,7 +2368,8 @@ int main(int argc, char** argv) {
                   : (ch == 'x' || ch == 'X') ? nanopdf::MarkupType::StrikeOut
                                              : nanopdf::MarkupType::Highlight;
               viewer.markups.push_back({viewer.sel_page, viewer.sel_quads, ty});
-              viewer.toast = "Annotated  ·  press 'w' to save annotated copy";
+              viewer.anno_order.push_back('m');
+              viewer.toast = "Annotated  ·  'z' undo  ·  'w' save copy";
               viewer.sel_page = -1;
               viewer.sel_quads.clear();
               viewer.sel_text.clear();
@@ -2376,6 +2381,20 @@ int main(int argc, char** argv) {
           } else if (ch == 'm' || ch == 'M') {
             viewer.note_placing = true;
             viewer.toast = "Click on the page to place a note";
+            dirty = true;
+          } else if (ch == 'z' || ch == 'Z') {
+            // Undo the most recently added annotation.
+            if (viewer.anno_order.empty()) {
+              viewer.toast = "Nothing to undo";
+            } else {
+              char last = viewer.anno_order.back();
+              viewer.anno_order.pop_back();
+              if (last == 'm' && !viewer.markups.empty())
+                viewer.markups.pop_back();
+              else if (last == 'n' && !viewer.notes.empty())
+                viewer.notes.pop_back();
+              viewer.toast = "Undid annotation";
+            }
             dirty = true;
           } else if (ch == 'w' || ch == 'W') {
             save_markups(viewer);
