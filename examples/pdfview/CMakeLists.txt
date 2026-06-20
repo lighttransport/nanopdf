@@ -108,6 +108,13 @@ target_include_directories(pdfview PRIVATE
 target_compile_definitions(pdfview PRIVATE
   "PDFVIEW_FONTS_DIR=\"${NANOPDF_ROOT}/fonts\"")
 
+# Enable warnings on pdfview's own sources only (the bundled lightui C layer is
+# compiled as-is). Keep these clean.
+if(NOT MSVC)
+  set_source_files_properties(pdfview.cc pdf_document.cc pdf_debug.cc
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
+endif()
+
 if(PDFVIEW_MCP)
   target_compile_definitions(pdfview PRIVATE PDFVIEW_HAVE_MCP=1)
   if(WIN32)

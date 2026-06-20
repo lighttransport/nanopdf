@@ -346,14 +346,19 @@ static bool x11_translate_event(lui_window_x11_t *xw,
 static float x11_detect_dpi_scale(void)
 {
     float dpi = 96.0f;
+    int   have_xft_dpi = 0;
 
-    /* Method 1: Xft.dpi */
+    /* Method 1: Xft.dpi (set by most desktop environments; reflects the user's
+     * configured display scale, including fractional scales like 1.25x). */
     const char *xft = XGetDefault(g_display, "Xft", "dpi");
     if (xft) {
         float v = 0.0f;
-        if (sscanf(xft, "%f", &v) == 1 && v > 0.0f)
+        if (sscanf(xft, "%f", &v) == 1 && v > 0.0f) {
             dpi = v;
-    } else {
+            have_xft_dpi = 1;
+        }
+    }
+    if (!have_xft_dpi) {
         /* Method 2: physical screen dimensions */
         int    mm  = DisplayWidthMM(g_display, g_screen);
         int    px  = DisplayWidth(g_display, g_screen);
@@ -369,9 +374,12 @@ static float x11_detect_dpi_scale(void)
     if (scale < 1.0f) scale = 1.0f;
     if (scale > 4.0f) scale = 4.0f;
 
-    /* Many X11 setups report generic 96 DPI even on 4K panels.  Treat a
-     * 3840px-wide desktop as at least 2x when the caller opts into HDPI. */
-    if (DisplayWidth(g_display, g_screen) >= 3840 && scale < 2.0f)
+    /* Only guess from desktop width when we had NO explicit Xft.dpi: many X11
+     * setups report a generic 96 DPI even on 4K panels. When Xft.dpi WAS set we
+     * trust it — otherwise a wide multi-monitor desktop at, say, 1.25x would be
+     * wrongly forced to 2.0. */
+    if (!have_xft_dpi && DisplayWidth(g_display, g_screen) >= 3840 &&
+        scale < 2.0f)
         scale = 2.0f;
 
     return scale;

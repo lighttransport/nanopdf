@@ -17,11 +17,13 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "pdf_document.hh"
 #include "pdf_debug.hh"
@@ -40,19 +42,34 @@ extern "C" {
 #include <unistd.h>  // usleep
 #endif
 
+// stb_image_write encoders (compiled into libnanopdf.a). Declared here to avoid
+// pulling in the implementation header; signatures match stb_image_write.h.
+extern "C" {
+int stbi_write_png(const char* filename, int w, int h, int comp,
+                   const void* data, int stride_in_bytes);
+int stbi_write_jpg(const char* filename, int w, int h, int comp,
+                   const void* data, int quality);
+}
+
 namespace {
 
-constexpr int kInitialWidth = 1100;
+constexpr int kInitialWidth = 1100;   // logical window size (lightui scales it)
 constexpr int kInitialHeight = 800;
-constexpr int kToolbarH = 44;
-constexpr int kPageMargin = 16;       // gap around the page in the content area
-constexpr int kSidebarW = 300;        // sidebar width (physical px)
-constexpr int kRowH = 24;             // outline row height
-constexpr int kTabH = 30;             // sidebar tab-bar height
-constexpr int kThumbW = 220;          // thumbnail render target width
-constexpr int kThumbImgH = 200;       // thumbnail image area height per cell
-constexpr int kThumbCellH = 234;      // full thumbnail cell height (img + label)
-constexpr int kThumbMargin = 34;      // horizontal margin around thumbnails
+// UI chrome metrics, in physical pixels. lightui hands us a physical-resolution
+// surface (logical * dpi_scale), so on a HiDPI display these are multiplied by
+// the DPI factor once at startup via scale_ui_metrics(). Hence: mutable, not
+// constexpr. Base values target a 1x display.
+int kToolbarH = 44;
+int kPageMargin = 16;       // gap around the page in the content area
+int kSidebarW = 300;        // sidebar width
+int kRowH = 24;             // outline row height
+int kTabH = 30;             // sidebar tab-bar height
+int kThumbW = 220;          // thumbnail render target width
+int kThumbImgH = 200;       // thumbnail image area height per cell
+int kThumbCellH = 234;      // full thumbnail cell height (img + label)
+int kThumbMargin = 34;      // horizontal margin around thumbnails
+int kRightW = 340;          // right panel width
+int kRevRowH = 50;          // revision-row height
 constexpr float kMinZoom = 0.1f;
 constexpr float kMaxZoom = 8.0f;
 constexpr float kZoomStep = 1.2f;
@@ -141,6 +158,10 @@ struct Viewer {
   int page_px = 0, page_py = 0;
   float page_scale = 1.0f;
 
+  int screenshot_seq = 0;  // counter for auto-named screenshot files
+  std::string toast;       // transient message (e.g. "Saved screenshot");
+                           // shown in the toolbar until the next input
+
   char status[256] = {0};
 };
 
@@ -177,6 +198,60 @@ void dump_surface_ppm(const lvg_surface_t* s, const char* path) {
     }
   }
   std::fclose(f);
+}
+
+// Lower-cased file extension (without the dot), e.g. "out.PNG" -> "png".
+std::string file_ext_lower(const std::string& path) {
+  size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos) return std::string();
+  std::string ext = path.substr(dot + 1);
+  for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+  return ext;
+}
+
+// Save a surface as PNG or JPG (chosen by @path extension; PNG default). The
+// surface holds 0xAARRGGBB pixels with a row stride that may exceed width, so
+// pack a tight RGB buffer first. Returns false on failure.
+bool save_surface_image(const lvg_surface_t* s, const std::string& path) {
+  if (!s || !s->pixels || s->width <= 0 || s->height <= 0) return false;
+  const int w = s->width, h = s->height;
+  std::vector<unsigned char> rgb((size_t)w * h * 3);
+  for (int y = 0; y < h; ++y) {
+    const uint32_t* row = s->pixels + (size_t)y * s->stride;
+    unsigned char* dst = rgb.data() + (size_t)y * w * 3;
+    for (int x = 0; x < w; ++x) {
+      uint32_t p = row[x];
+      dst[x * 3 + 0] = (unsigned char)((p >> 16) & 0xFF);
+      dst[x * 3 + 1] = (unsigned char)((p >> 8) & 0xFF);
+      dst[x * 3 + 2] = (unsigned char)(p & 0xFF);
+    }
+  }
+  std::string ext = file_ext_lower(path);
+  int ok;
+  if (ext == "jpg" || ext == "jpeg")
+    ok = stbi_write_jpg(path.c_str(), w, h, 3, rgb.data(), 90);
+  else
+    ok = stbi_write_png(path.c_str(), w, h, 3, rgb.data(), w * 3);
+  return ok != 0;
+}
+
+// Scale all physical-pixel UI metrics by the display's DPI factor. Called once
+// at startup with the window surface's dpi_scale; a no-op at 1x (and for the
+// headless 1x render paths, which never call it).
+void scale_ui_metrics(float s) {
+  if (s <= 1.0f) return;
+  auto sc = [&](int& v) { v = (int)(v * s + 0.5f); };
+  sc(kToolbarH);
+  sc(kPageMargin);
+  sc(kSidebarW);
+  sc(kRowH);
+  sc(kTabH);
+  sc(kThumbW);
+  sc(kThumbImgH);
+  sc(kThumbCellH);
+  sc(kThumbMargin);
+  sc(kRightW);
+  sc(kRevRowH);
 }
 
 float fit_width_zoom(Viewer& v, int content_w) {
@@ -250,7 +325,6 @@ void draw_thumb_panel(Viewer& v, lvg_canvas_t* c, int panel_y, int H) {
   v.thumb_scroll =
       clampi(v.thumb_scroll, 0, std::max(0, n * kThumbCellH - avail));
   const int area_w = sb_w - 2 * kThumbMargin;
-  const int lh = v.font ? lui_font_line_height(v.font) : 12;
   for (int i = 0; i < n; ++i) {
     int cy = panel_y + i * kThumbCellH - v.thumb_scroll;
     if (cy + kThumbCellH <= panel_y || cy >= H) continue;  // cull off-screen
@@ -327,9 +401,6 @@ void draw_sidebar(Viewer& v, lvg_canvas_t* c, int H) {
 }
 
 // ---- Right panel: document info / signatures / forms, and revisions --------
-
-constexpr int kRightW = 340;
-constexpr int kRevRowH = 50;
 
 int right_width(Viewer& v) {
   return (v.right_panel != 0 && v.doc.loaded()) ? kRightW : 0;
@@ -725,7 +796,10 @@ void draw(Viewer& v, lvg_surface_t* surf) {
   if (v.font) {
     int lh = lui_font_line_height(v.font);
     int ty = (kToolbarH - lh) / 2;
-    if (v.search_active || !v.query.empty()) {
+    if (!v.toast.empty()) {
+      lui_canvas_draw_text(&c, 14, ty, v.toast.c_str(), (int)v.toast.size(),
+                           v.font, kAccent);
+    } else if (v.search_active || !v.query.empty()) {
       // Search box (left) + page/zoom status (right).
       char sb[320];
       int nmatch = (v.match_page >= 0) ? (int)v.match_quads.size() : 0;
@@ -832,6 +906,24 @@ void run_search(Viewer& v, int start_page, int dir, int content_h) {
       scroll_to_current_match(v, content_h);
       return;
     }
+  }
+}
+
+// Save a screenshot of the current frame @surf to an auto-named PNG in the
+// working directory (e.g. "report.pdf_p03_1.png"). Updates v.status.
+void take_screenshot(Viewer& v, const lvg_surface_t* surf) {
+  if (!surf) return;
+  std::string base = v.title.empty() ? "pdfview" : v.title;
+  char name[320];
+  std::snprintf(name, sizeof(name), "%s_p%02d_%d.png", base.c_str(),
+                v.page + 1, ++v.screenshot_seq);
+  if (save_surface_image(surf, name)) {
+    v.toast = std::string("Saved screenshot: ") + name;
+    std::printf("pdfview: saved screenshot %s (%dx%d)\n", name, surf->width,
+                surf->height);
+  } else {
+    v.toast = std::string("Screenshot failed: ") + name;
+    std::fprintf(stderr, "pdfview: screenshot failed: %s\n", name);
   }
 }
 
@@ -1204,6 +1296,36 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Headless page screenshot to PNG/JPG (format chosen by output extension).
+  //   pdfview --screenshot <pdf> <out.png|jpg> [page1based] [scale]
+  if (argc > 1 && std::strcmp(argv[1], "--screenshot") == 0) {
+    if (argc < 4) {
+      std::fprintf(stderr,
+                   "usage: pdfview --screenshot <pdf> <out.png|jpg> "
+                   "[page] [scale]\n");
+      return 2;
+    }
+    int page1 = (argc > 4) ? std::atoi(argv[4]) : 1;
+    float scale = (argc > 5) ? (float)std::atof(argv[5]) : 1.5f;
+    pdfview::PdfDocument doc;
+    if (!doc.load_file(argv[2])) {
+      std::fprintf(stderr, "load failed: %s\n", doc.error().c_str());
+      return 1;
+    }
+    const pdfview::RenderedPage* rp = doc.render(page1 - 1, scale);
+    if (!rp || !rp->valid()) {
+      std::fprintf(stderr, "render failed: %s\n", doc.error().c_str());
+      return 1;
+    }
+    if (!save_surface_image(&rp->surface, argv[3])) {
+      std::fprintf(stderr, "write failed: %s\n", argv[3]);
+      return 1;
+    }
+    std::fprintf(stderr, "screenshot page %d at scale %.2f -> %dx%d -> %s\n",
+                 page1, scale, rp->width, rp->height, argv[3]);
+    return 0;
+  }
+
   // Headless full-frame composition check: run the exact draw() the window loop
   // uses (fit-width zoom, page blit + clip, toolbar, text) onto an offscreen
   // surface and dump it.
@@ -1486,12 +1608,25 @@ int main(int argc, char** argv) {
   }
   lui_window_show(win);
 
+  // HiDPI: the surface is physical-resolution (logical * dpi_scale). Scale the
+  // UI chrome metrics and the font to match so the UI isn't half-size on a 2x
+  // display.
+  float ui_scale = 1.0f;
+  if (lvg_surface_t* s0 = lui_window_get_surface(win)) {
+    if (s0->dpi_scale > 1.0f) ui_scale = s0->dpi_scale;
+    std::fprintf(stderr, "pdfview: dpi_scale=%.3f surface=%dx%d\n",
+                 s0->dpi_scale, s0->width, s0->height);
+  }
+  scale_ui_metrics(ui_scale);
+  const int ui_font_px = (int)(16 * ui_scale + 0.5f);
+
 #if PDFVIEW_HAVE_NFD
   NFD_Init();
 #endif
 
   Viewer viewer;
-  viewer.font = lui_font_create(PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf", 16);
+  viewer.font =
+      lui_font_create(PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf", ui_font_px);
   if (!viewer.font) {
     std::fprintf(stderr, "pdfview: warning: UI font not found at %s\n",
                  PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf");
@@ -1542,9 +1677,9 @@ int main(int argc, char** argv) {
     do {
       int W = 0, H = 0;
       lui_window_get_physical_size(win, &W, &H);
-      int lw = 0, lh = 0;
-      lui_window_get_size(win, &lw, &lh);
-      const float dpi = (lw > 0) ? (float)W / (float)lw : 1.0f;
+      // Note: mouse events from lightui are already in physical pixels (same
+      // space as the surface and our layout), so they are used as-is — no
+      // dpi rescaling.
       const int content_x = sidebar_width(viewer);
       const int right_w = right_width(viewer);
       const int content_w = std::max(1, W - content_x - right_w);
@@ -1561,6 +1696,10 @@ int main(int argc, char** argv) {
           break;
         case LUI_EVENT_KEY_DOWN: {
           int k = event.data.key.key;
+          if (!viewer.toast.empty()) {  // any key dismisses a lingering toast
+            viewer.toast.clear();
+            dirty = true;
+          }
           if (viewer.search_active) {
             // While typing a query, keys edit/commit the search.
             if (k == LUI_KEY_ESCAPE) {
@@ -1619,6 +1758,10 @@ int main(int argc, char** argv) {
         }
         case LUI_EVENT_TEXT_INPUT: {
           char ch = event.data.text.text[0];
+          if (!viewer.toast.empty()) {  // any key dismisses a lingering toast
+            viewer.toast.clear();
+            dirty = true;
+          }
           if (viewer.search_active) {
             if ((unsigned char)ch >= 0x20) {  // printable (incl. UTF-8 lead)
               viewer.query += event.data.text.text;
@@ -1716,12 +1859,20 @@ int main(int argc, char** argv) {
               viewer.debug_dump.clear();
             }
             dirty = true;
+          } else if (ch == 's' || ch == 'S') {
+            // Screenshot: render a fresh frame, then save the window surface.
+            lvg_surface_t* surface = lui_window_get_surface(win);
+            if (surface) {
+              draw(viewer, surface);
+              take_screenshot(viewer, surface);
+            }
+            dirty = true;
           }
           break;
         }
         case LUI_EVENT_MOUSE_MOVE: {
-          viewer.mouse_x = (int)(event.data.mouse_move.x * dpi);
-          viewer.mouse_y = (int)(event.data.mouse_move.y * dpi);
+          viewer.mouse_x = (int)event.data.mouse_move.x;
+          viewer.mouse_y = (int)event.data.mouse_move.y;
           if (viewer.selecting) {
             viewer.sel_x1 = viewer.mouse_x;
             viewer.sel_y1 = viewer.mouse_y;
@@ -1731,8 +1882,8 @@ int main(int argc, char** argv) {
         }
         case LUI_EVENT_MOUSE_DOWN: {
           if (event.data.mouse_button.button != LUI_MOUSE_LEFT) break;
-          int mx = (int)(event.data.mouse_button.x * dpi);
-          int my = (int)(event.data.mouse_button.y * dpi);
+          int mx = (int)event.data.mouse_button.x;
+          int my = (int)event.data.mouse_button.y;
           viewer.mouse_x = mx;
           viewer.mouse_y = my;
           const int panel_y = sidebar_panel_y();
@@ -1802,8 +1953,8 @@ int main(int argc, char** argv) {
         case LUI_EVENT_MOUSE_UP: {
           if (!viewer.selecting) break;
           viewer.selecting = false;
-          int mx = (int)(event.data.mouse_button.x * dpi);
-          int my = (int)(event.data.mouse_button.y * dpi);
+          int mx = (int)event.data.mouse_button.x;
+          int my = (int)event.data.mouse_button.y;
           viewer.sel_x1 = mx;
           viewer.sel_y1 = my;
           // Tiny drag = click, not a selection.

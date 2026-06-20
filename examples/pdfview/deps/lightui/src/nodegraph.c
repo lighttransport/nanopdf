@@ -1075,6 +1075,8 @@ void lui_nodegraph_auto_layout(lui_nodegraph_t *ng)
     }
 
     int n = ng->node_count;
+    if (n < 0) n = 0;  /* clamp into [0, LUI_NG_MAX_NODES] for the fixed buffers */
+    if (n > LUI_NG_MAX_NODES) n = LUI_NG_MAX_NODES;
 
     /* Build adjacency lists (outgoing edges) and in-degree */
     int adj[LUI_NG_MAX_NODES][LUI_NG_MAX_NODES];
@@ -1145,6 +1147,7 @@ void lui_nodegraph_auto_layout(lui_nodegraph_t *ng)
     for (int i = 0; i < n; i++)
         if (layer[i] > max_layer) max_layer = layer[i];
     int num_layers = max_layer + 1;
+    if (num_layers > LUI_NG_MAX_NODES) num_layers = LUI_NG_MAX_NODES;
 
     /* Step 3: Build per-layer node lists */
     int layer_nodes[LUI_NG_MAX_NODES][LUI_NG_MAX_NODES];

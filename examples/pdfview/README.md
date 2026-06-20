@@ -42,18 +42,31 @@ there is no link-time X11 dependency).
 
 ## Build
 
+Easiest — `run.sh` builds a dedicated LightVG-only nanopdf library plus the viewer:
+
 ```bash
-# 1) Build nanopdf first (provides libnanopdf.a with the shared lvg_ lightvg)
-cmake -S ../.. -B ../../build -DCMAKE_BUILD_TYPE=Release
-cmake --build ../../build -j
+./run.sh [document.pdf]      # or: ./run.sh --mcp document.pdf
+```
+
+Manual build:
+
+```bash
+# 1) Build nanopdf WITHOUT ThorVG (the viewer links only the LightVG backend;
+#    a ThorVG-enabled libnanopdf.a fails to link on tvg:: symbols). A dedicated
+#    build dir avoids clobbering a ThorVG-enabled build/ you may already have.
+cmake -S ../.. -B ../../build-pdfview -DCMAKE_BUILD_TYPE=Release -DNANOPDF_USE_THORVG=OFF
+cmake --build ../../build-pdfview --target nanopdf -j
 
 # 2) Build the viewer, pointing at that nanopdf build dir
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNANOPDF_BUILD_DIR=$(cd ../.. && pwd)/build
-cmake --build build -j
-
-# or just:
-./run.sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DNANOPDF_BUILD_DIR=$(cd ../.. && pwd)/build-pdfview
+cmake --build build -j     # -> ./build/pdfview
 ```
+
+> The viewer renders via nanopdf's LightVG backend (it does not link ThorVG). If
+> you point `NANOPDF_BUILD_DIR` at a `libnanopdf.a` built with `NANOPDF_USE_THORVG=ON`,
+> linking fails with undefined `tvg::…` symbols — rebuild nanopdf with
+> `-DNANOPDF_USE_THORVG=OFF` (as above).
 
 ## Run
 
@@ -76,7 +89,7 @@ cmake --build build -j
 | drag on page | Select text (copies to stdout) | `i` | Info / signatures / forms panel |
 | click outline / thumbnail | Jump to page | `r` | Revisions panel; `d` cycles After/Before/Diff |
 | `g` | Toggle **debug** mode | drag (debug) | Inspect region → PDF objects |
-| `Esc` | Clear search/selection, else quit | | |
+| `s` | Save screenshot (PNG) of the frame | `Esc` | Clear search/selection, else quit |
 
 ## Debug mode + MCP (LLM/VLM-assisted inspection)
 
@@ -95,7 +108,12 @@ runs the same server **headless** (offscreen render, no display) for LLM PDF ins
 Headless self-test modes (no display): `--selftest`, `--renderpage <pdf> <page> <out.ppm>`,
 `--compose <pdf> <out.ppm>`, `--search <pdf> <term> <out.ppm>`, `--info <pdf> <out.ppm>`,
 `--rev <pdf> <out.ppm> [before|diff]`, `--inspect <pdf> <page> <x1> <y1> <x2> <y2>`,
-`--debugview <pdf> <page> <x1> <y1> <x2> <y2> <out.ppm>`.
+`--debugview <pdf> <page> <x1> <y1> <x2> <y2> <out.ppm>`,
+`--screenshot <pdf> <out.png|jpg> [page] [scale]` (export a page as PNG/JPG; format
+chosen by the output extension).
+
+Interactively, press `s` to save a PNG screenshot of the current frame to the working
+directory (auto-named `<file>_p<NN>_<seq>.png`).
 
 ## Status
 
