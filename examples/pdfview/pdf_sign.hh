@@ -2,8 +2,9 @@
 // Copyright 2024 - Present, Light Transport Entertainment Inc.
 //
 // pdf_sign — digital-signature engine for pdfview, built on nanopdf's signing
-// framework (PdfWriter incremental update + apply_signature) and OpenSSL's
-// PKCS#7/CMS + RFC 3161 timestamp APIs.
+// framework (PdfWriter incremental update + apply_signature) and the pure-C11
+// ncrypto library for all cryptography (RSA/CMS/RFC 3161/PKCS#12 + TLS 1.3).
+// No OpenSSL.
 //
 // The signature is an adbe.pkcs7.detached CMS over the PDF /ByteRange. When a
 // timestamp authority (TSA) is configured, an RFC 3161 signature-timestamp is

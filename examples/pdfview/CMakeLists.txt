@@ -76,25 +76,12 @@ add_executable(pdfview
   ${LIGHTUI_SOURCES}
 )
 
-# OpenSSL is OPTIONAL. The pure-C++ stack in libnanopdf (crypto-pk/asn1-der/cms/
-# rfc3161/pkcs12) signs, http-timestamps and verifies with no OpenSSL; OpenSSL is
-# only needed for https TSAs (TLS) and the legacy signing path. Disable with
-# -DPDFVIEW_USE_OPENSSL=OFF for an OpenSSL-free build.
-option(PDFVIEW_USE_OPENSSL "Link OpenSSL for https TSAs / legacy signing" ON)
-if(PDFVIEW_USE_OPENSSL)
-  find_package(OpenSSL)
-  if(OpenSSL_FOUND)
-    target_link_libraries(pdfview PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    target_compile_definitions(pdfview PRIVATE PDFVIEW_HAVE_OPENSSL=1)
-    message(STATUS "pdfview: OpenSSL enabled (https TSAs available)")
-  else()
-    message(STATUS "pdfview: OpenSSL not found; building OpenSSL-free "
-                   "(http TSAs only)")
-  endif()
-else()
-  message(STATUS "pdfview: OpenSSL disabled; building OpenSSL-free "
-                 "(http TSAs only)")
-endif()
+# Cryptography: the standalone pure-C11 ncrypto library handles ALL signing,
+# timestamping (RFC 3161 + OpenTimestamps), TLS 1.3 and verification. No OpenSSL.
+set(NCRYPTO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${NANOPDF_ROOT}/ncrypto ${CMAKE_BINARY_DIR}/ncrypto)
+target_link_libraries(pdfview PRIVATE ncrypto)
+message(STATUS "pdfview: crypto via ncrypto (pure C11, OpenSSL-free)")
 if(NFD_SOURCES)
   set_source_files_properties(${NFD_SOURCES} PROPERTIES
     COMPILE_DEFINITIONS "${NFD_DEFINES}"

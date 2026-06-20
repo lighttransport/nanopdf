@@ -1,30 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024 - Present, Light Transport Entertainment Inc.
+//
+// pdf_sign — digital-signature engine for pdfview. The PDF structure work
+// (incremental update + ByteRange + apply_signature) uses nanopdf's PdfWriter;
+// ALL cryptography runs on the pure-C11 ncrypto library (RSA/CMS/RFC3161/PKCS12)
+// and its hand-rolled TLS 1.3 client. No OpenSSL.
 
 #include "pdf_sign.hh"
-
-// OpenSSL is optional: it is only needed for https TSAs (TLS) and the legacy
-// signing path. Without it, the pure-C++ stack still handles PEM/PKCS#12
-// signing, http timestamps, and verification.
-#ifndef PDFVIEW_HAVE_OPENSSL
-#define PDFVIEW_HAVE_OPENSSL 0
-#endif
-
-#if PDFVIEW_HAVE_OPENSSL
-#include <openssl/bio.h>
-#include <openssl/bn.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/http.h>
-#include <openssl/pem.h>
-#include <openssl/pkcs12.h>
-#include <openssl/pkcs7.h>
-#include <openssl/rand.h>
-#include <openssl/ssl.h>
-#include <openssl/ts.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#endif
 
 #include <netdb.h>
 #include <sys/socket.h>
@@ -35,299 +17,22 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <memory>
 #include <random>
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
-#include "asn1-der.hh"
-#include "cms.hh"
-#include "crypto.hh"
-#include "crypto-pk.hh"
-#include "pkcs12.hh"
-#include "rfc3161.hh"
 #include "tls_client.hh"
+
+#include "ncrypto/nc_asn1.h"
+#include "ncrypto/nc_cms.h"
+#include "ncrypto/nc_hash.h"
+#include "ncrypto/nc_pkcs12.h"
+#include "ncrypto/nc_rfc3161.h"
+#include "ncrypto/nc_rsa.h"
 
 namespace pdfview {
 
 namespace {
-
-#if PDFVIEW_HAVE_OPENSSL
-std::string ossl_err() {
-  unsigned long e = ERR_get_error();
-  if (!e) return "unknown OpenSSL error";
-  char buf[256];
-  ERR_error_string_n(e, buf, sizeof(buf));
-  return buf;
-}
-
-// --- credential loading -----------------------------------------------------
-
-struct Credentials {
-  X509* cert = nullptr;
-  EVP_PKEY* key = nullptr;
-  STACK_OF(X509)* chain = nullptr;  // additional certs (issuer chain)
-  ~Credentials() {
-    if (cert) X509_free(cert);
-    if (key) EVP_PKEY_free(key);
-    if (chain) sk_X509_pop_free(chain, X509_free);
-  }
-};
-
-bool load_credentials(const SignOptions& opt, Credentials* out,
-                      std::string* err) {
-  if (!opt.p12_path.empty()) {
-    BIO* bio = BIO_new_file(opt.p12_path.c_str(), "rb");
-    if (!bio) { *err = "cannot open PKCS#12: " + opt.p12_path; return false; }
-    PKCS12* p12 = d2i_PKCS12_bio(bio, nullptr);
-    BIO_free(bio);
-    if (!p12) { *err = "invalid PKCS#12 file: " + ossl_err(); return false; }
-    int ok = PKCS12_parse(p12, opt.p12_password.c_str(), &out->key, &out->cert,
-                          &out->chain);
-    PKCS12_free(p12);
-    if (!ok || !out->cert || !out->key) {
-      *err = "PKCS#12 parse failed (wrong password?): " + ossl_err();
-      return false;
-    }
-    return true;
-  }
-  if (opt.cert_pem_path.empty() || opt.key_pem_path.empty()) {
-    *err = "no credentials: provide --p12 or both --cert and --key";
-    return false;
-  }
-  BIO* cbio = BIO_new_file(opt.cert_pem_path.c_str(), "rb");
-  if (!cbio) { *err = "cannot open cert: " + opt.cert_pem_path; return false; }
-  out->cert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
-  // Any remaining certs in the file form the chain.
-  out->chain = sk_X509_new_null();
-  X509* extra;
-  while ((extra = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr)) != nullptr)
-    sk_X509_push(out->chain, extra);
-  BIO_free(cbio);
-  if (!out->cert) { *err = "invalid PEM certificate: " + ossl_err(); return false; }
-
-  BIO* kbio = BIO_new_file(opt.key_pem_path.c_str(), "rb");
-  if (!kbio) { *err = "cannot open key: " + opt.key_pem_path; return false; }
-  void* pw = opt.key_password.empty()
-                 ? nullptr
-                 : const_cast<char*>(opt.key_password.c_str());
-  out->key = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, pw);
-  BIO_free(kbio);
-  if (!out->key) { *err = "invalid PEM private key: " + ossl_err(); return false; }
-  return true;
-}
-
-// --- RFC 3161 timestamp -----------------------------------------------------
-
-const EVP_MD* md_by_name(const std::string& n) {
-  if (n == "sha384") return EVP_sha384();
-  if (n == "sha512") return EVP_sha512();
-  return EVP_sha256();
-}
-
-// TLS BIO callback for OSSL_HTTP (https TSAs like FreeTSA). Wraps @bio in TLS
-// on connect; tears it down on disconnect.
-BIO* http_tls_cb(BIO* bio, void* arg, int connect, int detail) {
-  SSL_CTX* ctx = static_cast<SSL_CTX*>(arg);
-  if (connect && detail) {  // set up TLS
-    BIO* sbio = BIO_new_ssl(ctx, /*client=*/1);
-    if (!sbio) return nullptr;
-    bio = BIO_push(sbio, bio);
-  } else if (!connect) {  // tear down
-    BIO_ssl_shutdown(bio);
-  }
-  return bio;
-}
-
-// Request an RFC 3161 timestamp token over @url for the message imprint
-// hash(@data). Returns the TimeStampToken as DER bytes, or empty on failure.
-std::vector<uint8_t> fetch_timestamp_token(const std::string& url,
-                                           const std::string& user,
-                                           const std::string& pass,
-                                           const unsigned char* data, size_t len,
-                                           const std::string& digest,
-                                           std::string* err) {
-  std::vector<uint8_t> result;
-  const EVP_MD* md = md_by_name(digest);
-  unsigned char hash[EVP_MAX_MD_SIZE];
-  unsigned int hlen = 0;
-  EVP_Digest(data, len, hash, &hlen, md, nullptr);
-
-  TS_REQ* req = TS_REQ_new();
-  TS_MSG_IMPRINT* imp = TS_MSG_IMPRINT_new();
-  X509_ALGOR* alg = X509_ALGOR_new();
-  X509_ALGOR_set0(alg, OBJ_nid2obj(EVP_MD_type(md)), V_ASN1_NULL, nullptr);
-  TS_REQ_set_version(req, 1);
-  TS_MSG_IMPRINT_set_algo(imp, alg);
-  TS_MSG_IMPRINT_set_msg(imp, hash, hlen);
-  TS_REQ_set_msg_imprint(req, imp);
-  TS_REQ_set_cert_req(req, 1);
-  // Random 64-bit nonce.
-  {
-    ASN1_INTEGER* nonce = ASN1_INTEGER_new();
-    unsigned char nb[8];
-    RAND_bytes(nb, sizeof(nb));
-    BIGNUM* bn = BN_bin2bn(nb, sizeof(nb), nullptr);
-    BN_to_ASN1_INTEGER(bn, nonce);
-    TS_REQ_set_nonce(req, nonce);
-    ASN1_INTEGER_free(nonce);
-    BN_free(bn);
-  }
-  X509_ALGOR_free(alg);
-  TS_MSG_IMPRINT_free(imp);
-
-  unsigned char* reqder = nullptr;
-  int reqlen = i2d_TS_REQ(req, &reqder);
-  TS_REQ_free(req);
-  if (reqlen <= 0) { *err = "failed to encode TS request"; return result; }
-
-  // Parse URL and POST via OSSL_HTTP (handles http + https).
-  char *host = nullptr, *port = nullptr, *path = nullptr;
-  int use_ssl = 0;
-  if (!OSSL_HTTP_parse_url(url.c_str(), &use_ssl, nullptr, &host, &port, nullptr,
-                           &path, nullptr, nullptr)) {
-    OPENSSL_free(reqder);
-    *err = "bad TSA url: " + url;
-    return result;
-  }
-  SSL_CTX* tls = nullptr;
-  if (use_ssl) {
-    tls = SSL_CTX_new(TLS_client_method());
-    SSL_CTX_set_verify(tls, SSL_VERIFY_NONE, nullptr);  // token is self-verifying
-  }
-  BIO* reqbio = BIO_new_mem_buf(reqder, reqlen);
-  OSSL_HTTP_bio_cb_t tls_cb = use_ssl ? http_tls_cb : nullptr;
-  OSSL_HTTP_REQ_CTX* rctx =
-      OSSL_HTTP_open(host, port, nullptr, nullptr, use_ssl, nullptr, nullptr,
-                     tls_cb, tls, 0, 30000);
-  TS_RESP* resp = nullptr;
-  if (rctx) {
-    STACK_OF(CONF_VALUE)* hdrs = nullptr;
-    if (!user.empty()) {
-      std::string cred = user + ":" + pass;
-      BIO* b64 = BIO_new(BIO_f_base64());
-      BIO* mem = BIO_new(BIO_s_mem());
-      BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-      b64 = BIO_push(b64, mem);
-      BIO_write(b64, cred.data(), (int)cred.size());
-      BIO_flush(b64);
-      char* enc = nullptr;
-      long n = BIO_get_mem_data(mem, &enc);
-      std::string auth = "Basic " + std::string(enc, (size_t)n);
-      X509V3_add_value("Authorization", auth.c_str(), &hdrs);
-      BIO_free_all(b64);
-    }
-    if (OSSL_HTTP_set1_request(rctx, path, hdrs, "application/timestamp-query",
-                               reqbio, "application/timestamp-reply",
-                               /*expect_asn1=*/1, /*max_resp_len=*/0,
-                               /*timeout=*/30000, /*keep_alive=*/0)) {
-      BIO* rbio = OSSL_HTTP_exchange(rctx, nullptr);
-      if (rbio) resp = d2i_TS_RESP_bio(rbio, nullptr);
-    }
-    if (hdrs) sk_CONF_VALUE_pop_free(hdrs, X509V3_conf_free);
-    OSSL_HTTP_close(rctx, 1);
-  }
-  BIO_free(reqbio);
-  OPENSSL_free(reqder);
-  OPENSSL_free(host);
-  OPENSSL_free(port);
-  OPENSSL_free(path);
-  if (tls) SSL_CTX_free(tls);
-
-  if (!resp) { *err = "no/invalid TSA response from " + url; return result; }
-  PKCS7* token = TS_RESP_get_token(resp);
-  if (token) {
-    unsigned char* td = nullptr;
-    int tl = i2d_PKCS7(token, &td);
-    if (tl > 0) {
-      result.assign(td, td + tl);
-      OPENSSL_free(td);
-    }
-  }
-  TS_RESP_free(resp);
-  if (result.empty()) *err = "TSA returned no token (rejected request?)";
-  return result;
-}
-
-// Attach a TimeStampToken as the id-aa-timeStampToken unsigned attribute of the
-// signer info. Returns true on success.
-bool embed_timestamp(PKCS7* p7, const std::vector<uint8_t>& token_der,
-                     std::string* err) {
-  STACK_OF(PKCS7_SIGNER_INFO)* sis = PKCS7_get_signer_info(p7);
-  if (!sis || sk_PKCS7_SIGNER_INFO_num(sis) < 1) {
-    *err = "no signer info to timestamp";
-    return false;
-  }
-  PKCS7_SIGNER_INFO* si = sk_PKCS7_SIGNER_INFO_value(sis, 0);
-  ASN1_OBJECT* oid = OBJ_txt2obj("1.2.840.113549.1.9.16.2.14", 1);
-  X509_ATTRIBUTE* attr = X509_ATTRIBUTE_new();
-  X509_ATTRIBUTE_set1_object(attr, oid);
-  X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE, token_der.data(),
-                           (int)token_der.size());
-  ASN1_OBJECT_free(oid);
-  if (!si->unauth_attr) si->unauth_attr = sk_X509_ATTRIBUTE_new_null();
-  sk_X509_ATTRIBUTE_push(si->unauth_attr, attr);
-  return true;
-}
-
-// Build the detached CMS/PKCS#7 signature over @data, optionally embedding an
-// RFC 3161 timestamp. Returns DER bytes (empty on failure).
-std::vector<uint8_t> build_cms(const std::vector<uint8_t>& data,
-                               const Credentials& cred, const SignOptions& opt,
-                               SignResult* sr) {
-  std::vector<uint8_t> der;
-  int flags = PKCS7_DETACHED | PKCS7_BINARY | PKCS7_NOSMIMECAP;
-  BIO* dbio = BIO_new_mem_buf(data.data(), (int)data.size());
-  PKCS7* p7 = PKCS7_sign(cred.cert, cred.key, cred.chain, dbio, flags);
-  BIO_free(dbio);
-  if (!p7) { sr->error = "PKCS7_sign failed: " + ossl_err(); return der; }
-
-  if (!opt.tsa_url.empty()) {
-    STACK_OF(PKCS7_SIGNER_INFO)* sis = PKCS7_get_signer_info(p7);
-    PKCS7_SIGNER_INFO* si = sk_PKCS7_SIGNER_INFO_value(sis, 0);
-    std::string terr;
-    std::vector<uint8_t> token = fetch_timestamp_token(
-        opt.tsa_url, opt.tsa_username, opt.tsa_password, si->enc_digest->data,
-        (size_t)si->enc_digest->length, opt.tsa_digest, &terr);
-    if (!token.empty() && embed_timestamp(p7, token, &terr)) {
-      sr->timestamped = true;
-      sr->timestamp_authority = opt.tsa_url;
-    } else {
-      // Non-fatal: keep the (untimestamped) signature, report the reason.
-      std::fprintf(stderr, "pdf_sign: timestamp skipped: %s\n", terr.c_str());
-    }
-  }
-
-  unsigned char* out = nullptr;
-  int len = i2d_PKCS7(p7, &out);
-  PKCS7_free(p7);
-  if (len > 0) {
-    der.assign(out, out + len);
-    OPENSSL_free(out);
-  } else {
-    sr->error = "failed to encode CMS: " + ossl_err();
-  }
-  return der;
-}
-#endif  // PDFVIEW_HAVE_OPENSSL
-
-// --- native (OpenSSL-free) signing path -------------------------------------
-
-// The pure-C++ stack (crypto-pk + asn1-der + cms) can sign with unencrypted PEM
-// credentials and no timestamp. p12, encrypted keys, and RFC 3161 still use
-// OpenSSL until those pieces are ported.
-bool native_eligible(const SignOptions& o) {
-  // Need credentials: a PKCS#12 bundle, or a PEM cert + key.
-  bool have_creds = !o.p12_path.empty() ||
-                    (!o.cert_pem_path.empty() && !o.key_pem_path.empty());
-  if (!have_creds) return false;
-  // Native timestamping works over both http and https TSAs (the latter via the
-  // hand-rolled TLS 1.3 client in tls_client.cc -- no OpenSSL needed).
-  if (!o.tsa_url.empty() && o.tsa_url.rfind("http://", 0) != 0 &&
-      o.tsa_url.rfind("https://", 0) != 0)
-    return false;
-  return true;
-}
 
 std::string read_text_file(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");
@@ -381,8 +86,40 @@ std::string base64(const std::string& in) {
   return o;
 }
 
-// Minimal HTTP/1.1 POST over a raw TCP socket (http:// only — no TLS). Returns
-// the response body bytes, or empty (with @err set) on failure.
+// Decode every "-----BEGIN CERTIFICATE-----" block of a PEM string to DER.
+std::vector<std::vector<uint8_t>> pem_to_certs(const std::string& pem) {
+  static const char* kBegin = "-----BEGIN CERTIFICATE-----";
+  static const char* kEnd = "-----END CERTIFICATE-----";
+  int d[256];
+  for (int i = 0; i < 256; ++i) d[i] = -1;
+  const char* B64 =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (int i = 0; i < 64; ++i) d[(unsigned char)B64[i]] = i;
+
+  std::vector<std::vector<uint8_t>> out;
+  size_t pos = 0;
+  while ((pos = pem.find(kBegin, pos)) != std::string::npos) {
+    size_t bstart = pos + std::strlen(kBegin);
+    size_t bend = pem.find(kEnd, bstart);
+    if (bend == std::string::npos) break;
+    std::vector<uint8_t> der;
+    int val = 0, bits = 0;
+    for (size_t i = bstart; i < bend; ++i) {
+      int dv = d[(unsigned char)pem[i]];
+      if (dv < 0) continue;
+      val = (val << 6) | dv;
+      bits += 6;
+      if (bits >= 8) { bits -= 8; der.push_back((uint8_t)((val >> bits) & 0xFF)); }
+    }
+    if (!der.empty()) out.push_back(std::move(der));
+    pos = bend + std::strlen(kEnd);
+  }
+  return out;
+}
+
+// Minimal HTTP/1.1 POST. http:// goes over a raw TCP socket; https:// is routed
+// through the ncrypto TLS 1.3 client. Returns the response body, or empty (with
+// @err set) on failure.
 std::vector<uint8_t> http_post_raw(const std::string& url,
                                    const std::string& content_type,
                                    const std::string& accept,
@@ -458,7 +195,6 @@ std::vector<uint8_t> http_post_raw(const std::string& url,
     *err = "HTTP status not 200: " + headers.substr(0, headers.find("\r\n"));
     return out;
   }
-  // De-chunk if needed (Connection: close usually gives a plain body).
   std::string lower = headers;
   for (char& c : lower) c = (char)std::tolower((unsigned char)c);
   if (lower.find("transfer-encoding: chunked") != std::string::npos) {
@@ -480,48 +216,75 @@ std::vector<uint8_t> http_post_raw(const std::string& url,
   return out;
 }
 
-// Native (OpenSSL-free) RFC 3161 timestamp callback over http TSAs: hash the
-// signature value, request a token, and return it for embedding.
-nanopdf::cms::TsaCallback make_native_tsa(const SignOptions& opt,
-                                          SignResult* sr) {
-  return [opt, sr](const std::vector<uint8_t>& signature) -> std::vector<uint8_t> {
-    uint8_t digest[64];
-    size_t dlen = 32;
-    if (opt.tsa_digest == "sha512") {
-      nanopdf::crypto::SHA512::hash(signature.data(), signature.size(), digest);
-      dlen = 64;
-    } else if (opt.tsa_digest == "sha384") {
-      nanopdf::crypto::SHA384::hash(signature.data(), signature.size(), digest);
-      dlen = 48;
-    } else {
-      nanopdf::crypto::SHA256::hash(signature.data(), signature.size(), digest);
-      dlen = 32;
-    }
-    std::random_device rd;
-    uint64_t nonce = (uint64_t(rd()) << 32) ^ rd();
-    std::vector<uint8_t> req = nanopdf::rfc3161::build_request(
-        std::vector<uint8_t>(digest, digest + dlen),
-        nanopdf::rfc3161::hash_oid(opt.tsa_digest), nonce, true);
-    std::string e;
-    std::vector<uint8_t> resp =
-        http_post_raw(opt.tsa_url, "application/timestamp-query",
-                      "application/timestamp-reply", opt.tsa_username,
-                      opt.tsa_password, req, &e);
-    if (resp.empty()) {
-      std::fprintf(stderr, "pdf_sign: timestamp skipped: %s\n", e.c_str());
-      return {};
-    }
-    int status = 0;
-    std::vector<uint8_t> token = nanopdf::rfc3161::parse_response(resp, &status);
-    if (token.empty()) {
-      std::fprintf(stderr, "pdf_sign: TSA rejected request (status %d)\n",
-                   status);
-      return {};
-    }
-    sr->timestamped = true;
-    sr->timestamp_authority = opt.tsa_url;
-    return token;
-  };
+bool have_credentials(const SignOptions& o) {
+  return !o.p12_path.empty() ||
+         (!o.cert_pem_path.empty() && !o.key_pem_path.empty());
+}
+
+// Context handed to the C TSA callback during CMS construction.
+struct TsaCtx {
+  const SignOptions* opt;
+  SignResult* sr;
+};
+
+// nc_tsa_cb: hash the signature value, fetch an RFC 3161 token over http/https,
+// and append it for embedding as an unsigned attribute. Returns 0 on success.
+int tsa_callback(const uint8_t* signature, size_t sig_len, nc_buf* token_out,
+                 void* user) {
+  TsaCtx* ctx = static_cast<TsaCtx*>(user);
+  const SignOptions& opt = *ctx->opt;
+
+  uint8_t digest[64];
+  size_t dlen = 32;
+  if (opt.tsa_digest == "sha512") {
+    nc_sha512(signature, sig_len, digest);
+    dlen = 64;
+  } else if (opt.tsa_digest == "sha384") {
+    nc_sha384(signature, sig_len, digest);
+    dlen = 48;
+  } else {
+    nc_sha256(signature, sig_len, digest);
+    dlen = 32;
+  }
+
+  std::random_device rd;
+  uint64_t nonce = (uint64_t(rd()) << 32) ^ rd();
+  const char* oid = nc_rfc3161_hash_oid(opt.tsa_digest.c_str());
+  if (!oid) oid = nc_rfc3161_hash_oid("sha256");
+
+  nc_buf req;
+  nc_buf_init(&req);
+  if (nc_rfc3161_build_request(&req, digest, dlen, oid, nonce, 1) != 0) {
+    nc_buf_free(&req);
+    return 1;
+  }
+  std::vector<uint8_t> reqv(req.data, req.data + req.len);
+  nc_buf_free(&req);
+
+  std::string e;
+  std::vector<uint8_t> resp =
+      http_post_raw(opt.tsa_url, "application/timestamp-query",
+                    "application/timestamp-reply", opt.tsa_username,
+                    opt.tsa_password, reqv, &e);
+  if (resp.empty()) {
+    std::fprintf(stderr, "pdf_sign: timestamp skipped: %s\n", e.c_str());
+    return 1;
+  }
+
+  int status = 0;
+  nc_buf token;
+  nc_buf_init(&token);
+  if (nc_rfc3161_parse_response(resp.data(), resp.size(), &status, &token) != 0 ||
+      token.len == 0) {
+    std::fprintf(stderr, "pdf_sign: TSA rejected request (status %d)\n", status);
+    nc_buf_free(&token);
+    return 1;
+  }
+  nc_buf_put(token_out, token.data, token.len);
+  nc_buf_free(&token);
+  ctx->sr->timestamped = true;
+  ctx->sr->timestamp_authority = opt.tsa_url;
+  return 0;
 }
 
 }  // namespace
@@ -552,75 +315,62 @@ std::string tsa_url_for(const std::string& key) {
 SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
                     std::vector<uint8_t>* out) {
   SignResult sr;
-  const bool native = native_eligible(opt);
-
-  // Native (OpenSSL-free) credentials.
-  nanopdf::crypto::RsaPrivateKey nkey;
-  std::vector<uint8_t> nsigner;
-  std::vector<std::vector<uint8_t>> nchain;
-  std::string ntime;
-#if PDFVIEW_HAVE_OPENSSL
-  // OpenSSL credentials (legacy path: https timestamp).
-  Credentials cred;
-#endif
-
-  if (native) {
-    std::vector<std::vector<uint8_t>> certs;
-    if (!opt.p12_path.empty()) {
-      // PKCS#12 bundle (PBES2/AES; OpenSSL-free).
-      std::string raw = read_text_file(opt.p12_path);
-      nanopdf::pkcs12::Bundle b = nanopdf::pkcs12::parse(
-          reinterpret_cast<const uint8_t*>(raw.data()), raw.size(),
-          opt.p12_password);
-      if (!b.valid) {
-        sr.error = "PKCS#12 load failed: " + b.error;
-        return sr;
-      }
-      nkey = b.key;
-      certs = b.certs;
-    } else {
-      // PEM cert + key (key may be PBES2-encrypted with key_password).
-      nkey = nanopdf::crypto::rsa_parse_private_key_pem(
-          read_text_file(opt.key_pem_path), opt.key_password);
-      if (!nkey.valid) {
-        sr.error = "could not parse PEM private key (wrong password or "
-                   "unsupported encryption?)";
-        return sr;
-      }
-      certs = nanopdf::cms::pem_to_certs(read_text_file(opt.cert_pem_path));
-    }
-    if (certs.empty()) {
-      sr.error = "no signer certificate found";
-      return sr;
-    }
-    nsigner = certs[0];
-    nchain.assign(certs.begin() + 1, certs.end());
-    sr.signer_name = cert_cn(nsigner);
-    ntime = utc_now();
-    std::fprintf(stderr, "pdf_sign: signing with native (OpenSSL-free) CMS\n");
-  } else {
-#if PDFVIEW_HAVE_OPENSSL
-    std::string err;
-    if (!load_credentials(opt, &cred, &err)) {
-      sr.error = err;
-      return sr;
-    }
-    X509_NAME* nm = X509_get_subject_name(cred.cert);
-    char cn[256] = {0};
-    if (X509_NAME_get_text_by_NID(nm, NID_commonName, cn, sizeof(cn)) > 0)
-      sr.signer_name = cn;
-#else
-    sr.error =
-        "this build has no OpenSSL: https TSAs require an http TSA preset or a "
-        "build with -DPDFVIEW_USE_OPENSSL=ON";
+  if (!have_credentials(opt)) {
+    sr.error = "no credentials: provide a PKCS#12 (--p12) or PEM cert+key";
     return sr;
-#endif
   }
+
+  // Load the signer key + certificate chain via ncrypto.
+  nc_rsa_privkey nkey;
+  std::memset(&nkey, 0, sizeof(nkey));
+  std::vector<std::vector<uint8_t>> certs;
+  nc_pkcs12_bundle p12;
+  std::memset(&p12, 0, sizeof(p12));
+  bool have_p12 = false;
+
+  if (!opt.p12_path.empty()) {
+    std::string raw = read_text_file(opt.p12_path);
+    if (nc_pkcs12_parse(&p12, reinterpret_cast<const uint8_t*>(raw.data()),
+                        raw.size(),
+                        opt.p12_password.c_str()) != 0 || !p12.ok) {
+      sr.error = std::string("PKCS#12 load failed: ") +
+                 (p12.error[0] ? p12.error : "unknown");
+      nc_pkcs12_bundle_free(&p12);
+      return sr;
+    }
+    have_p12 = true;
+    nkey = p12.key;
+    for (int i = 0; i < p12.cert_count; ++i)
+      certs.emplace_back(p12.certs[i], p12.certs[i] + p12.cert_lens[i]);
+  } else {
+    std::string keypem = read_text_file(opt.key_pem_path);
+    if (nc_rsa_parse_privkey_pem(
+            &nkey, keypem.c_str(),
+            opt.key_password.empty() ? nullptr : opt.key_password.c_str()) != 0 ||
+        !nkey.valid) {
+      sr.error = "could not parse PEM private key (wrong password or "
+                 "unsupported encryption?)";
+      return sr;
+    }
+    certs = pem_to_certs(read_text_file(opt.cert_pem_path));
+  }
+
+  if (certs.empty()) {
+    sr.error = "no signer certificate found";
+    if (have_p12) nc_pkcs12_bundle_free(&p12);
+    return sr;
+  }
+  std::vector<uint8_t> nsigner = certs[0];
+  std::vector<std::vector<uint8_t>> nchain(certs.begin() + 1, certs.end());
+  sr.signer_name = cert_cn(nsigner);
+  std::string ntime = utc_now();
+  std::fprintf(stderr, "pdf_sign: signing with ncrypto (pure C11) CMS\n");
 
   nanopdf::PdfWriter writer;
   std::string werr;
   if (!writer.load_existing(in, &werr)) {
     sr.error = "load_existing failed: " + werr;
+    if (have_p12) nc_pkcs12_bundle_free(&p12);
     return sr;
   }
   nanopdf::SignatureFieldConfig cfg;
@@ -636,6 +386,7 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
   cfg.contact_info = opt.contact_info;
   if (writer.add_signature_field(cfg).empty()) {
     sr.error = "add_signature_field failed";
+    if (have_p12) nc_pkcs12_bundle_free(&p12);
     return sr;
   }
 
@@ -644,28 +395,45 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
   nanopdf::WriteResult wr = writer.write_incremental_for_signing(bytes, 32768);
   if (!wr.success) {
     sr.error = "write_incremental_for_signing failed: " + wr.error;
+    if (have_p12) nc_pkcs12_bundle_free(&p12);
     return sr;
   }
   const auto& phs = writer.get_signature_placeholders();
   if (phs.empty()) {
     sr.error = "no signature placeholder produced";
+    if (have_p12) nc_pkcs12_bundle_free(&p12);
     return sr;
   }
 
-  nanopdf::cms::TsaCallback native_tsa;
-  if (native && !opt.tsa_url.empty()) native_tsa = make_native_tsa(opt, &sr);
+  const bool want_tsa = !opt.tsa_url.empty();
+  TsaCtx tctx{&opt, &sr};
+
+  // The signing callback builds a detached CMS SignedData over the ByteRange
+  // content using ncrypto, optionally embedding an RFC 3161 timestamp token.
   nanopdf::SigningCallback cb =
       [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
-    if (native)
-      return nanopdf::cms::build_signed_data(data, nsigner, nchain, nkey, ntime,
-                                             native_tsa);
-#if PDFVIEW_HAVE_OPENSSL
-    return build_cms(data, cred, opt, &sr);
-#else
-    return {};
-#endif
+    std::vector<const uint8_t*> chain_ptrs;
+    std::vector<size_t> chain_lens;
+    for (const auto& c : nchain) {
+      chain_ptrs.push_back(c.data());
+      chain_lens.push_back(c.size());
+    }
+    nc_buf cms;
+    nc_buf_init(&cms);
+    int rc = nc_cms_build_signed_data(
+        &cms, data.data(), data.size(), nsigner.data(), nsigner.size(),
+        chain_ptrs.empty() ? nullptr : chain_ptrs.data(),
+        chain_lens.empty() ? nullptr : chain_lens.data(),
+        (int)chain_ptrs.size(), &nkey, ntime.c_str(),
+        want_tsa ? tsa_callback : nullptr, want_tsa ? &tctx : nullptr);
+    std::vector<uint8_t> sig;
+    if (rc == 0) sig.assign(cms.data, cms.data + cms.len);
+    nc_buf_free(&cms);
+    return sig;
   };
+
   nanopdf::WriteResult ar = nanopdf::apply_signature(bytes, phs[0], cb);
+  if (have_p12) nc_pkcs12_bundle_free(&p12);
   if (!ar.success) {
     if (sr.error.empty()) sr.error = "apply_signature failed: " + ar.error;
     return sr;
@@ -676,18 +444,17 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
 }
 
 // --- OpenTimestamps ---------------------------------------------------------
-// OTS calendar servers are https-only, so this path needs TLS (OpenSSL).
 
 std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
                                           std::string* errp) {
   std::string err;
   std::vector<uint8_t> ots;
-  // 1) SHA-256 of the document (pure C++).
+  // 1) SHA-256 of the document.
   uint8_t digest[32];
-  nanopdf::crypto::SHA256::hash(data.data(), data.size(), digest);
+  nc_sha256(data.data(), data.size(), digest);
 
   // 2) Submit the digest to a public calendar; take the first that answers.
-  //    The https POST goes through the hand-rolled TLS 1.3 client -- no OpenSSL.
+  //    The https POST goes through the ncrypto TLS 1.3 client -- no OpenSSL.
   static const char* kCalendars[] = {
       "https://alice.btc.calendar.opentimestamps.org/digest",
       "https://bob.btc.calendar.opentimestamps.org/digest",
@@ -721,7 +488,7 @@ std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
   return ots;
 }
 
-// --- verification (pure C++, no OpenSSL) ------------------------------------
+// --- verification -----------------------------------------------------------
 
 namespace {
 
@@ -769,23 +536,26 @@ VerifyResult verify_signature(const std::vector<uint8_t>& pdf,
   vr.covers_document = ranges_ok && (end >= pdf.size() - 2);
   if (!ranges_ok) { vr.error = "ByteRange out of bounds"; return vr; }
 
-  // Pure-C++ CMS verification (RSA PKCS#1 v1.5 + SHA-256), no OpenSSL.
-  nanopdf::cms::VerifyInfo vi = nanopdf::cms::verify_signed_data(cms, data);
-  vr.checked = vi.parsed;
-  if (!vi.parsed) {
-    vr.error = vi.error.empty() ? "cannot parse CMS" : vi.error;
+  // Pure-C11 CMS verification (RSA PKCS#1 v1.5 + SHA-256), no OpenSSL.
+  nc_cms_verify_info info;
+  std::memset(&info, 0, sizeof(info));
+  nc_cms_verify_signed_data(&info, cms.data(), cms.size(), data.data(),
+                            data.size());
+  vr.checked = info.parsed;
+  if (!info.parsed) {
+    vr.error = info.error[0] ? info.error : "cannot parse CMS";
     return vr;
   }
-  vr.signature_valid = vi.signature_valid && vi.digest_valid;
-  vr.signer = vi.signer_cn;
-  vr.digest_algorithm = vi.digest_algorithm;
-  vr.signing_time = format_asn1_time(vi.signing_time);
-  vr.has_timestamp = vi.has_timestamp;
-  vr.timestamp_time = format_asn1_time(vi.timestamp_time);
-  vr.timestamp_authority = vi.timestamp_authority;
+  vr.signature_valid = info.signature_valid && info.digest_valid;
+  vr.signer = info.signer_cn;
+  vr.digest_algorithm = info.digest_algorithm;
+  vr.signing_time = format_asn1_time(info.signing_time);
+  vr.has_timestamp = info.has_timestamp != 0;
+  vr.timestamp_time = format_asn1_time(info.timestamp_time);
+  vr.timestamp_authority = info.timestamp_authority;
   if (!vr.signature_valid && vr.error.empty())
-    vr.error = vi.signature_valid ? "digest does not cover document"
-                                  : "signature verification failed";
+    vr.error = info.signature_valid ? "digest does not cover document"
+                                    : "signature verification failed";
   return vr;
 }
 
