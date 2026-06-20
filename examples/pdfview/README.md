@@ -92,7 +92,7 @@ different file.
 | `p` then digits, `Enter` | Go to page number | | |
 | `↑` / `↓` / wheel | Scroll | `/` then type, `Enter` | Search; `n`/`N` next/prev |
 | drag on page | Select text (`Ctrl+C` to copy) | `i` | Info / signatures / forms panel |
-| `h` | Highlight the selection | `w` | Save annotated copy (`*.annotated.pdf`) |
+| `h` / `u` / `x` | Highlight / underline / strikethrough the selection | `w` | Save annotated copy (`*.annotated.pdf`) |
 | click outline / thumbnail | Jump to page | `r` | Revisions panel; `d` cycles After/Before/Diff |
 | `g` | Toggle **debug** mode | drag (debug) | Inspect region → PDF objects |
 | `s` | Save screenshot (PNG) of the frame | `[` / `]` | Rotate view CCW / CW |

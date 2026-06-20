@@ -148,12 +148,13 @@ struct Viewer {
   std::vector<nanopdf::TextQuad> match_quads;  // one bbox per match (page coords)
   int match_index = -1;         // currently focused match
 
-  // Highlight annotations created in this session (page + page-space quads).
-  struct Highlight {
+  // Text-markup annotations created this session (page + page-space quads).
+  struct Markup {
     int page;
     std::vector<nanopdf::TextQuad> quads;
+    nanopdf::MarkupType type;
   };
-  std::vector<Highlight> highlights;
+  std::vector<Markup> markups;
 
   // Drag selection.
   bool selecting = false;
@@ -870,14 +871,27 @@ void draw(Viewer& v, lvg_surface_t* surf) {
                             LVG_IMAGE_FILTER_BILINEAR);
 
       if (show == rp) {  // overlays apply to the normal (after) view only
-        // Highlight annotations created this session (persistent yellow).
-        for (const auto& h : v.highlights) {
-          if (h.page != v.page) continue;
-          for (const auto& q : h.quads) {
+        // Markup annotations created this session.
+        for (const auto& m : v.markups) {
+          if (m.page != v.page) continue;
+          for (const auto& q : m.quads) {
             int sx, sy, sw, sh;
             map_quad_to_screen(v, q, &sx, &sy, &sw, &sh);
-            lvg_canvas_fill_rect(&c, sx, sy, sw, sh,
-                                 LVG_COLOR_ARGB(0x66, 0xFF, 0xE0, 0x00));
+            const int t = std::max(1, ui_px(2));
+            switch (m.type) {
+              case nanopdf::MarkupType::Underline:
+                lvg_canvas_fill_rect(&c, sx, sy + sh - t, sw, t,
+                                     LVG_COLOR_RGB(0xD8, 0x20, 0x20));
+                break;
+              case nanopdf::MarkupType::StrikeOut:
+                lvg_canvas_fill_rect(&c, sx, sy + sh / 2, sw, t,
+                                     LVG_COLOR_RGB(0xD8, 0x20, 0x20));
+                break;
+              default:  // Highlight / Squiggly
+                lvg_canvas_fill_rect(&c, sx, sy, sw, sh,
+                                     LVG_COLOR_ARGB(0x66, 0xFF, 0xE0, 0x00));
+                break;
+            }
           }
         }
         // Search-match highlights.
@@ -1120,11 +1134,11 @@ void take_screenshot(Viewer& v, const lvg_surface_t* surf) {
   }
 }
 
-// Write the document plus this session's highlight annotations to a sibling
+// Write the document plus this session's markup annotations to a sibling
 // "<name>.annotated.pdf" via a nanopdf incremental update. Sets v.toast.
-void save_highlights(Viewer& v) {
-  if (v.highlights.empty()) {
-    v.toast = "No highlights to save";
+void save_markups(Viewer& v) {
+  if (v.markups.empty()) {
+    v.toast = "No annotations to save";
     return;
   }
   nanopdf::PdfWriter w;
@@ -1133,15 +1147,27 @@ void save_highlights(Viewer& v) {
     v.toast = "Save failed (load): " + err;
     return;
   }
-  for (const auto& h : v.highlights) {
-    nanopdf::HighlightConfig cfg;
-    cfg.page = h.page;
-    cfg.color_preset = nanopdf::HighlightColor::Yellow;
-    cfg.subject = "Highlight";
-    for (const auto& q : h.quads)
-      cfg.quads.push_back(
-          nanopdf::quad_from_rect(q.x, q.y, q.width, q.height));
-    w.add_highlight_to_existing_page(h.page, cfg);
+  for (const auto& m : v.markups) {
+    std::vector<nanopdf::QuadPoints> quads;
+    for (const auto& q : m.quads)
+      quads.push_back(nanopdf::quad_from_rect(q.x, q.y, q.width, q.height));
+    if (m.type == nanopdf::MarkupType::Highlight) {
+      nanopdf::HighlightConfig cfg;
+      cfg.page = m.page;
+      cfg.quads = quads;
+      cfg.color_preset = nanopdf::HighlightColor::Yellow;
+      cfg.subject = "Highlight";
+      w.add_highlight_to_existing_page(m.page, cfg);
+    } else {
+      nanopdf::TextMarkupConfig cfg;
+      cfg.page = m.page;
+      cfg.quads = quads;
+      cfg.type = m.type;
+      cfg.r = 0.85;
+      cfg.g = 0.1;
+      cfg.b = 0.1;  // red, like Preview underline/strikethrough
+      w.add_text_markup_to_existing_page(m.page, cfg);
+    }
   }
   std::string out = v.doc_path;
   size_t dot = out.find_last_of('.');
@@ -1149,8 +1175,8 @@ void save_highlights(Viewer& v) {
   nanopdf::WriteResult wr = w.write_incremental_to_file(out);
   if (wr.success) {
     const char* slash = std::strrchr(out.c_str(), '/');
-    v.toast = std::string("Saved ") + std::to_string(v.highlights.size()) +
-              " highlight(s) -> " + (slash ? slash + 1 : out.c_str());
+    v.toast = std::string("Saved ") + std::to_string(v.markups.size()) +
+              " annotation(s) -> " + (slash ? slash + 1 : out.c_str());
     std::printf("pdfview: wrote %s\n", out.c_str());
   } else {
     v.toast = "Save failed: " + wr.error;
@@ -1166,7 +1192,7 @@ bool load_document(Viewer& v, lui_window_t* win, const char* path) {
   const char* slash = std::strrchr(path, '/');
   v.title = slash ? slash + 1 : path;
   v.doc_path = path;
-  v.highlights.clear();
+  v.markups.clear();
   v.page = 0;
   v.scroll_x = 0;
   v.scroll_y = 0;
@@ -2264,20 +2290,27 @@ int main(int argc, char** argv) {
           } else if (ch == '[') {
             viewer.rotation = (viewer.rotation + 270) % 360;  // rotate CCW
             dirty = true;
-          } else if (ch == 'h' || ch == 'H') {
-            // Highlight the current text selection.
+          } else if (ch == 'h' || ch == 'H' || ch == 'u' || ch == 'U' ||
+                     ch == 'x' || ch == 'X') {
+            // Mark up the current text selection (h=highlight, u=underline,
+            // x=strikethrough).
             if (viewer.sel_page >= 0 && !viewer.sel_quads.empty()) {
-              viewer.highlights.push_back({viewer.sel_page, viewer.sel_quads});
-              viewer.toast = "Highlighted  ·  press 'w' to save annotated copy";
+              nanopdf::MarkupType ty =
+                  (ch == 'u' || ch == 'U')   ? nanopdf::MarkupType::Underline
+                  : (ch == 'x' || ch == 'X') ? nanopdf::MarkupType::StrikeOut
+                                             : nanopdf::MarkupType::Highlight;
+              viewer.markups.push_back({viewer.sel_page, viewer.sel_quads, ty});
+              viewer.toast = "Annotated  ·  press 'w' to save annotated copy";
               viewer.sel_page = -1;
               viewer.sel_quads.clear();
               viewer.sel_text.clear();
             } else {
-              viewer.toast = "Select text first, then 'h' to highlight";
+              viewer.toast = "Select text first (h=highlight u=underline "
+                             "x=strikethrough)";
             }
             dirty = true;
           } else if (ch == 'w' || ch == 'W') {
-            save_highlights(viewer);
+            save_markups(viewer);
             dirty = true;
           }
           break;
