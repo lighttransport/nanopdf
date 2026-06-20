@@ -153,6 +153,11 @@ tools (e.g. poppler `pdfsig`). An agent can drive signing via the MCP `pdf_sign`
 tool. Note: signing requires nanopdf's writer to load the input; PDFs that use
 cross-reference streams are not yet loadable for incremental update.
 
+The **Info panel** (`i`) cryptographically verifies each signature via OpenSSL —
+showing VALID/INVALID, whether it covers the whole document, the signer, digest,
+signing time, and any embedded RFC 3161 timestamp (time + TSA) — rather than the
+digest-only integrity check.
+
 ### HiDPI / display scaling
 The viewer renders to a physical-resolution surface and scales all chrome (metrics,
 font, scroll/threshold deltas) by the display's DPI factor, honoring the desktop's

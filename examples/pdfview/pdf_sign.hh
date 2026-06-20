@@ -80,6 +80,31 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
 SignResult sign_pdf_file(const std::string& in_path, const std::string& out_path,
                          const SignOptions& opt);
 
+// --- verification -----------------------------------------------------------
+
+struct VerifyResult {
+  bool checked = false;       // verification was attempted (CMS parsed)
+  bool signature_valid = false;  // CMS signature is cryptographically valid
+  bool covers_document = false;  // ByteRange spans the whole file
+  std::string signer;            // signer certificate common name
+  std::string signer_dn;         // signer full distinguished name
+  std::string digest_algorithm;  // e.g. "SHA-256"
+  std::string signing_time;      // from signed attributes (UTC)
+  bool has_timestamp = false;
+  std::string timestamp_time;    // RFC 3161 token genTime (UTC)
+  std::string timestamp_authority;
+  std::string error;
+};
+
+// Cryptographically verify a signature field against the full PDF bytes. Does
+// NOT require a trusted CA store (self-signed certs verify); it confirms the
+// signature math and ByteRange integrity, and parses any embedded RFC 3161
+// timestamp. @br is the field's ByteRange [o1,l1,o2,l2]; @cms is the DER
+// /Contents; @file_size is the total PDF size.
+VerifyResult verify_signature(const std::vector<uint8_t>& pdf,
+                              const std::vector<uint64_t>& byte_range,
+                              const std::vector<uint8_t>& cms);
+
 }  // namespace pdfview
 
 #endif  // PDFVIEW_PDF_SIGN_HH_

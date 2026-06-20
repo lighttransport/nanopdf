@@ -489,6 +489,8 @@ std::vector<InfoLine> build_info_lines(Viewer& v) {
   if (!pdf) return L;
   pdf->ensure_metadata_loaded();
   pdf->ensure_acro_form_loaded();
+  // Populate catalog.signature_fields (non-const; mirrors validate_signature).
+  const_cast<nanopdf::Pdf*>(pdf)->parse_signature_fields();
   const auto& cat = pdf->catalog;
   char buf[256];
 
@@ -528,13 +530,27 @@ std::vector<InfoLine> build_info_lines(Viewer& v) {
     if (!s.signing_date.empty())
       L.push_back({"  date: " + s.signing_date, false});
     if (s.is_signed) {
-      nanopdf::SignatureValidationResult vr =
-          nanopdf::validate_signature(*pdf, s);
-      L.push_back({std::string("  integrity: ") +
-                       (vr.integrity_valid ? "valid" : "INVALID"),
+      // Cryptographic verification via OpenSSL (signature math + ByteRange +
+      // embedded RFC 3161 timestamp), not just digest integrity.
+      pdfview::VerifyResult vr = pdfview::verify_signature(
+          v.doc.data(), s.byte_range, s.signature_contents);
+      L.push_back({std::string("  signature: ") +
+                       (!vr.checked ? "unverifiable"
+                                    : vr.signature_valid ? "VALID" : "INVALID"),
                    false});
-      if (!vr.signer_name.empty())
-        L.push_back({"  signer: " + vr.signer_name, false});
+      if (vr.covers_document)
+        L.push_back({"  covers: whole document", false});
+      if (!vr.signer.empty())
+        L.push_back({"  signer: " + vr.signer, false});
+      if (!vr.digest_algorithm.empty())
+        L.push_back({"  digest: " + vr.digest_algorithm, false});
+      if (!vr.signing_time.empty())
+        L.push_back({"  signed: " + vr.signing_time, false});
+      if (vr.has_timestamp) {
+        L.push_back({"  timestamp: " + vr.timestamp_time, false});
+        if (!vr.timestamp_authority.empty())
+          L.push_back({"  TSA: " + vr.timestamp_authority, false});
+      }
     }
   }
 
