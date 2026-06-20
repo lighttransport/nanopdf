@@ -130,6 +130,12 @@ directory (auto-named `<file>_p<NN>_<seq>.png`).
 - [x] MCP server: drive/inspect the viewer from an LLM/agent over HTTP, incl.
       VLM screenshots and the PDF debug tools (live `--mcp` and headless `--mcp-serve`).
 
+### HiDPI / display scaling
+The viewer renders to a physical-resolution surface and scales all chrome (metrics,
+font, scroll/threshold deltas) by the display's DPI factor, honoring the desktop's
+configured scale including fractional values (e.g. 1.25x) via `Xft.dpi`. The scale is
+re-applied if the window moves to a monitor with a different scale.
+
 ### Text extraction / search / CJK
 nanopdf text extraction resolves Unicode via the full mapping chain (ToUnicode CMap,
 Adobe-Japan1 CID→Unicode, `/Encoding` `/Differences` glyph names, WinAnsi/MacRoman/Symbol),

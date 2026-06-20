@@ -56,20 +56,36 @@ namespace {
 constexpr int kInitialWidth = 1100;   // logical window size (lightui scales it)
 constexpr int kInitialHeight = 800;
 // UI chrome metrics, in physical pixels. lightui hands us a physical-resolution
-// surface (logical * dpi_scale), so on a HiDPI display these are multiplied by
-// the DPI factor once at startup via scale_ui_metrics(). Hence: mutable, not
-// constexpr. Base values target a 1x display.
-int kToolbarH = 44;
-int kPageMargin = 16;       // gap around the page in the content area
-int kSidebarW = 300;        // sidebar width
-int kRowH = 24;             // outline row height
-int kTabH = 30;             // sidebar tab-bar height
-int kThumbW = 220;          // thumbnail render target width
-int kThumbImgH = 200;       // thumbnail image area height per cell
-int kThumbCellH = 234;      // full thumbnail cell height (img + label)
-int kThumbMargin = 34;      // horizontal margin around thumbnails
-int kRightW = 340;          // right panel width
-int kRevRowH = 50;          // revision-row height
+// surface (logical * dpi_scale), so on a HiDPI display these base (1x) values
+// are scaled by the DPI factor via apply_ui_scale(), called at startup and
+// whenever the window moves to a monitor with a different scale. The kXxxBase
+// constants hold the 1x design values; the mutable kXxx hold the scaled values
+// actually used when drawing.
+constexpr int kToolbarHBase = 44;
+constexpr int kPageMarginBase = 16;    // gap around the page in the content area
+constexpr int kSidebarWBase = 300;     // sidebar width
+constexpr int kRowHBase = 24;          // outline row height
+constexpr int kTabHBase = 30;          // sidebar tab-bar height
+constexpr int kThumbWBase = 220;       // thumbnail render target width
+constexpr int kThumbImgHBase = 200;    // thumbnail image area height per cell
+constexpr int kThumbCellHBase = 234;   // full thumbnail cell height (img+label)
+constexpr int kThumbMarginBase = 34;   // horizontal margin around thumbnails
+constexpr int kRightWBase = 340;       // right panel width
+constexpr int kRevRowHBase = 50;       // revision-row height
+int kToolbarH = kToolbarHBase;
+int kPageMargin = kPageMarginBase;
+int kSidebarW = kSidebarWBase;
+int kRowH = kRowHBase;
+int kTabH = kTabHBase;
+int kThumbW = kThumbWBase;
+int kThumbImgH = kThumbImgHBase;
+int kThumbCellH = kThumbCellHBase;
+int kThumbMargin = kThumbMarginBase;
+int kRightW = kRightWBase;
+int kRevRowH = kRevRowHBase;
+// Current UI scale (physical px per 1x design px). Read by interaction code to
+// scale hardcoded pixel deltas (scroll speed, drag threshold, shadow offset).
+float g_ui_scale = 1.0f;
 constexpr float kMinZoom = 0.1f;
 constexpr float kMaxZoom = 8.0f;
 constexpr float kZoomStep = 1.2f;
@@ -235,23 +251,43 @@ bool save_surface_image(const lvg_surface_t* s, const std::string& path) {
   return ok != 0;
 }
 
-// Scale all physical-pixel UI metrics by the display's DPI factor. Called once
-// at startup with the window surface's dpi_scale; a no-op at 1x (and for the
-// headless 1x render paths, which never call it).
-void scale_ui_metrics(float s) {
-  if (s <= 1.0f) return;
-  auto sc = [&](int& v) { v = (int)(v * s + 0.5f); };
-  sc(kToolbarH);
-  sc(kPageMargin);
-  sc(kSidebarW);
-  sc(kRowH);
-  sc(kTabH);
-  sc(kThumbW);
-  sc(kThumbImgH);
-  sc(kThumbCellH);
-  sc(kThumbMargin);
-  sc(kRightW);
-  sc(kRevRowH);
+// Scale all physical-pixel UI metrics by the display's DPI factor. Idempotent
+// (always derived from the 1x base values), so it can be re-applied when the
+// window moves to a monitor with a different scale. Headless 1x render paths
+// never call it, so the metrics stay at their base values there.
+void apply_ui_scale(float s) {
+  if (s < 1.0f) s = 1.0f;
+  g_ui_scale = s;
+  auto sc = [&](int base) { return (int)(base * s + 0.5f); };
+  kToolbarH = sc(kToolbarHBase);
+  kPageMargin = sc(kPageMarginBase);
+  kSidebarW = sc(kSidebarWBase);
+  kRowH = sc(kRowHBase);
+  kTabH = sc(kTabHBase);
+  kThumbW = sc(kThumbWBase);
+  kThumbImgH = sc(kThumbImgHBase);
+  kThumbCellH = sc(kThumbCellHBase);
+  kThumbMargin = sc(kThumbMarginBase);
+  kRightW = sc(kRightWBase);
+  kRevRowH = sc(kRevRowHBase);
+}
+
+// Scale a 1x-design pixel delta (scroll amounts, thresholds) by the UI scale.
+int ui_px(float base) { return (int)(base * g_ui_scale + 0.5f); }
+
+constexpr int kUiFontBase = 16;  // UI font size at 1x (physical px = base*scale)
+const char* const kUiFontPath = PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf";
+
+// Apply a UI scale: rescale metrics and (re)create the UI font at the matching
+// size. Destroys @old on success; on font-load failure keeps @old. Returns the
+// font to use.
+lui_font_t* set_ui_scale(float s, lui_font_t* old) {
+  if (s < 1.0f) s = 1.0f;
+  apply_ui_scale(s);
+  lui_font_t* f = lui_font_create(kUiFontPath, (int)(kUiFontBase * s + 0.5f));
+  if (!f) return old;
+  if (old) lui_font_destroy(old);
+  return f;
 }
 
 float fit_width_zoom(Viewer& v, int content_w) {
@@ -742,7 +778,8 @@ void draw(Viewer& v, lvg_surface_t* surf) {
 
       lvg_rect_t clip = lvg_rect_make(content_x, content_y, content_w, content_h);
       lvg_canvas_set_clip(&c, &clip);
-      lvg_canvas_fill_rect(&c, px + 4, py + 4, pw, ph, kPageShadow);
+      const int sh = ui_px(4);  // drop-shadow offset
+      lvg_canvas_fill_rect(&c, px + sh, py + sh, pw, ph, kPageShadow);
       lvg_canvas_draw_image(&c, px, py, pw, ph, &show->surface, nullptr,
                             LVG_IMAGE_FILTER_BILINEAR);
 
@@ -1610,26 +1647,24 @@ int main(int argc, char** argv) {
 
   // HiDPI: the surface is physical-resolution (logical * dpi_scale). Scale the
   // UI chrome metrics and the font to match so the UI isn't half-size on a 2x
-  // display.
-  float ui_scale = 1.0f;
+  // display. Tracked in cur_scale so a monitor change (resize event) can
+  // re-apply it.
+  float cur_scale = 1.0f;
   if (lvg_surface_t* s0 = lui_window_get_surface(win)) {
-    if (s0->dpi_scale > 1.0f) ui_scale = s0->dpi_scale;
+    if (s0->dpi_scale > 1.0f) cur_scale = s0->dpi_scale;
     std::fprintf(stderr, "pdfview: dpi_scale=%.3f surface=%dx%d\n",
                  s0->dpi_scale, s0->width, s0->height);
   }
-  scale_ui_metrics(ui_scale);
-  const int ui_font_px = (int)(16 * ui_scale + 0.5f);
 
 #if PDFVIEW_HAVE_NFD
   NFD_Init();
 #endif
 
   Viewer viewer;
-  viewer.font =
-      lui_font_create(PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf", ui_font_px);
+  viewer.font = set_ui_scale(cur_scale, nullptr);
   if (!viewer.font) {
     std::fprintf(stderr, "pdfview: warning: UI font not found at %s\n",
-                 PDFVIEW_FONTS_DIR "/arimo/Arimo-Regular.ttf");
+                 kUiFontPath);
   }
 
   if (initial_path) load_document(viewer, win, initial_path);
@@ -1690,8 +1725,20 @@ int main(int argc, char** argv) {
         case LUI_EVENT_QUIT:
           running = false;
           break;
+        case LUI_EVENT_WINDOW_RESIZE: {
+          // Moving to a monitor with a different scale changes dpi_scale; if so,
+          // re-apply UI metrics and rebuild the font at the new size.
+          float ns = event.data.resize.dpi_scale;
+          if (ns >= 1.0f && std::fabs(ns - cur_scale) > 0.01f) {
+            cur_scale = ns;
+            viewer.font = set_ui_scale(ns, viewer.font);
+            // Thumbnails are cached by render scale, which changes with kThumbW,
+            // so they re-render lazily at the new size — no explicit clear.
+          }
+          dirty = true;
+          break;
+        }
         case LUI_EVENT_WINDOW_EXPOSE:
-        case LUI_EVENT_WINDOW_RESIZE:
           dirty = true;
           break;
         case LUI_EVENT_KEY_DOWN: {
@@ -1958,8 +2005,8 @@ int main(int argc, char** argv) {
           viewer.sel_x1 = mx;
           viewer.sel_y1 = my;
           // Tiny drag = click, not a selection.
-          if (std::abs(viewer.sel_x1 - viewer.sel_x0) < 3 &&
-              std::abs(viewer.sel_y1 - viewer.sel_y0) < 3) {
+          if (std::abs(viewer.sel_x1 - viewer.sel_x0) < ui_px(3) &&
+              std::abs(viewer.sel_y1 - viewer.sel_y0) < ui_px(3)) {
             dirty = true;
             break;
           }
@@ -1999,17 +2046,18 @@ int main(int argc, char** argv) {
           break;
         }
         case LUI_EVENT_SCROLL: {
-          // Route the wheel to whatever the cursor is over.
+          // Route the wheel to whatever the cursor is over. Step sizes are in
+          // physical px, so scale them with the UI to keep a consistent feel.
           if (right_w > 0 && viewer.mouse_x >= W - right_w) {
-            viewer.info_scroll += (int)(event.data.scroll.delta_y * 60.0f);
+            viewer.info_scroll += (int)(event.data.scroll.delta_y * ui_px(60));
           } else if (content_x > 0 && viewer.mouse_x < content_x) {
             if (viewer.sidebar_mode == 0 && has_outline(viewer))
-              viewer.sidebar_scroll += (int)(event.data.scroll.delta_y * 60.0f);
+              viewer.sidebar_scroll += (int)(event.data.scroll.delta_y * ui_px(60));
             else
-              viewer.thumb_scroll += (int)(event.data.scroll.delta_y * 120.0f);
+              viewer.thumb_scroll += (int)(event.data.scroll.delta_y * ui_px(120));
           } else {
-            viewer.scroll_y += (int)(event.data.scroll.delta_y * 80.0f);
-            viewer.scroll_x += (int)(event.data.scroll.delta_x * 80.0f);
+            viewer.scroll_y += (int)(event.data.scroll.delta_y * ui_px(80));
+            viewer.scroll_x += (int)(event.data.scroll.delta_x * ui_px(80));
           }
           dirty = true;
           break;
