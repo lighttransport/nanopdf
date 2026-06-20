@@ -3,6 +3,8 @@
 
 #include "cms.hh"
 
+#include <cstring>
+
 #include "asn1-der.hh"
 #include "crypto.hh"
 
@@ -83,6 +85,36 @@ CertInfo parse_certificate(const Bytes& cert) {
   info.issuer_der.assign(issuer_start, tve);
   info.valid = tbs.ok;
   return info;
+}
+
+std::vector<Bytes> pem_to_certs(const std::string& pem) {
+  static const char* kBegin = "-----BEGIN CERTIFICATE-----";
+  static const char* kEnd = "-----END CERTIFICATE-----";
+  int dtab[256];
+  for (int i = 0; i < 256; ++i) dtab[i] = -1;
+  const char* B64 =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (int i = 0; i < 64; ++i) dtab[(unsigned char)B64[i]] = i;
+
+  std::vector<Bytes> out;
+  size_t pos = 0;
+  while ((pos = pem.find(kBegin, pos)) != std::string::npos) {
+    size_t bstart = pos + std::strlen(kBegin);
+    size_t bend = pem.find(kEnd, bstart);
+    if (bend == std::string::npos) break;
+    Bytes der;
+    int val = 0, bits = 0;
+    for (size_t i = bstart; i < bend; ++i) {
+      int dv = dtab[(unsigned char)pem[i]];
+      if (dv < 0) continue;
+      val = (val << 6) | dv;
+      bits += 6;
+      if (bits >= 8) { bits -= 8; der.push_back((uint8_t)((val >> bits) & 0xFF)); }
+    }
+    if (!der.empty()) out.push_back(std::move(der));
+    pos = bend + std::strlen(kEnd);
+  }
+  return out;
 }
 
 // IssuerAndSerialNumber ::= SEQUENCE { issuer Name, serialNumber INTEGER }

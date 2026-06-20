@@ -29,6 +29,9 @@ struct CertInfo {
 // Extract issuer + serial from a DER-encoded X.509 certificate.
 CertInfo parse_certificate(const Bytes& cert_der);
 
+// Decode every "-----BEGIN CERTIFICATE-----" block in @pem to DER (in order).
+std::vector<Bytes> pem_to_certs(const std::string& pem);
+
 // Build a detached PKCS#7/CMS SignedData (RSA + SHA-256) over @content.
 // @signer_cert_der is the signer's certificate; @chain_der are extra certs to
 // embed. @signing_time_utc is "YYMMDDhhmmssZ" (UTCTime). Returns DER bytes, or

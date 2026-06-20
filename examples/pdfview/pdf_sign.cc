@@ -19,10 +19,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <memory>
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
+#include "asn1-der.hh"
+#include "cms.hh"
+#include "crypto-pk.hh"
 
 namespace pdfview {
 
@@ -285,6 +289,53 @@ std::vector<uint8_t> build_cms(const std::vector<uint8_t>& data,
   return der;
 }
 
+// --- native (OpenSSL-free) signing path -------------------------------------
+
+// The pure-C++ stack (crypto-pk + asn1-der + cms) can sign with unencrypted PEM
+// credentials and no timestamp. p12, encrypted keys, and RFC 3161 still use
+// OpenSSL until those pieces are ported.
+bool native_eligible(const SignOptions& o) {
+  return o.p12_path.empty() && !o.cert_pem_path.empty() &&
+         !o.key_pem_path.empty() && o.key_password.empty() && o.tsa_url.empty();
+}
+
+std::string read_text_file(const std::string& path) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return "";
+  std::string s;
+  char buf[4096];
+  size_t n;
+  while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+  std::fclose(f);
+  return s;
+}
+
+// Current UTC time as an ASN.1 UTCTime string "YYMMDDhhmmssZ".
+std::string utc_now() {
+  std::time_t t = std::time(nullptr);
+  std::tm tmv;
+  gmtime_r(&t, &tmv);
+  char buf[16];
+  std::strftime(buf, sizeof(buf), "%y%m%d%H%M%SZ", &tmv);
+  return buf;
+}
+
+// Extract the first commonName string from a DER certificate (for reporting).
+std::string cert_cn(const std::vector<uint8_t>& der) {
+  const uint8_t oid[] = {0x06, 0x03, 0x55, 0x04, 0x03};  // id-at-commonName
+  for (size_t i = 0; i + 7 < der.size(); ++i) {
+    if (std::memcmp(&der[i], oid, sizeof(oid)) == 0) {
+      size_t j = i + sizeof(oid);
+      uint8_t tag = der[j];
+      size_t len = der[j + 1];
+      if ((tag == 0x0c || tag == 0x13 || tag == 0x16) &&
+          j + 2 + len <= der.size())
+        return std::string(reinterpret_cast<const char*>(&der[j + 2]), len);
+    }
+  }
+  return "";
+}
+
 }  // namespace
 
 // --- TSA presets ------------------------------------------------------------
@@ -313,14 +364,42 @@ std::string tsa_url_for(const std::string& key) {
 SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
                     std::vector<uint8_t>* out) {
   SignResult sr;
+  const bool native = native_eligible(opt);
+
+  // Native (OpenSSL-free) credentials.
+  nanopdf::crypto::RsaPrivateKey nkey;
+  std::vector<uint8_t> nsigner;
+  std::vector<std::vector<uint8_t>> nchain;
+  std::string ntime;
+  // OpenSSL credentials (p12 / encrypted key / timestamp path).
   Credentials cred;
-  std::string err;
-  if (!load_credentials(opt, &cred, &err)) {
-    sr.error = err;
-    return sr;
-  }
-  // Common name for reporting.
-  {
+
+  if (native) {
+    nkey = nanopdf::crypto::rsa_parse_private_key_pem(
+        read_text_file(opt.key_pem_path));
+    if (!nkey.valid) {
+      sr.error =
+          "could not parse PEM private key (native path supports unencrypted "
+          "RSA keys only)";
+      return sr;
+    }
+    std::vector<std::vector<uint8_t>> certs =
+        nanopdf::cms::pem_to_certs(read_text_file(opt.cert_pem_path));
+    if (certs.empty()) {
+      sr.error = "no certificate found in " + opt.cert_pem_path;
+      return sr;
+    }
+    nsigner = certs[0];
+    nchain.assign(certs.begin() + 1, certs.end());
+    sr.signer_name = cert_cn(nsigner);
+    ntime = utc_now();
+    std::fprintf(stderr, "pdf_sign: signing with native (OpenSSL-free) CMS\n");
+  } else {
+    std::string err;
+    if (!load_credentials(opt, &cred, &err)) {
+      sr.error = err;
+      return sr;
+    }
     X509_NAME* nm = X509_get_subject_name(cred.cert);
     char cn[256] = {0};
     if (X509_NAME_get_text_by_NID(nm, NID_commonName, cn, sizeof(cn)) > 0)
@@ -364,6 +443,8 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
 
   nanopdf::SigningCallback cb =
       [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    if (native)
+      return nanopdf::cms::build_signed_data(data, nsigner, nchain, nkey, ntime);
     return build_cms(data, cred, opt, &sr);
   };
   nanopdf::WriteResult ar = nanopdf::apply_signature(bytes, phs[0], cb);
