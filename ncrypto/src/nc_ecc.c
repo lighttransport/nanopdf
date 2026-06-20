@@ -310,6 +310,21 @@ int nc_ecdsa_verify(const nc_ec_curve* curve, const uint8_t* pub,
   nc_bi_from_bytes(&Qx, pub, fb);
   nc_bi_from_bytes(&Qy, pub + fb, fb);
 
+  /* Validate the public key: coordinates in [0,p), not the identity, and on the
+     curve (y^2 == x^3 + a*x + b mod p). Rejects invalid-curve points. */
+  if (nc_bi_cmp(&Qx, &curve->p) >= 0 || nc_bi_cmp(&Qy, &curve->p) >= 0) return 0;
+  if (nc_bi_is_zero(&Qx) && nc_bi_is_zero(&Qy)) return 0;
+  {
+    nc_bigint lhs, rhs, t;
+    mmul(&lhs, &Qy, &Qy, &curve->p);            /* y^2 */
+    mmul(&t, &Qx, &Qx, &curve->p);
+    mmul(&rhs, &t, &Qx, &curve->p);             /* x^3 */
+    mmul(&t, &curve->a, &Qx, &curve->p);        /* a*x */
+    madd(&rhs, &rhs, &t, &curve->p);
+    madd(&rhs, &rhs, &curve->b, &curve->p);     /* + b */
+    if (nc_bi_cmp(&lhs, &rhs) != 0) return 0;
+  }
+
   nc_bi_from_bytes(&r, r_be, r_len);
   nc_bi_from_bytes(&s, s_be, s_len);
 

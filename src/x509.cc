@@ -551,23 +551,30 @@ VerifyResult verify_chain(const std::vector<Bytes>& der_chain,
   // Walk from the leaf to a trusted root, verifying each signature + validity.
   const Certificate* cur = &leaf;
   for (int depth = 0; depth < 16; ++depth) {
-    if (now_epoch && (now_epoch < cur->not_before ||
-                      (cur->not_after && now_epoch > cur->not_after))) {
+    // Validity. An unparseable date (not_before/not_after == 0) is treated as a
+    // failure rather than "no constraint" (fail closed).
+    if (now_epoch && (cur->not_before == 0 || cur->not_after == 0 ||
+                      now_epoch < cur->not_before ||
+                      now_epoch > cur->not_after)) {
       res.error = "certificate expired or not yet valid";
       return res;
     }
-    // Trust anchor: a root whose subject is this cert's issuer.
+    // Trust anchor: a CA root whose subject is this cert's issuer.
     for (const auto& root : store.roots) {
+      if (!root.is_ca) continue;  // issuer must be a CA (basicConstraints)
       if (root.subject_der == cur->issuer_der && verify_signature(*cur, root)) {
         if (now_epoch && root.not_after && now_epoch > root.not_after) continue;
         res.ok = true;
         return res;
       }
     }
-    // Otherwise find an intermediate in the presented chain.
+    // Otherwise find a CA intermediate in the presented chain. An end-entity
+    // (CA:FALSE) cert must never be accepted as an issuer (basicConstraints
+    // bypass / certificate forgery).
     const Certificate* next = nullptr;
     for (const auto& cand : chain) {
       if (&cand == cur) continue;
+      if (!cand.is_ca) continue;
       if (cand.subject_der == cur->issuer_der && verify_signature(*cur, cand)) {
         next = &cand;
         break;

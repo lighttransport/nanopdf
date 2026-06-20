@@ -182,6 +182,19 @@ bool ecdsa_verify(const EcCurve& curve, const uint8_t* pub, size_t pub_len,
   BigInt Qx = BigInt::from_bytes(pub, fb);
   BigInt Qy = BigInt::from_bytes(pub + fb, fb);
 
+  // Validate the public key: coordinates in [0,p), not the identity, and on the
+  // curve (y^2 == x^3 + a*x + b mod p). Rejects invalid-curve points.
+  if (BigInt::cmp(Qx, curve.p) >= 0 || BigInt::cmp(Qy, curve.p) >= 0)
+    return false;
+  if (Qx.is_zero() && Qy.is_zero()) return false;
+  {
+    BigInt lhs = mmul(Qy, Qy, curve.p);
+    BigInt rhs = mmul(mmul(Qx, Qx, curve.p), Qx, curve.p);
+    rhs = madd(rhs, mmul(curve.a, Qx, curve.p), curve.p);
+    rhs = madd(rhs, curve.b, curve.p);
+    if (BigInt::cmp(lhs, rhs) != 0) return false;
+  }
+
   BigInt r = BigInt::from_bytes(r_be, r_len);
   BigInt s = BigInt::from_bytes(s_be, s_len);
   // 1 <= r,s < n

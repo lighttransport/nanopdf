@@ -13,6 +13,11 @@
 extern "C" {
 #endif
 
+/* Largest RSA modulus accepted (4096-bit). Bounds bignum intermediates: a
+ * 128-limb modulus squares to 256 limbs, within NC_BIGINT_MAX_LIMBS (264).
+ * Larger keys are rejected rather than risk overflowing the fixed-size bignum. */
+#define NC_RSA_MAX_MODULUS_BYTES 512
+
 typedef struct {
   nc_bigint n, e;
   size_t modulus_bytes;  /* ceil(bitlen(n)/8) */

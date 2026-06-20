@@ -236,7 +236,10 @@ static void parse_spki(const uint8_t* b, const uint8_t* e, nc_x509_cert* c) {
     nc_bi_from_bytes(&c->rsa_pub.n, nb, (size_t)(ne - nb));
     nc_bi_from_bytes(&c->rsa_pub.e, eb, (size_t)(ee - eb));
     c->rsa_pub.modulus_bytes = (nc_bi_bitlen(&c->rsa_pub.n) + 7) / 8;
-    c->rsa_pub.valid = !nc_bi_is_zero(&c->rsa_pub.n);
+    /* Reject implausibly large moduli: they would overflow the fixed-size
+       bignum during verification (see NC_RSA_MAX_MODULUS_BYTES). */
+    c->rsa_pub.valid = !nc_bi_is_zero(&c->rsa_pub.n) &&
+                       c->rsa_pub.modulus_bytes <= NC_RSA_MAX_MODULUS_BYTES;
     c->key_type = NC_KEY_RSA;
   } else if (is_ec && curve) {
     c->key_type = NC_KEY_EC;
@@ -865,16 +868,19 @@ int nc_x509_verify_chain(nc_verify_result* res, const uint8_t* const* der_chain,
   for (depth = 0; depth < 16; ++depth) {
     int r;
     const nc_x509_cert* next = NULL;
+    /* Validity. Treat an unparseable date (not_before/not_after == 0) as a
+       failure rather than "no constraint" (fail closed). */
     if (now_epoch &&
-        (now_epoch < cur->not_before ||
-         (cur->not_after && now_epoch > cur->not_after))) {
+        (cur->not_before == 0 || cur->not_after == 0 ||
+         now_epoch < cur->not_before || now_epoch > cur->not_after)) {
       snprintf(res->error, sizeof(res->error),
                "certificate expired or not yet valid");
       return -1;
     }
-    /* Trust anchor: a root whose subject is this cert's issuer. */
+    /* Trust anchor: a CA root whose subject is this cert's issuer. */
     for (r = 0; r < store->count; ++r) {
       const nc_x509_cert* root = &store->roots[r];
+      if (!root->is_ca) continue;  /* issuer must be a CA (basicConstraints) */
       if (names_eq(root, cur) && nc_x509_verify_signature(cur, root)) {
         if (now_epoch && root->not_after && now_epoch > root->not_after)
           continue;
@@ -882,10 +888,13 @@ int nc_x509_verify_chain(nc_verify_result* res, const uint8_t* const* der_chain,
         return 0;
       }
     }
-    /* Otherwise find an intermediate in the presented chain. */
+    /* Otherwise find a CA intermediate in the presented chain. An end-entity
+       (CA:FALSE) cert must never be accepted as an issuer (basicConstraints
+       bypass / cert forgery). */
     for (i = 0; i < n; ++i) {
       const nc_x509_cert* cand = &chain[i];
       if (cand == cur) continue;
+      if (!cand->is_ca) continue;
       if (names_eq(cand, cur) && nc_x509_verify_signature(cur, cand)) {
         next = cand;
         break;

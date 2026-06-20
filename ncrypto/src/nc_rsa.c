@@ -136,6 +136,10 @@ int nc_rsa_parse_privkey_der(nc_rsa_privkey* key, const uint8_t* der,
     return -1;
   }
   key->modulus_bytes = (nc_bi_bitlen(&key->n) + 7) / 8;
+  if (key->modulus_bytes > NC_RSA_MAX_MODULUS_BYTES) {
+    memset(key, 0, sizeof(*key));
+    return -1;
+  }
   key->valid = 1;
   return 0;
 }
@@ -211,6 +215,7 @@ int nc_pbes2_decrypt(const uint8_t* algid, size_t algidlen, const uint8_t* enc,
   if (der_read_tl(&pk, &itc, &itclen) != 0x02) return -1; /* iterationCount */
   uint32_t iters = 0;
   for (size_t i = 0; i < itclen; ++i) iters = (iters << 8) | itc[i];
+  if (iters == 0 || iters > 10000000u) return -1; /* bound CPU (DoS guard) */
   nc_prf prf = NC_PRF_SHA1; /* PBKDF2 default PRF */
   while (pk.p < pk.end && pk.ok) {
     /* optional keyLength (INTEGER) and prf (AlgorithmIdentifier SEQUENCE) */
@@ -296,7 +301,7 @@ int nc_rsa_sign_pkcs1v15(const nc_rsa_privkey* key, const uint8_t* digest_info,
   if (!key->valid) return -1;
   size_t k = key->modulus_bytes;
   if (di_len + 11 > k) return -1; /* message too long for modulus */
-  if (k > NC_BIGINT_MAX_LIMBS * 4) return -1;
+  if (k > NC_RSA_MAX_MODULUS_BYTES) return -1;
 
   /* EM = 0x00 || 0x01 || PS(0xFF...) || 0x00 || DigestInfo */
   uint8_t em[NC_BIGINT_MAX_LIMBS * 4];
@@ -328,7 +333,7 @@ int nc_rsa_verify_pkcs1v15(const nc_rsa_pubkey* key, const uint8_t* sig,
   if (!key->valid || sig_len != key->modulus_bytes) return 0;
   size_t k = key->modulus_bytes;
   if (di_len + 11 > k) return 0;
-  if (k > NC_BIGINT_MAX_LIMBS * 4) return 0;
+  if (k > NC_RSA_MAX_MODULUS_BYTES) return 0;
 
   nc_bigint s, m;
   nc_bi_from_bytes(&s, sig, sig_len);
@@ -400,7 +405,7 @@ int nc_rsa_verify_pss(const nc_rsa_pubkey* key, const uint8_t* sig,
   size_t em_bits = mod_bits - 1;
   size_t em_len = (em_bits + 7) / 8;
   if (em_len < hlen + 2) return 0;
-  if (em_len > NC_BIGINT_MAX_LIMBS * 4) return 0;
+  if (em_len > NC_RSA_MAX_MODULUS_BYTES) return 0;
 
   nc_bigint s;
   nc_bi_from_bytes(&s, sig, sig_len);

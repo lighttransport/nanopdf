@@ -129,7 +129,7 @@ void nc_bi_add(nc_bigint* r, const nc_bigint* a, const nc_bigint* b) {
     t.limb[i] = (uint32_t)s;
     carry = s >> 32;
   }
-  if (carry) {
+  if (carry && i < NC_BIGINT_MAX_LIMBS) {
     t.limb[i++] = (uint32_t)carry;
   }
   t.len = i;
@@ -163,6 +163,10 @@ void nc_bi_mul(nc_bigint* r, const nc_bigint* a, const nc_bigint* b) {
     return;
   }
   int n = a->len + b->len;
+  /* Defensive bound: the fixed-capacity struct cannot hold a larger product.
+     Callers reject oversized RSA moduli at parse time; this prevents an OOB
+     write should one slip through. */
+  if (n > NC_BIGINT_MAX_LIMBS) { nc_bi_zero(r); return; }
   for (int i = 0; i < n; ++i) t.limb[i] = 0;
   for (int i = 0; i < a->len; ++i) {
     uint64_t carry = 0;
@@ -187,7 +191,7 @@ static void nc_bi_shl1(nc_bigint* v) {
     v->limb[i] = (v->limb[i] << 1) | carry;
     carry = nc;
   }
-  if (carry) {
+  if (carry && v->len < NC_BIGINT_MAX_LIMBS) {
     v->limb[v->len] = carry;
     v->len++;
   }
