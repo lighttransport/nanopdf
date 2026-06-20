@@ -196,6 +196,8 @@ struct Viewer {
   int rev_cache_page = -1;
   float rev_cache_scale = 0.0f;
 
+  bool show_help = false;  // keybinding help overlay
+
   // View rotation in degrees clockwise (0/90/180/270), applied to all pages.
   int rotation = 0;
   std::vector<uint32_t> rot_argb;   // rotated copy of the current page
@@ -995,7 +997,32 @@ void draw(Viewer& v, lvg_surface_t* surf) {
                            v.font, kTextColor);
     }
   }
-  if (!v.doc.loaded() && v.font) {
+  if (v.show_help && v.font) {
+    static const char* kHelp[] = {
+        "Keyboard shortcuts",
+        "",
+        "o  open file        / type Enter  search     n/N next/prev",
+        "<- -> j k  page      p NN Enter   go to page",
+        "Home/End first/last  + - 0 1 f    zoom / fit",
+        "b sidebar  t pages   i info       r revisions  g debug",
+        "[ ] rotate           s screenshot",
+        "drag select  Ctrl+C copy",
+        "h u x  highlight/underline/strikethrough selection",
+        "m click type  note   z undo       w save annotated copy",
+        "?  toggle this help  Esc close",
+    };
+    const int n = (int)(sizeof(kHelp) / sizeof(kHelp[0]));
+    const int lh = lui_font_line_height(v.font) + ui_px(4);
+    const int bw = ui_px(560), bh = lh * n + ui_px(24);
+    const int bx = (W - bw) / 2, by = (H - bh) / 2;
+    lvg_canvas_fill_rect(&c, bx, by, bw, bh, LVG_COLOR_ARGB(0xF0, 0x20, 0x23, 0x28));
+    lvg_canvas_fill_rect(&c, bx, by, bw, ui_px(2), kAccent);
+    for (int i = 0; i < n; ++i)
+      lui_canvas_draw_text(&c, bx + ui_px(16), by + ui_px(12) + i * lh,
+                           kHelp[i], (int)std::strlen(kHelp[i]), v.font,
+                           i == 0 ? kAccent : kTextColor);
+  }
+  if (!v.doc.loaded() && v.font && !v.show_help) {
     // Centered "Open file" button + drag-and-drop hint.
     const int lh = lui_font_line_height(v.font);
     const char* label = "Open PDF…";
@@ -2267,6 +2294,11 @@ int main(int argc, char** argv) {
             }
             break;
           }
+          if (k == LUI_KEY_ESCAPE && viewer.show_help) {
+            viewer.show_help = false;
+            dirty = true;
+            break;
+          }
           if (k == LUI_KEY_ESCAPE) {
             // Clear search/selection first; quit only when nothing to clear.
             if (!viewer.query.empty() || viewer.sel_page >= 0) {
@@ -2457,6 +2489,9 @@ int main(int argc, char** argv) {
               viewer.toast = "Select text first (h=highlight u=underline "
                              "x=strikethrough)";
             }
+            dirty = true;
+          } else if (ch == '?') {
+            viewer.show_help = !viewer.show_help;
             dirty = true;
           } else if (ch == 'm' || ch == 'M') {
             viewer.note_placing = true;
