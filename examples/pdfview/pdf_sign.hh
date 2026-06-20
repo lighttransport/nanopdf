@@ -96,6 +96,15 @@ struct VerifyResult {
   std::string error;
 };
 
+// --- OpenTimestamps (Bitcoin-anchored, detached proof) ----------------------
+
+// Create an OpenTimestamps proof for @data by submitting its SHA-256 digest to
+// a public calendar server. Returns the .ots proof bytes (empty on failure).
+// This is NOT RFC 3161 and is not embedded in the PDF — it is a detached proof
+// to be saved as "<file>.ots" and later upgraded/verified with the `ots` tool.
+std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
+                                          std::string* err);
+
 // Cryptographically verify a signature field against the full PDF bytes. Does
 // NOT require a trusted CA store (self-signed certs verify); it confirms the
 // signature math and ByteRange integrity, and parses any embedded RFC 3161

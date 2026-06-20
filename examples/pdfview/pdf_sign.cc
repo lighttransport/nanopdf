@@ -376,6 +376,106 @@ SignResult sign_pdf(const std::vector<uint8_t>& in, const SignOptions& opt,
   return sr;
 }
 
+// --- OpenTimestamps ---------------------------------------------------------
+
+namespace {
+
+// Minimal HTTP POST of a binary body via OSSL_HTTP (http + https). Returns the
+// raw response bytes, or empty on failure.
+std::vector<uint8_t> http_post_binary(const std::string& url,
+                                      const std::string& content_type,
+                                      const std::string& accept,
+                                      const std::vector<uint8_t>& body,
+                                      std::string* err) {
+  std::vector<uint8_t> out;
+  char *host = nullptr, *port = nullptr, *path = nullptr;
+  int use_ssl = 0;
+  if (!OSSL_HTTP_parse_url(url.c_str(), &use_ssl, nullptr, &host, &port, nullptr,
+                           &path, nullptr, nullptr)) {
+    *err = "bad url: " + url;
+    return out;
+  }
+  SSL_CTX* tls = nullptr;
+  if (use_ssl) {
+    tls = SSL_CTX_new(TLS_client_method());
+    SSL_CTX_set_verify(tls, SSL_VERIFY_NONE, nullptr);
+  }
+  BIO* reqbio = BIO_new_mem_buf(body.data(), (int)body.size());
+  OSSL_HTTP_bio_cb_t tls_cb = use_ssl ? http_tls_cb : nullptr;
+  OSSL_HTTP_REQ_CTX* rctx = OSSL_HTTP_open(host, port, nullptr, nullptr, use_ssl,
+                                           nullptr, nullptr, tls_cb, tls, 0,
+                                           30000);
+  if (rctx) {
+    STACK_OF(CONF_VALUE)* hdrs = nullptr;
+    if (!accept.empty()) X509V3_add_value("Accept", accept.c_str(), &hdrs);
+    if (OSSL_HTTP_set1_request(rctx, path, hdrs, content_type.c_str(), reqbio,
+                               nullptr, /*expect_asn1=*/0, /*max_resp_len=*/0,
+                               30000, 0)) {
+      BIO* rbio = OSSL_HTTP_exchange(rctx, nullptr);
+      if (rbio) {
+        unsigned char buf[4096];
+        int n;
+        while ((n = BIO_read(rbio, buf, sizeof(buf))) > 0)
+          out.insert(out.end(), buf, buf + n);
+      }
+    }
+    if (hdrs) sk_CONF_VALUE_pop_free(hdrs, X509V3_conf_free);
+    OSSL_HTTP_close(rctx, 1);
+  }
+  BIO_free(reqbio);
+  OPENSSL_free(host);
+  OPENSSL_free(port);
+  OPENSSL_free(path);
+  if (tls) SSL_CTX_free(tls);
+  if (out.empty()) *err = "no response from " + url;
+  return out;
+}
+
+}  // namespace
+
+std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
+                                          std::string* errp) {
+  std::string err;
+  std::vector<uint8_t> ots;
+  // 1) SHA-256 of the document.
+  unsigned char digest[32];
+  unsigned int dlen = 0;
+  EVP_Digest(data.data(), data.size(), digest, &dlen, EVP_sha256(), nullptr);
+
+  // 2) Submit the digest to a public calendar; take the first that answers.
+  static const char* kCalendars[] = {
+      "https://alice.btc.calendar.opentimestamps.org/digest",
+      "https://bob.btc.calendar.opentimestamps.org/digest",
+      "https://finney.calendar.eternitywall.com/digest",
+      nullptr};
+  std::vector<uint8_t> body(digest, digest + dlen);
+  std::vector<uint8_t> cal;
+  for (int i = 0; kCalendars[i]; ++i) {
+    std::string e;
+    cal = http_post_binary(kCalendars[i], "application/x-www-form-urlencoded",
+                           "application/vnd.opentimestamps.v1", body, &e);
+    if (!cal.empty()) break;
+    err = e;
+  }
+  if (cal.empty()) {
+    if (errp) *errp = "no calendar responded: " + err;
+    return ots;
+  }
+
+  // 3) Assemble the detached .ots proof:
+  //    HEADER_MAGIC | version(1) | file-hash-op(SHA256=0x08) | digest | ts
+  static const unsigned char kMagic[] = {
+      0x00, 'O',  'p',  'e',  'n',  'T',  'i',  'm',  'e',  's',  't',
+      'a',  'm',  'p',  's',  0x00, 0x00, 'P',  'r',  'o',  'o',  'f',
+      0x00, 0xbf, 0x89, 0xe2, 0xe8, 0x84, 0xe8, 0x92, 0x94};
+  ots.insert(ots.end(), kMagic, kMagic + sizeof(kMagic));
+  ots.push_back(0x01);  // major version (varuint)
+  ots.push_back(0x08);  // OpSHA256 tag (the op applied to the file)
+  ots.insert(ots.end(), digest, digest + dlen);
+  ots.insert(ots.end(), cal.begin(), cal.end());
+  return ots;
+}
+
 // --- verification -----------------------------------------------------------
 
 namespace {

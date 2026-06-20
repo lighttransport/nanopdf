@@ -152,7 +152,11 @@ pdfview --sign in.pdf out.pdf --cert cert.pem --key key.pem --tsa freetsa
 When `--tsa` is given, an RFC 3161 signature-timestamp (`id-aa-timeStampToken`) is
 embedded, producing a PAdES-T / CAdES-T style signature. TSA presets:
 `digicert`, `globalsign`, `sectigo` (http), `freetsa` (https); or pass a full URL.
-`opentimestamps` is reserved (it is not RFC 3161). Signatures verify with external
+`opentimestamps` is a separate, Bitcoin-anchored document timestamp (not RFC 3161,
+not embedded in the PDF): `pdfview --ots <file> [out.ots]` submits the file's
+SHA-256 to a public OpenTimestamps calendar and writes a detached `.ots` proof
+(upgrade/verify later with the `ots` tool); also available as the MCP
+`pdf_opentimestamp` tool. Signatures verify with external
 tools (e.g. poppler `pdfsig`). An agent can drive signing via the MCP `pdf_sign`
 tool. Note: signing requires nanopdf's writer to load the input; PDFs that use
 cross-reference streams are not yet loadable for incremental update.

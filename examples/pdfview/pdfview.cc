@@ -1518,6 +1518,47 @@ void tool_sign(const char* a, int al, void* /*u*/, char** out, int* olen) {
   *olen = -1;
 }
 
+void tool_opentimestamp(const char* a, int al, void* /*u*/, char** out,
+                        int* olen) {
+  lui_json_t* j = lui_json_parse(a, al);
+  const char* in = lui_json_string(lui_json_get(j, "in"));
+  const char* outp = lui_json_string(lui_json_get(j, "out"));
+  std::string inp = in ? in : "";
+  std::string outpath = outp ? outp : (inp + ".ots");
+  lui_json_free(j);
+  std::string msg;
+  FILE* f = inp.empty() ? nullptr : std::fopen(inp.c_str(), "rb");
+  if (!f) {
+    msg = "error: cannot open 'in'";
+  } else {
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> data((size_t)(n > 0 ? n : 0));
+    if (n > 0 && std::fread(data.data(), 1, (size_t)n, f) != (size_t)n) n = -1;
+    std::fclose(f);
+    std::string err;
+    std::vector<uint8_t> ots =
+        (n < 0) ? std::vector<uint8_t>()
+                : pdfview::opentimestamps_stamp(data, &err);
+    if (ots.empty()) {
+      msg = "OpenTimestamps failed: " + err;
+    } else {
+      FILE* of = std::fopen(outpath.c_str(), "wb");
+      if (of) {
+        std::fwrite(ots.data(), 1, ots.size(), of);
+        std::fclose(of);
+        msg = "wrote OpenTimestamps proof (" + std::to_string(ots.size()) +
+              " bytes) -> " + outpath;
+      } else {
+        msg = "error: cannot write " + outpath;
+      }
+    }
+  }
+  *out = mcp_text(msg);
+  *olen = -1;
+}
+
 lui_mcp_t* mcp_start(Viewer& v, bool* dirty, int port, lvg_surface_t* surface) {
   static McpCtx ctx;
   ctx.v = &v;
@@ -1588,6 +1629,12 @@ lui_mcp_t* mcp_start(Viewer& v, bool* dirty, int port, lvg_surface_t* surface) {
       "\"tsa_user\":{\"type\":\"string\"},\"tsa_pass\":{\"type\":\"string\"}},"
       "\"required\":[\"in\",\"out\"]}",
       tool_sign);
+  reg("pdf_opentimestamp",
+      "Create an OpenTimestamps (Bitcoin-anchored) proof of a file's SHA-256 "
+      "via a public calendar; writes a detached '<in>.ots' (or 'out').",
+      "{\"type\":\"object\",\"properties\":{\"in\":{\"type\":\"string\"},"
+      "\"out\":{\"type\":\"string\"}},\"required\":[\"in\"]}",
+      tool_opentimestamp);
   return mcp;
 }
 #endif  // PDFVIEW_HAVE_MCP
@@ -1727,6 +1774,39 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "signed by '%s' -> %s%s\n", r.signer_name.c_str(),
                  argv[3],
                  r.timestamped ? "  (RFC 3161 timestamped)" : "");
+    return 0;
+  }
+
+  // Headless OpenTimestamps proof.  pdfview --ots <file> [out.ots]
+  if (argc > 1 && std::strcmp(argv[1], "--ots") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "usage: pdfview --ots <file> [out.ots]\n");
+      return 2;
+    }
+    FILE* f = std::fopen(argv[2], "rb");
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[2]); return 1; }
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> data((size_t)(n > 0 ? n : 0));
+    if (n > 0) { if (std::fread(data.data(), 1, (size_t)n, f) != (size_t)n) {
+      std::fclose(f); std::fprintf(stderr, "read error\n"); return 1; } }
+    std::fclose(f);
+    std::string err;
+    std::vector<uint8_t> ots = pdfview::opentimestamps_stamp(data, &err);
+    if (ots.empty()) {
+      std::fprintf(stderr, "OpenTimestamps failed: %s\n", err.c_str());
+      return 1;
+    }
+    std::string out = (argc > 3) ? argv[3] : (std::string(argv[2]) + ".ots");
+    FILE* of = std::fopen(out.c_str(), "wb");
+    if (!of) { std::fprintf(stderr, "cannot write %s\n", out.c_str()); return 1; }
+    std::fwrite(ots.data(), 1, ots.size(), of);
+    std::fclose(of);
+    std::fprintf(stderr,
+                 "OpenTimestamps proof (%zu bytes) -> %s\n"
+                 "  upgrade/verify later with: ots upgrade %s ; ots verify %s\n",
+                 ots.size(), out.c_str(), out.c_str(), out.c_str());
     return 0;
   }
 
