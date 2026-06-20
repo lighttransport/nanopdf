@@ -82,6 +82,7 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/security/test_aes.cc
     unit/security/test_hash.cc
     unit/security/test_rc4.cc
+    unit/security/test_rsa_pk.cc
     unit/text/test_text_extraction.cc
     unit/text/test_text_state.cc
     unit/text/test_text_layout.cc
