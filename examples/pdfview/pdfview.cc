@@ -26,6 +26,7 @@ extern "C" {
 #include <vector>
 
 #include "pdf_document.hh"
+#include "pdf-writer.hh"
 #include "pdf_debug.hh"
 #include "pdf_sign.hh"
 
@@ -123,6 +124,7 @@ struct Viewer {
   pdfview::PdfDocument doc;
   lui_font_t* font = nullptr;
   std::string title;       // base filename for the toolbar
+  std::string doc_path;    // full path of the loaded document (for saving)
   int page = 0;            // 0-based current page
   float zoom = 1.0f;       // px per PDF point
   int scroll_x = 0;        // content scroll offset (px), >= 0
@@ -145,6 +147,13 @@ struct Viewer {
   int match_page = -1;          // page the current matches belong to
   std::vector<nanopdf::TextQuad> match_quads;  // one bbox per match (page coords)
   int match_index = -1;         // currently focused match
+
+  // Highlight annotations created in this session (page + page-space quads).
+  struct Highlight {
+    int page;
+    std::vector<nanopdf::TextQuad> quads;
+  };
+  std::vector<Highlight> highlights;
 
   // Drag selection.
   bool selecting = false;
@@ -861,6 +870,16 @@ void draw(Viewer& v, lvg_surface_t* surf) {
                             LVG_IMAGE_FILTER_BILINEAR);
 
       if (show == rp) {  // overlays apply to the normal (after) view only
+        // Highlight annotations created this session (persistent yellow).
+        for (const auto& h : v.highlights) {
+          if (h.page != v.page) continue;
+          for (const auto& q : h.quads) {
+            int sx, sy, sw, sh;
+            map_quad_to_screen(v, q, &sx, &sy, &sw, &sh);
+            lvg_canvas_fill_rect(&c, sx, sy, sw, sh,
+                                 LVG_COLOR_ARGB(0x66, 0xFF, 0xE0, 0x00));
+          }
+        }
         // Search-match highlights.
         if (v.match_page == v.page) {
           for (size_t i = 0; i < v.match_quads.size(); ++i) {
@@ -1101,6 +1120,43 @@ void take_screenshot(Viewer& v, const lvg_surface_t* surf) {
   }
 }
 
+// Write the document plus this session's highlight annotations to a sibling
+// "<name>.annotated.pdf" via a nanopdf incremental update. Sets v.toast.
+void save_highlights(Viewer& v) {
+  if (v.highlights.empty()) {
+    v.toast = "No highlights to save";
+    return;
+  }
+  nanopdf::PdfWriter w;
+  std::string err;
+  if (!w.load_existing(v.doc.data(), &err)) {
+    v.toast = "Save failed (load): " + err;
+    return;
+  }
+  for (const auto& h : v.highlights) {
+    nanopdf::HighlightConfig cfg;
+    cfg.page = h.page;
+    cfg.color_preset = nanopdf::HighlightColor::Yellow;
+    cfg.subject = "Highlight";
+    for (const auto& q : h.quads)
+      cfg.quads.push_back(
+          nanopdf::quad_from_rect(q.x, q.y, q.width, q.height));
+    w.add_highlight_to_existing_page(h.page, cfg);
+  }
+  std::string out = v.doc_path;
+  size_t dot = out.find_last_of('.');
+  out = (dot == std::string::npos ? out : out.substr(0, dot)) + ".annotated.pdf";
+  nanopdf::WriteResult wr = w.write_incremental_to_file(out);
+  if (wr.success) {
+    const char* slash = std::strrchr(out.c_str(), '/');
+    v.toast = std::string("Saved ") + std::to_string(v.highlights.size()) +
+              " highlight(s) -> " + (slash ? slash + 1 : out.c_str());
+    std::printf("pdfview: wrote %s\n", out.c_str());
+  } else {
+    v.toast = "Save failed: " + wr.error;
+  }
+}
+
 // Load a document and reset view state. @win may be null (headless modes).
 bool load_document(Viewer& v, lui_window_t* win, const char* path) {
   if (!v.doc.load_file(path)) {
@@ -1109,6 +1165,8 @@ bool load_document(Viewer& v, lui_window_t* win, const char* path) {
   }
   const char* slash = std::strrchr(path, '/');
   v.title = slash ? slash + 1 : path;
+  v.doc_path = path;
+  v.highlights.clear();
   v.page = 0;
   v.scroll_x = 0;
   v.scroll_y = 0;
@@ -2205,6 +2263,21 @@ int main(int argc, char** argv) {
             dirty = true;
           } else if (ch == '[') {
             viewer.rotation = (viewer.rotation + 270) % 360;  // rotate CCW
+            dirty = true;
+          } else if (ch == 'h' || ch == 'H') {
+            // Highlight the current text selection.
+            if (viewer.sel_page >= 0 && !viewer.sel_quads.empty()) {
+              viewer.highlights.push_back({viewer.sel_page, viewer.sel_quads});
+              viewer.toast = "Highlighted  ·  press 'w' to save annotated copy";
+              viewer.sel_page = -1;
+              viewer.sel_quads.clear();
+              viewer.sel_text.clear();
+            } else {
+              viewer.toast = "Select text first, then 'h' to highlight";
+            }
+            dirty = true;
+          } else if (ch == 'w' || ch == 'W') {
+            save_highlights(viewer);
             dirty = true;
           }
           break;
