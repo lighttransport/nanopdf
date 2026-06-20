@@ -27,6 +27,7 @@ extern "C" {
 
 #include "pdf_document.hh"
 #include "pdf_debug.hh"
+#include "pdf_sign.hh"
 
 #if PDFVIEW_HAVE_NFD
 extern "C" {
@@ -1247,6 +1248,48 @@ void tool_clear_highlight(const char*, int, void* u, char** out, int* olen) {
   *olen = -1;
 }
 
+void tool_sign(const char* a, int al, void* /*u*/, char** out, int* olen) {
+  lui_json_t* j = lui_json_parse(a, al);
+  auto str = [&](const char* k) -> std::string {
+    const char* s = lui_json_string(lui_json_get(j, k));
+    return s ? s : "";
+  };
+  pdfview::SignOptions o;
+  std::string in = str("in"), outp = str("out");
+  o.p12_path = str("p12");
+  o.p12_password = str("pass");
+  o.cert_pem_path = str("cert");
+  o.key_pem_path = str("key");
+  o.key_password = str("keypass");
+  if (!str("reason").empty()) o.reason = str("reason");
+  if (!str("location").empty()) o.location = str("location");
+  if (!str("field").empty()) o.field_name = str("field");
+  std::string tsa = str("tsa");
+  if (!tsa.empty()) {
+    std::string preset = pdfview::tsa_url_for(tsa);
+    o.tsa_url = preset.empty() ? tsa : preset;
+  }
+  o.tsa_username = str("tsa_user");
+  o.tsa_password = str("tsa_pass");
+  lui_json_free(j);
+  if (in.empty() || outp.empty()) {
+    *out = mcp_text("error: 'in' and 'out' paths are required");
+    *olen = -1;
+    return;
+  }
+  pdfview::SignResult r = pdfview::sign_pdf_file(in, outp, o);
+  std::string msg;
+  if (r.ok) {
+    msg = "signed by '" + r.signer_name + "' -> " + outp;
+    if (r.timestamped) msg += "  (RFC 3161 timestamped via " +
+                              r.timestamp_authority + ")";
+  } else {
+    msg = "sign failed: " + r.error;
+  }
+  *out = mcp_text(msg);
+  *olen = -1;
+}
+
 lui_mcp_t* mcp_start(Viewer& v, bool* dirty, int port, lvg_surface_t* surface) {
   static McpCtx ctx;
   ctx.v = &v;
@@ -1303,6 +1346,20 @@ lui_mcp_t* mcp_start(Viewer& v, bool* dirty, int port, lvg_surface_t* surface) {
       tool_highlight_object);
   reg("pdf_clear_highlight", "Clear all debug/search highlights.", obj_only,
       tool_clear_highlight);
+  reg("pdf_sign",
+      "Digitally sign a PDF (PKCS#7/CMS detached) with an optional RFC 3161 "
+      "timestamp. Credentials: a PKCS#12 ({p12,pass}) or PEM ({cert,key,"
+      "keypass}). TSA presets for 'tsa': digicert, globalsign, sectigo, "
+      "freetsa (or a full URL).",
+      "{\"type\":\"object\",\"properties\":{\"in\":{\"type\":\"string\"},"
+      "\"out\":{\"type\":\"string\"},\"p12\":{\"type\":\"string\"},"
+      "\"pass\":{\"type\":\"string\"},\"cert\":{\"type\":\"string\"},"
+      "\"key\":{\"type\":\"string\"},\"keypass\":{\"type\":\"string\"},"
+      "\"reason\":{\"type\":\"string\"},\"location\":{\"type\":\"string\"},"
+      "\"field\":{\"type\":\"string\"},\"tsa\":{\"type\":\"string\"},"
+      "\"tsa_user\":{\"type\":\"string\"},\"tsa_pass\":{\"type\":\"string\"}},"
+      "\"required\":[\"in\",\"out\"]}",
+      tool_sign);
   return mcp;
 }
 #endif  // PDFVIEW_HAVE_MCP
@@ -1392,6 +1449,56 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "screenshot page %d at scale %.2f -> %dx%d -> %s\n",
                  page1, scale, rp->width, rp->height, argv[3]);
+    return 0;
+  }
+
+  // Headless digital signing.
+  //   pdfview --sign <in.pdf> <out.pdf> (--p12 F --pass P | --cert C --key K
+  //           [--keypass P]) [--reason R] [--location L] [--field N] [--visible]
+  //           [--page N] [--tsa <preset|url>] [--tsa-user U] [--tsa-pass P]
+  // TSA presets: digicert, globalsign, sectigo, freetsa, opentimestamps.
+  if (argc > 1 && std::strcmp(argv[1], "--sign") == 0) {
+    if (argc < 4) {
+      std::fprintf(stderr,
+                   "usage: pdfview --sign <in.pdf> <out.pdf> "
+                   "(--p12 F --pass P | --cert C --key K) [--reason R] "
+                   "[--location L] [--field N] [--visible] [--page N] "
+                   "[--tsa <preset|url>] [--tsa-user U] [--tsa-pass P]\n"
+                   "TSA presets: digicert globalsign sectigo freetsa "
+                   "opentimestamps\n");
+      return 2;
+    }
+    pdfview::SignOptions o;
+    auto val = [&](int& i) -> const char* {
+      return (i + 1 < argc) ? argv[++i] : "";
+    };
+    for (int i = 4; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--p12") o.p12_path = val(i);
+      else if (a == "--pass") o.p12_password = val(i);
+      else if (a == "--cert") o.cert_pem_path = val(i);
+      else if (a == "--key") o.key_pem_path = val(i);
+      else if (a == "--keypass") o.key_password = val(i);
+      else if (a == "--reason") o.reason = val(i);
+      else if (a == "--location") o.location = val(i);
+      else if (a == "--field") o.field_name = val(i);
+      else if (a == "--visible") o.visible = true;
+      else if (a == "--page") o.page = std::atoi(val(i));
+      else if (a == "--tsa") {
+        std::string t = val(i);
+        std::string preset = pdfview::tsa_url_for(t);
+        o.tsa_url = preset.empty() ? t : preset;
+      } else if (a == "--tsa-user") o.tsa_username = val(i);
+      else if (a == "--tsa-pass") o.tsa_password = val(i);
+    }
+    pdfview::SignResult r = pdfview::sign_pdf_file(argv[2], argv[3], o);
+    if (!r.ok) {
+      std::fprintf(stderr, "sign failed: %s\n", r.error.c_str());
+      return 1;
+    }
+    std::fprintf(stderr, "signed by '%s' -> %s%s\n", r.signer_name.c_str(),
+                 argv[3],
+                 r.timestamped ? "  (RFC 3161 timestamped)" : "");
     return 0;
   }
 

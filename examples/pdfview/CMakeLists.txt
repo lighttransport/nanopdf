@@ -70,9 +70,14 @@ add_executable(pdfview
   pdfview.cc
   pdf_document.cc
   pdf_debug.cc
+  pdf_sign.cc
   ${NFD_SOURCES}
   ${LIGHTUI_SOURCES}
 )
+
+# OpenSSL: digital signatures (PKCS#7/CMS) + RFC 3161 timestamps.
+find_package(OpenSSL REQUIRED)
+target_link_libraries(pdfview PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 if(NFD_SOURCES)
   set_source_files_properties(${NFD_SOURCES} PROPERTIES
     COMPILE_DEFINITIONS "${NFD_DEFINES}"

@@ -134,6 +134,25 @@ directory (auto-named `<file>_p<NN>_<seq>.png`).
 - [x] MCP server: drive/inspect the viewer from an LLM/agent over HTTP, incl.
       VLM screenshots and the PDF debug tools (live `--mcp` and headless `--mcp-serve`).
 
+### Digital signatures + RFC 3161 timestamps
+pdfview can apply a real cryptographic signature (PKCS#7/CMS `adbe.pkcs7.detached`,
+SHA-256) via OpenSSL, as an incremental update that preserves existing revisions:
+
+```bash
+# PKCS#12 bundle, with a DigiCert timestamp:
+pdfview --sign in.pdf out.pdf --p12 id.p12 --pass secret --reason "Approved" --tsa digicert
+# PEM cert + key:
+pdfview --sign in.pdf out.pdf --cert cert.pem --key key.pem --tsa freetsa
+```
+
+When `--tsa` is given, an RFC 3161 signature-timestamp (`id-aa-timeStampToken`) is
+embedded, producing a PAdES-T / CAdES-T style signature. TSA presets:
+`digicert`, `globalsign`, `sectigo` (http), `freetsa` (https); or pass a full URL.
+`opentimestamps` is reserved (it is not RFC 3161). Signatures verify with external
+tools (e.g. poppler `pdfsig`). An agent can drive signing via the MCP `pdf_sign`
+tool. Note: signing requires nanopdf's writer to load the input; PDFs that use
+cross-reference streams are not yet loadable for incremental update.
+
 ### HiDPI / display scaling
 The viewer renders to a physical-resolution surface and scales all chrome (metrics,
 font, scroll/threshold deltas) by the display's DPI factor, honoring the desktop's
