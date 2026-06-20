@@ -156,6 +156,16 @@ struct Viewer {
   };
   std::vector<Markup> markups;
 
+  // Sticky-note annotations (page + page-space anchor + text).
+  struct Note {
+    int page;
+    double x, y;
+    std::string text;
+  };
+  std::vector<Note> notes;
+  bool note_placing = false;  // waiting for a click to drop a note
+  bool note_typing = false;   // editing notes.back().text
+
   // Drag selection.
   bool selecting = false;
   int sel_x0 = 0, sel_y0 = 0, sel_x1 = 0, sel_y1 = 0;  // screen px
@@ -819,6 +829,7 @@ void ensure_rev_render(Viewer& v, const pdfview::RenderedPage* after) {
 // Defined below; used by draw() for highlight placement.
 void map_quad_to_screen(Viewer& v, const nanopdf::TextQuad& q, int* sx, int* sy,
                         int* sw, int* sh);
+void pdf_to_screen(Viewer& v, double gx, double gy, int* sx, int* sy);
 
 void draw(Viewer& v, lvg_surface_t* surf) {
   lvg_canvas_t c;
@@ -892,6 +903,23 @@ void draw(Viewer& v, lvg_surface_t* surf) {
                                      LVG_COLOR_ARGB(0x66, 0xFF, 0xE0, 0x00));
                 break;
             }
+          }
+        }
+        // Sticky-note markers.
+        for (size_t i = 0; i < v.notes.size(); ++i) {
+          if (v.notes[i].page != v.page) continue;
+          int nx, ny;
+          pdf_to_screen(v, v.notes[i].x, v.notes[i].y, &nx, &ny);
+          const int sz = ui_px(16);
+          const bool editing = v.note_typing && i == v.notes.size() - 1;
+          lvg_canvas_fill_rect(&c, nx, ny - sz, sz, sz,
+                               LVG_COLOR_RGB(0xFF, 0xC8, 0x40));
+          lvg_canvas_fill_rect(&c, nx, ny - sz, sz, ui_px(2),
+                               LVG_COLOR_RGB(0xB0, 0x80, 0x00));
+          if (editing && v.font) {  // show the in-progress note text
+            std::string t = v.notes[i].text + "_";
+            lui_canvas_draw_text(&c, nx + sz + ui_px(4), ny - sz, t.c_str(),
+                                 (int)t.size(), v.font, kAccent);
           }
         }
         // Search-match highlights.
@@ -1137,7 +1165,7 @@ void take_screenshot(Viewer& v, const lvg_surface_t* surf) {
 // Write the document plus this session's markup annotations to a sibling
 // "<name>.annotated.pdf" via a nanopdf incremental update. Sets v.toast.
 void save_markups(Viewer& v) {
-  if (v.markups.empty()) {
+  if (v.markups.empty() && v.notes.empty()) {
     v.toast = "No annotations to save";
     return;
   }
@@ -1146,6 +1174,11 @@ void save_markups(Viewer& v) {
   if (!w.load_existing(v.doc.data(), &err)) {
     v.toast = "Save failed (load): " + err;
     return;
+  }
+  for (const auto& n : v.notes) {
+    // Note anchor is the top-left; give it a small icon-sized rect.
+    w.add_text_annotation_to_existing_page(n.page, n.x, n.y - 18, 18, 18,
+                                           n.text);
   }
   for (const auto& m : v.markups) {
     std::vector<nanopdf::QuadPoints> quads;
@@ -1175,7 +1208,8 @@ void save_markups(Viewer& v) {
   nanopdf::WriteResult wr = w.write_incremental_to_file(out);
   if (wr.success) {
     const char* slash = std::strrchr(out.c_str(), '/');
-    v.toast = std::string("Saved ") + std::to_string(v.markups.size()) +
+    v.toast = std::string("Saved ") +
+              std::to_string(v.markups.size() + v.notes.size()) +
               " annotation(s) -> " + (slash ? slash + 1 : out.c_str());
     std::printf("pdfview: wrote %s\n", out.c_str());
   } else {
@@ -1193,6 +1227,9 @@ bool load_document(Viewer& v, lui_window_t* win, const char* path) {
   v.title = slash ? slash + 1 : path;
   v.doc_path = path;
   v.markups.clear();
+  v.notes.clear();
+  v.note_placing = false;
+  v.note_typing = false;
   v.page = 0;
   v.scroll_x = 0;
   v.scroll_y = 0;
@@ -2080,6 +2117,25 @@ int main(int argc, char** argv) {
             viewer.toast.clear();
             dirty = true;
           }
+          if (viewer.note_typing) {
+            if (k == LUI_KEY_ESCAPE) {
+              if (!viewer.notes.empty() && viewer.notes.back().text.empty())
+                viewer.notes.pop_back();  // discard empty note
+              viewer.note_typing = false;
+            } else if (k == LUI_KEY_RETURN) {
+              if (!viewer.notes.empty() && viewer.notes.back().text.empty())
+                viewer.notes.pop_back();
+              viewer.note_typing = false;
+            } else if (k == LUI_KEY_BACKSPACE && !viewer.notes.empty() &&
+                       !viewer.notes.back().text.empty()) {
+              std::string& t = viewer.notes.back().text;
+              size_t i = t.size();
+              do { --i; } while (i > 0 && ((unsigned char)t[i] & 0xC0) == 0x80);
+              t.erase(i);
+            }
+            dirty = true;
+            break;
+          }
           if (viewer.goto_active) {
             if (k == LUI_KEY_ESCAPE) {
               viewer.goto_active = false;
@@ -2167,6 +2223,14 @@ int main(int argc, char** argv) {
           if (!viewer.toast.empty()) {  // any key dismisses a lingering toast
             viewer.toast.clear();
             dirty = true;
+          }
+          if (viewer.note_typing) {
+            if ((unsigned char)ch >= 0x20 && !viewer.notes.empty() &&
+                viewer.notes.back().text.size() < 240) {
+              viewer.notes.back().text += event.data.text.text;
+              dirty = true;
+            }
+            break;
           }
           if (viewer.goto_active) {
             if (ch >= '0' && ch <= '9' && viewer.goto_buf.size() < 7) {
@@ -2309,6 +2373,10 @@ int main(int argc, char** argv) {
                              "x=strikethrough)";
             }
             dirty = true;
+          } else if (ch == 'm' || ch == 'M') {
+            viewer.note_placing = true;
+            viewer.toast = "Click on the page to place a note";
+            dirty = true;
           } else if (ch == 'w' || ch == 'W') {
             save_markups(viewer);
             dirty = true;
@@ -2390,6 +2458,18 @@ int main(int argc, char** argv) {
               my >= viewer.open_btn_y &&
               my < viewer.open_btn_y + viewer.open_btn_h) {
             open_via_dialog(viewer, win);
+            dirty = true;
+            break;
+          }
+          // Note placement: drop a sticky note where clicked, then type it.
+          if (viewer.note_placing && my >= kToolbarH && mx >= content_x &&
+              mx < W - right_w && viewer.doc.loaded()) {
+            double gx, gy;
+            screen_to_page(viewer, mx, my, &gx, &gy);
+            viewer.notes.push_back({viewer.page, gx, gy, ""});
+            viewer.note_placing = false;
+            viewer.note_typing = true;
+            viewer.toast.clear();
             dirty = true;
             break;
           }
