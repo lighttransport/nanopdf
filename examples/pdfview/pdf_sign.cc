@@ -724,53 +724,29 @@ std::vector<uint8_t> opentimestamps_stamp(const std::vector<uint8_t>& data,
   return ots;
 }
 
-// --- verification -----------------------------------------------------------
+// --- verification (pure C++, no OpenSSL) ------------------------------------
 
 namespace {
 
-std::string asn1_time_str(const ASN1_TIME* t) {
-  if (!t) return "";
-  BIO* b = BIO_new(BIO_s_mem());
-  ASN1_TIME_print(b, t);
-  char buf[64] = {0};
-  int n = BIO_read(b, buf, sizeof(buf) - 1);
-  BIO_free(b);
-  return n > 0 ? std::string(buf, (size_t)n) : "";
-}
-
-// Parse the id-aa-timeStampToken unsigned attribute, returning genTime + TSA.
-void parse_timestamp(PKCS7* p7, VerifyResult* vr) {
-  STACK_OF(PKCS7_SIGNER_INFO)* sis = PKCS7_get_signer_info(p7);
-  if (!sis || sk_PKCS7_SIGNER_INFO_num(sis) < 1) return;
-  PKCS7_SIGNER_INFO* si = sk_PKCS7_SIGNER_INFO_value(sis, 0);
-  if (!si->unauth_attr) return;
-  ASN1_OBJECT* oid = OBJ_txt2obj("1.2.840.113549.1.9.16.2.14", 1);
-  for (int i = 0; i < sk_X509_ATTRIBUTE_num(si->unauth_attr); ++i) {
-    X509_ATTRIBUTE* at = sk_X509_ATTRIBUTE_value(si->unauth_attr, i);
-    if (OBJ_cmp(X509_ATTRIBUTE_get0_object(at), oid) != 0) continue;
-    ASN1_TYPE* tv = X509_ATTRIBUTE_get0_type(at, 0);
-    if (!tv || tv->type != V_ASN1_SEQUENCE) break;
-    const unsigned char* p = tv->value.sequence->data;
-    PKCS7* token = d2i_PKCS7(nullptr, &p, tv->value.sequence->length);
-    if (token) {
-      TS_TST_INFO* tst = PKCS7_to_TS_TST_INFO(token);
-      if (tst) {
-        vr->has_timestamp = true;
-        vr->timestamp_time = asn1_time_str(TS_TST_INFO_get_time(tst));
-        const GENERAL_NAME* tsa = TS_TST_INFO_get_tsa(tst);
-        if (tsa && tsa->type == GEN_DIRNAME) {
-          char nm[256] = {0};
-          X509_NAME_get_text_by_NID(tsa->d.directoryName, NID_commonName, nm,
-                                    sizeof(nm));
-          vr->timestamp_authority = nm;
-        }
-        TS_TST_INFO_free(tst);
-      }
-      PKCS7_free(token);
-    }
-    break;
+// Format an ASN.1 UTCTime ("YYMMDDhhmmssZ") or GeneralizedTime
+// ("YYYYMMDDhhmmssZ") into "YYYY-MM-DD HH:MM:SS UTC". Falls back to the raw
+// string if it doesn't match.
+std::string format_asn1_time(const std::string& s) {
+  std::string d = s;
+  if (!d.empty() && d.back() == 'Z') d.pop_back();
+  std::string yyyy, mm, dd, hh, mi, ss;
+  if (d.size() >= 12 && d.size() < 14) {  // UTCTime YYMMDDhhmm[ss]
+    int yy = (d[0] - '0') * 10 + (d[1] - '0');
+    yyyy = std::to_string(yy < 50 ? 2000 + yy : 1900 + yy);
+    mm = d.substr(2, 2); dd = d.substr(4, 2); hh = d.substr(6, 2);
+    mi = d.substr(8, 2); ss = d.size() >= 12 ? d.substr(10, 2) : "00";
+  } else if (d.size() >= 14) {  // GeneralizedTime YYYYMMDDhhmmss
+    yyyy = d.substr(0, 4); mm = d.substr(4, 2); dd = d.substr(6, 2);
+    hh = d.substr(8, 2); mi = d.substr(10, 2); ss = d.substr(12, 2);
+  } else {
+    return s;
   }
-  ASN1_OBJECT_free(oid);
+  return yyyy + "-" + mm + "-" + dd + " " + hh + ":" + mi + ":" + ss + " UTC";
 }
 
 }  // namespace
@@ -783,11 +759,6 @@ VerifyResult verify_signature(const std::vector<uint8_t>& pdf,
     vr.error = "missing CMS or ByteRange";
     return vr;
   }
-  const unsigned char* p = cms.data();
-  PKCS7* p7 = d2i_PKCS7(nullptr, &p, (long)cms.size());
-  if (!p7) { vr.error = "cannot parse CMS: " + ossl_err(); return vr; }
-  vr.checked = true;
-
   // Reconstruct the signed bytes from the ByteRange.
   std::vector<uint8_t> data;
   bool ranges_ok = true;
@@ -797,52 +768,27 @@ VerifyResult verify_signature(const std::vector<uint8_t>& pdf,
     data.insert(data.end(), pdf.begin() + (ptrdiff_t)off,
                 pdf.begin() + (ptrdiff_t)(off + len));
   }
-  // "covers document": the ByteRange leaves only the /Contents hex gap.
-  if (br.size() >= 4) {
-    uint64_t end = br[2] + br[3];
-    vr.covers_document = ranges_ok && (end >= pdf.size() - 2);
-  }
+  uint64_t end = br[2] + br[3];
+  vr.covers_document = ranges_ok && (end >= pdf.size() - 2);
+  if (!ranges_ok) { vr.error = "ByteRange out of bounds"; return vr; }
 
-  if (ranges_ok) {
-    BIO* indata = BIO_new_mem_buf(data.data(), (int)data.size());
-    // PKCS7_NOVERIFY: don't require a trusted CA chain (self-signed ok); the
-    // signature math + ByteRange digest are still verified.
-    int rc = PKCS7_verify(p7, nullptr, nullptr, indata, nullptr,
-                          PKCS7_NOVERIFY);
-    vr.signature_valid = (rc == 1);
-    if (rc != 1) vr.error = "signature invalid: " + ossl_err();
-    BIO_free(indata);
-  } else {
-    vr.error = "ByteRange out of bounds";
+  // Pure-C++ CMS verification (RSA PKCS#1 v1.5 + SHA-256), no OpenSSL.
+  nanopdf::cms::VerifyInfo vi = nanopdf::cms::verify_signed_data(cms, data);
+  vr.checked = vi.parsed;
+  if (!vi.parsed) {
+    vr.error = vi.error.empty() ? "cannot parse CMS" : vi.error;
+    return vr;
   }
-
-  // Signer identity + digest algorithm + signing time.
-  STACK_OF(X509)* signers = PKCS7_get0_signers(p7, nullptr, PKCS7_NOVERIFY);
-  if (signers && sk_X509_num(signers) > 0) {
-    X509* sc = sk_X509_value(signers, 0);
-    X509_NAME* nm = X509_get_subject_name(sc);
-    char cn[256] = {0};
-    if (X509_NAME_get_text_by_NID(nm, NID_commonName, cn, sizeof(cn)) > 0)
-      vr.signer = cn;
-    char* dn = X509_NAME_oneline(nm, nullptr, 0);
-    if (dn) { vr.signer_dn = dn; OPENSSL_free(dn); }
-  }
-  if (signers) sk_X509_free(signers);
-
-  STACK_OF(PKCS7_SIGNER_INFO)* sis = PKCS7_get_signer_info(p7);
-  if (sis && sk_PKCS7_SIGNER_INFO_num(sis) > 0) {
-    PKCS7_SIGNER_INFO* si = sk_PKCS7_SIGNER_INFO_value(sis, 0);
-    if (si->digest_alg)
-      vr.digest_algorithm = OBJ_nid2sn(OBJ_obj2nid(si->digest_alg->algorithm));
-    ASN1_TYPE* st = PKCS7_get_signed_attribute(si, NID_pkcs9_signingTime);
-    if (st && st->type == V_ASN1_UTCTIME)
-      vr.signing_time = asn1_time_str(st->value.utctime);
-    else if (st && st->type == V_ASN1_GENERALIZEDTIME)
-      vr.signing_time = asn1_time_str((ASN1_TIME*)st->value.generalizedtime);
-  }
-
-  parse_timestamp(p7, &vr);
-  PKCS7_free(p7);
+  vr.signature_valid = vi.signature_valid && vi.digest_valid;
+  vr.signer = vi.signer_cn;
+  vr.digest_algorithm = vi.digest_algorithm;
+  vr.signing_time = format_asn1_time(vi.signing_time);
+  vr.has_timestamp = vi.has_timestamp;
+  vr.timestamp_time = format_asn1_time(vi.timestamp_time);
+  vr.timestamp_authority = vi.timestamp_authority;
+  if (!vr.signature_valid && vr.error.empty())
+    vr.error = vi.signature_valid ? "digest does not cover document"
+                                  : "signature verification failed";
   return vr;
 }
 

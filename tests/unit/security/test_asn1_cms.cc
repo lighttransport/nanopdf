@@ -149,6 +149,38 @@ TEST_SUITE("CMS SignedData") {
       }
     CHECK(found);
   }
+
+  TEST_CASE("build -> verify round-trips; tamper is rejected") {
+    crypto::RsaPrivateKey key = crypto::rsa_parse_private_key_pem(kTestKeyPem);
+    REQUIRE(key.valid);
+    cms::Bytes cert(kTestCertDer, kTestCertDer + sizeof(kTestCertDer));
+    cms::Bytes content = {'s', 'i', 'g', 'n', ' ', 'm', 'e'};
+    cms::Bytes der =
+        cms::build_signed_data(content, cert, {}, key, "260620120000Z");
+    REQUIRE(!der.empty());
+
+    cms::VerifyInfo vi = cms::verify_signed_data(der, content);
+    CHECK(vi.parsed);
+    CHECK(vi.signature_valid);
+    CHECK(vi.digest_valid);
+    CHECK_EQ(vi.signer_cn, std::string("nanopdf cms test"));
+
+    // Tampered content: signature still verifies (over signedAttrs) but the
+    // messageDigest no longer matches.
+    cms::Bytes bad = content;
+    bad[0] ^= 0xFF;
+    cms::VerifyInfo vt = cms::verify_signed_data(der, bad);
+    CHECK(vt.signature_valid);
+    CHECK(!vt.digest_valid);
+  }
+
+  TEST_CASE("extract_rsa_public_key + subject_common_name") {
+    cms::Bytes cert(kTestCertDer, kTestCertDer + sizeof(kTestCertDer));
+    crypto::RsaPublicKey pub = cms::extract_rsa_public_key(cert);
+    CHECK(pub.valid);
+    CHECK_EQ((int)pub.modulus_bytes, 128);  // 1024-bit
+    CHECK_EQ(cms::subject_common_name(cert), std::string("nanopdf cms test"));
+  }
 }
 
 TEST_SUITE("RFC 3161 timestamp") {
