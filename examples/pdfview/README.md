@@ -93,7 +93,8 @@ different file.
 | drag on page | Select text (`Ctrl+C` to copy) | `i` | Info / signatures / forms panel |
 | click outline / thumbnail | Jump to page | `r` | Revisions panel; `d` cycles After/Before/Diff |
 | `g` | Toggle **debug** mode | drag (debug) | Inspect region → PDF objects |
-| `s` | Save screenshot (PNG) of the frame | `Esc` | Clear search/selection, else quit |
+| `s` | Save screenshot (PNG) of the frame | `[` / `]` | Rotate view CCW / CW |
+| | | `Esc` | Clear search/selection, else quit |
 
 ## Debug mode + MCP (LLM/VLM-assisted inspection)
 

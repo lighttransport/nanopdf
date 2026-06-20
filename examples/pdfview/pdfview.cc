@@ -171,6 +171,13 @@ struct Viewer {
   int rev_cache_page = -1;
   float rev_cache_scale = 0.0f;
 
+  // View rotation in degrees clockwise (0/90/180/270), applied to all pages.
+  int rotation = 0;
+  std::vector<uint32_t> rot_argb;   // rotated copy of the current page
+  lvg_surface_t rot_surface{};
+  int rot_rotation = -1;
+  const uint32_t* rot_src = nullptr;  // source buffer the cache was built from
+
   // Current page placement (physical px), set by draw() for coord mapping.
   int page_px = 0, page_py = 0;
   float page_scale = 1.0f;
@@ -295,9 +302,45 @@ lui_font_t* set_ui_scale(float s, lui_font_t* old) {
   return f;
 }
 
+// Rotate an ARGB buffer by @rot degrees clockwise (0/90/180/270) into @dst.
+void rotate_argb(const uint32_t* src, int sw, int sh, int rot,
+                 std::vector<uint32_t>& dst, int* dw, int* dh) {
+  if (rot == 90 || rot == 270) { *dw = sh; *dh = sw; } else { *dw = sw; *dh = sh; }
+  dst.assign((size_t)(*dw) * (*dh), 0);
+  for (int y = 0; y < sh; ++y) {
+    const uint32_t* srow = src + (size_t)y * sw;
+    for (int x = 0; x < sw; ++x) {
+      int ox, oy;
+      switch (rot) {
+        case 90:  ox = sh - 1 - y; oy = x; break;
+        case 180: ox = sw - 1 - x; oy = sh - 1 - y; break;
+        case 270: ox = y; oy = sw - 1 - x; break;
+        default:  ox = x; oy = y; break;
+      }
+      dst[(size_t)oy * (*dw) + ox] = srow[x];
+    }
+  }
+}
+
+// Ensure v.rot_surface holds @rp rotated by v.rotation; returns the surface to
+// display (the original when rotation == 0). Cached by (page, rotation, scale).
+const lvg_surface_t* rotated_surface(Viewer& v, const pdfview::RenderedPage* rp) {
+  if (v.rotation == 0 || !rp || !rp->valid()) return rp ? &rp->surface : nullptr;
+  if (v.rot_src != rp->argb.data() || v.rot_rotation != v.rotation) {
+    int dw = 0, dh = 0;
+    rotate_argb(rp->argb.data(), rp->width, rp->height, v.rotation, v.rot_argb,
+                &dw, &dh);
+    v.rot_surface = lvg_surface_wrap(v.rot_argb.data(), dw, dh, dw);
+    v.rot_rotation = v.rotation;
+    v.rot_src = rp->argb.data();
+  }
+  return &v.rot_surface;
+}
+
 float fit_width_zoom(Viewer& v, int content_w) {
   double wpt = 0, hpt = 0;
   v.doc.page_size_points(v.page, &wpt, &hpt);
+  if (v.rotation == 90 || v.rotation == 270) std::swap(wpt, hpt);  // displayed w
   if (wpt <= 0) return v.zoom;
   return clampf((float)((content_w - 2 * kPageMargin) / wpt), kMinZoom, kMaxZoom);
 }
@@ -305,6 +348,7 @@ float fit_width_zoom(Viewer& v, int content_w) {
 float fit_page_zoom(Viewer& v, int content_w, int content_h) {
   double wpt = 0, hpt = 0;
   v.doc.page_size_points(v.page, &wpt, &hpt);
+  if (v.rotation == 90 || v.rotation == 270) std::swap(wpt, hpt);
   if (wpt <= 0 || hpt <= 0) return v.zoom;
   float zw = (float)((content_w - 2 * kPageMargin) / wpt);
   float zh = (float)((content_h - 2 * kPageMargin) / hpt);
@@ -788,8 +832,9 @@ void draw(Viewer& v, lvg_surface_t* surf) {
       show = &v.diff_page;
 
     if (rp && rp->valid() && show && show->valid()) {
-      const int pw = show->width;
-      const int ph = show->height;
+      const lvg_surface_t* disp = rotated_surface(v, show);
+      const int pw = disp->width;   // displayed (post-rotation) dimensions
+      const int ph = disp->height;
 
       const int max_sx = std::max(0, pw - content_w);
       const int max_sy = std::max(0, ph - content_h);
@@ -806,9 +851,9 @@ void draw(Viewer& v, lvg_surface_t* surf) {
 
       lvg_rect_t clip = lvg_rect_make(content_x, content_y, content_w, content_h);
       lvg_canvas_set_clip(&c, &clip);
-      const int sh = ui_px(4);  // drop-shadow offset
-      lvg_canvas_fill_rect(&c, px + sh, py + sh, pw, ph, kPageShadow);
-      lvg_canvas_draw_image(&c, px, py, pw, ph, &show->surface, nullptr,
+      const int shadow = ui_px(4);  // drop-shadow offset
+      lvg_canvas_fill_rect(&c, px + shadow, py + shadow, pw, ph, kPageShadow);
+      lvg_canvas_draw_image(&c, px, py, pw, ph, disp, nullptr,
                             LVG_IMAGE_FILTER_BILINEAR);
 
       if (show == rp) {  // overlays apply to the normal (after) view only
@@ -922,26 +967,60 @@ int utf8_char_count(const std::string& s) {
   return n;
 }
 
-// Map a text quad (PDF user space, y-up) to a screen rect using the current
-// page placement recorded by draw().
-void map_quad_to_screen(Viewer& v, const nanopdf::TextQuad& q, int* sx, int* sy,
-                        int* sw, int* sh) {
+// Map a PDF user-space point (y-up) to a screen pixel, honoring v.rotation.
+void pdf_to_screen(Viewer& v, double gx, double gy, int* sx, int* sy) {
   double left, bottom, right, top;
   v.doc.page_box(v.page, &left, &bottom, &right, &top);
-  float s = v.page_scale;
-  *sx = v.page_px + (int)((q.x - left) * s);
-  *sy = v.page_py + (int)((top - (q.y + q.height)) * s);
-  *sw = std::max(1, (int)(q.width * s));
-  *sh = std::max(1, (int)(q.height * s));
+  float s = (v.page_scale > 0) ? v.page_scale : 1.0f;
+  double ix = (gx - left) * s, iy = (top - gy) * s;  // unrotated image px
+  double pw0 = (right - left) * s, ph0 = (top - bottom) * s;
+  double dx, dy;
+  switch (v.rotation) {
+    case 90:  dx = ph0 - iy; dy = ix; break;
+    case 180: dx = pw0 - ix; dy = ph0 - iy; break;
+    case 270: dx = iy; dy = pw0 - ix; break;
+    default:  dx = ix; dy = iy; break;
+  }
+  *sx = v.page_px + (int)dx;
+  *sy = v.page_py + (int)dy;
 }
 
-// Inverse map: a screen point to PDF user-space coords on the current page.
+// Map a text quad (PDF user space, y-up) to a screen rect (rotation-aware:
+// the quad's corners are mapped and bounded).
+void map_quad_to_screen(Viewer& v, const nanopdf::TextQuad& q, int* sx, int* sy,
+                        int* sw, int* sh) {
+  int cx[4], cy[4];
+  pdf_to_screen(v, q.x, q.y, &cx[0], &cy[0]);
+  pdf_to_screen(v, q.x + q.width, q.y, &cx[1], &cy[1]);
+  pdf_to_screen(v, q.x, q.y + q.height, &cx[2], &cy[2]);
+  pdf_to_screen(v, q.x + q.width, q.y + q.height, &cx[3], &cy[3]);
+  int x0 = cx[0], y0 = cy[0], x1 = cx[0], y1 = cy[0];
+  for (int i = 1; i < 4; ++i) {
+    x0 = std::min(x0, cx[i]); y0 = std::min(y0, cy[i]);
+    x1 = std::max(x1, cx[i]); y1 = std::max(y1, cy[i]);
+  }
+  *sx = x0;
+  *sy = y0;
+  *sw = std::max(1, x1 - x0);
+  *sh = std::max(1, y1 - y0);
+}
+
+// Inverse map: a screen point to PDF user-space coords (rotation-aware).
 void screen_to_page(Viewer& v, int sx, int sy, double* gx, double* gy) {
   double left, bottom, right, top;
   v.doc.page_box(v.page, &left, &bottom, &right, &top);
   float s = (v.page_scale > 0) ? v.page_scale : 1.0f;
-  *gx = left + (sx - v.page_px) / s;
-  *gy = top - (sy - v.page_py) / s;
+  double dx = sx - v.page_px, dy = sy - v.page_py;
+  double pw0 = (right - left) * s, ph0 = (top - bottom) * s;
+  double ix, iy;
+  switch (v.rotation) {
+    case 90:  iy = ph0 - dx; ix = dy; break;
+    case 180: ix = pw0 - dx; iy = ph0 - dy; break;
+    case 270: iy = dx; ix = pw0 - dy; break;  // dx=iy, dy=pw0-ix
+    default:  ix = dx; iy = dy; break;
+  }
+  *gx = left + ix / s;
+  *gy = top - iy / s;
 }
 
 // Collect one bounding box per match of @q on @page (PDF coords).
@@ -1025,6 +1104,7 @@ bool load_document(Viewer& v, lui_window_t* win, const char* path) {
   v.scroll_x = 0;
   v.scroll_y = 0;
   v.fit_width = true;
+  v.rotation = 0;
   v.sidebar_scroll = 0;
   v.thumb_scroll = 0;
   v.sidebar_mode = v.doc.outline().empty() ? 1 : 0;  // Pages if no bookmarks
@@ -2084,6 +2164,12 @@ int main(int argc, char** argv) {
               draw(viewer, surface);
               take_screenshot(viewer, surface);
             }
+            dirty = true;
+          } else if (ch == ']') {
+            viewer.rotation = (viewer.rotation + 90) % 360;  // rotate CW
+            dirty = true;
+          } else if (ch == '[') {
+            viewer.rotation = (viewer.rotation + 270) % 360;  // rotate CCW
             dirty = true;
           }
           break;
