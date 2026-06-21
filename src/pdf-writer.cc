@@ -1580,7 +1580,7 @@ void PageBuilder::add_highlight(double x, double y, double width, double height,
   config.type = MarkupType::Highlight;
   config.quads.push_back(quad_from_rect(x, y, width, height));
   get_highlight_color(color, config.r, config.g, config.b);
-  highlights_.push_back(config);
+  highlights_.push_back(std::move(config));
 }
 
 void PageBuilder::add_highlight(const HighlightConfig& config) {
@@ -1600,7 +1600,7 @@ void PageBuilder::add_highlight(const HighlightConfig& config) {
     get_highlight_color(config.color_preset, markup.r, markup.g, markup.b);
   }
 
-  highlights_.push_back(markup);
+  highlights_.push_back(std::move(markup));
 }
 
 void PageBuilder::add_highlight(const std::vector<QuadPoints>& quads,
@@ -1609,7 +1609,7 @@ void PageBuilder::add_highlight(const std::vector<QuadPoints>& quads,
   config.type = MarkupType::Highlight;
   config.quads = quads;
   get_highlight_color(color, config.r, config.g, config.b);
-  highlights_.push_back(config);
+  highlights_.push_back(std::move(config));
 }
 
 void PageBuilder::add_text_markup(const TextMarkupConfig& config) {
