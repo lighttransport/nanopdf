@@ -1,8 +1,9 @@
-# Build directories
+# Build directories (single canonical build/ per project; everything else ignored)
 build/
 build_*/
-build-mingw-*/
+build-*/
 **/build/
+**/build-*/
 
 # CMake
 CMakeCache.txt

@@ -115,8 +115,8 @@ fonts/                  Open-source font files (Arimo, Tinos, Cousine, Noto, STI
 cmake/                  CMake modules (sanitizers, toolchains, font embedding)
 scripts/                Build and utility scripts
 data/                   Test PDF files and resources
-docs/                   Active documentation (THIRD_PARTY, MCP_USAGE, FONTS_EMBEDDING, WASM)
-docs/archive/           Historical development notes
+docs/                   Active documentation (THIRD_PARTY, MCP_USAGE, FONTS_EMBEDDING, WASM,
+                        C_WRITER_USAGE, C11_MIGRATION roadmap)
 ```
 
 ## Code Architecture
@@ -203,11 +203,16 @@ Uses `nanotest` - a custom header-only C++17 test framework (~300 LOC) with:
 - Auto-registration and CTest integration
 
 ### Test Executables
-- `nanopdf_unit_suite`: All unit tests (~500 cases across core, filters, fonts, text, document, annotations, forms, security, graphics)
-- `test_parse_real_pdfs`: Integration tests parsing real PDF files from `data/`
-- `test_text_extraction`: Integration tests for text extraction on real PDFs
-- `test_arlington_*`, `test_safedocs`, `test_corpus_parsing`, `test_pdf_differences`: Validation tests
-- `test_visual_thorvg`, `test_visual_blend2d`: Visual regression (when backend enabled)
+
+Tests are aggregated into a few binaries (one per category) that all use the nanotest
+global registry; CTest selects them by label (`unit` / `integration` / `validation`):
+
+- `nanopdf_unit_suite`: All unit tests (~500 cases across core, filters, fonts, text, document, annotations, forms, security, graphics) + MCP JSON tests
+- `nanopdf_integration_suite`: All integration tests (parse real PDFs + text extraction) merged into one binary
+- `nanopdf_validation_suite`: All validation tests (Arlington parse/validate, SafeDocs, corpus parsing, PDF differences) merged into one binary
+- `nanopdf_c_api_smoke`: C API smoke test (separate, C language)
+- `test_visual_thorvg`, `test_visual_blend2d`, `test_visual_lightvg`: Visual regression (per backend)
+- `ncrypto/tests/test_*`: 13 standalone pure-C11 crypto tests (separate project)
 
 ### Compilation Defines
 

@@ -492,4 +492,6 @@ TEST_CASE("synthetic PDF supports search and selection geometry") {
 
 }  // TEST_SUITE("TextExtraction")
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() { return nanotest::run_all_tests(); }
+#endif
