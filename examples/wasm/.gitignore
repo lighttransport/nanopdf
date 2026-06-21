@@ -1,4 +1,11 @@
 node_modules/
 dist/
-src/nanopdf.js
-src/nanopdf.wasm
+# NOTE: src/nanopdf.js and src/nanopdf.wasm (the prebuilt Emscripten module) are
+# committed on purpose so the GitHub Pages deploy can build the viewer without an
+# Emscripten toolchain. Rebuild + recommit them when the C++ changes
+# (see scripts/bootstrap-emscripten.sh).
+
+# CJK fonts (~10MB) are streamed from the jsDelivr CDN at runtime
+# (loadCDNCJKFonts in src/font-loader.js), so they are NOT committed/self-hosted.
+public/fonts/noto-sans-jp/
+public/fonts/noto-serif-jp/

@@ -1,7 +1,12 @@
 import './style.css';
 import createModule from 'nanopdf-wasm';
 import wasmUrl from 'nanopdf-wasm-bin';
-import { loadStandardFonts, loadCJKFonts } from './font-loader.js';
+import { loadStandardFonts, loadCDNCJKFonts } from './font-loader.js';
+
+// External fonts live alongside the site under <base>/fonts. Derive the path
+// from Vite's BASE_URL so it works both at the dev-server root ('/') and under
+// a GitHub Pages project path (e.g. '/nanopdf/'). BASE_URL always ends in '/'.
+const FONTS_BASE = `${import.meta.env.BASE_URL}fonts`;
 
 // State
 let Module = null;
@@ -2233,17 +2238,19 @@ async function init() {
     if (!embeddedFontsAvailable) {
       try {
         showLoading('Loading fonts...');
-        const stdCount = await loadStandardFonts(Module, '/fonts', (ratio, name) => {
+        const stdCount = await loadStandardFonts(Module, FONTS_BASE, (ratio, name) => {
           loadingText.textContent = `Loading font: ${name} (${Math.round(ratio * 100)}%)`;
         });
         console.log(`Loaded ${stdCount} standard fonts from external files`);
 
-        // Load CJK fonts in the background (they're large)
-        loadCJKFonts(Module, '/fonts', (ratio, name) => {
+        // Load CJK fonts in the background (they're large, ~10MB). These are
+        // not self-hosted — they stream from the jsDelivr CDN (@embedpdf/fonts-jp)
+        // so the deployed site stays small. See loadCDNCJKFonts in font-loader.js.
+        loadCDNCJKFonts(Module, (ratio, name) => {
           console.log(`CJK font: ${name} (${Math.round(ratio * 100)}%)`);
         }).then(cjkCount => {
           if (cjkCount > 0) {
-            console.log(`Loaded ${cjkCount} CJK fonts from external files`);
+            console.log(`Loaded ${cjkCount} CJK fonts from CDN`);
           }
         }).catch(e => {
           console.log('CJK fonts not available:', e.message);

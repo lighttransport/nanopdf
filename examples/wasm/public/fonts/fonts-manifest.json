@@ -41,14 +41,6 @@
       "size": 838652
     },
     {
-      "name": "NotoSansJP-Regular",
-      "category": 4,
-      "weight": 400,
-      "italic": false,
-      "file": "noto-sans-jp/NotoSansJP-Regular.otf",
-      "size": 4533028
-    },
-    {
       "name": "Arimo-Bold",
       "category": 0,
       "weight": 700,
@@ -111,14 +103,6 @@
       "italic": false,
       "file": "cousine/Cousine-Regular.ttf",
       "size": 308360
-    },
-    {
-      "name": "NotoSerifJP-Regular",
-      "category": 5,
-      "weight": 400,
-      "italic": false,
-      "file": "noto-serif-jp/NotoSerifJP-Regular.otf",
-      "size": 6210492
     },
     {
       "name": "NotoSansSymbols-Regular",

@@ -60,6 +60,9 @@ data/external/
 
 # Emscripten
 *.wasm
+# Exception: the WASM viewer ships a committed prebuilt module so GitHub Pages
+# can build without an Emscripten toolchain.
+!examples/wasm/src/nanopdf.wasm
 *.js.map
 # Generated font embedding headers
 embedded-fonts.hh

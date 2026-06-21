@@ -1,0 +1,75 @@
+name: Deploy WASM viewer to GitHub Pages
+
+# Builds the Vite-based WASM PDF viewer in examples/wasm/ and publishes it to
+# GitHub Pages. The Emscripten module (examples/wasm/src/nanopdf.{js,wasm}) is
+# committed, so no Emscripten toolchain is needed here — we only run the JS build.
+#
+# One-time setup in the repo: Settings -> Pages -> Build and deployment ->
+# Source: "GitHub Actions".
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'examples/wasm/**'
+      - '.github/workflows/deploy-wasm-pages.yml'
+  workflow_dispatch:
+
+# Allow this workflow to publish to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One concurrent deployment; cancel superseded in-progress runs.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build viewer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/wasm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: examples/wasm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build site
+        # base must match the project-pages path: https://<owner>.github.io/nanopdf/
+        env:
+          VITE_BASE: /nanopdf/
+        run: npm run build
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: examples/wasm/dist
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
