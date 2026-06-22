@@ -228,6 +228,7 @@ nanopdf embeds or links the following third-party libraries:
 | [fpnge](https://github.com/veluca93/fpnge) | — | Apache 2.0 | Google LLC, Luca Versari |
 | [libdeflate](https://github.com/ebiggers/libdeflate) | 1.25 | MIT | Eric Biggers |
 | [TinyDNGLoader](https://github.com/syoyo/tinydng) | — | MIT | Syoyo Fujita |
+| lightvg (software vector graphics, from [lightui](https://github.com/lighttransport/lightui)) | — | Apache 2.0 | Light Transport Entertainment Inc. |
 | [nanostl](https://github.com/lighttransport/nanostl) | — | MIT | Light Transport Entertainment Inc. |
 | [fast_float](https://github.com/fastfloat/fast_float) (via nanostl) | — | Apache 2.0 / Boost 1.0 | Daniel Lemire et al. |
 | [Ryu](https://github.com/ulfjack/ryu) (via nanostl) | — | Apache 2.0 / Boost 1.0 | Ulf Adams |
@@ -235,15 +236,29 @@ nanopdf embeds or links the following third-party libraries:
 | CCITT Fax decoder (from [PDFium](https://pdfium.googlesource.com/pdfium/)) | — | BSD-3-Clause | The PDFium Authors, Foxit Software Inc. |
 | [ThorVG](https://github.com/thorvg/thorvg) (optional) | 1.0.1 | MIT | ThorVG Project |
 | [Blend2D](https://blend2d.com/) (optional) | — | Zlib | Blend2D Authors |
+| [libtiff](http://www.libtiff.org/) (optional, `NANOPDF_USE_LIBTIFF`) | — | libtiff (BSD-style) | Sam Leffler, Silicon Graphics Inc. |
+| [Adobe Glyph List](https://github.com/adobe-type-tools/agl-aglfn) (data, embedded) | — | BSD-3-Clause | Adobe Inc. |
 
-### Bundled Fonts (optional, SIL Open Font License 1.1)
+All cryptography (RSA, ECDSA, AES, SHA, X.509, CMS, RFC 3161, TLS 1.3) is
+implemented in-tree (`src/` C++ and the pure-C11 `ncrypto/` stack) — nanopdf has
+**no OpenSSL or other external crypto dependency**.
 
-When building with `NANOPDF_EMBED_FONTS` or `NANOPDF_EMBED_CJK_FONTS`:
+### Bundled Fonts (optional)
 
-- **Arimo** — metric-compatible Arial replacement (Google, SIL OFL 1.1)
-- **Tinos** — metric-compatible Times New Roman replacement (Google, SIL OFL 1.1)
-- **Cousine** — metric-compatible Courier New replacement (Google, SIL OFL 1.1)
-- **Noto Sans JP / Noto Serif JP** — Japanese font support (Google, SIL OFL 1.1)
+Embedded when building with `NANOPDF_EMBED_FONTS` or `NANOPDF_EMBED_CJK_FONTS`,
+and served by the WASM viewer. Two licenses apply:
+
+**Apache License 2.0** (Google Croscore fonts; `LICENSE.txt` in each folder):
+
+- **Arimo** — metric-compatible Arial/Helvetica replacement
+- **Tinos** — metric-compatible Times New Roman replacement
+- **Cousine** — metric-compatible Courier New replacement
+
+**SIL Open Font License 1.1** (`OFL.txt` in each folder):
+
+- **Noto Sans JP / Noto Serif JP** — Japanese (CJK) support (Google)
+- **Noto Sans Symbols** — symbol / ZapfDingbats fallback (Google)
+- **STIX Two Math** — Symbol / math glyph fallback (STIX Fonts Project / IEEE)
 
 ## License
 
