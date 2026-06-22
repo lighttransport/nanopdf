@@ -2107,6 +2107,45 @@ canvasScroll.addEventListener('wheel', (e) => {
   }
 }, { passive: false });
 
+// Pan the page by dragging with the middle mouse (wheel) button.
+let isPanning = false;
+let panStartX = 0;
+let panStartY = 0;
+let panScrollLeft = 0;
+let panScrollTop = 0;
+
+function onPanMove(e) {
+  if (!isPanning) return;
+  canvasScroll.scrollLeft = panScrollLeft - (e.clientX - panStartX);
+  canvasScroll.scrollTop = panScrollTop - (e.clientY - panStartY);
+}
+
+function endPan() {
+  if (!isPanning) return;
+  isPanning = false;
+  canvasScroll.classList.remove('panning');
+  window.removeEventListener('mousemove', onPanMove);
+  window.removeEventListener('mouseup', endPan);
+}
+
+canvasScroll.addEventListener('mousedown', (e) => {
+  if (e.button !== 1) return; // middle (wheel) button only
+  e.preventDefault();         // suppress the browser's middle-click autoscroll
+  isPanning = true;
+  panStartX = e.clientX;
+  panStartY = e.clientY;
+  panScrollLeft = canvasScroll.scrollLeft;
+  panScrollTop = canvasScroll.scrollTop;
+  canvasScroll.classList.add('panning');
+  window.addEventListener('mousemove', onPanMove);
+  window.addEventListener('mouseup', endPan);
+});
+
+// Stop the middle-click default action (autoscroll / paste-on-*nix) on release.
+canvasScroll.addEventListener('auxclick', (e) => {
+  if (e.button === 1) e.preventDefault();
+});
+
 // Keyboard navigation
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;

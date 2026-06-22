@@ -427,6 +427,13 @@ body {
   padding: 20px;
   background: #e8eaed;
 }
+/* While panning with the middle mouse button. */
+.canvas-scroll.panning {
+  cursor: grabbing;
+}
+.canvas-scroll.panning * {
+  cursor: grabbing !important;
+}
 /* Canvas wrapper for rotation support */
 .canvas-wrapper {
   display: inline-flex;
