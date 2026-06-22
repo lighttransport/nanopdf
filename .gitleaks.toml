@@ -1,0 +1,27 @@
+# gitleaks configuration for nanopdf.
+#
+# Extends the built-in default ruleset and allowlists known throwaway test-only
+# key material so a clean scan reports ZERO findings — meaning any new finding is
+# a real alert worth investigating. See AGENTS.md ("Secret-scanning audit").
+#
+# Everything allowlisted below is a non-secret: crypto unit-test vectors (a 1024-bit
+# RSA test key, test certificates) and a documentation example key. None are real
+# credentials. Do NOT add real secrets here — fix the leak instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Throwaway test-only key material and doc examples (verified non-secrets)"
+paths = [
+  # ncrypto pure-C11 crypto unit-test vectors
+  '''ncrypto/tests/test_rsa\.c''',
+  '''ncrypto/tests/test_cms\.c''',
+  '''ncrypto/tests/test_x509\.c''',
+  # C++ security unit tests
+  '''tests/unit/security/test_rsa_pk\.cc''',
+  '''tests/unit/security/test_asn1_cms\.cc''',
+  '''tests/unit/security/test_x509\.cc''',
+  # Documentation example key (illustrative, not a real credential)
+  '''examples/pdfsign/README\.md''',
+]
