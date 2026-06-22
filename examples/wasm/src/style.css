@@ -63,6 +63,20 @@ body {
 .toolbar button:hover, .toolbar label:hover {
   background: #e8e8e8;
 }
+.toolbar .github-link {
+  margin-left: auto;
+  background: #f5f5f5;
+  border: 1px solid #ccc;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  color: #333;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.toolbar .github-link:hover {
+  background: #e8e8e8;
+}
 .toolbar button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
