@@ -20,30 +20,8 @@ target_compile_definitions(test_fixtures PRIVATE
     NANOPDF_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
 )
 
-# Helper function for creating integration tests
-function(add_nanopdf_integration_test test_name test_source)
-    add_executable(${test_name} ${test_source})
-    target_link_libraries(${test_name} PRIVATE nanopdf nanotest test_fixtures)
-    target_include_directories(${test_name} PRIVATE
-        ${PROJECT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/fixtures
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-
-    target_compile_definitions(${test_name} PRIVATE
-        NANOPDF_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
-    )
-
-    if(COMMAND add_sanitizers)
-        add_sanitizers(${test_name})
-    endif()
-
-    add_test(NAME ${test_name} COMMAND ${test_name})
-    set_tests_properties(${test_name} PROPERTIES
-        LABELS "integration"
-        TIMEOUT 300  # Integration tests may take longer
-    )
-endfunction()
+# Integration and validation tests are each aggregated into a single binary in
+# their respective subdirectories (see integration/ and validation/ CMakeLists).
 
 # Unit test suite: single binary target.
 set(NANOPDF_UNIT_TEST_SOURCES
@@ -82,6 +60,11 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/security/test_aes.cc
     unit/security/test_hash.cc
     unit/security/test_rc4.cc
+    unit/security/test_rsa_pk.cc
+    unit/security/test_ecc.cc
+    unit/security/test_x509.cc
+    unit/security/test_asn1_cms.cc
+    unit/security/test_tls_crypto.cc
     unit/text/test_text_extraction.cc
     unit/text/test_text_state.cc
     unit/text/test_text_layout.cc

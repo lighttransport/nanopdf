@@ -196,7 +196,7 @@ class StreamReader {
       return false;
     }
 
-    const char val = static_cast<const char>(binary_[idx_]);
+    const char val = static_cast<char>(binary_[idx_]);
 
     (*ret) = bool(val);
     idx_ += 1;
@@ -209,7 +209,7 @@ class StreamReader {
       return false;
     }
 
-    const char val = static_cast<const char>(binary_[idx_]);
+    const char val = static_cast<char>(binary_[idx_]);
 
     (*ret) = val;
     idx_ += 1;

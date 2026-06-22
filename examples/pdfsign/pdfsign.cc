@@ -8,12 +8,14 @@
 //   verify  - Verify signatures in a PDF
 //   info    - Display signature information
 //   timestamp - Add a document timestamp
+//   set-password - Rewrite a PDF with password protection
 //
 // Usage:
 //   pdfsign sign <input.pdf> <output.pdf> --cert <cert.pem> --key <key.pem>
 //   pdfsign verify <input.pdf>
 //   pdfsign info <input.pdf>
 //   pdfsign timestamp <input.pdf> <output.pdf> --tsa <url>
+//   pdfsign set-password <input.pdf> <output.pdf> --user-password <pass>
 
 #include <iostream>
 #include <fstream>
@@ -28,6 +30,7 @@
 
 #include "../../src/nanopdf.hh"
 #include "../../src/crypto.hh"
+#include "../../src/pdf-writer.hh"
 
 namespace {
 
@@ -37,6 +40,7 @@ enum class Command {
   Verify,
   Info,
   Timestamp,
+  SetPassword,
   Help
 };
 
@@ -47,6 +51,9 @@ struct SignOptions {
   std::string cert_file;
   std::string key_file;
   std::string key_password;
+  std::string user_password;
+  std::string owner_password;
+  std::string encryption_algorithm{"aes-128"};
   std::string tsa_url;
   std::string reason;
   std::string location;
@@ -851,6 +858,82 @@ int sign_pdf(const SignOptions& options) {
   return 0;
 }
 
+nanopdf::EncryptionAlgorithm parse_encryption_algorithm(const std::string& name,
+                                                        bool* ok) {
+  *ok = true;
+  if (name == "aes-128") return nanopdf::EncryptionAlgorithm::AES_128;
+  if (name == "aes-256") return nanopdf::EncryptionAlgorithm::AES_256;
+  if (name == "rc4-128") return nanopdf::EncryptionAlgorithm::RC4_128;
+  if (name == "rc4-40") return nanopdf::EncryptionAlgorithm::RC4_40;
+  *ok = false;
+  return nanopdf::EncryptionAlgorithm::AES_128;
+}
+
+// Rewrite a PDF with standard PDF password protection.
+int set_pdf_password(const SignOptions& options) {
+  std::vector<uint8_t> pdf_data = read_file(options.input_file);
+  if (pdf_data.empty()) {
+    std::cerr << "Error: Failed to read input file: " << options.input_file << "\n";
+    return 1;
+  }
+
+  nanopdf::Pdf pdf;
+  if (!nanopdf::parse_from_memory(pdf_data.data(), pdf_data.size(), &pdf)) {
+    std::cerr << "Error: Failed to parse PDF file\n";
+    return 1;
+  }
+  if (!pdf.load_document_structure()) {
+    std::cerr << "Error: Failed to load PDF document structure\n";
+    return 1;
+  }
+
+  bool algorithm_ok = false;
+  nanopdf::EncryptionAlgorithm algorithm =
+      parse_encryption_algorithm(options.encryption_algorithm, &algorithm_ok);
+  if (!algorithm_ok) {
+    std::cerr << "Error: unsupported encryption algorithm: "
+              << options.encryption_algorithm << "\n";
+    return 1;
+  }
+
+  nanopdf::PdfWriter writer;
+  writer.set_title("Password protected PDF");
+  writer.set_creator("nanopdf pdfsign example");
+  int imported = writer.import_pages_from(pdf);
+  if (imported <= 0) {
+    std::cerr << "Error: Failed to import pages from input PDF\n";
+    return 1;
+  }
+
+  nanopdf::EncryptionConfig config;
+  config.algorithm = algorithm;
+  config.user_password = options.user_password;
+  config.owner_password = options.owner_password.empty()
+      ? options.user_password
+      : options.owner_password;
+  config.permissions = nanopdf::UserPermissions::view_only();
+  config.permissions.allow_print = true;
+  config.permissions.allow_copy = false;
+  config.encrypt_metadata = true;
+  writer.set_encryption(config);
+
+  if (!writer.is_encrypted()) {
+    std::cerr << "Error: Failed to enable encryption; owner password is required\n";
+    return 1;
+  }
+
+  nanopdf::WriteResult result = writer.write_to_file(options.output_file);
+  if (!result.success) {
+    std::cerr << "Error: Failed to write output file: " << result.error << "\n";
+    return 1;
+  }
+
+  std::cout << "Password-protected PDF written to: " << options.output_file << "\n";
+  std::cout << "  Pages imported: " << imported << "\n";
+  std::cout << "  Algorithm: " << options.encryption_algorithm << "\n";
+  return 0;
+}
+
 void print_usage(const char* program_name) {
   std::cout << "PDF Digital Signature Tool using nanopdf\n";
   std::cout << "\n";
@@ -859,12 +942,14 @@ void print_usage(const char* program_name) {
   std::cout << "  " << program_name << " verify <input.pdf> [options]\n";
   std::cout << "  " << program_name << " info <input.pdf> [options]\n";
   std::cout << "  " << program_name << " timestamp <input.pdf> <output.pdf> --tsa <url>\n";
+  std::cout << "  " << program_name << " set-password <input.pdf> <output.pdf> --user-password <pass> [options]\n";
   std::cout << "\n";
   std::cout << "Commands:\n";
   std::cout << "  sign       Sign a PDF with a certificate\n";
   std::cout << "  verify     Verify signatures in a PDF\n";
   std::cout << "  info       Display signature information\n";
   std::cout << "  timestamp  Add a document timestamp\n";
+  std::cout << "  set-password  Rewrite a PDF with password protection\n";
   std::cout << "\n";
   std::cout << "Sign options:\n";
   std::cout << "  --cert <file>      Certificate file (PEM format)\n";
@@ -881,6 +966,11 @@ void print_usage(const char* program_name) {
   std::cout << "Timestamp options:\n";
   std::cout << "  --tsa <url>        Time Stamp Authority URL\n";
   std::cout << "\n";
+  std::cout << "Password options:\n";
+  std::cout << "  --user-password <pass>   Password required to open the PDF\n";
+  std::cout << "  --owner-password <pass>  Password for changing security settings\n";
+  std::cout << "  --algorithm <name>       aes-128, aes-256, rc4-128, or rc4-40 (default: aes-128)\n";
+  std::cout << "\n";
   std::cout << "General options:\n";
   std::cout << "  -v, --verbose      Verbose output\n";
   std::cout << "  --help             Show this help\n";
@@ -890,6 +980,7 @@ void print_usage(const char* program_name) {
   std::cout << "  " << program_name << " verify document.pdf -v\n";
   std::cout << "  " << program_name << " sign input.pdf signed.pdf --cert cert.pem --key key.pem\n";
   std::cout << "  " << program_name << " sign input.pdf certified.pdf --cert cert.pem --key key.pem --certify 2\n";
+  std::cout << "  " << program_name << " set-password input.pdf locked.pdf --user-password secret\n";
 }
 
 bool parse_arguments(int argc, char* argv[], SignOptions& options) {
@@ -906,6 +997,8 @@ bool parse_arguments(int argc, char* argv[], SignOptions& options) {
     options.command = Command::Info;
   } else if (cmd == "timestamp") {
     options.command = Command::Timestamp;
+  } else if (cmd == "set-password") {
+    options.command = Command::SetPassword;
   } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
     options.command = Command::Help;
     return true;
@@ -917,9 +1010,11 @@ bool parse_arguments(int argc, char* argv[], SignOptions& options) {
   int arg_index = 2;
 
   // Parse positional arguments based on command
-  if (options.command == Command::Sign || options.command == Command::Timestamp) {
+  if (options.command == Command::Sign ||
+      options.command == Command::Timestamp ||
+      options.command == Command::SetPassword) {
     if (argc < 4) {
-      std::cerr << "Error: sign/timestamp requires input and output files\n";
+      std::cerr << "Error: command requires input and output files\n";
       return false;
     }
     options.input_file = argv[2];
@@ -944,6 +1039,12 @@ bool parse_arguments(int argc, char* argv[], SignOptions& options) {
       options.key_file = argv[++i];
     } else if (arg == "--password" && i + 1 < argc) {
       options.key_password = argv[++i];
+    } else if (arg == "--user-password" && i + 1 < argc) {
+      options.user_password = argv[++i];
+    } else if (arg == "--owner-password" && i + 1 < argc) {
+      options.owner_password = argv[++i];
+    } else if (arg == "--algorithm" && i + 1 < argc) {
+      options.encryption_algorithm = argv[++i];
     } else if (arg == "--reason" && i + 1 < argc) {
       options.reason = argv[++i];
     } else if (arg == "--location" && i + 1 < argc) {
@@ -973,6 +1074,13 @@ bool parse_arguments(int argc, char* argv[], SignOptions& options) {
   if (options.command == Command::Sign) {
     if (options.cert_file.empty()) {
       std::cerr << "Error: --cert is required for signing\n";
+      return false;
+    }
+  }
+
+  if (options.command == Command::SetPassword) {
+    if (options.user_password.empty()) {
+      std::cerr << "Error: --user-password is required for set-password\n";
       return false;
     }
   }
@@ -1022,6 +1130,10 @@ int main(int argc, char* argv[]) {
 
   if (options.command == Command::Sign) {
     return sign_pdf(options);
+  }
+
+  if (options.command == Command::SetPassword) {
+    return set_pdf_password(options);
   }
 
   if (options.command == Command::Timestamp) {

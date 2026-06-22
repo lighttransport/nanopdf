@@ -691,8 +691,8 @@ const int kISOAdobeCharsetSize = 229;
 
 // Expert charset: glyph index -> SID (166 glyphs)
 const int kExpertCharset[] = {
-    0,    // 0: .notdef
-    1,    // 1: space
+    0,  // 0: .notdef
+    1,  // 1: space
     229,  // 2: exclamsmall
     230,  // 3: Hungarumlautsmall
     231,  // 4: dollaroldstyle
@@ -703,10 +703,10 @@ const int kExpertCharset[] = {
     236,  // 9: parenrightsuperior
     237,  // 10: twodotenleader
     238,  // 11: onedotenleader
-    13,   // 12: comma
-    14,   // 13: hyphen
-    15,   // 14: period
-    99,   // 15: fraction
+    13,  // 12: comma
+    14,  // 13: hyphen
+    15,  // 14: period
+    99,  // 15: fraction
     239,  // 16: zerooldstyle
     240,  // 17: oneoldstyle
     241,  // 18: twooldstyle
@@ -717,8 +717,8 @@ const int kExpertCharset[] = {
     246,  // 23: sevenoldstyle
     247,  // 24: eightoldstyle
     248,  // 25: nineoldstyle
-    27,   // 26: colon
-    28,   // 27: semicolon
+    27,  // 26: colon
+    28,  // 27: semicolon
     249,  // 28: commasuperior
     250,  // 29: threequartersemdash
     251,  // 30: periodsuperior
@@ -737,136 +737,144 @@ const int kExpertCharset[] = {
     264,  // 43: ssuperior
     265,  // 44: tsuperior
     266,  // 45: ff
-    267,  // 46: ffi
-    268,  // 47: ffl
-    269,  // 48: parenleftinferior
-    270,  // 49: parenrightinferior
-    271,  // 50: Circumflexsmall
-    272,  // 51: hyphensuperior
-    273,  // 52: Gravesmall
-    274,  // 53: Asmall
-    275,  // 54: Bsmall
-    276,  // 55: Csmall
-    277,  // 56: Dsmall
-    278,  // 57: Esmall
-    279,  // 58: Fsmall
-    280,  // 59: Gsmall
-    281,  // 60: Hsmall
-    282,  // 61: Ismall
-    283,  // 62: Jsmall
-    284,  // 63: Ksmall
-    285,  // 64: Lsmall
-    286,  // 65: Msmall
-    287,  // 66: Nsmall
-    288,  // 67: Osmall
-    289,  // 68: Psmall
-    290,  // 69: Qsmall
-    291,  // 70: Rsmall
-    292,  // 71: Ssmall
-    293,  // 72: Tsmall
-    294,  // 73: Usmall
-    295,  // 74: Vsmall
-    296,  // 75: Wsmall
-    297,  // 76: Xsmall
-    298,  // 77: Ysmall
-    299,  // 78: Zsmall
-    300,  // 79: colonmonetary
-    301,  // 80: onefitted
-    302,  // 81: rupiah
-    303,  // 82: Tildesmall
-    304,  // 83: exclamdownsmall
-    305,  // 84: centoldstyle
-    306,  // 85: Lslashsmall
-    307,  // 86: Scaronsmall
-    308,  // 87: Zcaronsmall
-    309,  // 88: Dieresissmall
-    310,  // 89: Brevesmall
-    311,  // 90: Caronsmall
-    312,  // 91: Dotaccentsmall
-    313,  // 92: Macronsmall
-    314,  // 93: figuredash
-    315,  // 94: hypheninferior
-    316,  // 95: Ogoneksmall
-    317,  // 96: Ringsmall
-    318,  // 97: Cedillasmall
-    319,  // 98: questiondownsmall
-    320,  // 99: oneeighth
-    321,  // 100: threeeighths
-    322,  // 101: fiveeighths
-    323,  // 102: seveneighths
-    324,  // 103: onethird
-    325,  // 104: twothirds
-    326,  // 105: zerosuperior
-    327,  // 106: foursuperior
-    328,  // 107: fivesuperior
-    329,  // 108: sixsuperior
-    330,  // 109: sevensuperior
-    331,  // 110: eightsuperior
-    332,  // 111: ninesuperior
-    333,  // 112: zeroinferior
-    334,  // 113: oneinferior
-    335,  // 114: twoinferior
-    336,  // 115: threeinferior
-    337,  // 116: fourinferior
-    338,  // 117: fiveinferior
-    339,  // 118: sixinferior
-    340,  // 119: seveninferior
-    341,  // 120: eightinferior
-    342,  // 121: nineinferior
-    343,  // 122: centinferior
-    344,  // 123: dollarinferior
-    345,  // 124: periodinferior
-    346,  // 125: commainferior
-    347,  // 126: Agravesmall
-    348,  // 127: Aacutesmall
-    349,  // 128: Acircumflexsmall
-    350,  // 129: Atildesmall
-    351,  // 130: Adieresissmall
-    352,  // 131: Aringsmall
-    353,  // 132: AEsmall
-    354,  // 133: Ccedillasmall
-    355,  // 134: Egravesmall
-    356,  // 135: Eacutesmall
-    357,  // 136: Ecircumflexsmall
-    358,  // 137: Edieresissmall
-    359,  // 138: Igravesmall
-    360,  // 139: Iacutesmall
-    361,  // 140: Icircumflexsmall
-    362,  // 141: Idieresissmall
-    363,  // 142: Ethsmall
-    364,  // 143: Ntildesmall
-    365,  // 144: Ogravesmall
-    366,  // 145: Oacutesmall
-    367,  // 146: Ocircumflexsmall
-    368,  // 147: Otildesmall
-    369,  // 148: Odieresissmall
-    370,  // 149: OEsmall
-    371,  // 150: Oslashsmall
-    372,  // 151: Ugravesmall
-    373,  // 152: Uacutesmall
-    374,  // 153: Ucircumflexsmall
-    375,  // 154: Udieresissmall
-    376,  // 155: Yacutesmall
-    377,  // 156: Thornsmall
-    378,  // 157: Ydieresissmall
+    109,  // 46: fi
+    110,  // 47: fl
+    267,  // 48: ffi
+    268,  // 49: ffl
+    269,  // 50: parenleftinferior
+    270,  // 51: parenrightinferior
+    271,  // 52: Circumflexsmall
+    272,  // 53: hyphensuperior
+    273,  // 54: Gravesmall
+    274,  // 55: Asmall
+    275,  // 56: Bsmall
+    276,  // 57: Csmall
+    277,  // 58: Dsmall
+    278,  // 59: Esmall
+    279,  // 60: Fsmall
+    280,  // 61: Gsmall
+    281,  // 62: Hsmall
+    282,  // 63: Ismall
+    283,  // 64: Jsmall
+    284,  // 65: Ksmall
+    285,  // 66: Lsmall
+    286,  // 67: Msmall
+    287,  // 68: Nsmall
+    288,  // 69: Osmall
+    289,  // 70: Psmall
+    290,  // 71: Qsmall
+    291,  // 72: Rsmall
+    292,  // 73: Ssmall
+    293,  // 74: Tsmall
+    294,  // 75: Usmall
+    295,  // 76: Vsmall
+    296,  // 77: Wsmall
+    297,  // 78: Xsmall
+    298,  // 79: Ysmall
+    299,  // 80: Zsmall
+    300,  // 81: colonmonetary
+    301,  // 82: onefitted
+    302,  // 83: rupiah
+    303,  // 84: Tildesmall
+    304,  // 85: exclamdownsmall
+    305,  // 86: centoldstyle
+    306,  // 87: Lslashsmall
+    307,  // 88: Scaronsmall
+    308,  // 89: Zcaronsmall
+    309,  // 90: Dieresissmall
+    310,  // 91: Brevesmall
+    311,  // 92: Caronsmall
+    312,  // 93: Dotaccentsmall
+    313,  // 94: Macronsmall
+    314,  // 95: figuredash
+    315,  // 96: hypheninferior
+    316,  // 97: Ogoneksmall
+    317,  // 98: Ringsmall
+    318,  // 99: Cedillasmall
+    158,  // 100: onequarter
+    155,  // 101: onehalf
+    163,  // 102: threequarters
+    319,  // 103: questiondownsmall
+    320,  // 104: oneeighth
+    321,  // 105: threeeighths
+    322,  // 106: fiveeighths
+    323,  // 107: seveneighths
+    324,  // 108: onethird
+    325,  // 109: twothirds
+    326,  // 110: zerosuperior
+    150,  // 111: onesuperior
+    164,  // 112: twosuperior
+    169,  // 113: threesuperior
+    327,  // 114: foursuperior
+    328,  // 115: fivesuperior
+    329,  // 116: sixsuperior
+    330,  // 117: sevensuperior
+    331,  // 118: eightsuperior
+    332,  // 119: ninesuperior
+    333,  // 120: zeroinferior
+    334,  // 121: oneinferior
+    335,  // 122: twoinferior
+    336,  // 123: threeinferior
+    337,  // 124: fourinferior
+    338,  // 125: fiveinferior
+    339,  // 126: sixinferior
+    340,  // 127: seveninferior
+    341,  // 128: eightinferior
+    342,  // 129: nineinferior
+    343,  // 130: centinferior
+    344,  // 131: dollarinferior
+    345,  // 132: periodinferior
+    346,  // 133: commainferior
+    347,  // 134: Agravesmall
+    348,  // 135: Aacutesmall
+    349,  // 136: Acircumflexsmall
+    350,  // 137: Atildesmall
+    351,  // 138: Adieresissmall
+    352,  // 139: Aringsmall
+    353,  // 140: AEsmall
+    354,  // 141: Ccedillasmall
+    355,  // 142: Egravesmall
+    356,  // 143: Eacutesmall
+    357,  // 144: Ecircumflexsmall
+    358,  // 145: Edieresissmall
+    359,  // 146: Igravesmall
+    360,  // 147: Iacutesmall
+    361,  // 148: Icircumflexsmall
+    362,  // 149: Idieresissmall
+    363,  // 150: Ethsmall
+    364,  // 151: Ntildesmall
+    365,  // 152: Ogravesmall
+    366,  // 153: Oacutesmall
+    367,  // 154: Ocircumflexsmall
+    368,  // 155: Otildesmall
+    369,  // 156: Odieresissmall
+    370,  // 157: OEsmall
+    371,  // 158: Oslashsmall
+    372,  // 159: Ugravesmall
+    373,  // 160: Uacutesmall
+    374,  // 161: Ucircumflexsmall
+    375,  // 162: Udieresissmall
+    376,  // 163: Yacutesmall
+    377,  // 164: Thornsmall
+    378,  // 165: Ydieresissmall
 };
 
 const int kExpertCharsetSize = 166;
 
 // Expert Subset charset: glyph index -> SID (87 glyphs)
 const int kExpertSubsetCharset[] = {
-    0,    // 0: .notdef
-    1,    // 1: space
+    0,  // 0: .notdef
+    1,  // 1: space
     231,  // 2: dollaroldstyle
     232,  // 3: dollarsuperior
     235,  // 4: parenleftsuperior
     236,  // 5: parenrightsuperior
     237,  // 6: twodotenleader
     238,  // 7: onedotenleader
-    13,   // 8: comma
-    14,   // 9: hyphen
-    15,   // 10: period
-    99,   // 11: fraction
+    13,  // 8: comma
+    14,  // 9: hyphen
+    15,  // 10: period
+    99,  // 11: fraction
     239,  // 12: zerooldstyle
     240,  // 13: oneoldstyle
     241,  // 14: twooldstyle
@@ -877,8 +885,8 @@ const int kExpertSubsetCharset[] = {
     246,  // 19: sevenoldstyle
     247,  // 20: eightoldstyle
     248,  // 21: nineoldstyle
-    27,   // 22: colon
-    28,   // 23: semicolon
+    27,  // 22: colon
+    28,  // 23: semicolon
     249,  // 24: commasuperior
     250,  // 25: threequartersemdash
     251,  // 26: periodsuperior
@@ -896,44 +904,52 @@ const int kExpertSubsetCharset[] = {
     264,  // 38: ssuperior
     265,  // 39: tsuperior
     266,  // 40: ff
-    267,  // 41: ffi
-    268,  // 42: ffl
-    269,  // 43: parenleftinferior
-    270,  // 44: parenrightinferior
-    272,  // 45: hyphensuperior
-    300,  // 46: colonmonetary
-    301,  // 47: onefitted
-    302,  // 48: rupiah
-    305,  // 49: centoldstyle
-    314,  // 50: figuredash
-    315,  // 51: hypheninferior
-    320,  // 52: oneeighth
-    321,  // 53: threeeighths
-    322,  // 54: fiveeighths
-    323,  // 55: seveneighths
-    324,  // 56: onethird
-    325,  // 57: twothirds
-    326,  // 58: zerosuperior
-    327,  // 59: foursuperior
-    328,  // 60: fivesuperior
-    329,  // 61: sixsuperior
-    330,  // 62: sevensuperior
-    331,  // 63: eightsuperior
-    332,  // 64: ninesuperior
-    333,  // 65: zeroinferior
-    334,  // 66: oneinferior
-    335,  // 67: twoinferior
-    336,  // 68: threeinferior
-    337,  // 69: fourinferior
-    338,  // 70: fiveinferior
-    339,  // 71: sixinferior
-    340,  // 72: seveninferior
-    341,  // 73: eightinferior
-    342,  // 74: nineinferior
-    343,  // 75: centinferior
-    344,  // 76: dollarinferior
-    345,  // 77: periodinferior
-    346,  // 78: commainferior
+    109,  // 41: fi
+    110,  // 42: fl
+    267,  // 43: ffi
+    268,  // 44: ffl
+    269,  // 45: parenleftinferior
+    270,  // 46: parenrightinferior
+    272,  // 47: hyphensuperior
+    300,  // 48: colonmonetary
+    301,  // 49: onefitted
+    302,  // 50: rupiah
+    305,  // 51: centoldstyle
+    314,  // 52: figuredash
+    315,  // 53: hypheninferior
+    158,  // 54: onequarter
+    155,  // 55: onehalf
+    163,  // 56: threequarters
+    320,  // 57: oneeighth
+    321,  // 58: threeeighths
+    322,  // 59: fiveeighths
+    323,  // 60: seveneighths
+    324,  // 61: onethird
+    325,  // 62: twothirds
+    326,  // 63: zerosuperior
+    150,  // 64: onesuperior
+    164,  // 65: twosuperior
+    169,  // 66: threesuperior
+    327,  // 67: foursuperior
+    328,  // 68: fivesuperior
+    329,  // 69: sixsuperior
+    330,  // 70: sevensuperior
+    331,  // 71: eightsuperior
+    332,  // 72: ninesuperior
+    333,  // 73: zeroinferior
+    334,  // 74: oneinferior
+    335,  // 75: twoinferior
+    336,  // 76: threeinferior
+    337,  // 77: fourinferior
+    338,  // 78: fiveinferior
+    339,  // 79: sixinferior
+    340,  // 80: seveninferior
+    341,  // 81: eightinferior
+    342,  // 82: nineinferior
+    343,  // 83: centinferior
+    344,  // 84: dollarinferior
+    345,  // 85: periodinferior
+    346,  // 86: commainferior
 };
 
 const int kExpertSubsetCharsetSize = 87;

@@ -2,8 +2,8 @@
 // Copyright 2024 - Present, Light Transport Entertainment Inc.
 //
 // lvg-compat.hh — Compatibility shim that maps the subset of the ThorVG
-// (`tvg::`) API used by thorvg-backend.cc to nanopdf's vendored lightui VG
-// (`lui_canvas`) software rasterizer.
+// (`tvg::`) API used by thorvg-backend.cc to nanopdf's vendored lightvg
+// (`lvg_canvas`) software rasterizer.
 //
 // The shim is private to lightvg-backend.cc; it lives in `namespace lvg` so
 // it does not collide with the real `namespace tvg` from the actual ThorVG
@@ -17,13 +17,13 @@
 //   un-added paint.
 // * `SwCanvas::target()` wraps a caller-owned pixel buffer (no copy).
 // * `Scene` is a deferred command list. `SwCanvas::draw()` walks the scene
-//   and replays each paint onto the underlying `lui_canvas_t` immediately.
-// * Cubic Beziers are flattened to polygon vertices for `lui_canvas_*` fills
+//   and replays each paint onto the underlying `lvg_canvas_t` immediately.
+// * Cubic Beziers are flattened to polygon vertices for `lvg_canvas_*` fills
 //   and strokes; flattening uses adaptive subdivision capped at depth 6.
 // * Vector clip uses a rect fast path when possible, otherwise the clipper
 //   path is rasterized to an alpha mask and intersected with the canvas clip.
 // * Polygon gradient fills and gradient strokes are sampled per pixel when
-//   lui_canvas has no native primitive for the requested operation.
+//   lvg_canvas has no native primitive for the requested operation.
 
 #pragma once
 
@@ -36,8 +36,8 @@
 #include <vector>
 
 extern "C" {
-#include <lightui/vg/surface.h>
-#include <lightui/vg/canvas.h>
+#include <lightvg/surface.h>
+#include <lightvg/canvas.h>
 }
 
 namespace lvg {
@@ -177,7 +177,7 @@ class Paint {
   enum Kind { kShape, kPicture, kScene, kLinear, kRadial };
   virtual Kind kind() const = 0;
 
-  virtual void draw_on(lui_canvas_t* canvas) = 0;
+  virtual void draw_on(lvg_canvas_t* canvas) = 0;
 
  protected:
   BlendMethod blend_mode_{BlendMethod::Normal};
@@ -225,7 +225,7 @@ class Shape : public Paint {
   }
   Result strokeFill(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
   // Gradient strokeFill: takes ownership. Sampled per pixel on draw when
-  // lui_canvas has no gradient-stroke primitive.
+  // lvg_canvas has no gradient-stroke primitive.
   Result strokeFill(LinearGradient* g);
   Result strokeFill(RadialGradient* g);
   Result strokeCap(StrokeCap c) {
@@ -243,7 +243,7 @@ class Shape : public Paint {
   Result strokeDash(const float* pattern, uint32_t count, float phase = 0);
 
   Kind kind() const override { return kShape; }
-  void draw_on(lui_canvas_t* canvas) override;
+  void draw_on(lvg_canvas_t* canvas) override;
 
   // Used by Scene/Picture to expose the path for clip approximation.
   void compute_bbox(float* x, float* y, float* w, float* h) const;
@@ -301,7 +301,7 @@ class Picture : public Paint {
   }
 
   Kind kind() const override { return kPicture; }
-  void draw_on(lui_canvas_t* canvas) override;
+  void draw_on(lvg_canvas_t* canvas) override;
 
   // Forward-transformed bbox of the source image rectangle.
   void compute_bbox(float* x, float* y, float* w, float* h) const;
@@ -309,13 +309,13 @@ class Picture : public Paint {
  private:
   Picture() = default;
 
-  void draw_pixels(lui_canvas_t* canvas);
+  void draw_pixels(lvg_canvas_t* canvas);
 
   // Slow path: per-pixel inverse-transform sample for rotated/sheared,
   // mirrored, blended, or opacity-adjusted pictures.
-  void draw_transformed(lui_canvas_t* canvas);
+  void draw_transformed(lvg_canvas_t* canvas);
 
-  std::vector<uint32_t> pixels_;  // ARGB-packed for lui_surface
+  std::vector<uint32_t> pixels_;  // ARGB-packed for lvg_surface
   uint32_t width_{0};
   uint32_t height_{0};
   Matrix   transform_{1, 0, 0, 0, 1, 0, 0, 0, 1};
@@ -341,7 +341,7 @@ class LinearGradient : public Paint {
   }
 
   Kind kind() const override { return kLinear; }
-  void draw_on(lui_canvas_t* /*canvas*/) override {}
+  void draw_on(lvg_canvas_t* /*canvas*/) override {}
 
   // Sample colour at gradient parameter t in [0,1]; clamps according to
   // spread mode (Pad only honoured; Repeat/Reflect treated as Pad).
@@ -380,7 +380,7 @@ class RadialGradient : public Paint {
   }
 
   Kind kind() const override { return kRadial; }
-  void draw_on(lui_canvas_t* /*canvas*/) override {}
+  void draw_on(lvg_canvas_t* /*canvas*/) override {}
 
   void sample(float t, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) const;
 
@@ -424,7 +424,7 @@ class Scene : public Paint {
   Result add(Paint* p);
 
   Kind kind() const override { return kScene; }
-  void draw_on(lui_canvas_t* canvas) override;
+  void draw_on(lvg_canvas_t* canvas) override;
 
   // Reset state without destroying.
   void clear();
@@ -456,22 +456,22 @@ class SwCanvas {
   void setOutputSwizzle(bool enabled) { output_swizzle_enabled_ = enabled; }
 
   // Returns the wrapped surface (for direct pixel access).
-  lui_surface_t* surface() { return &surface_; }
+  lvg_surface_t* surface() { return &surface_; }
   ColorSpace colorspace() const { return cs_; }
 
  private:
   SwCanvas() = default;
 
   std::vector<Paint*> paints_;
-  lui_surface_t surface_{};
-  lui_canvas_t  canvas_{};
+  lvg_surface_t surface_{};
+  lvg_canvas_t  canvas_{};
   bool          have_canvas_{false};
   ColorSpace    cs_{ColorSpace::ABGR8888};
   bool          output_swizzle_enabled_{true};
 };
 
 // ---------------------------------------------------------------------------
-// Initializer (no-op for lui_canvas — kept for API parity with ThorVG).
+// Initializer (no-op for lvg_canvas — kept for API parity with ThorVG).
 // ---------------------------------------------------------------------------
 class Initializer {
  public:

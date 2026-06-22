@@ -1,0 +1,65 @@
+option('prefer_wayland',
+  type        : 'boolean',
+  value       : false,
+  description : 'Prefer Wayland over X11 on Linux/BSD',
+)
+
+option('lui_build_mcp',
+  type        : 'boolean',
+  value       : true,
+  description : 'Build MCP (Model Context Protocol) server for LLM debugging',
+)
+
+option('lui_build_freetype',
+  type        : 'boolean',
+  value       : false,
+  description : 'Build with FreeType/HarfBuzz font backend for quality comparison',
+)
+
+option('verify',
+  type        : 'boolean',
+  value       : false,
+  description : 'Build verification tests against blend2d/thorvg reference renderers',
+)
+
+# Pluggable canvas backends. Matching CMake's LVG_ENABLE_BLEND2D / _THORVG;
+# both are OFF by default so the common build path has no external deps.
+#
+# Blend2D has no native Meson build; enabling this option expects a
+# prebuilt static library (see scripts/fetch-verify-deps.sh). If a
+# turnkey Meson workflow matters to you, use the CMake build instead.
+option('lui_enable_blend2d',
+  type        : 'feature',
+  value       : 'disabled',
+  description : 'Enable the blend2d canvas backend (requires prebuilt ref/blend2d)',
+)
+
+option('lui_enable_thorvg',
+  type        : 'feature',
+  value       : 'disabled',
+  description : 'Enable the thorvg canvas backend (requires prebuilt ref/thorvg/build)',
+)
+
+option('lui_build_svg_tiny',
+  type        : 'boolean',
+  value       : true,
+  description : 'Build the minimal SVG-subset parser library (lightui_svg_tiny)',
+)
+
+option('lui_build_tiger_demo',
+  type        : 'boolean',
+  value       : true,
+  description : 'Build the tiger SVG demo (forces lui_build_svg_tiny=true)',
+)
+
+option('lui_build_geomap_tiny',
+  type        : 'boolean',
+  value       : true,
+  description : 'Build the minimal MVT/PBF parser library (lightui_geomap_tiny)',
+)
+
+option('lui_build_geomap_demo',
+  type        : 'boolean',
+  value       : true,
+  description : 'Build the 2.5D vector-map demo (forces lui_build_geomap_tiny=true)',
+)

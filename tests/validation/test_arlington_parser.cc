@@ -114,6 +114,8 @@ TEST_CASE("Load full Arlington model") {
 
 }  // TEST_SUITE
 
+#ifndef NANOPDF_TEST_SUITE_NO_MAIN
 int main() {
     return nanotest::run_all_tests();
 }
+#endif

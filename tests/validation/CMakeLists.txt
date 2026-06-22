@@ -1,4 +1,9 @@
-# Validation test infrastructure for PDF specification compliance testing
+# Validation test infrastructure for PDF specification compliance testing.
+#
+# All validation test .cc files are aggregated into a single binary
+# (nanopdf_validation_suite). Each .cc auto-registers its TEST_CASEs into the
+# nanotest global registry; their per-file main() is compiled out via
+# NANOPDF_TEST_SUITE_NO_MAIN, and validation_suite_main.cc provides the one main().
 
 # Arlington parser + validator library
 add_library(nanopdf_validation STATIC
@@ -11,46 +16,38 @@ target_include_directories(nanopdf_validation PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Helper function for validation tests
-function(add_nanopdf_validation_test test_name test_source)
-    add_executable(${test_name} ${test_source})
-    target_link_libraries(${test_name} PRIVATE
-        nanopdf nanopdf_validation nanotest test_fixtures)
-    target_include_directories(${test_name} PRIVATE
-        ${PROJECT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/tests/fixtures
-        ${CMAKE_SOURCE_DIR}/tests
-    )
+set(NANOPDF_VALIDATION_TEST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_arlington_parser.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_arlington_validate.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_safedocs.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_pdf_differences.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_corpus_parsing.cc
+)
 
-    target_compile_definitions(${test_name} PRIVATE
-        NANOPDF_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data"
-        NANOPDF_PROJECT_DIR="${PROJECT_SOURCE_DIR}"
-    )
+add_executable(nanopdf_validation_suite
+    ${NANOPDF_VALIDATION_TEST_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/validation_suite_main.cc
+)
+target_link_libraries(nanopdf_validation_suite PRIVATE
+    nanopdf nanopdf_validation nanotest test_fixtures)
+target_include_directories(nanopdf_validation_suite PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/tests/fixtures
+    ${CMAKE_SOURCE_DIR}/tests
+)
+target_compile_definitions(nanopdf_validation_suite PRIVATE
+    NANOPDF_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data"
+    NANOPDF_PROJECT_DIR="${PROJECT_SOURCE_DIR}"
+    NANOPDF_TEST_SUITE_NO_MAIN=1
+)
+if(COMMAND add_sanitizers)
+    add_sanitizers(nanopdf_validation_suite)
+endif()
 
-    if(COMMAND add_sanitizers)
-        add_sanitizers(${test_name})
-    endif()
-
-    add_test(NAME ${test_name} COMMAND ${test_name})
-    set_tests_properties(${test_name} PROPERTIES
-        LABELS "validation"
-        TIMEOUT ${ARGV2}
-    )
-endfunction()
-
-# Test executables
-add_nanopdf_validation_test(test_arlington_parser
-    test_arlington_parser.cc 600)
-
-add_nanopdf_validation_test(test_arlington_validate
-    test_arlington_validate.cc 600)
-
-add_nanopdf_validation_test(test_safedocs
-    test_safedocs.cc 3600)
-
-add_nanopdf_validation_test(test_pdf_differences
-    test_pdf_differences.cc 3600)
-
-add_nanopdf_validation_test(test_corpus_parsing
-    test_corpus_parsing.cc 3600)
+# Single registration; the longest individual budget (corpus/safedocs/diffs) governs.
+add_test(NAME nanopdf_validation_suite COMMAND nanopdf_validation_suite)
+set_tests_properties(nanopdf_validation_suite PROPERTIES
+    LABELS "validation"
+    TIMEOUT 3600
+)

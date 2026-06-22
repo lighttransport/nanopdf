@@ -1,0 +1,906 @@
+/*
+ * platform_x11.c — Linux X11 platform backend
+ *
+ * Uses XImage for efficient software-render presentation.
+ * Events are mapped to lui_event_t via XNextEvent / XPending.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#ifdef LUI_PLATFORM_X11
+
+#include "../platform_internal.h"
+#include "../../internal/lui_log.h"
+
+#include "lui_x11.h"
+#define LUI_X11_IMPLEMENTATION
+#include "lui_x11_loader.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+
+/* -------------------------------------------------------------------------
+ * Platform-specific window struct
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    lui_window_t  base;          /* MUST be first — enables safe casting */
+
+    Display      *display;
+    int           screen;
+    Window        xwindow;
+    GC            gc;
+    Visual       *visual;
+    int           depth;
+
+    XImage       *ximage;        /* wraps base.surface.pixels            */
+
+    /* WM_DELETE_WINDOW atom for close-button detection */
+    Atom          wm_delete_window;
+
+    /* XDND (drag-and-drop) atoms + per-drag state */
+    Atom          xdnd_aware, xdnd_enter, xdnd_position, xdnd_status,
+                  xdnd_leave, xdnd_drop, xdnd_finished, xdnd_selection,
+                  xdnd_action_copy, xdnd_type_list, xdnd_uri_list;
+    Window        xdnd_source;   /* source window of the current drag      */
+    Atom          xdnd_type;     /* negotiated data type (uri-list) or None */
+    int           xdnd_version;  /* source's XDND protocol version          */
+
+    /* Clipboard (CLIPBOARD selection ownership) */
+    Atom          clipboard, utf8_string, targets_atom;
+    char         *clipboard_text;  /* owned copy served on SelectionRequest  */
+
+    /* Previous mouse position for delta computation */
+    int           last_mouse_x;
+    int           last_mouse_y;
+
+    bool          has_pending_text;
+    lui_event_t   pending_text;
+} lui_window_x11_t;
+
+/* -------------------------------------------------------------------------
+ * Forward declarations
+ * ------------------------------------------------------------------------- */
+static bool           x11_init(void);
+static void           x11_shutdown(void);
+static lui_window_t  *x11_window_create(const char *title, int w, int h, uint32_t flags);
+static void           x11_window_destroy(lui_window_t *win);
+static void           x11_window_show(lui_window_t *win);
+static void           x11_window_hide(lui_window_t *win);
+static void           x11_window_set_title(lui_window_t *win, const char *title);
+static void           x11_window_get_size(const lui_window_t *win, int *w, int *h);
+static void           x11_window_get_physical_size(const lui_window_t *win, int *w, int *h);
+static lvg_surface_t *x11_window_get_surface(lui_window_t *win);
+static void           x11_window_present(lui_window_t *win);
+static void           x11_window_present_rect(lui_window_t *win, const lvg_rect_t *dirty);
+static bool           x11_window_poll_event(lui_window_t *win, lui_event_t *ev);
+static bool           x11_window_wait_event(lui_window_t *win, lui_event_t *ev);
+
+/* -------------------------------------------------------------------------
+ * Global display (one per process, shared across windows)
+ * ------------------------------------------------------------------------- */
+static Display *g_display = NULL;
+static int      g_screen  = 0;
+
+/* -------------------------------------------------------------------------
+ * Helpers
+ * ------------------------------------------------------------------------- */
+
+static int x11_host_byte_order(void)
+{
+    const uint32_t value = 1u;
+    return (*(const unsigned char *)&value != 0u) ? LSBFirst : MSBFirst;
+}
+
+/* Allocate (or re-allocate) the XImage that wraps the pixel buffer. */
+static bool x11_create_ximage(lui_window_x11_t *w)
+{
+    int phys_w = (int)(w->base.logical_w * w->base.dpi_scale);
+    int phys_h = (int)(w->base.logical_h * w->base.dpi_scale);
+
+    /* (Re-)allocate the pixel buffer */
+    if (!lvg_surface_resize(&w->base.surface, phys_w, phys_h))
+        return false;
+    /* Propagate the window's DPI scale into the surface so callers can read it. */
+    w->base.surface.dpi_scale = w->base.dpi_scale;
+
+    if (w->ximage) {
+        /* Detach the old XImage without freeing the data pointer we own */
+        w->ximage->data = NULL;
+        XDestroyImage(w->ximage);
+        w->ximage = NULL;
+    }
+
+    w->ximage = XCreateImage(
+        w->display,
+        w->visual,
+        (unsigned int)w->depth,
+        ZPixmap,
+        0,
+        (char *)w->base.surface.pixels,
+        (unsigned int)phys_w,
+        (unsigned int)phys_h,
+        32,
+        phys_w * 4
+    );
+    if (!w->ximage) return false;
+
+    /* Set byte order to match the host so X11 doesn't byte-swap. */
+    w->ximage->byte_order = x11_host_byte_order();
+    return true;
+}
+
+static void x11_sync_configured_size(lui_window_x11_t *xw)
+{
+    XEvent xe;
+
+    /* Drain startup events until the first ConfigureNotify is observed so the
+     * backing store matches the actual client area before the app renders. */
+    for (;;) {
+        XNextEvent(xw->display, &xe);
+        if (xe.type == ConfigureNotify) {
+            float s = xw->base.dpi_scale;
+            int new_log_w = (int)(xe.xconfigure.width  / s + 0.5f);
+            int new_log_h = (int)(xe.xconfigure.height / s + 0.5f);
+            if (new_log_w > 0 && new_log_h > 0 &&
+                (new_log_w != xw->base.logical_w ||
+                 new_log_h != xw->base.logical_h)) {
+                xw->base.logical_w = new_log_w;
+                xw->base.logical_h = new_log_h;
+                x11_create_ximage(xw);
+            }
+            return;
+        }
+    }
+}
+
+/* Map an X11 KeySym to our internal key code (basic set). */
+static int x11_map_keysym(KeySym ks)
+{
+    /* For now return the KeySym directly; callers should treat this as opaque
+     * until a full keymap is implemented. */
+    return (int)ks;
+}
+
+static int x11_keysym_to_text(KeySym ks, unsigned int state, char out[8])
+{
+    memset(out, 0, 8);
+    if (ks < 32 || ks >= 127)
+        return 0;
+
+    char ch = (char)ks;
+    bool shift = (state & ShiftMask) != 0;
+    if (shift) {
+        if (ch >= 'a' && ch <= 'z') {
+            ch = (char)(ch - 'a' + 'A');
+        } else {
+            switch (ch) {
+            case '1': ch = '!'; break;
+            case '2': ch = '@'; break;
+            case '3': ch = '#'; break;
+            case '4': ch = '$'; break;
+            case '5': ch = '%'; break;
+            case '6': ch = '^'; break;
+            case '7': ch = '&'; break;
+            case '8': ch = '*'; break;
+            case '9': ch = '('; break;
+            case '0': ch = ')'; break;
+            case '-': ch = '_'; break;
+            case '=': ch = '+'; break;
+            case '[': ch = '{'; break;
+            case ']': ch = '}'; break;
+            case '\\': ch = '|'; break;
+            case ';': ch = ':'; break;
+            case '\'': ch = '"'; break;
+            case ',': ch = '<'; break;
+            case '.': ch = '>'; break;
+            case '/': ch = '?'; break;
+            case '`': ch = '~'; break;
+            default: break;
+            }
+        }
+    }
+
+    out[0] = ch;
+    return 1;
+}
+
+/* ---- XDND (drag-and-drop) receiver helpers ----------------------------- */
+
+/* Decode one file:// URI from a text/uri-list into an absolute path.
+ * Returns 1 on success. Handles %XX percent-encoding and stops at CR/LF. */
+static int xdnd_uri_to_path(const char *uri, char *out, size_t out_sz)
+{
+    /* Skip a leading "file://host" prefix, keeping the path from the first
+     * '/'. Plain paths (no scheme) are accepted as-is. */
+    const char *p = uri;
+    if (strncmp(p, "file://", 7) == 0) {
+        p += 7;
+        const char *slash = strchr(p, '/');
+        if (slash) p = slash;  /* drop the optional host component */
+    }
+    size_t o = 0;
+    for (; *p && *p != '\r' && *p != '\n' && o + 1 < out_sz; ++p) {
+        if (*p == '%' && p[1] && p[2]) {
+            char hex[3] = { p[1], p[2], 0 };
+            char *end = NULL;
+            long v = strtol(hex, &end, 16);
+            if (end == hex + 2) { out[o++] = (char)v; p += 2; continue; }
+        }
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+    return o > 0;
+}
+
+/* Reply to an XdndPosition with an XdndStatus (accept iff we have a type). */
+static void xdnd_send_status(lui_window_x11_t *xw)
+{
+    XEvent e;
+    memset(&e, 0, sizeof(e));
+    e.xclient.type         = ClientMessage;
+    e.xclient.display      = xw->display;
+    e.xclient.window       = xw->xdnd_source;
+    e.xclient.message_type = xw->xdnd_status;
+    e.xclient.format       = 32;
+    e.xclient.data.l[0]    = (long)xw->xwindow;
+    e.xclient.data.l[1]    = (xw->xdnd_type != None) ? 1 : 0;  /* accept */
+    e.xclient.data.l[2]    = 0;  /* empty rect: keep sending XdndPosition */
+    e.xclient.data.l[3]    = 0;
+    e.xclient.data.l[4]    = (long)xw->xdnd_action_copy;
+    XSendEvent(xw->display, xw->xdnd_source, False, 0, &e);
+    XFlush(xw->display);
+}
+
+/* Tell the source the drop is complete (accepted = 1, rejected = 0). */
+static void xdnd_send_finished(lui_window_x11_t *xw, int accepted)
+{
+    XEvent e;
+    memset(&e, 0, sizeof(e));
+    e.xclient.type         = ClientMessage;
+    e.xclient.display      = xw->display;
+    e.xclient.window       = xw->xdnd_source;
+    e.xclient.message_type = xw->xdnd_finished;
+    e.xclient.format       = 32;
+    e.xclient.data.l[0]    = (long)xw->xwindow;
+    e.xclient.data.l[1]    = accepted ? 1 : 0;
+    e.xclient.data.l[2]    = accepted ? (long)xw->xdnd_action_copy : 0;
+    XSendEvent(xw->display, xw->xdnd_source, False, 0, &e);
+    XFlush(xw->display);
+}
+
+/* Translate a raw XEvent into a lui_event_t.
+ * Returns false if the event should be discarded. */
+static bool x11_translate_event(lui_window_x11_t *xw,
+                                  const XEvent *xe,
+                                  lui_event_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    switch (xe->type) {
+    case ClientMessage:
+        if ((Atom)xe->xclient.data.l[0] == xw->wm_delete_window) {
+            out->type            = LUI_EVENT_QUIT;
+            xw->base.should_close = true;
+            return true;
+        }
+        /* --- XDND receiver protocol --- */
+        if ((Atom)xe->xclient.message_type == xw->xdnd_enter) {
+            xw->xdnd_source  = (Window)xe->xclient.data.l[0];
+            xw->xdnd_version = (int)((unsigned long)xe->xclient.data.l[1] >> 24);
+            xw->xdnd_type    = None;
+            if (!(xe->xclient.data.l[1] & 1)) {
+                /* Up to three types listed inline in data.l[2..4]. */
+                for (int i = 2; i <= 4; i++)
+                    if ((Atom)xe->xclient.data.l[i] == xw->xdnd_uri_list)
+                        xw->xdnd_type = xw->xdnd_uri_list;
+            } else {
+                /* More than three types: read the XdndTypeList property. */
+                Atom rtype; int rfmt;
+                unsigned long n, after; unsigned char *data = NULL;
+                if (XGetWindowProperty(xw->display, xw->xdnd_source,
+                        xw->xdnd_type_list, 0, 64, False, XA_ATOM, &rtype,
+                        &rfmt, &n, &after, &data) == Success && data) {
+                    Atom *types = (Atom *)data;
+                    for (unsigned long i = 0; i < n; i++)
+                        if (types[i] == xw->xdnd_uri_list)
+                            xw->xdnd_type = xw->xdnd_uri_list;
+                    XFree(data);
+                }
+            }
+            return false;
+        }
+        if ((Atom)xe->xclient.message_type == xw->xdnd_position) {
+            xw->xdnd_source = (Window)xe->xclient.data.l[0];
+            xdnd_send_status(xw);
+            return false;
+        }
+        if ((Atom)xe->xclient.message_type == xw->xdnd_leave) {
+            xw->xdnd_source = None;
+            xw->xdnd_type   = None;
+            return false;
+        }
+        if ((Atom)xe->xclient.message_type == xw->xdnd_drop) {
+            if (xw->xdnd_type != None) {
+                Time t = (Time)xe->xclient.data.l[2];
+                XConvertSelection(xw->display, xw->xdnd_selection,
+                                  xw->xdnd_type, xw->xdnd_selection,
+                                  xw->xwindow, t);
+                XFlush(xw->display);  /* path arrives via SelectionNotify */
+            } else {
+                xdnd_send_finished(xw, 0);
+            }
+            return false;
+        }
+        return false;
+
+    case SelectionNotify:
+        if (xe->xselection.property == xw->xdnd_selection) {
+            Atom rtype; int rfmt;
+            unsigned long n, after; unsigned char *data = NULL;
+            int got = 0;
+            if (XGetWindowProperty(xw->display, xw->xwindow, xw->xdnd_selection,
+                    0, 0x10000, False, AnyPropertyType, &rtype, &rfmt, &n,
+                    &after, &data) == Success && data) {
+                got = xdnd_uri_to_path((const char *)data, out->data.drop.path,
+                                       sizeof(out->data.drop.path));
+                XFree(data);
+            }
+            xdnd_send_finished(xw, got);
+            xw->xdnd_source = None;
+            xw->xdnd_type   = None;
+            if (got) {
+                out->type = LUI_EVENT_FILE_DROP;
+                return true;
+            }
+            return false;
+        }
+        return false;
+
+    case SelectionRequest: {
+        /* Serve the CLIPBOARD selection we own (set via set_clipboard_text). */
+        const XSelectionRequestEvent *rq = &xe->xselectionrequest;
+        XEvent note;
+        memset(&note, 0, sizeof(note));
+        note.xselection.type      = SelectionNotify;
+        note.xselection.display   = xw->display;
+        note.xselection.requestor = rq->requestor;
+        note.xselection.selection = rq->selection;
+        note.xselection.target    = rq->target;
+        note.xselection.property  = None;  /* None = refused, unless filled in */
+        note.xselection.time      = rq->time;
+        if (xw->clipboard_text && rq->selection == xw->clipboard) {
+            Atom prop = rq->property ? rq->property : rq->target;
+            if (rq->target == xw->targets_atom) {
+                Atom targets[3] = { xw->targets_atom, xw->utf8_string,
+                                    XA_STRING };
+                XChangeProperty(xw->display, rq->requestor, prop, XA_ATOM, 32,
+                                PropModeReplace, (unsigned char *)targets, 3);
+                note.xselection.property = prop;
+            } else if (rq->target == xw->utf8_string ||
+                       rq->target == XA_STRING) {
+                XChangeProperty(xw->display, rq->requestor, prop, rq->target, 8,
+                                PropModeReplace,
+                                (const unsigned char *)xw->clipboard_text,
+                                (int)strlen(xw->clipboard_text));
+                note.xselection.property = prop;
+            }
+        }
+        XSendEvent(xw->display, rq->requestor, False, 0, &note);
+        XFlush(xw->display);
+        return false;
+    }
+
+    case SelectionClear:
+        /* Lost CLIPBOARD ownership (another app copied something). */
+        if (xe->xselectionclear.selection == xw->clipboard) {
+            free(xw->clipboard_text);
+            xw->clipboard_text = NULL;
+        }
+        return false;
+
+    case Expose:
+        if (xe->xexpose.count == 0) {
+            out->type = LUI_EVENT_WINDOW_EXPOSE;
+            return true;
+        }
+        return false;
+
+    case ConfigureNotify: {
+        /* ConfigureNotify reports physical pixels (window is physical-sized). */
+        float s = xw->base.dpi_scale;
+        int new_log_w = (int)(xe->xconfigure.width  / s + 0.5f);
+        int new_log_h = (int)(xe->xconfigure.height / s + 0.5f);
+        if (new_log_w != xw->base.logical_w || new_log_h != xw->base.logical_h) {
+            xw->base.logical_w = new_log_w;
+            xw->base.logical_h = new_log_h;
+            /* Rebuild the XImage for the new physical size */
+            x11_create_ximage(xw);
+            out->type                  = LUI_EVENT_WINDOW_RESIZE;
+            out->data.resize.width     = new_log_w;
+            out->data.resize.height    = new_log_h;
+            out->data.resize.dpi_scale = s;
+            return true;
+        }
+        return false;
+    }
+
+    case FocusIn:
+        out->type = LUI_EVENT_WINDOW_FOCUS_IN;
+        return true;
+
+    case FocusOut:
+        out->type = LUI_EVENT_WINDOW_FOCUS_OUT;
+        return true;
+
+    case KeyPress:
+    case KeyRelease: {
+        KeySym ks = XLookupKeysym((XKeyEvent *)&xe->xkey, 0);
+        if (ks == NoSymbol)
+            ks = (KeySym)xe->xkey.keycode;
+
+        uint32_t mods = 0;
+        unsigned int state = xe->xkey.state;
+        if (state & ShiftMask)   mods |= LUI_MOD_SHIFT;
+        if (state & ControlMask) mods |= LUI_MOD_CTRL;
+        if (state & Mod1Mask)    mods |= LUI_MOD_ALT;
+        if (state & Mod4Mask)    mods |= LUI_MOD_SUPER;
+        if (state & LockMask)    mods |= LUI_MOD_CAPS;
+        if (state & Mod2Mask)    mods |= LUI_MOD_NUM;
+
+        if (xe->type == KeyPress) {
+            out->type           = LUI_EVENT_KEY_DOWN;
+            out->data.key.key      = x11_map_keysym(ks);
+            out->data.key.scancode = xe->xkey.keycode;
+            out->data.key.mods     = mods;
+            out->data.key.repeat   = false; /* TODO: detect repeat */
+            if (!(mods & (LUI_MOD_CTRL | LUI_MOD_ALT | LUI_MOD_SUPER)) &&
+                x11_keysym_to_text(ks, state, xw->pending_text.data.text.text)) {
+                xw->pending_text.type = LUI_EVENT_TEXT_INPUT;
+                xw->has_pending_text = true;
+            }
+        } else {
+            out->type           = LUI_EVENT_KEY_UP;
+            out->data.key.key      = x11_map_keysym(ks);
+            out->data.key.scancode = xe->xkey.keycode;
+            out->data.key.mods     = mods;
+        }
+        return true;
+    }
+
+    case MotionNotify: {
+        /*
+         * Report in physical pixel coordinates — canvas, layout, and
+         * hit-testing all operate on the physical-pixel surface directly.
+         */
+        int x = xe->xmotion.x;
+        int y = xe->xmotion.y;
+        out->type              = LUI_EVENT_MOUSE_MOVE;
+        out->data.mouse_move.x  = x;
+        out->data.mouse_move.y  = y;
+        out->data.mouse_move.dx = x - xw->last_mouse_x;
+        out->data.mouse_move.dy = y - xw->last_mouse_y;
+        xw->last_mouse_x = x;
+        xw->last_mouse_y = y;
+        return true;
+    }
+
+    case ButtonPress:
+    case ButtonRelease: {
+        int btn = xe->xbutton.button;
+        /* X11 buttons 4/5 are scroll wheel */
+        if (btn == 4 || btn == 5) {
+            if (xe->type == ButtonPress) {
+                out->type              = LUI_EVENT_SCROLL;
+                out->data.scroll.x      = xe->xbutton.x;
+                out->data.scroll.y      = xe->xbutton.y;
+                out->data.scroll.delta_y = (btn == 4) ? -1.0f : 1.0f;
+            }
+            return xe->type == ButtonPress;
+        }
+        lui_mouse_button_t mb;
+        if      (btn == 1) mb = LUI_MOUSE_LEFT;
+        else if (btn == 2) mb = LUI_MOUSE_MIDDLE;
+        else               mb = LUI_MOUSE_RIGHT;
+
+        out->type                     = (xe->type == ButtonPress)
+                                         ? LUI_EVENT_MOUSE_DOWN
+                                         : LUI_EVENT_MOUSE_UP;
+        out->data.mouse_button.x       = xe->xbutton.x;
+        out->data.mouse_button.y       = xe->xbutton.y;
+        out->data.mouse_button.button  = mb;
+        out->data.mouse_button.clicks  = 1;
+        return true;
+    }
+
+    default:
+        return false;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Platform ops implementation
+ * ------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------
+ * DPI detection
+ *
+ * Priority:
+ *  1. Xft.dpi X resource  (set by most desktop environments)
+ *  2. Physical screen size reported by the X server
+ *
+ * dpi_scale = dpi / 96, rounded to the nearest 0.25 increment,
+ * clamped to [1.0, 4.0].
+ * ------------------------------------------------------------------------- */
+static float x11_detect_dpi_scale(void)
+{
+    float dpi = 96.0f;
+    int   have_xft_dpi = 0;
+
+    /* Method 1: Xft.dpi (set by most desktop environments; reflects the user's
+     * configured display scale, including fractional scales like 1.25x). */
+    const char *xft = XGetDefault(g_display, "Xft", "dpi");
+    if (xft) {
+        float v = 0.0f;
+        if (sscanf(xft, "%f", &v) == 1 && v > 0.0f) {
+            dpi = v;
+            have_xft_dpi = 1;
+        }
+    }
+    if (!have_xft_dpi) {
+        /* Method 2: physical screen dimensions */
+        int    mm  = DisplayWidthMM(g_display, g_screen);
+        int    px  = DisplayWidth(g_display, g_screen);
+        if (mm > 0)
+            dpi = (float)px * 25.4f / (float)mm;
+    }
+
+    float scale = dpi / 96.0f;
+
+    /* Round to nearest 0.25 */
+    scale = (float)((int)(scale * 4.0f + 0.5f)) / 4.0f;
+
+    if (scale < 1.0f) scale = 1.0f;
+    if (scale > 4.0f) scale = 4.0f;
+
+    /* Only guess from desktop width when we had NO explicit Xft.dpi: many X11
+     * setups report a generic 96 DPI even on 4K panels. When Xft.dpi WAS set we
+     * trust it — otherwise a wide multi-monitor desktop at, say, 1.25x would be
+     * wrongly forced to 2.0. */
+    if (!have_xft_dpi && DisplayWidth(g_display, g_screen) >= 3840 &&
+        scale < 2.0f)
+        scale = 2.0f;
+
+    return scale;
+}
+
+static bool x11_init(void)
+{
+    if (lui_x11_load(&g_lui_x11) != 0) {
+        LUI_LOG_ERR("x11: cannot load libX11.so");
+        return false;
+    }
+
+    g_display = XOpenDisplay(NULL);
+    if (!g_display) {
+        LUI_LOG_ERR("x11: cannot open display");
+        lui_x11_unload(&g_lui_x11);
+        return false;
+    }
+    g_screen = DefaultScreen(g_display);
+    return true;
+}
+
+static void x11_shutdown(void)
+{
+    if (g_display) {
+        XCloseDisplay(g_display);
+        g_display = NULL;
+    }
+    lui_x11_unload(&g_lui_x11);
+}
+
+static lui_window_t *x11_window_create(const char *title,
+                                        int w, int h,
+                                        uint32_t flags)
+{
+    if (!g_display) return NULL;
+
+    lui_window_x11_t *xw =
+        (lui_window_x11_t *)calloc(1, sizeof(lui_window_x11_t));
+    if (!xw) return NULL;
+
+    /* Initialise base */
+    xw->base.logical_w   = w;
+    xw->base.logical_h   = h;
+    xw->base.dpi_scale   = (flags & LUI_WINDOW_HDPI) ? x11_detect_dpi_scale() : 1.0f;
+    xw->base.should_close = false;
+    xw->display = g_display;
+    xw->screen  = g_screen;
+
+    /* Choose visual — default TrueColor visual */
+    xw->visual = DefaultVisual(g_display, g_screen);
+    xw->depth  = DefaultDepth(g_display, g_screen);
+
+    /* Create the X11 window */
+    XSetWindowAttributes swa;
+    memset(&swa, 0, sizeof(swa));
+    swa.background_pixel = BlackPixel(g_display, g_screen);
+    swa.event_mask = (ExposureMask | KeyPressMask | KeyReleaseMask |
+                      ButtonPressMask | ButtonReleaseMask |
+                      PointerMotionMask | StructureNotifyMask |
+                      FocusChangeMask);
+    swa.bit_gravity  = StaticGravity;
+    swa.backing_store = Always;
+
+    /* Create the window at physical pixels so XPutImage blits 1:1. */
+    int phys_w = (int)(w * xw->base.dpi_scale + 0.5f);
+    int phys_h = (int)(h * xw->base.dpi_scale + 0.5f);
+
+    xw->xwindow = XCreateWindow(
+        g_display,
+        RootWindow(g_display, g_screen),
+        0, 0,
+        (unsigned int)phys_w, (unsigned int)phys_h,
+        0,
+        xw->depth,
+        InputOutput,
+        xw->visual,
+        CWBackPixel | CWEventMask | CWBitGravity | CWBackingStore,
+        &swa
+    );
+    if (!xw->xwindow) {
+        free(xw);
+        return NULL;
+    }
+
+    /* Window hints */
+    XSizeHints *sh = XAllocSizeHints();
+    if (sh) {
+        sh->flags = PMinSize;
+        sh->min_width = sh->min_height = 1;
+        if (!(flags & LUI_WINDOW_RESIZABLE)) {
+            sh->flags    |= PMaxSize | PMinSize;
+            sh->max_width  = sh->min_width  = phys_w;
+            sh->max_height = sh->min_height = phys_h;
+        }
+        XSetWMNormalHints(g_display, xw->xwindow, sh);
+        XFree(sh);
+    }
+
+    /* Title */
+    XStoreName(g_display, xw->xwindow, title ? title : "");
+
+    /* WM_DELETE_WINDOW protocol */
+    xw->wm_delete_window = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(g_display, xw->xwindow, &xw->wm_delete_window, 1);
+
+    /* XDND: advertise drop support (protocol version 5) and intern atoms. */
+    xw->xdnd_aware       = XInternAtom(g_display, "XdndAware", False);
+    xw->xdnd_enter       = XInternAtom(g_display, "XdndEnter", False);
+    xw->xdnd_position    = XInternAtom(g_display, "XdndPosition", False);
+    xw->xdnd_status      = XInternAtom(g_display, "XdndStatus", False);
+    xw->xdnd_leave       = XInternAtom(g_display, "XdndLeave", False);
+    xw->xdnd_drop        = XInternAtom(g_display, "XdndDrop", False);
+    xw->xdnd_finished    = XInternAtom(g_display, "XdndFinished", False);
+    xw->xdnd_selection   = XInternAtom(g_display, "XdndSelection", False);
+    xw->xdnd_action_copy = XInternAtom(g_display, "XdndActionCopy", False);
+    xw->xdnd_type_list   = XInternAtom(g_display, "XdndTypeList", False);
+    xw->xdnd_uri_list    = XInternAtom(g_display, "text/uri-list", False);
+    xw->xdnd_source      = None;
+    xw->xdnd_type        = None;
+    {
+        Atom version = 5;
+        XChangeProperty(g_display, xw->xwindow, xw->xdnd_aware, XA_ATOM, 32,
+                        PropModeReplace, (const unsigned char *)&version, 1);
+    }
+
+    /* Clipboard atoms */
+    xw->clipboard    = XInternAtom(g_display, "CLIPBOARD", False);
+    xw->utf8_string  = XInternAtom(g_display, "UTF8_STRING", False);
+    xw->targets_atom = XInternAtom(g_display, "TARGETS", False);
+    xw->clipboard_text = NULL;
+
+    /* GC */
+    xw->gc = XCreateGC(g_display, xw->xwindow, 0, NULL);
+
+    /* Allocate pixel buffer and XImage */
+    if (!x11_create_ximage(xw)) {
+        XDestroyWindow(g_display, xw->xwindow);
+        free(xw);
+        return NULL;
+    }
+
+    /* Show unless HIDDEN flag is set */
+    if (!(flags & LUI_WINDOW_HIDDEN))
+        XMapWindow(g_display, xw->xwindow);
+
+    XFlush(g_display);
+    if (!(flags & LUI_WINDOW_HIDDEN))
+        x11_sync_configured_size(xw);
+    return (lui_window_t *)xw;
+}
+
+static void x11_window_destroy(lui_window_t *win)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    if (!xw) return;
+
+    if (xw->ximage) {
+        xw->ximage->data = NULL;
+        XDestroyImage(xw->ximage);
+    }
+    /* Free the pixel buffer (owned by the surface, not the XImage) */
+    free(xw->base.surface.pixels);
+    xw->base.surface.pixels = NULL;
+
+    free(xw->clipboard_text);
+    if (xw->gc)      XFreeGC(xw->display, xw->gc);
+    if (xw->xwindow) XDestroyWindow(xw->display, xw->xwindow);
+    XFlush(xw->display);
+    free(xw);
+}
+
+static void x11_window_show(lui_window_t *win)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    XMapWindow(xw->display, xw->xwindow);
+    XFlush(xw->display);
+}
+
+static void x11_window_hide(lui_window_t *win)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    XUnmapWindow(xw->display, xw->xwindow);
+    XFlush(xw->display);
+}
+
+static void x11_window_set_title(lui_window_t *win, const char *title)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    XStoreName(xw->display, xw->xwindow, title ? title : "");
+    XFlush(xw->display);
+}
+
+static void x11_window_set_clipboard_text(lui_window_t *win, const char *utf8)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    free(xw->clipboard_text);
+    xw->clipboard_text = NULL;
+    if (utf8 && *utf8) {
+        size_t n = strlen(utf8);
+        xw->clipboard_text = (char *)malloc(n + 1);
+        if (xw->clipboard_text) memcpy(xw->clipboard_text, utf8, n + 1);
+    }
+    /* Own the CLIPBOARD selection so other apps fetch our text on paste. */
+    XSetSelectionOwner(xw->display, xw->clipboard,
+                       xw->clipboard_text ? xw->xwindow : None, CurrentTime);
+    XFlush(xw->display);
+}
+
+static void x11_window_get_size(const lui_window_t *win, int *w, int *h)
+{
+    if (w) *w = win->logical_w;
+    if (h) *h = win->logical_h;
+}
+
+static void x11_window_get_physical_size(const lui_window_t *win,
+                                          int *w, int *h)
+{
+    if (w) *w = win->surface.width;
+    if (h) *h = win->surface.height;
+}
+
+static lvg_surface_t *x11_window_get_surface(lui_window_t *win)
+{
+    return &win->surface;
+}
+
+static void x11_window_present(lui_window_t *win)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    if (!xw->ximage) return;
+
+    /* Update the XImage data pointer in case the buffer was reallocated */
+    xw->ximage->data = (char *)xw->base.surface.pixels;
+
+    int phys_w = xw->base.surface.width;
+    int phys_h = xw->base.surface.height;
+
+    XPutImage(xw->display, xw->xwindow, xw->gc,
+              xw->ximage,
+              0, 0, 0, 0,
+              (unsigned int)phys_w,
+              (unsigned int)phys_h);
+    XFlush(xw->display);
+}
+
+static void x11_window_present_rect(lui_window_t *win, const lvg_rect_t *dirty)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    if (!xw->ximage || !dirty || dirty->width <= 0 || dirty->height <= 0) {
+        x11_window_present(win);
+        return;
+    }
+
+    int x0 = dirty->x;
+    int y0 = dirty->y;
+    int x1 = dirty->x + dirty->width;
+    int y1 = dirty->y + dirty->height;
+    int phys_w = xw->base.surface.width;
+    int phys_h = xw->base.surface.height;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > phys_w) x1 = phys_w;
+    if (y1 > phys_h) y1 = phys_h;
+    if (x1 <= x0 || y1 <= y0)
+        return;
+
+    /* Update the XImage data pointer in case the buffer was reallocated. */
+    xw->ximage->data = (char *)xw->base.surface.pixels;
+
+    XPutImage(xw->display, xw->xwindow, xw->gc,
+              xw->ximage,
+              x0, y0, x0, y0,
+              (unsigned int)(x1 - x0),
+              (unsigned int)(y1 - y0));
+    XFlush(xw->display);
+}
+
+static bool x11_window_poll_event(lui_window_t *win, lui_event_t *ev)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    if (xw->has_pending_text) {
+        *ev = xw->pending_text;
+        xw->has_pending_text = false;
+        return true;
+    }
+    while (XPending(xw->display)) {
+        XEvent xe;
+        XNextEvent(xw->display, &xe);
+        if (xe.type == MotionNotify) {
+            XEvent latest = xe;
+            while (XCheckTypedWindowEvent(xw->display, xw->xwindow,
+                                          MotionNotify, &latest))
+                xe = latest;
+        }
+        if (x11_translate_event(xw, &xe, ev))
+            return true;
+    }
+    return false;
+}
+
+static bool x11_window_wait_event(lui_window_t *win, lui_event_t *ev)
+{
+    lui_window_x11_t *xw = (lui_window_x11_t *)win;
+    for (;;) {
+        XEvent xe;
+        XNextEvent(xw->display, &xe);
+        if (x11_translate_event(xw, &xe, ev))
+            return true;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Platform ops table
+ * ------------------------------------------------------------------------- */
+const lui_platform_ops_t lui_platform_ops = {
+    .init                    = x11_init,
+    .shutdown                = x11_shutdown,
+    .window_create           = x11_window_create,
+    .window_destroy          = x11_window_destroy,
+    .window_show             = x11_window_show,
+    .window_hide             = x11_window_hide,
+    .window_set_title        = x11_window_set_title,
+    .window_set_clipboard_text = x11_window_set_clipboard_text,
+    .window_get_size         = x11_window_get_size,
+    .window_get_physical_size = x11_window_get_physical_size,
+    .window_get_surface      = x11_window_get_surface,
+    .window_present          = x11_window_present,
+    .window_present_rect     = x11_window_present_rect,
+    .window_poll_event       = x11_window_poll_event,
+    .window_wait_event       = x11_window_wait_event,
+};
+
+#endif /* LUI_PLATFORM_X11 */

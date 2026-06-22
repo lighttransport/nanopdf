@@ -1580,7 +1580,7 @@ void PageBuilder::add_highlight(double x, double y, double width, double height,
   config.type = MarkupType::Highlight;
   config.quads.push_back(quad_from_rect(x, y, width, height));
   get_highlight_color(color, config.r, config.g, config.b);
-  highlights_.push_back(config);
+  highlights_.push_back(std::move(config));
 }
 
 void PageBuilder::add_highlight(const HighlightConfig& config) {
@@ -1600,7 +1600,7 @@ void PageBuilder::add_highlight(const HighlightConfig& config) {
     get_highlight_color(config.color_preset, markup.r, markup.g, markup.b);
   }
 
-  highlights_.push_back(markup);
+  highlights_.push_back(std::move(markup));
 }
 
 void PageBuilder::add_highlight(const std::vector<QuadPoints>& quads,
@@ -1609,7 +1609,7 @@ void PageBuilder::add_highlight(const std::vector<QuadPoints>& quads,
   config.type = MarkupType::Highlight;
   config.quads = quads;
   get_highlight_color(color, config.r, config.g, config.b);
-  highlights_.push_back(config);
+  highlights_.push_back(std::move(config));
 }
 
 void PageBuilder::add_text_markup(const TextMarkupConfig& config) {
@@ -2292,6 +2292,8 @@ struct PdfWriter::Impl {
   int existing_page_count = 0;            // Number of pages in existing PDF
   int existing_pages_obj = 0;             // Pages object from existing PDF
   std::vector<int> existing_page_objs;    // Page objects from existing PDF
+  bool existing_encrypted = false;        // Existing PDF has an /Encrypt dict
+  std::string existing_encrypt_ref;       // "N G R" of the /Encrypt dictionary
 
   // Object tracking
   int next_obj_id = 1;
@@ -3548,11 +3550,16 @@ bool PdfWriter::load_existing(const std::vector<uint8_t>& data, std::string* err
     return false;
   }
 
-  // Find and parse trailer
+  // Find and parse trailer. Classic xref tables are followed by a "trailer"
+  // keyword; PDF 1.5+ cross-reference STREAMS have no trailer keyword — their
+  // trailer dictionary (Root/Info/Size/ID/Prev) is the xref-stream object's own
+  // dictionary at xref_offset. parse_trailer() locates the next "<<", so for an
+  // xref stream we point it at the object start.
   size_t trailer_pos = find_keyword(data, xref_offset, "trailer");
+  bool is_xref_stream = false;
   if (trailer_pos == std::string::npos) {
-    if (error) *error = "Could not find trailer";
-    return false;
+    trailer_pos = xref_offset;  // parse the xref-stream object's dictionary
+    is_xref_stream = true;
   }
 
   int root_obj = 0, root_gen = 0;
@@ -3561,9 +3568,69 @@ bool PdfWriter::load_existing(const std::vector<uint8_t>& data, std::string* err
   std::vector<uint8_t> id1, id2;
 
   if (!parse_trailer(data, trailer_pos, root_obj, root_gen, info_obj, info_gen,
-                     size_value, id1, id2)) {
-    if (error) *error = "Failed to parse trailer";
+                     size_value, id1, id2) ||
+      root_obj == 0) {
+    if (error)
+      *error = is_xref_stream ? "Could not parse xref-stream trailer dictionary"
+                              : "Failed to parse trailer";
     return false;
+  }
+
+  // Detect encryption: the trailer (classic or xref-stream) dictionary holds
+  // an /Encrypt reference. Incremental updates of encrypted PDFs require
+  // re-encrypting new objects and carrying /Encrypt forward, which is not yet
+  // implemented — write_incremental_* will reject such documents to avoid
+  // producing a file whose existing content can no longer be decrypted.
+  {
+    size_t d0 = find_keyword(data, trailer_pos, "<<");
+    if (d0 != std::string::npos) {
+      // Find the matching ">>" honoring nested dictionaries (/DecodeParms etc.).
+      int depth = 0;
+      size_t p = d0, end = std::string::npos;
+      while (p + 1 < data.size()) {
+        if (data[p] == '<' && data[p + 1] == '<') { depth++; p += 2; }
+        else if (data[p] == '>' && data[p + 1] == '>') {
+          depth--; p += 2;
+          if (depth == 0) { end = p; break; }
+        } else { ++p; }
+      }
+      if (end != std::string::npos) {
+        std::string dict(reinterpret_cast<const char*>(data.data()) + d0,
+                         end - d0);
+        size_t ep = dict.find("/Encrypt");
+        if (ep != std::string::npos) {
+          impl_->existing_encrypted = true;
+          // Capture the "N G R" indirect reference to carry into our trailer.
+          int en = 0, eg = 0;
+          char r = 0;
+          if (std::sscanf(dict.c_str() + ep + 8, " %d %d %c", &en, &eg, &r) ==
+                  3 && r == 'R') {
+            impl_->existing_encrypt_ref =
+                std::to_string(en) + " " + std::to_string(eg) + " R";
+          }
+        }
+      }
+    }
+  }
+
+  // For encrypted PDFs, derive the document key (empty user password) by
+  // parsing the document, so new objects' strings/streams are encrypted with
+  // the same key (the signature /Contents stays exempt). The /Encrypt dict is
+  // carried forward in the trailer.
+  if (impl_->existing_encrypted && !impl_->existing_encrypt_ref.empty()) {
+    Pdf enc_pdf;
+    if (parse_from_memory(data.data(), data.size(), &enc_pdf) &&
+        !enc_pdf.security.encryption_key.empty()) {
+      impl_->encryption_enabled = true;
+      impl_->encryption_key = enc_pdf.security.encryption_key;
+      impl_->encryption_config.algorithm = enc_pdf.security.algorithm;
+      impl_->encrypt_obj_id = std::atoi(impl_->existing_encrypt_ref.c_str());
+    } else {
+      // Could not derive the key (e.g. owner-only password): refuse rather
+      // than emit a file whose existing content can't be decrypted.
+      if (error) *error = "encrypted PDF: could not derive the document key";
+      return false;
+    }
   }
 
   // Store existing PDF data and metadata
@@ -3629,6 +3696,12 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
   if (!impl_->has_existing) {
     result.success = false;
     result.error = "No existing PDF loaded - use load_existing() first";
+    return result;
+  }
+
+  if (impl_->existing_encrypted && impl_->existing_encrypt_ref.empty()) {
+    result.success = false;
+    result.error = "encrypted PDF: could not locate the /Encrypt reference";
     return result;
   }
 
@@ -3809,7 +3882,10 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
                            sig_field.sig_obj_id, config.contact_info)
                     << "\n";
     }
-    impl_->output << "/M (" << get_pdf_timestamp() << ")\n";
+    impl_->output << "/M "
+                  << impl_->format_pdf_string_for_object(sig_field.sig_obj_id,
+                                                         get_pdf_timestamp())
+                  << "\n";
 
     // ByteRange placeholder
     size_t byte_range_offset = base_offset + impl_->output.tellp();
@@ -4338,6 +4414,11 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
   if (impl_->existing_info_obj > 0) {
     impl_->output << "/Info " << impl_->existing_info_obj << " "
                   << impl_->existing_info_gen << " R\n";
+  }
+  // Carry the encryption dictionary forward so readers using this (newest)
+  // trailer still decrypt the existing content.
+  if (!impl_->existing_encrypt_ref.empty()) {
+    impl_->output << "/Encrypt " << impl_->existing_encrypt_ref << "\n";
   }
   impl_->output << "/Prev " << impl_->prev_xref_offset << "\n";
   // Document ID

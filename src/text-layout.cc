@@ -4,6 +4,7 @@
 #include "text-layout.hh"
 #include "nanopdf.hh"
 #include "string-parse.hh"
+#include "font-unicode-map.hh"
 
 #include <algorithm>
 #include <cmath>
@@ -1210,24 +1211,10 @@ private:
     if (!text_state_.current_font) {
       return char_code < 128 ? char_code : '?';
     }
-
-    const BaseFont* font = text_state_.current_font;
-
-    // Try ToUnicode CMap first
-    if (!font->to_unicode_cmap.code_to_unicode.empty()) {
-      auto it = font->to_unicode_cmap.code_to_unicode.find(char_code);
-      if (it != font->to_unicode_cmap.code_to_unicode.end()) {
-        return it->second;
-      }
-    }
-
-    // For simple fonts, use character code directly
-    if (font->subtype != "Type0") {
-      return char_code < 256 ? char_code : '?';
-    }
-
-    // For Type0 fonts with Identity-H/V, use CID as Unicode (approximation)
-    return char_code;
+    // Full PDF code->Unicode resolution (ToUnicode CMap, Adobe-Japan1 CID,
+    // /Encoding /Differences glyph names, WinAnsi/MacRoman/Symbol bases),
+    // shared with the rendering backends for consistent extraction.
+    return map_char_to_unicode(text_state_.current_font, char_code);
   }
 
   double get_char_width(uint32_t char_code) {

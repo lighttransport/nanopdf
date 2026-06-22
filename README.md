@@ -151,8 +151,12 @@ scripts/download-corpora.sh
 Run corpus parsing tests (requires downloaded corpora):
 
 ```bash
-NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/test_corpus_parsing
+NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/nanopdf_validation_suite
 ```
+
+(All validation tests -- corpus, SafeDocs, Arlington, PDF-differences -- are built into
+the single `nanopdf_validation_suite` binary; run `ctest --test-dir build -L validation`
+to drive it via CTest.)
 
 Supported corpora:
 - **CC-MAIN-2021** -- 100k+ real-world PDFs from Common Crawl (99.66% parse rate, 0 crashes)
@@ -165,7 +169,7 @@ Supported corpora:
 Validate parsed PDF structure against the Arlington PDF model (machine-readable PDF spec):
 
 ```bash
-NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/test_arlington_validate
+NANOPDF_TEST_DATA_DIR=tests/data ./build/tests/validation/nanopdf_validation_suite
 ```
 
 ### CI helper

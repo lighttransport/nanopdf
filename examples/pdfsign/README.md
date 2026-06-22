@@ -8,6 +8,7 @@ A CLI tool for signing, verifying, and inspecting PDF digital signatures.
 - **Verify signatures** and check document integrity
 - **Display signature info** including MDP/certification details
 - **Timestamp support** (RFC 3161)
+- **Set PDF passwords** with writer-backed standard PDF encryption
 - Support for **certification (DocMDP)** and **approval** signatures
 
 ## Building
@@ -112,6 +113,16 @@ Verification status:
 ./build/pdfsign timestamp input.pdf timestamped.pdf --tsa http://timestamp.server/
 ```
 
+### Set a PDF Password
+
+```bash
+./build/pdfsign set-password input.pdf locked.pdf --user-password secret
+
+# Optional owner password and algorithm
+./build/pdfsign set-password input.pdf locked.pdf \
+    --user-password open-secret --owner-password owner-secret --algorithm aes-256
+```
+
 ## Command Reference
 
 ### Commands
@@ -122,6 +133,7 @@ Verification status:
 | `verify` | Verify signatures in a PDF |
 | `info` | Display signature information |
 | `timestamp` | Add a document timestamp |
+| `set-password` | Rewrite a PDF with password protection |
 
 ### Sign Options
 
@@ -149,6 +161,14 @@ Verification status:
 |--------|-------------|
 | `-v, --verbose` | Verbose output |
 | `--help` | Show help message |
+
+### Password Options
+
+| Option | Description |
+|--------|-------------|
+| `--user-password <pass>` | Password required to open the PDF |
+| `--owner-password <pass>` | Password required to change security settings; defaults to user password |
+| `--algorithm <name>` | `aes-128`, `aes-256`, `rc4-128`, or `rc4-40`; default is `aes-128` |
 
 ## Certificate Format
 
@@ -194,6 +214,7 @@ are allowed afterward:
 - PKCS#12 (.p12/.pfx) files not yet supported
 - TSA timestamping requires network access
 - Some advanced signature features may not be supported
+- `set-password` rewrites pages through `PdfWriter` import; it is intended as an encryption API example and may not preserve every advanced source-PDF feature byte-for-byte
 
 ## Integration with OpenSSL
 

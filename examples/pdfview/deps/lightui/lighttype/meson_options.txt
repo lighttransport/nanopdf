@@ -1,0 +1,2 @@
+option('ltt_build_freetype', type : 'boolean', value : false,
+       description : 'Build with FreeType/HarfBuzz backend')

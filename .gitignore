@@ -1,8 +1,9 @@
-# Build directories
+# Build directories (single canonical build/ per project; everything else ignored)
 build/
 build_*/
-build-mingw-*/
+build-*/
 **/build/
+**/build-*/
 
 # CMake
 CMakeCache.txt
@@ -59,6 +60,9 @@ data/external/
 
 # Emscripten
 *.wasm
+# Exception: the WASM viewer ships a committed prebuilt module so GitHub Pages
+# can build without an Emscripten toolchain.
+!examples/wasm/src/nanopdf.wasm
 *.js.map
 # Generated font embedding headers
 embedded-fonts.hh

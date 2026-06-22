@@ -4,6 +4,10 @@ import { resolve } from 'path';
 const srcDir = resolve(__dirname, 'src');
 
 export default defineConfig({
+  // Base public path. Defaults to '/' for local dev/preview; the GitHub Pages
+  // deploy workflow sets VITE_BASE=/nanopdf/ to match the project-pages URL
+  // https://lighttransport.github.io/nanopdf/ .
+  base: process.env.VITE_BASE || '/',
   resolve: {
     alias: {
       // Allow `import createModule from 'nanopdf-wasm'` in source

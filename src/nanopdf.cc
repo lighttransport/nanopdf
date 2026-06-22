@@ -9252,6 +9252,93 @@ bool parse_cmap_value(const Pdf& pdf, const Value& value, CMap* cmap) {
 }  // namespace
 
 // Parse Type0 (CID) font
+// Parse an embedded TrueType (FontFile2) cmap and build a GID->Unicode map by
+// reversing the font's Unicode cmap subtable (formats 4 and 12). Used to make
+// Identity-H CID fonts that lack a /ToUnicode CMap text-extractable.
+static void build_gid_to_unicode_from_truetype(
+    const uint8_t* d, size_t n, std::map<uint32_t, uint32_t>& gid2uni) {
+  auto u16 = [](const uint8_t* p) -> uint16_t {
+    return (uint16_t)((p[0] << 8) | p[1]);
+  };
+  auto u32 = [](const uint8_t* p) -> uint32_t {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+  };
+  if (n < 12) return;
+  uint16_t num_tables = u16(d + 4);
+  uint32_t cmap_off = 0;
+  for (uint16_t i = 0; i < num_tables; ++i) {
+    size_t rec = 12 + (size_t)i * 16;
+    if (rec + 16 > n) break;
+    if (std::memcmp(d + rec, "cmap", 4) == 0) {
+      cmap_off = u32(d + rec + 8);
+      break;
+    }
+  }
+  if (!cmap_off || cmap_off + 4 > n) return;
+  uint16_t nsub = u16(d + cmap_off + 2);
+  uint32_t best = 0;
+  int best_score = -1;
+  for (uint16_t i = 0; i < nsub; ++i) {
+    size_t rec = cmap_off + 4 + (size_t)i * 8;
+    if (rec + 8 > n) break;
+    uint16_t plat = u16(d + rec), enc = u16(d + rec + 2);
+    uint32_t off = u32(d + rec + 4);
+    int score = -1;
+    if (plat == 3 && enc == 10) score = 4;       // Windows UCS-4
+    else if (plat == 3 && enc == 1) score = 3;   // Windows BMP
+    else if (plat == 0) score = 2;               // Unicode
+    else if (plat == 3 && enc == 0) score = 1;   // Symbol
+    if (score > best_score) {
+      best_score = score;
+      best = cmap_off + off;
+    }
+  }
+  if (!best || best + 4 > n) return;
+  uint16_t format = u16(d + best);
+  auto put = [&](uint32_t uni, uint32_t gid) {
+    if (gid && gid2uni.find(gid) == gid2uni.end()) gid2uni[gid] = uni;
+  };
+  if (format == 4) {
+    if (best + 14 > n) return;
+    uint16_t segx2 = u16(d + best + 6);
+    uint16_t segc = segx2 / 2;
+    size_t end_o = best + 14;
+    size_t start_o = end_o + segx2 + 2;
+    size_t delta_o = start_o + segx2;
+    size_t range_o = delta_o + segx2;
+    for (uint16_t s = 0; s < segc; ++s) {
+      if (range_o + (size_t)s * 2 + 2 > n) break;
+      uint16_t end = u16(d + end_o + (size_t)s * 2);
+      uint16_t start = u16(d + start_o + (size_t)s * 2);
+      int16_t delta = (int16_t)u16(d + delta_o + (size_t)s * 2);
+      uint16_t ro = u16(d + range_o + (size_t)s * 2);
+      for (uint32_t c = start; c <= end && c != 0xFFFF; ++c) {
+        uint16_t gid;
+        if (ro == 0) {
+          gid = (uint16_t)(c + delta);
+        } else {
+          size_t gi = range_o + (size_t)s * 2 + ro + (size_t)(c - start) * 2;
+          if (gi + 2 > n) continue;
+          uint16_t g = u16(d + gi);
+          gid = g ? (uint16_t)(g + delta) : 0;
+        }
+        put(c, gid);
+      }
+    }
+  } else if (format == 12) {
+    if (best + 16 > n) return;
+    uint32_t ngroups = u32(d + best + 12);
+    for (uint32_t i = 0; i < ngroups; ++i) {
+      size_t g = best + 16 + (size_t)i * 12;
+      if (g + 12 > n) break;
+      uint32_t sc = u32(d + g), ec = u32(d + g + 4), sg = u32(d + g + 8);
+      if (ec < sc || ec - sc > 0x20000) continue;  // sanity cap
+      for (uint32_t c = sc; c <= ec; ++c) put(c, sg + (c - sc));
+    }
+  }
+}
+
 std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& font_dict) {
   auto font = std::unique_ptr<Type0Font>(new Type0Font());
 
@@ -9421,6 +9508,55 @@ std::unique_ptr<BaseFont> parse_type0_font(const Pdf& pdf, const Dictionary& fon
       }
 
       font->descendant_font = std::move(descendant);
+    }
+  }
+
+  // Fallback for Identity-H/V CID fonts lacking /ToUnicode: reverse the embedded
+  // TrueType cmap (GID->Unicode) so the text is extractable/searchable AND the
+  // renderer can substitute the right glyph (instead of tofu) when needed.
+  {
+    const bool identity_enc = font->encoding_cmap.name.empty() ||
+                              font->encoding_cmap.name == "Identity-H" ||
+                              font->encoding_cmap.name == "Identity-V";
+    if (font->to_unicode_cmap.code_to_unicode.empty() && identity_enc &&
+        font->descendant_font && font->descendant_font->descriptor &&
+        font->descendant_font->descriptor->font_file_type ==
+            FontFileType::FontFile2) {
+      const Value& ff = font->descendant_font->descriptor->font_file;
+      Value resolved;
+      uint32_t ff_obj = 0, ff_gen = 0;
+      if (ff.type == Value::REFERENCE) {
+        ff_obj = ff.ref_object_number;
+        ff_gen = ff.ref_generation_number;
+        ResolvedObject r = resolve_reference(pdf, ff.ref_object_number,
+                                             ff.ref_generation_number);
+        if (r.success) resolved = r.value;
+      } else if (ff.type == Value::STREAM) {
+        resolved = ff;
+      }
+      if (resolved.type == Value::STREAM) {
+        // Pass the stream's object number so encrypted font programs decrypt
+        // with the correct per-object key.
+        DecodedStream dec =
+            decode_stream(const_cast<Pdf&>(pdf), resolved, ff_obj, ff_gen);
+        if (dec.success && !dec.data.empty()) {
+          std::map<uint32_t, uint32_t> gid2uni;
+          build_gid_to_unicode_from_truetype(dec.data.data(), dec.data.size(),
+                                             gid2uni);
+          if (!gid2uni.empty()) {
+            auto& out = font->to_unicode_cmap.code_to_unicode;
+            const auto& c2g = font->cid_to_gid_map;
+            if (c2g.empty()) {
+              for (const auto& kv : gid2uni) out[kv.first] = kv.second;  // CID==GID
+            } else {
+              for (uint32_t cid = 0; cid < c2g.size(); ++cid) {
+                auto it = gid2uni.find(c2g[cid]);
+                if (it != gid2uni.end()) out[cid] = it->second;
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -10320,11 +10456,16 @@ std::unique_ptr<OutlineItem> parse_outline_item(const Pdf& pdf, const Dictionary
     if (dest_it->second.type == Value::ARRAY) {
       const auto& arr = dest_it->second.array;
       if (!arr.empty()) {
-        // First element is page reference
+        // First element is the destination page (indirect reference). Map it to
+        // the 0-based page index by matching the page object number.
         if (arr[0].type == Value::REFERENCE) {
-          // Would need to look up page number from object reference
-          // For now, use object number as approximation
-          item->dest_page = arr[0].ref_object_number;
+          uint32_t page_obj = arr[0].ref_object_number;
+          for (size_t i = 0; i < pdf.catalog.pages.size(); ++i) {
+            if (pdf.catalog.pages[i].object_number == page_obj) {
+              item->dest_page = static_cast<uint32_t>(i);
+              break;
+            }
+          }
         }
 
         // Rest are position parameters
@@ -10343,7 +10484,25 @@ std::unique_ptr<OutlineItem> parse_outline_item(const Pdf& pdf, const Dictionary
       if (s_it != action_dict.end()) {
         if (s_it->second.type == Value::NAME) {
           const std::string& action_name = s_it->second.name;
-          if (action_name == "URI") {
+          if (action_name == "GoTo") {
+            // Go-to-page action: /D = [pageRef /Fit ...]. Map the page
+            // reference to its 0-based index.
+            item->action_type = OutlineAction::GoTo;
+            auto d_it = action_dict.find("D");
+            if (d_it != action_dict.end() &&
+                d_it->second.type == Value::ARRAY) {
+              const auto& darr = d_it->second.array;
+              if (!darr.empty() && darr[0].type == Value::REFERENCE) {
+                uint32_t page_obj = darr[0].ref_object_number;
+                for (size_t i = 0; i < pdf.catalog.pages.size(); ++i) {
+                  if (pdf.catalog.pages[i].object_number == page_obj) {
+                    item->dest_page = static_cast<uint32_t>(i);
+                    break;
+                  }
+                }
+              }
+            }
+          } else if (action_name == "URI") {
             item->action_type = OutlineAction::URI;
             auto uri_it = action_dict.find("URI");
             if (uri_it != action_dict.end()) {
@@ -10446,29 +10605,76 @@ std::unique_ptr<OutlineItem> parse_outline_item(const Pdf& pdf, const Dictionary
 
 // Parse document outline (bookmarks)
 void parse_document_outline(const Pdf& pdf, DocumentCatalog& catalog) {
-  if (catalog.outlines.empty()) {
+  // The catalog.outlines member is not reliably populated for all documents
+  // (e.g. when /Outlines is an indirect reference resolved lazily), so resolve
+  // the outline dictionary straight from the catalog. Prefer the pre-parsed
+  // member when present; otherwise fall back to resolving /Outlines.
+  const Dictionary* outlines_dict = nullptr;
+  Dictionary resolved_outlines;
+  if (!catalog.outlines.empty()) {
+    outlines_dict = &catalog.outlines;
+  } else {
+    auto catalog_obj = resolve_reference(pdf, pdf.root, 0);
+    if (!catalog_obj.success || catalog_obj.value.type != Value::DICTIONARY) {
+      return;
+    }
+    auto outlines_it = catalog_obj.value.dict.find("Outlines");
+    if (outlines_it == catalog_obj.value.dict.end()) {
+      return;
+    }
+    Value outlines_value = outlines_it->second;
+    if (outlines_value.type == Value::REFERENCE) {
+      auto resolved =
+          resolve_reference(pdf, outlines_value.ref_object_number,
+                            outlines_value.ref_generation_number);
+      if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
+        return;
+      }
+      outlines_value = resolved.value;
+    }
+    if (outlines_value.type != Value::DICTIONARY) {
+      return;
+    }
+    resolved_outlines = std::move(outlines_value.dict);
+    outlines_dict = &resolved_outlines;
+  }
+
+  auto type_it = outlines_dict->find("Type");
+  if (type_it != outlines_dict->end() && type_it->second.type == Value::NAME &&
+      type_it->second.name != "Outlines") {
     return;
   }
 
-  auto type_it = catalog.outlines.find("Type");
-  if (type_it != catalog.outlines.end()) {
-    if (type_it->second.type == Value::NAME) {
-      if (type_it->second.name != "Outlines") {
-        return;
-      }
-    }
+  // Parse the first top-level item, then walk its root-level siblings.
+  auto first_it = outlines_dict->find("First");
+  if (first_it == outlines_dict->end() ||
+      first_it->second.type != Value::REFERENCE) {
+    return;
   }
+  auto first_obj = resolve_reference(pdf, first_it->second.ref_object_number,
+                                     first_it->second.ref_generation_number);
+  if (!first_obj.success || first_obj.value.type != Value::DICTIONARY) {
+    return;
+  }
+  catalog.outline_root = parse_outline_item(pdf, first_obj.value.dict);
 
-  // Get first outline item
-  auto first_it = catalog.outlines.find("First");
-  if (first_it != catalog.outlines.end()) {
-    if (first_it->second.type == Value::REFERENCE) {
-      auto first_obj = resolve_reference(pdf, first_it->second.ref_object_number,
-                                         first_it->second.ref_generation_number);
-      if (first_obj.success && first_obj.value.type == Value::DICTIONARY) {
-        catalog.outline_root = parse_outline_item(pdf, first_obj.value.dict);
-      }
+  const Dictionary* current = &first_obj.value.dict;
+  std::vector<Dictionary> sibling_dicts;  // keep resolved dicts alive
+  while (catalog.outline_root) {
+    auto next_it = current->find("Next");
+    if (next_it == current->end() || next_it->second.type != Value::REFERENCE) {
+      break;
     }
+    auto next_obj = resolve_reference(pdf, next_it->second.ref_object_number,
+                                      next_it->second.ref_generation_number);
+    if (!next_obj.success || next_obj.value.type != Value::DICTIONARY) {
+      break;
+    }
+    sibling_dicts.push_back(std::move(next_obj.value.dict));
+    const Dictionary& sib = sibling_dicts.back();
+    auto sibling = parse_outline_item(pdf, sib);
+    if (sibling) catalog.outline_root->children.push_back(std::move(sibling));
+    current = &sib;
   }
 }
 
