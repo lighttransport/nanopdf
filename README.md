@@ -5,6 +5,9 @@ document structure, text extraction, form manipulation, annotations, encryption,
 rasterization. The codebase is self-contained with no external dependencies (zlib is provided by
 the bundled miniz library).
 
+**🌐 Live demo (WebAssembly viewer):** https://lighttransport.github.io/nanopdf/ — runs entirely
+in your browser (built from `examples/wasm/`).
+
 ## Features
 
 ### Core Parsing
