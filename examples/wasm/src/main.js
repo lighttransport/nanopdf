@@ -638,12 +638,14 @@ function ensureDiffOverlay() {
           <button data-mode="before">Before</button>
           <button data-mode="after">After</button>
           <button data-mode="swipe">Swipe</button>
+          <button data-mode="text">Text</button>
         </div>
         <button class="rev-diff-close" id="rev-diff-close" title="Close">&times;</button>
       </div>
       <div class="rev-diff-changeinfo" id="rev-diff-changeinfo"></div>
       <div class="rev-diff-body">
         <canvas id="rev-diff-canvas"></canvas>
+        <div class="rev-diff-text hidden" id="rev-diff-text"></div>
         <div class="rev-diff-empty hidden" id="rev-diff-empty"></div>
       </div>
       <div class="rev-diff-strip" id="rev-diff-strip"></div>
@@ -715,10 +717,75 @@ function diffPageChanged() {
   return false;
 }
 
+// Word-level diff between two strings -> array of {t:'same'|'add'|'del', w:word}.
+// Classic LCS over whitespace-split tokens (page text is short enough for O(n*m)).
+function wordDiff(beforeText, afterText) {
+  const a = beforeText.split(/\s+/).filter(Boolean);
+  const b = afterText.split(/\s+/).filter(Boolean);
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { out.push({ t: 'same', w: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ t: 'del', w: a[i] }); i++; }
+    else { out.push({ t: 'add', w: b[j] }); j++; }
+  }
+  while (i < n) out.push({ t: 'del', w: a[i++] });
+  while (j < m) out.push({ t: 'add', w: b[j++] });
+  return out;
+}
+
+// Render the word-level text diff for the current diff page into #rev-diff-text.
+function renderTextDiff() {
+  const host = document.getElementById('rev-diff-text');
+  if (!host) return;
+  if (!Module._nanopdf_extract_revision_text) {
+    host.innerHTML = '<div class="rev-diff-textmsg">Text diff unavailable in this build.</div>';
+    return;
+  }
+  const before = Module.UTF8ToString(Module._nanopdf_extract_revision_text(diffState.byteBefore, diffState.page));
+  const after = Module.UTF8ToString(Module._nanopdf_extract_revision_text(diffState.byteAfter, diffState.page));
+  const parts = wordDiff(before, after);
+  const added = parts.filter(p => p.t === 'add').length;
+  const removed = parts.filter(p => p.t === 'del').length;
+  if (added === 0 && removed === 0) {
+    host.innerHTML = `<div class="rev-diff-textmsg">No text changes on this page${after.trim() ? '' : ' (no extractable text)'}.</div>`;
+    return;
+  }
+  let html = `<div class="rev-diff-textmsg">+${added} word${added === 1 ? '' : 's'} added, −${removed} removed</div><div class="rev-diff-textbody">`;
+  for (const p of parts) {
+    const w = escapeHtml(p.w);
+    if (p.t === 'same') html += w + ' ';
+    else if (p.t === 'add') html += `<span class="td-add">${w}</span> `;
+    else html += `<span class="td-del">${w}</span> `;
+  }
+  host.innerHTML = html + '</div>';
+}
+
 function paintDiffCanvas() {
   const overlay = document.getElementById('rev-diff-overlay');
   const canvas = document.getElementById('rev-diff-canvas');
   const empty = document.getElementById('rev-diff-empty');
+  const textHost = document.getElementById('rev-diff-text');
+
+  // Text mode: word-level diff instead of the pixel canvas.
+  if (diffState.mode === 'text') {
+    canvas.classList.add('hidden');
+    empty.classList.add('hidden');
+    textHost.classList.remove('hidden');
+    renderTextDiff();
+    document.getElementById('rev-diff-pageinfo').textContent =
+      `Page ${diffState.page + 1} / ${diffState.pageCount}`;
+    overlay.querySelector('#rev-diff-prev').disabled = diffState.page <= 0;
+    overlay.querySelector('#rev-diff-next').disabled = diffState.page >= diffState.pageCount - 1;
+    return;
+  }
+  if (textHost) textHost.classList.add('hidden');
+
   const ctx = canvas.getContext('2d');
   const img = composeDiffImage(ctx);
   if (!img) {

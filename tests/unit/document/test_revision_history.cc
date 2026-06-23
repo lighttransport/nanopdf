@@ -59,4 +59,38 @@ TEST_CASE("Detects signed DocMDP revision history") {
         std::string::npos);
 }
 
+// Per-revision text extraction (backs the viewer's text-level diff): re-parsing
+// a revision-truncated byte range yields that revision's page text, distinct
+// from the latest revision. Mirrors the WASM nanopdf_extract_revision_text
+// bridge (parse_from_memory(data, byte_len) + extract_text_from_page).
+TEST_CASE("Extracts per-revision page text from a truncated buffer") {
+  std::vector<uint8_t> data;
+  REQUIRE(test::read_file(fixture_path("revision_text_change.pdf"), data));
+
+  Pdf pdf;
+  REQUIRE(parse_from_memory(data.data(), data.size(), &pdf));
+  pdf.load_document_structure();
+
+  auto history = detect_revision_history(pdf);
+  REQUIRE_EQ(history.revisions.size(), size_t(2));
+
+  // Latest revision (full document) shows the modified text.
+  REQUIRE_FALSE(pdf.catalog.pages.empty());
+  std::string latest = extract_text_from_page(pdf, pdf.catalog.pages[0]);
+  CHECK(latest.find("Modified") != std::string::npos);
+  CHECK(latest.find("Original") == std::string::npos);
+
+  // First revision (truncated to its end offset) shows the original text.
+  size_t rev1_end = history.revisions[0].end_offset;
+  REQUIRE(rev1_end > 0);
+  REQUIRE(rev1_end < data.size());
+  Pdf rev1;
+  REQUIRE(parse_from_memory(data.data(), rev1_end, &rev1));
+  rev1.load_document_structure();
+  REQUIRE_FALSE(rev1.catalog.pages.empty());
+  std::string original = extract_text_from_page(rev1, rev1.catalog.pages[0]);
+  CHECK(original.find("Original") != std::string::npos);
+  CHECK(original.find("Modified") == std::string::npos);
+}
+
 }  // TEST_SUITE

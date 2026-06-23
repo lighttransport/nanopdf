@@ -432,6 +432,33 @@ const char* nanopdf_extract_text(int page_index) {
   return g_text_buffer.c_str();
 }
 
+// Extract a page's text from a specific revision snapshot. @byte_len is that
+// revision's end offset (revisions[].endOffset); the document is re-parsed from
+// just the first @byte_len bytes (same mechanism as
+// nanopdf_render_revision_page). Used by the viewer's per-revision text diff.
+// Returns "" if the page is absent in that revision.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_extract_revision_text(unsigned int byte_len,
+                                          int page_index) {
+  g_text_buffer.clear();
+  if (!g_pdf || g_pdf_data.empty() || byte_len == 0 ||
+      byte_len > g_pdf_data.size()) {
+    return g_text_buffer.c_str();
+  }
+  nanopdf::Pdf rev_pdf;
+  if (!nanopdf::parse_from_memory(g_pdf_data.data(), byte_len, &rev_pdf) ||
+      !rev_pdf.load_document_structure()) {
+    return g_text_buffer.c_str();
+  }
+  if (page_index < 0 ||
+      page_index >= static_cast<int>(rev_pdf.catalog.pages.size())) {
+    return g_text_buffer.c_str();
+  }
+  g_text_buffer =
+      nanopdf::extract_text_from_page(rev_pdf, rev_pdf.catalog.pages[page_index]);
+  return g_text_buffer.c_str();
+}
+
 // Helper to escape JSON strings
 static std::string json_escape(const std::string& s) {
   std::string result;

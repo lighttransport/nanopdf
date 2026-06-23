@@ -1050,6 +1050,7 @@ body {
   height: auto;
 }
 .rev-diff-body canvas.dimmed { opacity: 0.5; }
+.rev-diff-body canvas.hidden { display: none; }
 .rev-diff-empty {
   position: absolute;
   top: 50%;
@@ -1063,6 +1064,45 @@ body {
   color: #555;
 }
 .rev-diff-empty.hidden { display: none; }
+.rev-diff-text {
+  align-self: stretch;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18);
+  padding: 16px 20px;
+  max-width: 900px;
+  width: 100%;
+  overflow: auto;
+}
+.rev-diff-text.hidden { display: none; }
+.rev-diff-textmsg {
+  font-size: 12px;
+  font-weight: 600;
+  color: #555;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #eee;
+}
+.rev-diff-textbody {
+  font-family: 'SF Mono', Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #333;
+  word-break: break-word;
+}
+.rev-diff-textbody .td-add {
+  background: #d3f9d8;
+  color: #0a7a32;
+  border-radius: 3px;
+  padding: 0 2px;
+}
+.rev-diff-textbody .td-del {
+  background: #ffe3e3;
+  color: #c0392b;
+  border-radius: 3px;
+  padding: 0 2px;
+  text-decoration: line-through;
+}
 .rev-diff-changeinfo {
   display: flex;
   align-items: center;
