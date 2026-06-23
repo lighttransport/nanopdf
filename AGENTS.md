@@ -4,6 +4,29 @@ Operational playbooks for agents and contributors working in this repository.
 
 ---
 
+## Git push policy (coding agents)
+
+**A coding agent MUST NOT run `git push` without explicit, per-push permission
+from the user.** This is a hard rule.
+
+- Committing locally is fine. **Pushing is not** — `git push` (to any branch or
+  remote, including force-push and PR branches) requires the user to explicitly
+  approve **that** push. Approval for one push does **not** carry over to the next.
+- Phrases like "commit and push" or "push it" in the user's message count as
+  explicit permission for that single push. A standing instruction to "always
+  push" does not — confirm each time.
+- **Before every push, run the secret-scanning audit below and confirm it is
+  clean.** If any new gitleaks finding or any trufflehog *verified* secret
+  appears, **do not push** — stop and report.
+
+Pre-push checklist:
+
+1. Run the [secret-scanning one-shot](#one-shot) → must print `SECRET SCAN CLEAN`.
+2. Have explicit user permission for this specific push.
+3. Only then `git push`.
+
+---
+
 ## Secret-scanning audit (gitleaks + trufflehog)
 
 Run this before **making the repo public**, before **tagging a release**, and
