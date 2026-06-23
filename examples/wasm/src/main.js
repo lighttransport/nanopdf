@@ -4411,6 +4411,39 @@ canvasScroll.addEventListener('auxclick', (e) => {
   if (e.button === 1) e.preventDefault();
 });
 
+// Pinch-to-zoom on touch devices. Two-finger gesture steps through the existing
+// zoom levels (reusing zoomIn/zoomOut so clamping, re-render, and state-persist
+// all apply). Single-touch is untouched, so pointer-based annotation drawing and
+// text selection keep working.
+let pinchActive = false;
+let pinchBaseDist = 0;
+function touchDistance(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.hypot(dx, dy);
+}
+canvasScroll.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2) {
+    pinchActive = true;
+    pinchBaseDist = touchDistance(e.touches);
+    e.preventDefault();  // suppress the browser's native page pinch-zoom
+  }
+}, { passive: false });
+canvasScroll.addEventListener('touchmove', (e) => {
+  if (!pinchActive || e.touches.length !== 2) return;
+  e.preventDefault();
+  const d = touchDistance(e.touches);
+  if (pinchBaseDist <= 0) { pinchBaseDist = d; return; }
+  const ratio = d / pinchBaseDist;
+  if (ratio > 1.2) { zoomIn(); pinchBaseDist = d; }
+  else if (ratio < 0.83) { zoomOut(); pinchBaseDist = d; }
+}, { passive: false });
+function endPinch(e) {
+  if (pinchActive && e.touches.length < 2) { pinchActive = false; pinchBaseDist = 0; }
+}
+canvasScroll.addEventListener('touchend', endPinch);
+canvasScroll.addEventListener('touchcancel', endPinch);
+
 // Keyboard navigation
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
