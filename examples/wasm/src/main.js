@@ -508,8 +508,9 @@ const diffState = {
   revIndex: 0,
   page: 0,
   pageCount: 0,
-  mode: 'diff',          // 'diff' | 'before' | 'after' | 'swipe'
+  mode: 'diff',          // 'diff' | 'before' | 'after' | 'swipe' | 'side' | 'text'
   swipe: 0.5,
+  threshold: 28,         // luma diff sensitivity (higher = ignore more AA noise)
   before: null,          // { data, w, h } or null (page absent in prev revision)
   after: null,
   byteAfter: 0,
@@ -600,7 +601,7 @@ function composeDiffImage(ctx) {
   }
 
   // 'diff' mode — signed luminance difference.
-  const T = 28;          // ignore sub-threshold AA noise
+  const T = diffState.threshold;   // luma threshold: ignore sub-threshold AA noise
   for (let i = 0; i < B.length; i += 4) {
     const bL = lum(B, i);
     const aL = A ? lum(A, i) : 255;  // no prior page => everything is "added"
@@ -656,6 +657,10 @@ function ensureDiffOverlay() {
           <button id="rev-diff-next" title="Next page">&rarr;</button>
         </div>
         <input type="range" id="rev-diff-swipe" min="0" max="100" value="50" class="hidden" />
+        <label class="rev-diff-sens" id="rev-diff-sens" title="Diff threshold: lower catches faint changes, higher ignores anti-aliasing noise">
+          Threshold <span id="rev-diff-sens-val">28</span>
+          <input type="range" id="rev-diff-sens-range" min="5" max="80" value="28" />
+        </label>
         <div class="rev-diff-legend">
           <span><i class="swatch added"></i>Added</span>
           <span><i class="swatch removed"></i>Removed</span>
@@ -673,6 +678,7 @@ function ensureDiffOverlay() {
       el.querySelectorAll('.rev-diff-modes button').forEach(x => x.classList.toggle('active', x === b));
       el.querySelector('#rev-diff-swipe').classList.toggle('hidden', diffState.mode !== 'swipe');
       el.querySelector('.rev-diff-legend').classList.toggle('hidden', diffState.mode !== 'diff');
+      el.querySelector('#rev-diff-sens').classList.toggle('hidden', diffState.mode !== 'diff');
       paintDiffCanvas();
     });
   });
@@ -680,6 +686,14 @@ function ensureDiffOverlay() {
   el.querySelector('#rev-diff-next').addEventListener('click', () => stepDiffPage(1));
   el.querySelector('#rev-diff-swipe').addEventListener('input', (e) => {
     diffState.swipe = e.target.value / 100;
+    paintDiffCanvas();
+  });
+  el.querySelector('#rev-diff-sens-range').addEventListener('input', (e) => {
+    diffState.threshold = parseInt(e.target.value, 10) || 28;
+    el.querySelector('#rev-diff-sens-val').textContent = diffState.threshold;
+    // The threshold changes which pages count as changed -> recompute the strip
+    // (keeping the current page), then repaint.
+    rescanChangedPages();
     paintDiffCanvas();
   });
   return el;
@@ -710,7 +724,7 @@ function diffPageChanged() {
   const a = A.data, b = B.data;
   let changed = 0;
   for (let i = 0; i < b.length; i += 4) {
-    if (Math.abs(lum(a, i) - lum(b, i)) > 28) {
+    if (Math.abs(lum(a, i) - lum(b, i)) > diffState.threshold) {
       if (++changed > 40) return true;
     }
   }
@@ -764,6 +778,25 @@ function renderTextDiff() {
     else html += `<span class="td-del">${w}</span> `;
   }
   host.innerHTML = html + '</div>';
+}
+
+// Recompute which pages differ at the current threshold (capped for big docs),
+// preserving the current page. Returns the first changed page index, or -1.
+function rescanChangedPages() {
+  const savedPage = diffState.page;
+  const scanLimit = diffState.pageCount <= 60 ? diffState.pageCount : 0;
+  diffState.changed = new Set();
+  diffState.changedComputed = scanLimit > 0;
+  let first = -1;
+  for (let p = 0; p < scanLimit; p++) {
+    diffState.page = p;
+    loadDiffPage();
+    if (diffPageChanged()) { diffState.changed.add(p); if (first < 0) first = p; }
+  }
+  diffState.page = savedPage;
+  loadDiffPage();
+  renderDiffStrip();
+  return first;
 }
 
 function paintDiffCanvas() {
@@ -842,6 +875,7 @@ function openRevisionDiff(revIndex) {
   overlay.querySelectorAll('.rev-diff-modes button').forEach(x => x.classList.toggle('active', x.dataset.mode === 'diff'));
   overlay.querySelector('#rev-diff-swipe').classList.add('hidden');
   overlay.querySelector('.rev-diff-legend').classList.remove('hidden');
+  overlay.querySelector('#rev-diff-sens').classList.remove('hidden');
   const signer = rev.signerName || rev.associatedSignature;
   overlay.querySelector('#rev-diff-title').textContent =
     `Revision ${rev.revision} changes` + (signer ? ` — signed by ${signer}` : '');
@@ -851,15 +885,7 @@ function openRevisionDiff(revIndex) {
 
   // Precompute which pages changed (cap the scan for very large docs), and
   // land on the first changed page.
-  diffState.changed = new Set();
-  const scanLimit = diffState.pageCount <= 60 ? diffState.pageCount : 0;
-  diffState.changedComputed = scanLimit > 0;
-  let first = -1;
-  for (let p = 0; p < scanLimit; p++) {
-    diffState.page = p;
-    loadDiffPage();
-    if (diffPageChanged()) { diffState.changed.add(p); if (first < 0) first = p; }
-  }
+  const first = rescanChangedPages();
   diffState.page = first >= 0 ? first : Math.min(currentPage, diffState.pageCount - 1);
   loadDiffPage();
   renderDiffStrip();

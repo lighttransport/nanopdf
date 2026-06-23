@@ -1166,6 +1166,17 @@ body {
 .rev-diff-pagenav span { font-size: 12px; color: #444; min-width: 78px; text-align: center; }
 #rev-diff-swipe { flex: 1; max-width: 260px; }
 #rev-diff-swipe.hidden { display: none; }
+.rev-diff-sens {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #555;
+  white-space: nowrap;
+}
+.rev-diff-sens.hidden { display: none; }
+.rev-diff-sens input[type="range"] { width: 90px; }
+.rev-diff-sens span { font-variant-numeric: tabular-nums; color: #333; min-width: 16px; }
 .rev-diff-legend {
   display: flex;
   gap: 14px;
