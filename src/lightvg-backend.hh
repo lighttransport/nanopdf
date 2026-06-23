@@ -121,6 +121,11 @@ private:
   // Parse PDF content stream and emit lvg paints into the active scene.
   bool parse_pdf_content(const std::vector<uint8_t>& content_data);
 
+  // Render a page's annotations (appearance streams + form-widget defaults)
+  // into the active scene. Shared by both render_page() overloads.
+  void render_annotations(const Pdf& pdf, const Page& page, float page_width,
+                          float page_height, float scale);
+
   // Graphics state for PDF rendering
   struct GraphicsState {
     float current_x{0.0f};

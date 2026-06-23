@@ -30,6 +30,7 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/core/test_pdf_parsing.cc
     unit/core/test_pdf_function.cc
     unit/annotations/test_annotation_types.cc
+    unit/annotations/test_incremental_annotations.cc
     unit/annotations/test_freetext_annotation.cc
     unit/annotations/test_link_annotation.cc
     unit/annotations/test_markup_annotation.cc
@@ -73,11 +74,14 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/document/test_document_structure.cc
     unit/document/test_pdfa_validation.cc
     unit/document/test_revision_history.cc
+    unit/document/test_signature_validation.cc
+    unit/document/test_signing.cc
     unit/graphics/test_color_transform.cc
     unit/backends/test_render_progress.cc
     unit/backends/test_focal_radial_gradient.cc
     unit/filters/test_tiff_decode.cc
     unit/forms/test_form_manipulation.cc
+    unit/forms/test_form_writeback.cc
 )
 
 add_executable(nanopdf_unit_suite

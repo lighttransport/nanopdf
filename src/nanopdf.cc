@@ -10112,6 +10112,41 @@ std::unique_ptr<Annotation> parse_annotation(const Pdf& pdf, const Value& annot_
     }
   }
 
+  // Appearance streams (/AP). Store the normal (/N) appearance so the renderer
+  // draws it as a Form XObject. /AP and /N may be indirect references; the
+  // backend resolves the stored value, so keep N as-is (reference or stream).
+  // /N may also be a sub-dictionary keyed by appearance state (/AS) — pick the
+  // active state's stream in that case.
+  auto ap_it = dict.find("AP");
+  if (ap_it != dict.end()) {
+    const Value* ap = &ap_it->second;
+    Value resolved_ap;
+    if (ap->type == Value::REFERENCE) {
+      ResolvedObject r = resolve_reference(pdf, ap->ref_object_number,
+                                           ap->ref_generation_number);
+      if (r.success) { resolved_ap = std::move(r.value); ap = &resolved_ap; }
+    }
+    if (ap->type == Value::DICTIONARY) {
+      auto n_it = ap->dict.find("N");
+      if (n_it != ap->dict.end()) {
+        const Value& n = n_it->second;
+        // If /N is a stream/reference, use it directly. If it's a sub-dict of
+        // states, select by /AS.
+        if (n.type == Value::REFERENCE || n.type == Value::STREAM) {
+          annot->appearance_streams["N"] = n;
+        } else if (n.type == Value::DICTIONARY) {
+          auto as_it = dict.find("AS");
+          if (as_it != dict.end() && as_it->second.type == Value::NAME) {
+            auto state_it = n.dict.find(as_it->second.name);
+            if (state_it != n.dict.end()) {
+              annot->appearance_streams["N"] = state_it->second;
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Parse border
   auto border_it = dict.find("Border");
   if (border_it != dict.end() && border_it->second.type == Value::ARRAY) {
@@ -13328,8 +13363,31 @@ bool parse_der_element(const uint8_t* data, size_t data_len, size_t& pos,
   if (len_byte < 0x80) {
     length = len_byte;
   } else if (len_byte == 0x80) {
-    // Indefinite length - not supported in DER, but handle gracefully
-    return false;
+    // Indefinite length (BER): the content runs until an end-of-contents
+    // marker (00 00) at this nesting depth. Some signing tools / HSMs emit
+    // BER-encoded PKCS#7/CMS rather than strict DER, so we must accept it.
+    // Only constructed encodings may use indefinite length.
+    if (!out.constructed) return false;
+    size_t scan = pos;
+    for (;;) {
+      if (scan + 1 >= data_len) return false;  // need room for EOC
+      if (data[scan] == 0x00 && data[scan + 1] == 0x00) {
+        // End-of-contents marker: content is everything before it.
+        out.content = data + pos;
+        out.content_length = scan - pos;
+        out.full_length =
+            static_cast<size_t>((data + scan + 2) - out.full_start);
+        pos = scan + 2;
+        return true;
+      }
+      // Skip over the next (possibly nested) TLV to reach the following
+      // element boundary.
+      DERElement child;
+      size_t child_pos = scan;
+      if (!parse_der_element(data, data_len, child_pos, child)) return false;
+      if (child_pos <= scan) return false;  // guard against non-progress
+      scan = child_pos;
+    }
   } else {
     size_t num_bytes = len_byte & 0x7F;
     if (num_bytes > 4 || pos + num_bytes > data_len) return false;
@@ -13795,6 +13853,32 @@ SignatureValidationResult validate_signature(const Pdf& pdf,
     sha1.finalize();
     final_computed_digest.resize(nanopdf::crypto::SHA1::DIGEST_SIZE);
     sha1.get_digest(final_computed_digest.data());
+  } else if (result.digest_algorithm == "SHA-384") {
+    // Recompute with SHA-384
+    nanopdf::crypto::SHA384 sha384;
+    for (size_t i = 0; i < field.byte_range.size(); i += 2) {
+      uint64_t offset = field.byte_range[i];
+      uint64_t length = field.byte_range[i + 1];
+      if (length == 0) continue;
+      sha384.update(pdf.data + static_cast<size_t>(offset),
+                    static_cast<size_t>(length));
+    }
+    sha384.finalize();
+    final_computed_digest.resize(nanopdf::crypto::SHA384::DIGEST_SIZE);
+    sha384.get_digest(final_computed_digest.data());
+  } else if (result.digest_algorithm == "SHA-512") {
+    // Recompute with SHA-512
+    nanopdf::crypto::SHA512 sha512;
+    for (size_t i = 0; i < field.byte_range.size(); i += 2) {
+      uint64_t offset = field.byte_range[i];
+      uint64_t length = field.byte_range[i + 1];
+      if (length == 0) continue;
+      sha512.update(pdf.data + static_cast<size_t>(offset),
+                    static_cast<size_t>(length));
+    }
+    sha512.finalize();
+    final_computed_digest.resize(nanopdf::crypto::SHA512::DIGEST_SIZE);
+    sha512.get_digest(final_computed_digest.data());
   } else if (result.digest_algorithm == "MD5") {
     // Recompute with MD5
     nanopdf::crypto::MD5 md5;

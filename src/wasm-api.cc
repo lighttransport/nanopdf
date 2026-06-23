@@ -16,10 +16,17 @@
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
+#include "pdf-attachments.hh"
 #include "render-backend.hh"
 #include "string-parse.hh"
 #include "text-layout.hh"
 #include "table-extraction.hh"
+#include "cms.hh"
+#include "pkcs12.hh"
+#include "rfc3161.hh"
+#include "crypto.hh"
+#include "x509.hh"
+#include <ctime>
 
 #ifdef NANOPDF_USE_BLEND2D
 #include "blend2d-backend.hh"
@@ -86,7 +93,7 @@ struct PageInfo {
 };
 
 struct Annotation {
-  int type;  // 0=text, 1=line, 2=rect, 3=oval, 4=highlight
+  int type;  // 0=text, 1=line, 2=rect, 3=oval, 4=highlight, 5=image
   double x1, y1, x2, y2;
   double r, g, b, a;
   double line_width;
@@ -94,7 +101,13 @@ struct Annotation {
   std::string font_name;
   double font_size;
   bool filled;
+  int image_id = -1;          // for type 5 (image stamp): id from register_stamp_image
+  std::string image_name;     // resolved page resource name during export
 };
+
+// Registered image stamps (encoded PNG/JPEG bytes), keyed by id.
+static std::map<int, std::vector<uint8_t>> g_stamp_images;
+static int g_next_stamp_id = 0;
 
 struct DocumentInfo {
   std::vector<uint8_t> data;
@@ -416,6 +429,33 @@ const char* nanopdf_extract_text(int page_index) {
 
   const auto& page = g_pdf->catalog.pages[page_index];
   g_text_buffer = nanopdf::extract_text_from_page(*g_pdf, page);
+  return g_text_buffer.c_str();
+}
+
+// Extract a page's text from a specific revision snapshot. @byte_len is that
+// revision's end offset (revisions[].endOffset); the document is re-parsed from
+// just the first @byte_len bytes (same mechanism as
+// nanopdf_render_revision_page). Used by the viewer's per-revision text diff.
+// Returns "" if the page is absent in that revision.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_extract_revision_text(unsigned int byte_len,
+                                          int page_index) {
+  g_text_buffer.clear();
+  if (!g_pdf || g_pdf_data.empty() || byte_len == 0 ||
+      byte_len > g_pdf_data.size()) {
+    return g_text_buffer.c_str();
+  }
+  nanopdf::Pdf rev_pdf;
+  if (!nanopdf::parse_from_memory(g_pdf_data.data(), byte_len, &rev_pdf) ||
+      !rev_pdf.load_document_structure()) {
+    return g_text_buffer.c_str();
+  }
+  if (page_index < 0 ||
+      page_index >= static_cast<int>(rev_pdf.catalog.pages.size())) {
+    return g_text_buffer.c_str();
+  }
+  g_text_buffer =
+      nanopdf::extract_text_from_page(rev_pdf, rev_pdf.catalog.pages[page_index]);
   return g_text_buffer.c_str();
 }
 
@@ -1251,6 +1291,52 @@ int nanopdf_annot_add_highlight(int page_index, float x, float y, float w, float
   return static_cast<int>(g_page_annotations[page_index].size() - 1);
 }
 
+// Register an image (PNG/JPEG bytes) for use as a stamp. Returns an id (>=0),
+// or -1 if the image cannot be decoded.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_register_stamp_image(const uint8_t* data, size_t len) {
+  if (!data || len == 0) {
+    g_last_error = "Invalid image data";
+    return -1;
+  }
+  // Validate it decodes before storing.
+  nanopdf::ImageData img = nanopdf::ImageData::FromMemory(data, len);
+  if (!img.valid()) {
+    g_last_error = "Unsupported or corrupt image";
+    return -1;
+  }
+  int id = g_next_stamp_id++;
+  g_stamp_images[id].assign(data, data + len);
+  return id;
+}
+
+// Add an image-stamp annotation. (x,y) is the lower-left corner; (w,h) the size
+// in page points. image_id comes from nanopdf_register_stamp_image.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_annot_add_image(int page_index, float x, float y, float w, float h,
+                            int image_id) {
+  if (page_index < 0 || page_index >= static_cast<int>(g_working_pages.size())) {
+    g_last_error = "Invalid page index";
+    return -1;
+  }
+  if (g_stamp_images.find(image_id) == g_stamp_images.end()) {
+    g_last_error = "Unknown image id";
+    return -1;
+  }
+  Annotation annot;
+  annot.type = 5;  // Image stamp
+  annot.x1 = x;
+  annot.y1 = y;
+  annot.x2 = w;
+  annot.y2 = h;
+  annot.r = annot.g = annot.b = annot.a = 1.0;
+  annot.line_width = 0;
+  annot.filled = false;
+  annot.image_id = image_id;
+  g_page_annotations[page_index].push_back(annot);
+  return static_cast<int>(g_page_annotations[page_index].size() - 1);
+}
+
 // Remove annotation
 EMSCRIPTEN_KEEPALIVE
 int nanopdf_annot_remove(int page_index, int annot_index) {
@@ -1521,6 +1607,24 @@ int nanopdf_export_pdf() {
       annots = &annot_it->second;
     }
 
+    // Pre-register image-stamp resources on the writer (PageBuilder cannot add
+    // resources, only draw them), recording the resolved name per annotation.
+    if (annots) {
+      for (auto& annot : *annots) {
+        if (annot.type == 5 && annot.image_name.empty()) {
+          auto sit = g_stamp_images.find(annot.image_id);
+          if (sit != g_stamp_images.end()) {
+            nanopdf::ImageData img =
+                nanopdf::ImageData::FromMemory(sit->second.data(), sit->second.size());
+            if (img.valid()) {
+              annot.image_name = img.has_alpha() ? g_writer->add_image_with_alpha(img)
+                                                 : g_writer->add_image(img);
+            }
+          }
+        }
+      }
+    }
+
     // Capture image name for this page
     std::string img_name = page_images[i];
     int rotation = pinfo.rotation;
@@ -1631,6 +1735,13 @@ int nanopdf_export_pdf() {
               builder.set_fill_color(annot.r, annot.g, annot.b);
               builder.rectangle(annot.x1, annot.y1, annot.x2, annot.y2);
               builder.fill();
+              break;
+
+            case 5:  // Image stamp (x1,y1 = lower-left; x2,y2 = w,h)
+              if (!annot.image_name.empty()) {
+                builder.draw_image(annot.image_name, annot.x1, annot.y1,
+                                   annot.x2, annot.y2);
+              }
               break;
           }
 
@@ -2818,6 +2929,380 @@ size_t nanopdf_form_get_size() {
 }
 
 // ============================================================
+// Incremental annotation editing (real, re-editable annotations)
+// ============================================================
+//
+// Unlike the flatten/export path, these add genuine PDF annotation objects to an
+// existing document via an incremental update, so they re-open as editable
+// annotations. Supports text markup (highlight/underline/squiggly/strikeout)
+// and sticky-note text annotations.
+
+static nanopdf::PdfWriter* g_edit_writer = nullptr;
+static std::vector<uint8_t> g_edit_output;
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_load(const uint8_t* data, size_t size) {
+  if (!data || size == 0) {
+    g_last_error = "Invalid input data";
+    return 0;
+  }
+  if (g_edit_writer) { delete g_edit_writer; g_edit_writer = nullptr; }
+  g_edit_writer = new nanopdf::PdfWriter();
+  std::vector<uint8_t> pdf_data(data, data + size);
+  std::string error;
+  if (!g_edit_writer->load_existing(pdf_data, &error)) {
+    g_last_error = "Failed to load PDF for editing: " + error;
+    delete g_edit_writer;
+    g_edit_writer = nullptr;
+    return 0;
+  }
+  return 1;
+}
+
+// Add a text-markup annotation over a rectangle (page points, lower-left origin).
+// markup_type: 0=highlight, 1=underline, 2=squiggly, 3=strikeout.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_add_markup(int page_index, int markup_type,
+                            float x, float y, float w, float h,
+                            float r, float g, float b, float a) {
+  if (!g_edit_writer) { g_last_error = "Edit writer not initialized"; return 0; }
+  nanopdf::TextMarkupConfig cfg;
+  cfg.page = page_index;
+  switch (markup_type) {
+    case 1: cfg.type = nanopdf::MarkupType::Underline; break;
+    case 2: cfg.type = nanopdf::MarkupType::Squiggly; break;
+    case 3: cfg.type = nanopdf::MarkupType::StrikeOut; break;
+    default: cfg.type = nanopdf::MarkupType::Highlight; break;
+  }
+  cfg.quads.push_back(nanopdf::quad_from_rect(x, y, w, h));
+  cfg.r = r; cfg.g = g; cfg.b = b; cfg.alpha = a;
+  return g_edit_writer->add_text_markup_to_existing_page(page_index, cfg) ? 1 : 0;
+}
+
+// Add a sticky-note text annotation.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_add_note(int page_index, float x, float y, float w, float h,
+                          const char* contents) {
+  if (!g_edit_writer) { g_last_error = "Edit writer not initialized"; return 0; }
+  return g_edit_writer->add_text_annotation_to_existing_page(
+             page_index, x, y, w, h, contents ? contents : "") ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_save() {
+  if (!g_edit_writer) { g_last_error = "Edit writer not initialized"; return 0; }
+  g_edit_output.clear();
+  auto result = g_edit_writer->write_incremental(g_edit_output);
+  if (!result.success) {
+    g_last_error = "Annotation save failed: " + result.error;
+    return 0;
+  }
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_edit_get_buffer() {
+  return g_edit_output.empty() ? nullptr : g_edit_output.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_edit_get_size() {
+  return g_edit_output.size();
+}
+
+// ============================================================
+// Digital signing API (in-browser, OpenSSL-free)
+//
+// Signs an existing PDF with an uploaded PKCS#12 (.p12/.pfx) bundle entirely
+// client-side: pkcs12::parse -> add_signature_field -> write_incremental_for_
+// signing -> cms::build_signed_data (detached PKCS#7, RSA+SHA-256) ->
+// apply_signature. The result is an incrementally-updated, signed PDF that
+// validates in nanopdf and spec-compliant viewers.
+//
+// RFC 3161 timestamping (PAdES-T) uses a prepare/finalize split because the TSA
+// network hop is an async JS fetch() while the C++ signing callback is
+// synchronous: nanopdf_sign_prepare() runs the (deterministic) signature and
+// returns a TimeStampReq DER; JS POSTs it to the TSA and hands the response to
+// nanopdf_sign_finalize(), which embeds the token as the id-aa-timeStampToken
+// unsigned attribute and writes the final /Contents. Because PKCS#1 v1.5 with
+// fixed signedAttrs is deterministic, the signature timestamped by the TSA is
+// byte-identical to the one finally embedded.
+// ============================================================
+
+static std::vector<uint8_t> g_sign_output;
+static std::vector<uint8_t> g_sign_tsreq;
+
+namespace {
+// Current time as a UTCTime string "YYMMDDhhmmssZ" for the CMS signingTime.
+std::string sign_utc_now() {
+  std::time_t t = std::time(nullptr);
+  std::tm tm_utc{};
+#if defined(_WIN32)
+  gmtime_s(&tm_utc, &t);
+#else
+  gmtime_r(&t, &tm_utc);
+#endif
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%02d%02d%02d%02d%02d%02dZ",
+                (tm_utc.tm_year + 1900) % 100, tm_utc.tm_mon + 1,
+                tm_utc.tm_mday, tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+  return std::string(buf);
+}
+
+// State carried between sign_prepare() and sign_finalize() for the TSA path.
+struct SignSession {
+  bool active = false;
+  std::vector<uint8_t> prepared;            // pristine write_for_signing bytes
+  nanopdf::SignaturePlaceholder placeholder;
+  std::vector<uint8_t> signer;
+  std::vector<std::vector<uint8_t>> chain;
+  nanopdf::crypto::RsaPrivateKey key;
+  std::string utc;
+};
+static SignSession g_sign_session;
+
+// Shared setup: parse the bundle, place the field, write_for_signing. On
+// success fills @signer/@chain/@key/@bytes/@placeholder and returns true.
+bool sign_prepare_common(const uint8_t* pdf, size_t pdf_len, const uint8_t* p12,
+                         size_t p12_len, const char* password,
+                         const char* reason, const char* location,
+                         const char* contact, int page, float x, float y,
+                         float w, float h, int visible,
+                         std::vector<uint8_t>& signer,
+                         std::vector<std::vector<uint8_t>>& chain,
+                         nanopdf::crypto::RsaPrivateKey& key,
+                         std::vector<uint8_t>& bytes,
+                         nanopdf::SignaturePlaceholder& placeholder) {
+  if (!pdf || pdf_len == 0) { g_last_error = "No PDF data to sign"; return false; }
+  if (!p12 || p12_len == 0) { g_last_error = "No PKCS#12 data"; return false; }
+
+  auto bundle = nanopdf::pkcs12::parse(p12, p12_len, password ? password : "");
+  if (!bundle.valid) {
+    g_last_error = "PKCS#12 parse failed (wrong password or unsupported "
+                   "format): " + bundle.error;
+    return false;
+  }
+  if (bundle.certs.empty()) {
+    g_last_error = "PKCS#12 contains no certificate";
+    return false;
+  }
+
+  nanopdf::PdfWriter writer;
+  std::vector<uint8_t> in(pdf, pdf + pdf_len);
+  std::string werr;
+  if (!writer.load_existing(in, &werr)) {
+    g_last_error = "load_existing failed: " + werr;
+    return false;
+  }
+
+  nanopdf::SignatureFieldConfig cfg;
+  cfg.name = "Signature1";
+  cfg.page = page;
+  cfg.x = x;
+  cfg.y = y;
+  cfg.width = w;
+  cfg.height = h;
+  cfg.visible = visible != 0;
+  cfg.reason = reason ? reason : "";
+  cfg.location = location ? location : "";
+  cfg.contact_info = contact ? contact : "";
+  if (writer.add_signature_field(cfg).empty()) {
+    g_last_error = "add_signature_field failed";
+    return false;
+  }
+
+  // Reserve generous space for the signer cert + chain (+ TSA token in /Contents).
+  auto wr = writer.write_incremental_for_signing(bytes, 32768);
+  if (!wr.success) {
+    g_last_error = "write_incremental_for_signing failed: " + wr.error;
+    return false;
+  }
+  const auto& phs = writer.get_signature_placeholders();
+  if (phs.empty()) {
+    g_last_error = "no signature placeholder produced";
+    return false;
+  }
+  placeholder = phs[0];
+  signer = bundle.certs[0];
+  chain.assign(bundle.certs.begin() + 1, bundle.certs.end());
+  key = bundle.key;
+  return true;
+}
+}  // namespace
+
+// Sign @pdf with the PKCS#12 bundle @p12 (unlocked by @password) WITHOUT a
+// timestamp. Places a signature field on @page at (@x,@y) sized @w x @h (page
+// points, lower-left origin); set @visible=0 for an invisible signature.
+// Returns 1 on success (signed bytes in g_sign_output) or 0 on failure.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_sign_pdf(const uint8_t* pdf, size_t pdf_len,
+                     const uint8_t* p12, size_t p12_len, const char* password,
+                     const char* reason, const char* location,
+                     const char* contact, int page, float x, float y, float w,
+                     float h, int visible) {
+  g_sign_output.clear();
+  g_sign_session.active = false;
+
+  std::vector<uint8_t> signer, bytes;
+  std::vector<std::vector<uint8_t>> chain;
+  nanopdf::crypto::RsaPrivateKey key;
+  nanopdf::SignaturePlaceholder ph;
+  if (!sign_prepare_common(pdf, pdf_len, p12, p12_len, password, reason,
+                           location, contact, page, x, y, w, h, visible, signer,
+                           chain, key, bytes, ph)) {
+    return 0;
+  }
+  const std::string utc = sign_utc_now();
+  nanopdf::SigningCallback cb =
+      [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    return nanopdf::cms::build_signed_data(data, signer, chain, key, utc);
+  };
+  auto ar = nanopdf::apply_signature(bytes, ph, cb);
+  if (!ar.success) {
+    g_last_error = "apply_signature failed: " + ar.error;
+    return 0;
+  }
+  g_sign_output = std::move(bytes);
+  return 1;
+}
+
+// Phase A of timestamped signing. Performs the (deterministic) signature and
+// builds an RFC 3161 TimeStampReq over it (SHA-256 message imprint). On success
+// returns 1; the request DER is available via nanopdf_sign_tsreq_buffer/size and
+// the session is held for nanopdf_sign_finalize(). @nonce_lo/@nonce_hi form the
+// 64-bit TSA nonce (any value; echoed back by the TSA).
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_sign_prepare(const uint8_t* pdf, size_t pdf_len, const uint8_t* p12,
+                         size_t p12_len, const char* password,
+                         const char* reason, const char* location,
+                         const char* contact, int page, float x, float y,
+                         float w, float h, int visible, uint32_t nonce_lo,
+                         uint32_t nonce_hi) {
+  g_sign_output.clear();
+  g_sign_tsreq.clear();
+  g_sign_session.active = false;
+
+  std::vector<uint8_t> signer, bytes;
+  std::vector<std::vector<uint8_t>> chain;
+  nanopdf::crypto::RsaPrivateKey key;
+  nanopdf::SignaturePlaceholder ph;
+  if (!sign_prepare_common(pdf, pdf_len, p12, p12_len, password, reason,
+                           location, contact, page, x, y, w, h, visible, signer,
+                           chain, key, bytes, ph)) {
+    return 0;
+  }
+  const std::string utc = sign_utc_now();
+
+  // Run a throwaway apply_signature to capture the deterministic signature, then
+  // build the TimeStampReq over SHA-256(signature). The TsaCallback returns {}
+  // so no token is embedded in this throwaway pass.
+  std::vector<uint8_t> captured_sig;
+  nanopdf::cms::TsaCallback capture =
+      [&](const std::vector<uint8_t>& signature) -> std::vector<uint8_t> {
+    captured_sig = signature;
+    return {};
+  };
+  nanopdf::SigningCallback cb =
+      [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    return nanopdf::cms::build_signed_data(data, signer, chain, key, utc,
+                                           capture);
+  };
+  std::vector<uint8_t> tmp = bytes;  // keep `bytes` pristine for finalize
+  auto ar = nanopdf::apply_signature(tmp, ph, cb);
+  if (!ar.success || captured_sig.empty()) {
+    g_last_error = ar.success ? "could not capture signature for timestamp"
+                              : ("apply_signature failed: " + ar.error);
+    return 0;
+  }
+
+  uint8_t imprint[nanopdf::crypto::SHA256::DIGEST_SIZE];
+  nanopdf::crypto::SHA256::hash(captured_sig.data(), captured_sig.size(),
+                                imprint);
+  uint64_t nonce = (static_cast<uint64_t>(nonce_hi) << 32) | nonce_lo;
+  g_sign_tsreq = nanopdf::rfc3161::build_request(
+      std::vector<uint8_t>(imprint, imprint + sizeof(imprint)),
+      nanopdf::rfc3161::hash_oid("sha256"), nonce, true);
+  if (g_sign_tsreq.empty()) {
+    g_last_error = "failed to build RFC 3161 timestamp request";
+    return 0;
+  }
+
+  g_sign_session.active = true;
+  g_sign_session.prepared = std::move(bytes);
+  g_sign_session.placeholder = ph;
+  g_sign_session.signer = std::move(signer);
+  g_sign_session.chain = std::move(chain);
+  g_sign_session.key = std::move(key);
+  g_sign_session.utc = utc;
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_sign_tsreq_buffer() {
+  return g_sign_tsreq.empty() ? nullptr : g_sign_tsreq.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_sign_tsreq_size() {
+  return g_sign_tsreq.size();
+}
+
+// Phase B of timestamped signing. @tsr is the TSA's DER TimeStampResp (from the
+// JS fetch of the request returned by nanopdf_sign_prepare). Extracts the token,
+// re-signs (deterministically) embedding it as the signature timestamp, writes
+// /Contents, and leaves the result in g_sign_output. Returns 1 on success.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_sign_finalize(const uint8_t* tsr, size_t tsr_len) {
+  g_sign_output.clear();
+  if (!g_sign_session.active) {
+    g_last_error = "no signing session — call nanopdf_sign_prepare first";
+    return 0;
+  }
+  if (!tsr || tsr_len == 0) {
+    g_last_error = "empty timestamp response";
+    g_sign_session.active = false;
+    return 0;
+  }
+  int status = 0;
+  std::vector<uint8_t> token = nanopdf::rfc3161::parse_response(
+      std::vector<uint8_t>(tsr, tsr + tsr_len), &status);
+  if (token.empty()) {
+    g_last_error = "TSA rejected the request (PKIStatus " +
+                   std::to_string(status) + ")";
+    g_sign_session.active = false;
+    return 0;
+  }
+
+  const auto& s = g_sign_session;
+  nanopdf::cms::TsaCallback embed =
+      [&](const std::vector<uint8_t>&) -> std::vector<uint8_t> { return token; };
+  nanopdf::SigningCallback cb =
+      [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    return nanopdf::cms::build_signed_data(data, s.signer, s.chain, s.key,
+                                           s.utc, embed);
+  };
+  std::vector<uint8_t> bytes = s.prepared;
+  auto ar = nanopdf::apply_signature(bytes, s.placeholder, cb);
+  g_sign_session.active = false;
+  if (!ar.success) {
+    g_last_error = "apply_signature failed: " + ar.error;
+    return 0;
+  }
+  g_sign_output = std::move(bytes);
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_sign_get_buffer() {
+  return g_sign_output.empty() ? nullptr : g_sign_output.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_sign_get_size() {
+  return g_sign_output.size();
+}
+
+// ============================================================
 // PDF Merge / Split API
 // ============================================================
 
@@ -3041,6 +3526,76 @@ const char* nanopdf_validate_signature(int sig_index) {
   return g_text_buffer.c_str();
 }
 
+// Validate the signer certificate chain of signature @sig_index against a
+// trust store built from the PEM CA bundle in @ca_pem (length @ca_len). Returns
+// JSON: {certCount, trustChecked, trusted, anchorCN, error}. With no CA bundle
+// (@ca_len == 0) trustChecked is false — the signer's integrity is still valid
+// (see nanopdf_validate_signature), but trust against a root store is "not
+// checked". This is path validation only: signature chain + validity period +
+// CA basic-constraints; CRL/OCSP revocation is out of scope.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_verify_trust(int sig_index, const uint8_t* ca_pem,
+                                 size_t ca_len) {
+  if (!g_pdf) {
+    g_text_buffer = "{\"error\":\"No PDF loaded\"}";
+    return g_text_buffer.c_str();
+  }
+  if (g_pdf->catalog.signature_fields.empty()) {
+    g_pdf->parse_signature_fields();
+  }
+  if (sig_index < 0 ||
+      sig_index >= static_cast<int>(g_pdf->catalog.signature_fields.size())) {
+    g_text_buffer = "{\"error\":\"Invalid signature index\"}";
+    return g_text_buffer.c_str();
+  }
+
+  const auto& sig = g_pdf->catalog.signature_fields[sig_index];
+  auto chain = nanopdf::cms::extract_certificates(sig.signature_contents);
+  if (chain.empty()) {
+    g_text_buffer =
+        "{\"certCount\":0,\"trustChecked\":false,"
+        "\"error\":\"no certificates embedded in signature\"}";
+    return g_text_buffer.c_str();
+  }
+
+  std::string json = "{\"certCount\":" + std::to_string(chain.size());
+
+  // No CA bundle supplied: integrity is checked elsewhere, trust is not.
+  if (!ca_pem || ca_len == 0) {
+    json += ",\"trustChecked\":false}";
+    g_text_buffer = json;
+    return g_text_buffer.c_str();
+  }
+
+  nanopdf::x509::TrustStore store;
+  std::string pem(reinterpret_cast<const char*>(ca_pem), ca_len);
+  for (const auto& der : nanopdf::cms::pem_to_certs(pem)) {
+    auto c = nanopdf::x509::parse(der.data(), der.size());
+    if (c.parsed) store.roots.push_back(std::move(c));
+  }
+  store.loaded = !store.roots.empty();
+  json += ",\"rootCount\":" + std::to_string(store.roots.size());
+  if (!store.loaded) {
+    json += ",\"trustChecked\":false,"
+            "\"error\":\"no valid certificates in the CA bundle\"}";
+    g_text_buffer = json;
+    return g_text_buffer.c_str();
+  }
+
+  // Hostname check is irrelevant for document signing -> pass empty.
+  int64_t now = static_cast<int64_t>(std::time(nullptr));
+  auto vr = nanopdf::x509::verify_chain(chain, store, "", now);
+  json += ",\"trustChecked\":true";
+  json += ",\"trusted\":" + std::string(vr.ok ? "true" : "false");
+  if (!vr.subject_cn.empty())
+    json += ",\"anchorCN\":\"" + json_escape(vr.subject_cn) + "\"";
+  if (!vr.ok && !vr.error.empty())
+    json += ",\"error\":\"" + json_escape(vr.error) + "\"";
+  json += "}";
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
 // Get document revision history and DocMDP analysis as JSON.
 EMSCRIPTEN_KEEPALIVE
 const char* nanopdf_get_revision_history() {
@@ -3136,6 +3691,115 @@ const char* nanopdf_page_to_markdown(int page_index) {
 
   g_text_buffer = text_page->to_markdown();
   return g_text_buffer.c_str();
+}
+
+// Detect tables on @page_index and serialize them in @format
+// (0=CSV, 1=HTML, 2=JSON, 3=Markdown). Multiple tables are concatenated (CSV/MD
+// separated by a blank line; JSON as an array). Returns "" if the page has no
+// detectable table.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_extract_tables(int page_index, int format) {
+  g_text_buffer.clear();
+  if (!g_pdf || page_index < 0 ||
+      page_index >= static_cast<int>(g_pdf->catalog.pages.size())) {
+    return g_text_buffer.c_str();
+  }
+  const auto& page = g_pdf->catalog.pages[page_index];
+  auto text_page = nanopdf::extract_text_layout(*g_pdf, page);
+  if (!text_page) return g_text_buffer.c_str();
+
+  auto tables = nanopdf::extract_tables(*text_page);
+  if (tables.empty()) return g_text_buffer.c_str();
+
+  std::string out;
+  if (format == 2) {  // JSON array
+    out = "[";
+    for (size_t i = 0; i < tables.size(); ++i) {
+      if (i) out += ",";
+      out += tables[i].to_json();
+    }
+    out += "]";
+  } else {
+    for (size_t i = 0; i < tables.size(); ++i) {
+      if (i) out += "\n\n";
+      switch (format) {
+        case 1: out += tables[i].to_html(); break;
+        case 3: out += tables[i].to_markdown(); break;
+        default: out += tables[i].to_csv(); break;  // 0 = CSV
+      }
+    }
+  }
+  g_text_buffer = std::move(out);
+  return g_text_buffer.c_str();
+}
+
+// ============================================================
+// Attachments (embedded files)
+// ============================================================
+
+static std::vector<uint8_t> g_attachment_buffer;
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_attachments_count() {
+  if (!g_pdf) return 0;
+  nanopdf::AttachmentExtractor ex(*g_pdf);
+  return ex.get_count();
+}
+
+// JSON: {"attachments":[{index,name,description,mimeType,size,creationDate,
+//        modDate,relationship}],"count":N}
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_attachments_list() {
+  if (!g_pdf) {
+    g_text_buffer = "{\"attachments\":[],\"count\":0}";
+    return g_text_buffer.c_str();
+  }
+  nanopdf::AttachmentExtractor ex(*g_pdf);
+  int n = ex.get_count();
+  std::string json = "{\"attachments\":[";
+  for (int i = 0; i < n; ++i) {
+    nanopdf::FileAttachment a = ex.get_attachment(i);
+    if (i) json += ",";
+    json += "{\"index\":" + std::to_string(i);
+    json += ",\"name\":\"" + json_escape(a.name) + "\"";
+    json += ",\"description\":\"" + json_escape(a.description) + "\"";
+    json += ",\"mimeType\":\"" + json_escape(a.mime_type) + "\"";
+    json += ",\"size\":" + std::to_string(a.success ? a.data.size() : a.size);
+    json += ",\"creationDate\":\"" + json_escape(a.creation_date) + "\"";
+    json += ",\"modDate\":\"" + json_escape(a.modification_date) + "\"";
+    json += ",\"relationship\":\"" + json_escape(a.relationship) + "\"}";
+  }
+  json += "],\"count\":" + std::to_string(n) + "}";
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Extract one attachment's bytes into a buffer retrievable via the getters.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_attachment_extract(int index) {
+  g_attachment_buffer.clear();
+  if (!g_pdf) {
+    g_last_error = "No PDF loaded";
+    return 0;
+  }
+  nanopdf::AttachmentExtractor ex(*g_pdf);
+  nanopdf::FileAttachment a = ex.get_attachment(index);
+  if (!a.success) {
+    g_last_error = a.error.empty() ? "Failed to extract attachment" : a.error;
+    return 0;
+  }
+  g_attachment_buffer = std::move(a.data);
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_attachment_get_buffer() {
+  return g_attachment_buffer.empty() ? nullptr : g_attachment_buffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_attachment_get_size() {
+  return g_attachment_buffer.size();
 }
 
 // ============================================================

@@ -33,6 +33,11 @@ CertInfo parse_certificate(const Bytes& cert_der);
 // Decode every "-----BEGIN CERTIFICATE-----" block in @pem to DER (in order).
 std::vector<Bytes> pem_to_certs(const std::string& pem);
 
+// Extract the embedded certificates (DER) from a CMS/PKCS#7 SignedData, in the
+// order they appear in the [0] certificates field (signer first for documents
+// nanopdf produces). Empty if none / parse failure.
+std::vector<Bytes> extract_certificates(const Bytes& cms_der);
+
 // Extract the RSA public key from an X.509 certificate's SubjectPublicKeyInfo.
 crypto::RsaPublicKey extract_rsa_public_key(const Bytes& cert_der);
 

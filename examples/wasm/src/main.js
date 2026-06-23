@@ -35,6 +35,29 @@ let activeSidebarTab = 'outline';
 let zoomLevel = 1.0;
 let rotation = 0; // 0, 90, 180, 270
 let fitMode = 'width'; // 'width' or 'page'
+
+// Persisted view preferences (zoom, fit mode, backend) + per-file last page.
+const VIEW_STATE_KEY = 'nanopdf-view-state';
+function loadViewState() {
+  try { return JSON.parse(localStorage.getItem(VIEW_STATE_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+}
+function saveViewState() {
+  try {
+    const s = loadViewState();
+    s.zoom = zoomLevel;
+    s.fitMode = fitMode;
+    s.backend = renderBackend;
+    if (fileName) {
+      s.pages = s.pages || {};
+      s.pages[fileName] = currentPage;
+      // Bound the per-file page map so it can't grow without limit.
+      const keys = Object.keys(s.pages);
+      if (keys.length > 50) delete s.pages[keys[0]];
+    }
+    localStorage.setItem(VIEW_STATE_KEY, JSON.stringify(s));
+  } catch (e) { /* storage disabled/full: ignore */ }
+}
 // CSS-pixel display size of the page canvas (the bitmap is this * devicePixelRatio).
 // Overlay/coordinate math uses these, NOT canvas.width/height (which are device px).
 let pageDisplayWidth = 0;
@@ -60,6 +83,7 @@ let selectedAnnotId = null;
 let annotIdCounter = 1;
 let annotDraft = null;           // in-progress drawing
 let annotDragState = null;       // moving an existing annotation in select mode
+let pendingStampImage = null;    // { imageId, dataURL, aspect } awaiting placement
 // formFields[pageIndex] = [{name, type, value, rect:{x,y,width,height}, multiline, ...}]
 let formFieldsByPage = {};
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -75,6 +99,11 @@ const dropOverlay = document.getElementById('drop-overlay');
 const pdfInput = document.getElementById('pdf-input');
 const openPdfBtn = document.getElementById('open-pdf-btn');
 const openUrlBtn = document.getElementById('open-url-btn');
+const combineBtn = document.getElementById('combine-btn');
+const combineInput = document.getElementById('combine-input');
+const extractPagesBtn = document.getElementById('extract-pages-btn');
+const organizeBtn = document.getElementById('organize-btn');
+const signBtn = document.getElementById('sign-btn');
 const renderBtn = document.getElementById('render-btn');
 const extractBtn = document.getElementById('extract-btn');
 const backendToggleBtn = document.getElementById('backend-toggle-btn');
@@ -116,6 +145,10 @@ const annotColor = document.getElementById('annot-color');
 const annotFill = document.getElementById('annot-fill');
 const annotDeleteBtn = document.getElementById('annot-delete');
 const saveAnnotBtn = document.getElementById('save-annot-btn');
+const saveEditableBtn = document.getElementById('save-editable-btn');
+const saveFormBtn = document.getElementById('save-form-btn');
+const markupPopover = document.getElementById('markup-popover');
+const stampInput = document.getElementById('stamp-input');
 
 function setStatus(msg, isError = false) {
   statusText.textContent = msg;
@@ -212,6 +245,7 @@ function switchRenderBackend() {
   if (activeSidebarTab === 'info') renderInfoTab();
   if (activeSidebarTab === 'thumbs') updateSidebar();
   if (totalPages > 0) renderCurrentPage();
+  saveViewState();
 }
 
 // ---- Sidebar ----
@@ -346,7 +380,10 @@ function renderSignaturesTab() {
     html += `<section class="signature-card" data-signature-index="${index}">`;
     html += '<div class="signature-card-header">';
     html += `<div><div class="signature-name">${escapeHtml(name)}</div><div class="signature-status${statusClass}">${escapeHtml(status)}</div></div>`;
+    html += `<div style="display:flex;gap:6px;">`;
     html += `<button type="button" class="validate-signature-btn" data-signature-index="${index}" ${sig.signaturePresent ? '' : 'disabled'}>Validate</button>`;
+    html += `<button type="button" class="trust-signature-btn" data-signature-index="${index}" title="Check the signer chain against a CA bundle (PEM)" ${sig.signaturePresent ? '' : 'disabled'}>Check trust…</button>`;
+    html += `</div>`;
     html += '</div>';
     html += '<div class="signature-details">';
     html += renderSignatureDetail('Type', sig.isCertification ? 'Certification (DocMDP)' : 'Approval');
@@ -372,6 +409,7 @@ function renderSignaturesTab() {
     }
     html += '</div>';
     html += `<div class="signature-validation" id="signature-validation-${index}"></div>`;
+    html += `<div class="signature-validation" id="signature-trust-${index}"></div>`;
     html += '</section>';
   });
   html += '</div>';
@@ -379,6 +417,9 @@ function renderSignaturesTab() {
   sidebarContent.innerHTML = html;
   sidebarContent.querySelectorAll('.validate-signature-btn').forEach(btn => {
     btn.addEventListener('click', () => validateSignature(parseInt(btn.dataset.signatureIndex, 10)));
+  });
+  sidebarContent.querySelectorAll('.trust-signature-btn').forEach(btn => {
+    btn.addEventListener('click', () => checkSignatureTrust(parseInt(btn.dataset.signatureIndex, 10)));
   });
 }
 
@@ -467,8 +508,10 @@ const diffState = {
   revIndex: 0,
   page: 0,
   pageCount: 0,
-  mode: 'diff',          // 'diff' | 'before' | 'after' | 'swipe'
+  mode: 'diff',          // 'diff' | 'before' | 'after' | 'swipe' | 'side' | 'text'
   swipe: 0.5,
+  threshold: 28,         // luma diff sensitivity (higher = ignore more AA noise)
+  showBoxes: true,       // draw change-region bounding boxes in diff mode
   before: null,          // { data, w, h } or null (page absent in prev revision)
   after: null,
   byteAfter: 0,
@@ -519,6 +562,28 @@ function composeDiffImage(ctx) {
     return out;
   }
 
+  if (diffState.mode === 'side') {
+    // Before | After in two synchronized panes (one image => scroll/zoom synced).
+    const gap = 14;
+    const W = w * 2 + gap;
+    const out2 = ctx.createImageData(W, h);
+    const o2 = out2.data;
+    o2.fill(255);
+    for (let i = 3; i < o2.length; i += 4) o2[i] = 255;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const si = (y * w + x) * 4;
+        if (A) {
+          const dl = (y * W + x) * 4;
+          o2[dl] = A[si]; o2[dl + 1] = A[si + 1]; o2[dl + 2] = A[si + 2]; o2[dl + 3] = 255;
+        }
+        const dr = (y * W + (w + gap) + x) * 4;
+        o2[dr] = B[si]; o2[dr + 1] = B[si + 1]; o2[dr + 2] = B[si + 2]; o2[dr + 3] = 255;
+      }
+    }
+    return out2;
+  }
+
   if (diffState.mode === 'swipe') {
     const splitX = Math.round(w * diffState.swipe);
     for (let y = 0; y < h; y++) {
@@ -537,7 +602,7 @@ function composeDiffImage(ctx) {
   }
 
   // 'diff' mode — signed luminance difference.
-  const T = 28;          // ignore sub-threshold AA noise
+  const T = diffState.threshold;   // luma threshold: ignore sub-threshold AA noise
   for (let i = 0; i < B.length; i += 4) {
     const bL = lum(B, i);
     const aL = A ? lum(A, i) : 255;  // no prior page => everything is "added"
@@ -571,16 +636,21 @@ function ensureDiffOverlay() {
         <div class="rev-diff-title" id="rev-diff-title">Revision changes</div>
         <div class="rev-diff-modes">
           <button data-mode="diff" class="active">Diff</button>
+          <button data-mode="side">Side-by-side</button>
           <button data-mode="before">Before</button>
           <button data-mode="after">After</button>
           <button data-mode="swipe">Swipe</button>
+          <button data-mode="text">Text</button>
         </div>
         <button class="rev-diff-close" id="rev-diff-close" title="Close">&times;</button>
       </div>
+      <div class="rev-diff-changeinfo" id="rev-diff-changeinfo"></div>
       <div class="rev-diff-body">
         <canvas id="rev-diff-canvas"></canvas>
+        <div class="rev-diff-text hidden" id="rev-diff-text"></div>
         <div class="rev-diff-empty hidden" id="rev-diff-empty"></div>
       </div>
+      <div class="rev-diff-strip" id="rev-diff-strip"></div>
       <div class="rev-diff-footer">
         <div class="rev-diff-pagenav">
           <button id="rev-diff-prev" title="Previous page">&larr;</button>
@@ -588,6 +658,13 @@ function ensureDiffOverlay() {
           <button id="rev-diff-next" title="Next page">&rarr;</button>
         </div>
         <input type="range" id="rev-diff-swipe" min="0" max="100" value="50" class="hidden" />
+        <label class="rev-diff-sens" id="rev-diff-sens" title="Diff threshold: lower catches faint changes, higher ignores anti-aliasing noise">
+          Threshold <span id="rev-diff-sens-val">28</span>
+          <input type="range" id="rev-diff-sens-range" min="5" max="80" value="28" />
+        </label>
+        <label class="rev-diff-boxes" id="rev-diff-boxes-label" title="Outline changed regions">
+          <input type="checkbox" id="rev-diff-boxes" checked /> Boxes
+        </label>
         <div class="rev-diff-legend">
           <span><i class="swatch added"></i>Added</span>
           <span><i class="swatch removed"></i>Removed</span>
@@ -605,13 +682,27 @@ function ensureDiffOverlay() {
       el.querySelectorAll('.rev-diff-modes button').forEach(x => x.classList.toggle('active', x === b));
       el.querySelector('#rev-diff-swipe').classList.toggle('hidden', diffState.mode !== 'swipe');
       el.querySelector('.rev-diff-legend').classList.toggle('hidden', diffState.mode !== 'diff');
+      el.querySelector('#rev-diff-sens').classList.toggle('hidden', diffState.mode !== 'diff');
+      el.querySelector('#rev-diff-boxes-label').classList.toggle('hidden', diffState.mode !== 'diff');
       paintDiffCanvas();
     });
+  });
+  el.querySelector('#rev-diff-boxes').addEventListener('change', (e) => {
+    diffState.showBoxes = e.target.checked;
+    paintDiffCanvas();
   });
   el.querySelector('#rev-diff-prev').addEventListener('click', () => stepDiffPage(-1));
   el.querySelector('#rev-diff-next').addEventListener('click', () => stepDiffPage(1));
   el.querySelector('#rev-diff-swipe').addEventListener('input', (e) => {
     diffState.swipe = e.target.value / 100;
+    paintDiffCanvas();
+  });
+  el.querySelector('#rev-diff-sens-range').addEventListener('input', (e) => {
+    diffState.threshold = parseInt(e.target.value, 10) || 28;
+    el.querySelector('#rev-diff-sens-val').textContent = diffState.threshold;
+    // The threshold changes which pages count as changed -> recompute the strip
+    // (keeping the current page), then repaint.
+    rescanChangedPages();
     paintDiffCanvas();
   });
   return el;
@@ -642,17 +733,160 @@ function diffPageChanged() {
   const a = A.data, b = B.data;
   let changed = 0;
   for (let i = 0; i < b.length; i += 4) {
-    if (Math.abs(lum(a, i) - lum(b, i)) > 28) {
+    if (Math.abs(lum(a, i) - lum(b, i)) > diffState.threshold) {
       if (++changed > 40) return true;
     }
   }
   return false;
 }
 
+// Word-level diff between two strings -> array of {t:'same'|'add'|'del', w:word}.
+// Classic LCS over whitespace-split tokens (page text is short enough for O(n*m)).
+function wordDiff(beforeText, afterText) {
+  const a = beforeText.split(/\s+/).filter(Boolean);
+  const b = afterText.split(/\s+/).filter(Boolean);
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { out.push({ t: 'same', w: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ t: 'del', w: a[i] }); i++; }
+    else { out.push({ t: 'add', w: b[j] }); j++; }
+  }
+  while (i < n) out.push({ t: 'del', w: a[i++] });
+  while (j < m) out.push({ t: 'add', w: b[j++] });
+  return out;
+}
+
+// Render the word-level text diff for the current diff page into #rev-diff-text.
+function renderTextDiff() {
+  const host = document.getElementById('rev-diff-text');
+  if (!host) return;
+  if (!Module._nanopdf_extract_revision_text) {
+    host.innerHTML = '<div class="rev-diff-textmsg">Text diff unavailable in this build.</div>';
+    return;
+  }
+  const before = Module.UTF8ToString(Module._nanopdf_extract_revision_text(diffState.byteBefore, diffState.page));
+  const after = Module.UTF8ToString(Module._nanopdf_extract_revision_text(diffState.byteAfter, diffState.page));
+  const parts = wordDiff(before, after);
+  const added = parts.filter(p => p.t === 'add').length;
+  const removed = parts.filter(p => p.t === 'del').length;
+  if (added === 0 && removed === 0) {
+    host.innerHTML = `<div class="rev-diff-textmsg">No text changes on this page${after.trim() ? '' : ' (no extractable text)'}.</div>`;
+    return;
+  }
+  let html = `<div class="rev-diff-textmsg">+${added} word${added === 1 ? '' : 's'} added, −${removed} removed</div><div class="rev-diff-textbody">`;
+  for (const p of parts) {
+    const w = escapeHtml(p.w);
+    if (p.t === 'same') html += w + ' ';
+    else if (p.t === 'add') html += `<span class="td-add">${w}</span> `;
+    else html += `<span class="td-del">${w}</span> `;
+  }
+  host.innerHTML = html + '</div>';
+}
+
+// Recompute which pages differ at the current threshold (capped for big docs),
+// preserving the current page. Returns the first changed page index, or -1.
+function rescanChangedPages() {
+  const savedPage = diffState.page;
+  const scanLimit = diffState.pageCount <= 60 ? diffState.pageCount : 0;
+  diffState.changed = new Set();
+  diffState.changedComputed = scanLimit > 0;
+  let first = -1;
+  for (let p = 0; p < scanLimit; p++) {
+    diffState.page = p;
+    loadDiffPage();
+    if (diffPageChanged()) { diffState.changed.add(p); if (first < 0) first = p; }
+  }
+  diffState.page = savedPage;
+  loadDiffPage();
+  renderDiffStrip();
+  return first;
+}
+
+// Cluster changed pixels into bounding boxes. Uses a coarse cell grid + 8-conn
+// connected components so a paragraph of changes becomes one box rather than
+// thousands of speckles. Each region is classified added (darker now) or
+// removed (lighter now) by its dominant pixel kind.
+function computeChangeRegions(before, after, threshold) {
+  if (!after) return [];
+  const w = after.w, h = after.h, bd = after.data;
+  const A = before && before.w === w && before.h === h ? before.data : null;
+  const cell = 8;
+  const cols = Math.ceil(w / cell), rows = Math.ceil(h / cell);
+  const addCnt = new Int32Array(cols * rows);
+  const delCnt = new Int32Array(cols * rows);
+  for (let y = 0; y < h; y++) {
+    const row = (y / cell | 0) * cols;
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const d = (A ? lum(A, i) : 255) - lum(bd, i);  // >0 added ink, <0 removed
+      if (d > threshold) addCnt[row + (x / cell | 0)]++;
+      else if (d < -threshold) delCnt[row + (x / cell | 0)]++;
+    }
+  }
+  const minPix = Math.max(3, (cell * cell * 0.06) | 0);
+  const kind = new Int8Array(cols * rows);   // 0 none, 1 add, 2 del
+  for (let c = 0; c < kind.length; c++) {
+    if (addCnt[c] + delCnt[c] >= minPix) kind[c] = addCnt[c] >= delCnt[c] ? 1 : 2;
+  }
+  const comp = new Int32Array(cols * rows).fill(-1);
+  const regions = [];
+  const stack = [];
+  for (let c0 = 0; c0 < kind.length; c0++) {
+    if (!kind[c0] || comp[c0] !== -1) continue;
+    const id = regions.length;
+    let minx = cols, miny = rows, maxx = 0, maxy = 0, addS = 0, delS = 0, cells = 0;
+    stack.push(c0); comp[c0] = id;
+    while (stack.length) {
+      const c = stack.pop();
+      const cx = c % cols, cy = (c / cols) | 0;
+      if (cx < minx) minx = cx; if (cy < miny) miny = cy;
+      if (cx > maxx) maxx = cx; if (cy > maxy) maxy = cy;
+      addS += addCnt[c]; delS += delCnt[c]; cells++;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        const nc = ny * cols + nx;
+        if (kind[nc] && comp[nc] === -1) { comp[nc] = id; stack.push(nc); }
+      }
+    }
+    if (cells < 2) continue;  // drop tiny specks
+    regions.push({
+      x: minx * cell, y: miny * cell,
+      w: Math.min(w, (maxx + 1) * cell) - minx * cell,
+      h: Math.min(h, (maxy + 1) * cell) - miny * cell,
+      kind: addS >= delS ? 'add' : 'del',
+    });
+  }
+  return regions;
+}
+
 function paintDiffCanvas() {
   const overlay = document.getElementById('rev-diff-overlay');
   const canvas = document.getElementById('rev-diff-canvas');
   const empty = document.getElementById('rev-diff-empty');
+  const textHost = document.getElementById('rev-diff-text');
+
+  // Text mode: word-level diff instead of the pixel canvas.
+  if (diffState.mode === 'text') {
+    canvas.classList.add('hidden');
+    empty.classList.add('hidden');
+    textHost.classList.remove('hidden');
+    renderTextDiff();
+    document.getElementById('rev-diff-pageinfo').textContent =
+      `Page ${diffState.page + 1} / ${diffState.pageCount}`;
+    overlay.querySelector('#rev-diff-prev').disabled = diffState.page <= 0;
+    overlay.querySelector('#rev-diff-next').disabled = diffState.page >= diffState.pageCount - 1;
+    return;
+  }
+  if (textHost) textHost.classList.add('hidden');
+
   const ctx = canvas.getContext('2d');
   const img = composeDiffImage(ctx);
   if (!img) {
@@ -669,10 +903,33 @@ function paintDiffCanvas() {
   if (noChange) empty.textContent = 'No visual changes on this page.';
   canvas.classList.toggle('dimmed', noChange);
   canvas.classList.remove('hidden');
+
+  // Overlay change-region bounding boxes (Diff mode only).
+  let regionCount = null;
+  if (diffState.mode === 'diff' && diffState.showBoxes !== false && !noChange) {
+    const regions = computeChangeRegions(diffState.before, diffState.after, diffState.threshold);
+    regionCount = regions.length;
+    ctx.lineWidth = 2;
+    ctx.font = '11px sans-serif';
+    for (const r of regions) {
+      ctx.strokeStyle = r.kind === 'add' ? 'rgba(16,162,72,0.95)' : 'rgba(200,40,40,0.95)';
+      ctx.strokeRect(r.x + 0.5, r.y + 0.5, Math.max(2, r.w), Math.max(2, r.h));
+    }
+  }
+  const changedCount = diffState.changedComputed ? diffState.changed.size : null;
   document.getElementById('rev-diff-pageinfo').textContent =
-    `Page ${diffState.page + 1} / ${diffState.pageCount}`;
+    `Page ${diffState.page + 1} / ${diffState.pageCount}` +
+    (changedCount != null ? ` — ${changedCount} changed` : '') +
+    (regionCount != null ? ` — ${regionCount} region${regionCount === 1 ? '' : 's'}` : '');
   overlay.querySelector('#rev-diff-prev').disabled = diffState.page <= 0;
   overlay.querySelector('#rev-diff-next').disabled = diffState.page >= diffState.pageCount - 1;
+  // Keep the strip's "current" highlight in sync.
+  const strip = document.getElementById('rev-diff-strip');
+  if (strip) {
+    strip.querySelectorAll('.rev-diff-chip').forEach((c, i) => {
+      c.classList.toggle('current', i === diffState.page);
+    });
+  }
 }
 
 function stepDiffPage(delta) {
@@ -700,23 +957,78 @@ function openRevisionDiff(revIndex) {
   overlay.querySelectorAll('.rev-diff-modes button').forEach(x => x.classList.toggle('active', x.dataset.mode === 'diff'));
   overlay.querySelector('#rev-diff-swipe').classList.add('hidden');
   overlay.querySelector('.rev-diff-legend').classList.remove('hidden');
+  overlay.querySelector('#rev-diff-sens').classList.remove('hidden');
+  overlay.querySelector('#rev-diff-boxes-label').classList.remove('hidden');
   const signer = rev.signerName || rev.associatedSignature;
   overlay.querySelector('#rev-diff-title').textContent =
     `Revision ${rev.revision} changes` + (signer ? ` — signed by ${signer}` : '');
   overlay.classList.remove('hidden');
   diffState.open = true;
+  renderDiffChangeInfo(rev);
 
-  // Jump to the first page that actually changed (cap the scan for big docs).
-  diffState.page = Math.min(currentPage, diffState.pageCount - 1);
-  const scanLimit = diffState.pageCount <= 30 ? diffState.pageCount : 0;
-  let landed = false;
-  for (let p = 0; p < scanLimit; p++) {
-    diffState.page = p;
-    loadDiffPage();
-    if (diffPageChanged()) { landed = true; break; }
-  }
-  if (!landed) { diffState.page = Math.min(currentPage, diffState.pageCount - 1); loadDiffPage(); }
+  // Precompute which pages changed (cap the scan for very large docs), and
+  // land on the first changed page.
+  const first = rescanChangedPages();
+  diffState.page = first >= 0 ? first : Math.min(currentPage, diffState.pageCount - 1);
+  loadDiffPage();
+  renderDiffStrip();
   paintDiffCanvas();
+}
+
+// Structural-change summary + DocMDP/tamper banner for the diff overlay.
+function renderDiffChangeInfo(rev) {
+  const el = document.getElementById('rev-diff-changeinfo');
+  if (!el) return;
+  const added = (rev.addedObjects || []).length;
+  const modified = (rev.modifiedObjects || []).length;
+  const deleted = (rev.deletedObjects || []).length;
+  const parts = [];
+  if (added) parts.push(`<span class="chg add">+${added} added</span>`);
+  if (modified) parts.push(`<span class="chg mod">~${modified} changed</span>`);
+  if (deleted) parts.push(`<span class="chg del">-${deleted} removed</span>`);
+  const objLine = parts.length
+    ? `<span class="chg-objs">Objects: ${parts.join(' ')}</span>`
+    : '';
+
+  let banner = '';
+  const violations = rev.docMDPViolations || [];
+  if (rev.hasDocMDP && rev.docMDPStatus === 'disallowed') {
+    banner = `<span class="chg-banner danger">⚠ Changes after signature are DISALLOWED by DocMDP` +
+      (violations.length ? `: ${violations[0]}` : '') + `</span>`;
+  } else if (rev.modifiedAfterSignature) {
+    banner = `<span class="chg-banner warn">Modified after signing` +
+      (rev.hasDocMDP ? ' (allowed by DocMDP)' : '') + `</span>`;
+  }
+
+  el.innerHTML = banner + objLine;
+  el.classList.toggle('hidden', !banner && !objLine);
+}
+
+// Footer strip of page chips; changed pages highlighted, click to jump.
+function renderDiffStrip() {
+  const strip = document.getElementById('rev-diff-strip');
+  if (!strip) return;
+  strip.innerHTML = '';
+  if (!diffState.changedComputed || diffState.pageCount <= 1) {
+    strip.classList.add('hidden');
+    return;
+  }
+  strip.classList.remove('hidden');
+  for (let p = 0; p < diffState.pageCount; p++) {
+    const chip = document.createElement('button');
+    chip.className = 'rev-diff-chip';
+    if (diffState.changed.has(p)) chip.classList.add('changed');
+    if (p === diffState.page) chip.classList.add('current');
+    chip.textContent = String(p + 1);
+    chip.title = `Page ${p + 1}${diffState.changed.has(p) ? ' (changed)' : ''}`;
+    chip.addEventListener('click', () => {
+      diffState.page = p;
+      loadDiffPage();
+      renderDiffStrip();
+      paintDiffCanvas();
+    });
+    strip.appendChild(chip);
+  }
 }
 
 function closeRevisionDiff() {
@@ -724,6 +1036,503 @@ function closeRevisionDiff() {
   if (overlay) overlay.classList.add('hidden');
   diffState.open = false;
   diffState.before = diffState.after = null;
+}
+
+// ---- Print ----
+
+let printing = false;
+
+// Render every page to an image and print via the browser. A print stylesheet
+// shows only the #print-container (one image per page, each on its own sheet);
+// the container is removed when printing finishes.
+async function printDocument() {
+  if (!Module || totalPages <= 0 || !hasRendering || printing) return;
+  printing = true;
+  const printBtn = document.getElementById('print-btn');
+  if (printBtn) { printBtn.disabled = true; printBtn.textContent = 'Rendering…'; }
+
+  // Tear down any stale container, then build a fresh one.
+  const old = document.getElementById('print-container');
+  if (old) old.remove();
+  const container = document.createElement('div');
+  container.id = 'print-container';
+
+  const tmp = document.createElement('canvas');
+  try {
+    for (let p = 0; p < totalPages; p++) {
+      const pw = Module._nanopdf_get_page_width(p) || 612;
+      // ~150 DPI for crisp print output, bounded so huge pages stay reasonable.
+      const maxW = Math.min(2200, Math.round(pw * (150 / 72)));
+      if (!renderPageToCanvas(p, tmp, maxW)) continue;
+      const img = document.createElement('img');
+      img.src = tmp.toDataURL('image/png');
+      img.className = 'print-page';
+      container.appendChild(img);
+      if (printBtn) printBtn.textContent = `Rendering… ${p + 1}/${totalPages}`;
+      // Yield so the progress text paints and the UI doesn't lock up.
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    if (!container.childElementCount) { setStatus('Nothing to print', true); return; }
+    document.body.appendChild(container);
+
+    const cleanup = () => {
+      const c = document.getElementById('print-container');
+      if (c) c.remove();
+      window.removeEventListener('afterprint', cleanup);
+    };
+    window.addEventListener('afterprint', cleanup);
+    // Re-render the on-screen page (the shared render buffer was reused above).
+    renderCurrentPage();
+    window.print();
+    // Fallback cleanup for browsers that don't fire afterprint reliably.
+    setTimeout(cleanup, 60000);
+  } finally {
+    printing = false;
+    if (printBtn) { printBtn.disabled = false; printBtn.textContent = 'Print'; }
+  }
+}
+
+// ---- Keyboard shortcut help overlay ----
+
+function ensureShortcutHelp() {
+  let el = document.getElementById('shortcut-help-overlay');
+  if (el) return el;
+  const mod = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
+  const rows = [
+    ['←  /  →', 'Previous / next page'],
+    ['Home  /  End', 'First / last page'],
+    [`${mod} F`, 'Focus search'],
+    [`${mod} +  /  ${mod} −`, 'Zoom in / out'],
+    [`${mod} 0`, 'Reset zoom'],
+    ['R', 'Rotate page'],
+    ['P', 'Print'],
+    ['V', 'Select / move tool'],
+    ['Delete', 'Delete selected annotation'],
+    ['Esc', 'Deselect / close overlay'],
+    ['?', 'Show / hide this help'],
+  ];
+  const diffRows = [
+    ['←  /  →', 'Previous / next page (in diff)'],
+    ['Esc', 'Close diff'],
+  ];
+  const rowHtml = (list) => list.map(([k, d]) =>
+    `<div class="kbd-row"><kbd>${escapeHtml(k)}</kbd><span>${escapeHtml(d)}</span></div>`).join('');
+  el = document.createElement('div');
+  el.id = 'shortcut-help-overlay';
+  el.className = 'shortcut-help-overlay hidden';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-label', 'Keyboard shortcuts');
+  el.innerHTML = `
+    <div class="shortcut-help-panel">
+      <div class="shortcut-help-header">
+        <span>Keyboard shortcuts</span>
+        <button id="shortcut-help-close" title="Close (Esc)" aria-label="Close">&times;</button>
+      </div>
+      <div class="shortcut-help-body">
+        <div class="kbd-group">${rowHtml(rows)}</div>
+        <div class="kbd-grouptitle">Revision diff</div>
+        <div class="kbd-group">${rowHtml(diffRows)}</div>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  el.querySelector('#shortcut-help-close').addEventListener('click', hideShortcutHelp);
+  el.addEventListener('click', (e) => { if (e.target === el) hideShortcutHelp(); });
+  return el;
+}
+
+function toggleShortcutHelp() {
+  const el = ensureShortcutHelp();
+  el.classList.toggle('hidden');
+}
+function hideShortcutHelp() {
+  const el = document.getElementById('shortcut-help-overlay');
+  if (el) el.classList.add('hidden');
+}
+function shortcutHelpOpen() {
+  const el = document.getElementById('shortcut-help-overlay');
+  return el && !el.classList.contains('hidden');
+}
+
+// ---- Digital signing (PKCS#12, in-browser, OpenSSL-free) ----
+
+let signP12Bytes = null;   // Uint8Array of the uploaded .p12/.pfx
+
+function ensureSignOverlay() {
+  let el = document.getElementById('sign-overlay');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'sign-overlay';
+  el.className = 'organize-overlay hidden';
+  el.innerHTML = `
+    <div class="organize-panel" style="width:460px;max-width:92vw;">
+      <div class="organize-header">
+        <div class="organize-title">Sign PDF</div>
+        <button id="sign-cancel">Cancel</button>
+      </div>
+      <div style="padding:18px 20px;display:flex;flex-direction:column;gap:12px;">
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Certificate (.p12 / .pfx)
+          <input type="file" id="sign-p12" accept=".p12,.pfx,application/x-pkcs12" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Certificate password
+          <input type="password" id="sign-pass" placeholder="PKCS#12 password" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Reason (optional)
+          <input type="text" id="sign-reason" placeholder="e.g. I approve this document" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Location (optional)
+          <input type="text" id="sign-location" placeholder="e.g. Tokyo, JP" />
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#444;">
+          <input type="checkbox" id="sign-visible" checked />
+          Visible signature on current page (bottom-left)
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#444;">
+          <input type="checkbox" id="sign-tsa" />
+          Add trusted timestamp (RFC 3161 / PAdES-T)
+        </label>
+        <label id="sign-tsa-url-row" style="display:none;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Timestamp authority URL
+          <input type="text" id="sign-tsa-url" value="https://freetsa.org/tsr" />
+          <span style="font-size:11px;color:#999;">The TSA must allow browser (CORS) requests; many don't. If it fails, signing falls back to no timestamp.</span>
+        </label>
+        <div id="sign-status" style="font-size:13px;color:#666;min-height:18px;"></div>
+      </div>
+      <div class="organize-footer">
+        <button class="primary" id="sign-go">Sign &amp; download</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  el.querySelector('#sign-cancel').addEventListener('click', closeSign);
+  el.addEventListener('click', (e) => { if (e.target === el) closeSign(); });
+  el.querySelector('#sign-p12').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) { signP12Bytes = null; return; }
+    signP12Bytes = new Uint8Array(await f.arrayBuffer());
+    setSignStatus(`Loaded ${f.name} (${signP12Bytes.length} bytes)`, '#2a7');
+  });
+  el.querySelector('#sign-go').addEventListener('click', doSign);
+  el.querySelector('#sign-tsa').addEventListener('change', (e) => {
+    el.querySelector('#sign-tsa-url-row').style.display = e.target.checked ? 'flex' : 'none';
+  });
+  return el;
+}
+
+function setSignStatus(msg, color) {
+  const s = document.getElementById('sign-status');
+  if (s) { s.textContent = msg; s.style.color = color || '#666'; }
+}
+
+function openSign() {
+  if (!Module || !Module._nanopdf_sign_pdf || !currentPdfBytes) return;
+  signP12Bytes = null;
+  const el = ensureSignOverlay();
+  el.querySelector('#sign-p12').value = '';
+  el.querySelector('#sign-pass').value = '';
+  setSignStatus('');
+  el.classList.remove('hidden');
+}
+
+function closeSign() {
+  const el = document.getElementById('sign-overlay');
+  if (el) el.classList.add('hidden');
+}
+
+function finishSign(suffix) {
+  const outPtr = Module._nanopdf_sign_get_buffer();
+  const outLen = Module._nanopdf_sign_get_size();
+  const signed = new Uint8Array(Module.HEAPU8.buffer, outPtr, outLen).slice();
+  const baseName = fileName.replace(/\.pdf$/i, '');
+  downloadNamedPdf(signed, `${baseName}_${suffix}.pdf`);
+  return outLen;
+}
+
+async function doSign() {
+  if (!signP12Bytes) { setSignStatus('Choose a .p12/.pfx certificate first.', '#c33'); return; }
+  const pass = document.getElementById('sign-pass').value || '';
+  const reason = document.getElementById('sign-reason').value || '';
+  const location = document.getElementById('sign-location').value || '';
+  const visible = document.getElementById('sign-visible').checked ? 1 : 0;
+  const wantTsa = document.getElementById('sign-tsa').checked;
+  const tsaUrl = (document.getElementById('sign-tsa-url').value || '').trim();
+  setSignStatus('Signing…');
+
+  // Signature rectangle: bottom-left of the current page (page points).
+  const x = 36, y = 36, w = 200, h = 48;
+
+  let pdfPtr = 0, p12Ptr = 0, passPtr = 0, reasonPtr = 0, locPtr = 0, contactPtr = 0;
+  const freeAll = () => {
+    if (pdfPtr) Module._nanopdf_free(pdfPtr);
+    if (p12Ptr) Module._nanopdf_free(p12Ptr);
+    if (passPtr) Module._free(passPtr);
+    if (reasonPtr) Module._free(reasonPtr);
+    if (locPtr) Module._free(locPtr);
+    if (contactPtr) Module._free(contactPtr);
+    pdfPtr = p12Ptr = passPtr = reasonPtr = locPtr = contactPtr = 0;
+  };
+  const lastErr = () => Module.UTF8ToString(Module._nanopdf_get_last_error());
+
+  try {
+    pdfPtr = Module._nanopdf_malloc(currentPdfBytes.length);
+    Module.HEAPU8.set(currentPdfBytes, pdfPtr);
+    p12Ptr = Module._nanopdf_malloc(signP12Bytes.length);
+    Module.HEAPU8.set(signP12Bytes, p12Ptr);
+    passPtr = Module.stringToNewUTF8(pass);
+    reasonPtr = Module.stringToNewUTF8(reason);
+    locPtr = Module.stringToNewUTF8(location);
+    contactPtr = Module.stringToNewUTF8('');
+
+    if (wantTsa && tsaUrl && Module._nanopdf_sign_prepare) {
+      // Phase A: build the deterministic signature + RFC 3161 request.
+      const nLo = (Math.random() * 0xffffffff) >>> 0;
+      const nHi = (Math.random() * 0xffffffff) >>> 0;
+      const okPrep = Module._nanopdf_sign_prepare(
+        pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
+        reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible, nLo, nHi);
+      if (!okPrep) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
+
+      const reqPtr = Module._nanopdf_sign_tsreq_buffer();
+      const reqLen = Module._nanopdf_sign_tsreq_size();
+      const tsReq = new Uint8Array(Module.HEAPU8.buffer, reqPtr, reqLen).slice();
+
+      setSignStatus('Requesting timestamp from TSA…');
+      let respBytes = null;
+      try {
+        const resp = await fetch(tsaUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/timestamp-query' },
+          body: tsReq,
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        respBytes = new Uint8Array(await resp.arrayBuffer());
+      } catch (netErr) {
+        // CORS / network failure: fall back to a non-timestamped signature.
+        setSignStatus('TSA unreachable (' + netErr.message + '); signing without timestamp…', '#c80');
+        const okPlain = Module._nanopdf_sign_pdf(
+          pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
+          reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible);
+        if (!okPlain) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
+        const n = finishSign('signed');
+        setSignStatus(`Signed without timestamp (${n} bytes). Downloaded.`, '#c80');
+        setTimeout(closeSign, 1400);
+        return;
+      }
+
+      // Phase B: embed the TSA token.
+      const respPtr = Module._nanopdf_malloc(respBytes.length);
+      Module.HEAPU8.set(respBytes, respPtr);
+      const okFin = Module._nanopdf_sign_finalize(respPtr, respBytes.length);
+      Module._nanopdf_free(respPtr);
+      if (!okFin) { setSignStatus('Timestamp failed: ' + lastErr(), '#c33'); return; }
+      const n = finishSign('signed_ts');
+      setSignStatus(`Signed + timestamped (${n} bytes). Downloaded.`, '#2a7');
+      setTimeout(closeSign, 900);
+      return;
+    }
+
+    // No timestamp: one-shot signing.
+    const ok = Module._nanopdf_sign_pdf(
+      pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
+      reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible);
+    if (!ok) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
+    const n = finishSign('signed');
+    setSignStatus(`Signed (${n} bytes). Downloaded.`, '#2a7');
+    setTimeout(closeSign, 900);
+  } catch (e) {
+    setSignStatus('Sign error: ' + e, '#c33');
+  } finally {
+    freeAll();
+  }
+}
+
+// ---- Page organizer (reorder / rotate / delete) ----
+
+// organizeModel: ordered array of { src: originalPageIndex, rot: 0|90|180|270 }
+let organizeModel = [];
+let organizeThumbCache = {};
+let organizeDragIndex = -1;
+
+function renderPageToCanvas(pageIdx, canvas, maxW) {
+  const pw = Module._nanopdf_get_page_width(pageIdx) || 612;
+  const ph = Module._nanopdf_get_page_height(pageIdx) || 792;
+  const scale = maxW / pw;
+  const w = Math.max(1, Math.round(pw * scale));
+  const h = Math.max(1, Math.round(ph * scale));
+  let ok = 0;
+  try { ok = Module._nanopdf_render_page(pageIdx, w, h, 72 * (w / pw)); } catch (e) { return false; }
+  if (ok !== 1) return false;
+  const ptr = Module._nanopdf_get_render_buffer();
+  const size = Module._nanopdf_get_render_buffer_size();
+  const rw = Module._nanopdf_get_render_width();
+  const rh = Module._nanopdf_get_render_height();
+  canvas.width = rw; canvas.height = rh;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(rw, rh);
+  img.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size));
+  ctx.putImageData(img, 0, 0);
+  return true;
+}
+
+function organizeThumb(src) {
+  if (organizeThumbCache[src]) return organizeThumbCache[src];
+  const c = document.createElement('canvas');
+  const url = renderPageToCanvas(src, c, 120) ? c.toDataURL('image/png') : '';
+  organizeThumbCache[src] = url;
+  return url;
+}
+
+function ensureOrganizeOverlay() {
+  let el = document.getElementById('organize-overlay');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'organize-overlay';
+  el.className = 'organize-overlay hidden';
+  el.innerHTML = `
+    <div class="organize-panel">
+      <div class="organize-header">
+        <div class="organize-title">Organize pages</div>
+        <button id="organize-reset">Reset</button>
+        <button id="organize-cancel">Cancel</button>
+      </div>
+      <div class="organize-grid" id="organize-grid"></div>
+      <div class="organize-footer">
+        <span id="organize-info" style="margin-right:auto;color:#666;font-size:13px;"></span>
+        <button class="primary" id="organize-save">Save reorganized PDF</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  el.querySelector('#organize-cancel').addEventListener('click', closeOrganize);
+  el.querySelector('#organize-reset').addEventListener('click', () => { openOrganize(); });
+  el.querySelector('#organize-save').addEventListener('click', saveOrganized);
+  el.addEventListener('click', (e) => { if (e.target === el) closeOrganize(); });
+  return el;
+}
+
+function openOrganize() {
+  if (!Module || totalPages <= 0 || !hasRendering) return;
+  organizeModel = [];
+  for (let i = 0; i < totalPages; i++) organizeModel.push({ src: i, rot: 0 });
+  organizeThumbCache = {};
+  const el = ensureOrganizeOverlay();
+  el.classList.remove('hidden');
+  renderOrganizeGrid();
+}
+
+function closeOrganize() {
+  const el = document.getElementById('organize-overlay');
+  if (el) el.classList.add('hidden');
+}
+
+function renderOrganizeGrid() {
+  const grid = document.getElementById('organize-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  organizeModel.forEach((entry, idx) => {
+    const card = document.createElement('div');
+    card.className = 'org-card';
+    card.draggable = true;
+    card.dataset.idx = idx;
+    const img = document.createElement('img');
+    img.src = organizeThumb(entry.src);
+    img.style.transform = entry.rot ? `rotate(${entry.rot}deg)` : '';
+    const label = document.createElement('div');
+    label.className = 'org-card-label';
+    label.textContent = `p.${entry.src + 1}`;
+    const actions = document.createElement('div');
+    actions.className = 'org-card-actions';
+    const mk = (txt, title, fn, cls) => {
+      const b = document.createElement('button');
+      b.textContent = txt; b.title = title; if (cls) b.className = cls;
+      b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+      return b;
+    };
+    actions.append(
+      mk('⟲', 'Rotate left', () => { entry.rot = ((entry.rot - 90) % 360 + 360) % 360; renderOrganizeGrid(); }),
+      mk('⟳', 'Rotate right', () => { entry.rot = (entry.rot + 90) % 360; renderOrganizeGrid(); }),
+      mk('🗑', 'Delete page', () => { organizeModel.splice(idx, 1); renderOrganizeGrid(); }, 'del'),
+    );
+    card.append(img, label, actions);
+
+    card.addEventListener('dragstart', () => { organizeDragIndex = idx; card.classList.add('dragging'); });
+    card.addEventListener('dragend', () => { organizeDragIndex = -1; card.classList.remove('dragging'); });
+    card.addEventListener('dragover', (e) => { e.preventDefault(); card.classList.add('drag-over'); });
+    card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+    card.addEventListener('drop', (e) => {
+      e.preventDefault();
+      card.classList.remove('drag-over');
+      const from = organizeDragIndex, to = idx;
+      if (from < 0 || from === to) return;
+      const [moved] = organizeModel.splice(from, 1);
+      organizeModel.splice(to, 0, moved);
+      renderOrganizeGrid();
+    });
+    grid.appendChild(card);
+  });
+  const info = document.getElementById('organize-info');
+  if (info) {
+    const anyRot = organizeModel.some((e) => e.rot % 360 !== 0);
+    info.textContent = `${organizeModel.length} page(s)` +
+      (anyRot ? ' — rotated pages are flattened on save' : ' — vector preserved');
+  }
+  const saveBtn = document.getElementById('organize-save');
+  if (saveBtn) saveBtn.disabled = organizeModel.length === 0;
+}
+
+async function exportOrganizedViaWork(model) {
+  const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
+  Module.HEAPU8.set(currentPdfBytes, ptr);
+  const docId = Module._nanopdf_doc_load(ptr, currentPdfBytes.length);
+  Module._nanopdf_free(ptr);
+  if (docId < 0) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load doc');
+  try {
+    Module._nanopdf_work_clear();
+    for (const e of model) {
+      const wi = Module._nanopdf_work_add_page(docId, e.src);
+      if (wi < 0) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to add page');
+      if (e.rot % 360 !== 0) Module._nanopdf_work_rotate_page(wi, ((e.rot % 360) + 360) % 360);
+    }
+    if (Module._nanopdf_export_pdf() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Export failed');
+    }
+    return copyWasmBuffer(Module._nanopdf_export_get_buffer, Module._nanopdf_export_get_size);
+  } finally {
+    Module._nanopdf_doc_close(docId);
+    Module._nanopdf_work_clear();
+  }
+}
+
+async function saveOrganized() {
+  if (!organizeModel.length) { setStatus('No pages to save', true); return; }
+  const order = organizeModel.map((e) => e.src);
+  const anyRot = organizeModel.some((e) => e.rot % 360 !== 0);
+  showLoading('Saving reorganized PDF...');
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    let out;
+    if (!anyRot && Module._nanopdf_split_pages) {
+      // Pure reorder/delete: vector-preserving via split.
+      const jp = Module.stringToNewUTF8('[' + order.join(',') + ']');
+      const ok = Module._nanopdf_split_pages(jp);
+      Module._free(jp);
+      if (ok !== 1) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Reorder failed');
+      out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    } else {
+      // Rotation present: route through the work/export path (flattened).
+      out = await exportOrganizedViaWork(organizeModel);
+    }
+    if (!out) throw new Error('Empty output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_organized.pdf');
+    setStatus(`Saved reorganized PDF (${organizeModel.length} page(s))`);
+    closeOrganize();
+  } catch (err) {
+    setStatus('Organize error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
 }
 
 // ---- Thumbnails ----
@@ -848,6 +1657,16 @@ function updateExportButton() {
   exportBtn.textContent = hasSelection
     ? `Export (${selectedPages.size})`
     : 'Export';
+
+  // Combine works on the whole document; Extract needs a page selection.
+  if (combineBtn) combineBtn.disabled = !(totalPages > 0 && Module && Module._nanopdf_merge_start);
+  if (extractPagesBtn) {
+    extractPagesBtn.disabled = !(hasSelection && Module && Module._nanopdf_split_pages);
+    extractPagesBtn.textContent = selectedPages.size > 0 ? `Extract (${selectedPages.size})` : 'Extract';
+  }
+  if (organizeBtn) organizeBtn.disabled = !docLoaded;
+  if (signBtn) signBtn.disabled = !(docLoaded && Module && Module._nanopdf_sign_pdf);
+  { const pb = document.getElementById('print-btn'); if (pb) pb.disabled = !(docLoaded && hasRendering); }
 
   // Guide the user when Protect is on but nothing is selected to export.
   if (protectExport.checked && !hasSelection && docLoaded) {
@@ -984,9 +1803,64 @@ function updateSidebar() {
     renderSignaturesTab();
   } else if (activeSidebarTab === 'history') {
     renderHistoryTab();
+  } else if (activeSidebarTab === 'files') {
+    renderAttachmentsTab();
   } else {
     renderInfoTab();
   }
+}
+
+// ---- Attachments (embedded files) tab ----
+
+function renderAttachmentsTab() {
+  if (!Module || totalPages <= 0) {
+    sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">No document loaded.</div>';
+    return;
+  }
+  if (!Module._nanopdf_attachments_list) {
+    sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">Attachment support needs a rebuilt WASM module.</div>';
+    return;
+  }
+  let data = { attachments: [], count: 0 };
+  try { data = JSON.parse(Module.UTF8ToString(Module._nanopdf_attachments_list())); } catch (e) {}
+  if (!data.count) {
+    sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">No embedded files.</div>';
+    return;
+  }
+  let html = '<div class="attach-list">';
+  for (const a of data.attachments) {
+    const kb = a.size ? ` · ${(a.size / 1024).toFixed(1)} KB` : '';
+    const meta = [a.mimeType, a.modDate || a.creationDate].filter(Boolean).join(' · ');
+    html += `<div class="attach-item">
+      <div class="attach-name" title="${escapeHtml(a.name)}">${escapeHtml(a.name || '(unnamed)')}</div>
+      <div class="attach-meta">${escapeHtml(meta)}${kb}</div>
+      ${a.description ? `<div class="attach-desc">${escapeHtml(a.description)}</div>` : ''}
+      <button class="attach-dl" data-index="${a.index}" data-name="${escapeHtml(a.name || 'attachment')}">Download</button>
+    </div>`;
+  }
+  html += '</div>';
+  sidebarContent.innerHTML = html;
+  sidebarContent.querySelectorAll('.attach-dl').forEach((btn) => {
+    btn.addEventListener('click', () => downloadAttachment(parseInt(btn.dataset.index, 10), btn.dataset.name));
+  });
+}
+
+function downloadAttachment(index, name) {
+  if (!Module._nanopdf_attachment_extract) return;
+  if (Module._nanopdf_attachment_extract(index) !== 1) {
+    setStatus('Failed to extract attachment: ' +
+      Module.UTF8ToString(Module._nanopdf_get_last_error()), true);
+    return;
+  }
+  const bytes = copyWasmBuffer(Module._nanopdf_attachment_get_buffer, Module._nanopdf_attachment_get_size);
+  if (!bytes) { setStatus('Attachment is empty', true); return; }
+  const blob = new Blob([bytes], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name || 'attachment';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  setStatus(`Downloaded "${name}" (${(bytes.length / 1024).toFixed(1)} KB)`);
 }
 
 // ---- Page Navigation ----
@@ -996,10 +1870,12 @@ function goToPage(pageIndex) {
   currentPage = pageIndex;
   selectedAnnotId = null;
   annotDraft = null;
+  hideMarkupPopover();
   updatePageDisplay();
   renderCurrentPage();
   clearSearch();
   updateThumbnailHighlight();
+  saveViewState();
 }
 
 window._jumpToPage = function(pageIndex) {
@@ -1051,6 +1927,7 @@ function zoomIn() {
   }
   updateZoomDisplay();
   renderCurrentPage();
+  saveViewState();
 }
 
 function zoomOut() {
@@ -1060,12 +1937,14 @@ function zoomOut() {
   }
   updateZoomDisplay();
   renderCurrentPage();
+  saveViewState();
 }
 
 function resetZoom() {
   zoomLevel = 1.0;
   updateZoomDisplay();
   renderCurrentPage();
+  saveViewState();
 }
 
 // ---- Rotation ----
@@ -1098,6 +1977,7 @@ function toggleFitMode() {
   fitMode = fitMode === 'width' ? 'page' : 'width';
   fitModeBtn.textContent = fitMode === 'width' ? 'Fit Width' : 'Fit Page';
   renderCurrentPage();
+  saveViewState();
 }
 
 // ---- Rendering ----
@@ -1372,9 +2252,20 @@ function drawAnnot(a) {
   const scale = getPageScale();
   const col = rgbToHex(a.color);
   if (a.type === 'text') { drawTextBox(a); return; }
+  if (a.type === 'image') { drawImageStamp(a); return; }
 
   let el;
-  if (a.type === 'highlight') {
+  if (a.type === 'redact') {
+    el = svgEl('rect');
+    const box = pdfBoxToScreen(a);
+    el.setAttribute('x', box.left); el.setAttribute('y', box.top);
+    el.setAttribute('width', Math.max(0, box.width));
+    el.setAttribute('height', Math.max(0, box.height));
+    el.setAttribute('fill', '#000');
+    el.setAttribute('stroke', '#e53935');     // red marker so users see redaction marks
+    el.setAttribute('stroke-width', '1.5');
+    el.setAttribute('stroke-dasharray', '4 2');
+  } else if (a.type === 'highlight') {
     el = svgEl('rect');
     const box = pdfBoxToScreen(a);
     el.setAttribute('x', box.left); el.setAttribute('y', box.top);
@@ -1474,19 +2365,25 @@ function startDraft(e) {
   const pos = annotPointerPos(e);
   const pdf = screenToPdf(pos.x, pos.y);
   const color = hexToRgb(annotColorHex);
+  const isRedact = annotTool === 'redact';
   annotDraft = {
     id: annotIdCounter++,
     type: annotTool,
-    color,
+    color: isRedact ? { r: 0, g: 0, b: 0 } : color,
     alpha: annotTool === 'highlight' ? 0.4 : 1,
     lineWidth: 2,
-    filled: annotFillShapes && (annotTool === 'rect' || annotTool === 'oval'),
+    filled: isRedact || (annotFillShapes && (annotTool === 'rect' || annotTool === 'oval')),
     _start: pdf,
   };
   if (annotTool === 'ink') annotDraft.points = [pdf];
   else if (annotTool === 'line' || annotTool === 'arrow') {
     annotDraft.x1 = pdf.x; annotDraft.y1 = pdf.y; annotDraft.x2 = pdf.x; annotDraft.y2 = pdf.y;
   } else { annotDraft.x = pdf.x; annotDraft.y = pdf.y; annotDraft.w = 0; annotDraft.h = 0; }
+  if (annotTool === 'image' && pendingStampImage) {
+    annotDraft.imageId = pendingStampImage.imageId;
+    annotDraft.dataURL = pendingStampImage.dataURL;
+    annotDraft._aspect = pendingStampImage.aspect || 1;
+  }
   renderAnnotations();
 }
 
@@ -1509,11 +2406,71 @@ function startTextBox(e) {
   updateSaveAnnotState();
 }
 
+// ---- Image / signature stamp ----
+
+function pickStampImage() {
+  if (stampInput) stampInput.click();
+}
+
+async function loadStampImage(file) {
+  if (!Module || !Module._nanopdf_register_stamp_image) {
+    setStatus('Image stamps need a rebuilt WASM module', true);
+    return;
+  }
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const dataURL = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = reject;
+      r.readAsDataURL(file);
+    });
+    // Natural size (for aspect ratio).
+    const aspect = await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img.naturalWidth / Math.max(1, img.naturalHeight));
+      img.onerror = () => resolve(1);
+      img.src = dataURL;
+    });
+    // Register the encoded bytes with the WASM module.
+    const ptr = Module._nanopdf_malloc(buf.length);
+    Module.HEAPU8.set(buf, ptr);
+    const id = Module._nanopdf_register_stamp_image(ptr, buf.length);
+    Module._nanopdf_free(ptr);
+    if (id < 0) {
+      setStatus('Could not load image: ' +
+        Module.UTF8ToString(Module._nanopdf_get_last_error()), true);
+      return;
+    }
+    pendingStampImage = { imageId: id, dataURL, aspect };
+    setAnnotTool('image');
+    setStatus('Click or drag on the page to place the image');
+  } catch (err) {
+    setStatus('Image load error: ' + err.message, true);
+  }
+}
+
+function drawImageStamp(a) {
+  const box = pdfBoxToScreen(a);
+  const el = svgEl('image');
+  el.setAttributeNS('http://www.w3.org/1999/xlink', 'href', a.dataURL);
+  el.setAttribute('href', a.dataURL);
+  el.setAttribute('x', box.left);
+  el.setAttribute('y', box.top);
+  el.setAttribute('width', Math.max(1, box.width));
+  el.setAttribute('height', Math.max(1, box.height));
+  el.setAttribute('preserveAspectRatio', 'none');
+  el.classList.add('annot-shape');
+  el.dataset.annotId = a.id;
+  annotSvg.appendChild(el);
+}
+
 function annotLayerPointerDown(e) {
   if (e.button !== 0) return;
   if (!annotEditingEnabled() || annotTool === 'select') return;
   e.preventDefault();
   if (annotTool === 'text') { startTextBox(e); return; }
+  if (annotTool === 'image' && !pendingStampImage) { pickStampImage(); return; }
   annotLayer.setPointerCapture?.(e.pointerId);
   startDraft(e);
 }
@@ -1543,9 +2500,21 @@ function annotLayerPointerUp(e) {
   let keep;
   if (d.type === 'ink') keep = d.points.length > 1;
   else if (d.type === 'line' || d.type === 'arrow') keep = Math.hypot(d.x2 - d.x1, d.y2 - d.y1) > 2;
-  else keep = d.w > 2 && d.h > 2;
+  else if (d.type === 'image') {
+    // A click (no real drag) places the image at a default size keeping aspect.
+    if (d.w <= 2 || d.h <= 2) {
+      const w = 160 / getPageScale();
+      d.w = w; d.h = w / (d._aspect || 1);
+      d.y = d._start.y - d.h;  // grow downward from the click point
+      d.x = d._start.x;
+    }
+    keep = true;
+    pendingStampImage = null;   // consume the pending image
+    setAnnotTool('select');
+  } else keep = d.w > 2 && d.h > 2;
   if (keep) {
     delete d._start;
+    delete d._aspect;
     pageAnnots().push(d);
     selectedAnnotId = d.id;
   }
@@ -1596,6 +2565,12 @@ function deleteSelectedAnnot() {
 
 // ---- Form-field visual fill ----
 
+function isCheckboxOn(value) {
+  if (!value) return false;
+  const v = String(value).replace(/^\//, '').toLowerCase();
+  return v !== '' && v !== 'off';
+}
+
 function loadFormFields() {
   formFieldsByPage = {};
   if (!Module || !Module._nanopdf_get_form_fields) return;
@@ -1606,16 +2581,25 @@ function loadFormFields() {
   } catch (e) { return; }
   if (!json || !json.fields) return;
   for (const f of json.fields) {
-    if (f.type !== 'text' || f.readOnly) continue;  // visual fill: editable text fields
+    if (f.readOnly) continue;
+    // Map the field type to an editable control kind.
+    let kind = null;
+    if (f.type === 'text') kind = 'text';
+    else if (f.type === 'button' && f.buttonType === 'checkbox') kind = 'checkbox';
+    else if (f.type === 'choice') kind = 'choice';
+    if (!kind) continue;  // radios/pushbuttons/signatures not yet editable
     for (const w of (f.widgets || [])) {
       if (w.page == null || w.page < 0 || !w.rect) continue;
       if (!formFieldsByPage[w.page]) formFieldsByPage[w.page] = [];
       formFieldsByPage[w.page].push({
         name: f.fullName || f.name || '',
+        kind,
         rect: w.rect,
         value: f.value || '',
+        checked: kind === 'checkbox' ? isCheckboxOn(f.value) : false,
         multiline: !!f.multiline,
         password: !!f.password,
+        options: Array.isArray(f.options) ? f.options : [],
         fontSize: 12,
       });
     }
@@ -1630,30 +2614,116 @@ function renderFormFields() {
   if (!fields) return;
   for (const fld of fields) {
     const box = pdfBoxToScreen({ x: fld.rect.x, y: fld.rect.y, w: fld.rect.width, h: fld.rect.height });
-    const input = document.createElement(fld.multiline ? 'textarea' : 'input');
-    if (!fld.multiline) input.type = fld.password ? 'password' : 'text';
+    let input;
+    if (fld.kind === 'checkbox') {
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = fld.checked;
+      input.addEventListener('change', () => { fld.checked = input.checked; updateSaveAnnotState(); });
+    } else if (fld.kind === 'choice') {
+      input = document.createElement('select');
+      for (const opt of fld.options) {
+        const o = document.createElement('option');
+        o.value = opt; o.textContent = opt;
+        if (opt === fld.value) o.selected = true;
+        input.appendChild(o);
+      }
+      input.addEventListener('change', () => { fld.value = input.value; updateSaveAnnotState(); });
+    } else {
+      input = document.createElement(fld.multiline ? 'textarea' : 'input');
+      if (!fld.multiline) input.type = fld.password ? 'password' : 'text';
+      input.value = fld.value;
+      input.addEventListener('input', () => { fld.value = input.value; updateSaveAnnotState(); });
+    }
     input.className = 'annot-formfield';
     input.style.left = box.left + 'px';
     input.style.top = box.top + 'px';
     input.style.width = Math.max(8, box.width) + 'px';
     input.style.height = Math.max(12, box.height) + 'px';
-    input.style.fontSize = Math.max(8, Math.min(box.height * 0.7, 18)) + 'px';
-    input.value = fld.value;
+    if (fld.kind === 'text' || fld.kind === 'choice') {
+      input.style.fontSize = Math.max(8, Math.min(box.height * 0.7, 18)) + 'px';
+    }
     input.title = fld.name;
-    input.addEventListener('input', () => { fld.value = input.value; updateSaveAnnotState(); });
     annotHtml.appendChild(input);
   }
+}
+
+// Save filled form fields as a real editable PDF via incremental update.
+async function saveEditableForm() {
+  if (!Module || !Module._nanopdf_form_load || !currentPdfBytes || !currentPdfBytes.length) {
+    setStatus('Editable form save not available', true);
+    return;
+  }
+  showLoading('Saving filled form...');
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
+    Module.HEAPU8.set(currentPdfBytes, ptr);
+    const ok = Module._nanopdf_form_load(ptr, currentPdfBytes.length);
+    Module._nanopdf_free(ptr);
+    if (ok !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load form');
+    }
+    // A field can have widgets on multiple pages; set each unique field once.
+    const done = new Set();
+    let count = 0;
+    for (const page in formFieldsByPage) {
+      for (const f of formFieldsByPage[page]) {
+        const key = f.kind + ':' + f.name;
+        if (done.has(key)) continue;
+        done.add(key);
+        const namePtr = Module.stringToNewUTF8(f.name);
+        if (f.kind === 'text') {
+          const vp = Module.stringToNewUTF8(f.value || '');
+          if (Module._nanopdf_form_set_text(namePtr, vp)) count++;
+          Module._free(vp);
+        } else if (f.kind === 'checkbox') {
+          if (Module._nanopdf_form_set_checkbox(namePtr, f.checked ? 1 : 0)) count++;
+        } else if (f.kind === 'choice') {
+          const vp = Module.stringToNewUTF8(f.value || '');
+          if (Module._nanopdf_form_set_choice(namePtr, vp)) count++;
+          Module._free(vp);
+        }
+        Module._free(namePtr);
+      }
+    }
+    if (Module._nanopdf_form_save() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Form save failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_form_get_buffer, Module._nanopdf_form_get_size);
+    if (!out) throw new Error('Empty form output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_filled.pdf');
+    setStatus(`Saved editable filled form (${count} field(s))`);
+  } catch (err) {
+    setStatus('Form save error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
+}
+
+function hasFillableFields() {
+  for (const k in formFieldsByPage) {
+    if (formFieldsByPage[k] && formFieldsByPage[k].length) return true;
+  }
+  return false;
 }
 
 function hasAnyAnnotations() {
   for (const k in annotations) if (annotations[k] && annotations[k].length) return true;
   for (const k in formFieldsByPage) {
-    for (const f of formFieldsByPage[k]) if (f.value && f.value.trim()) return true;
+    for (const f of formFieldsByPage[k]) if (formFieldBaked(f)) return true;
   }
   return false;
 }
 function updateSaveAnnotState() {
-  if (saveAnnotBtn) saveAnnotBtn.disabled = !(hasRendering && totalPages > 0);
+  const docLoaded = hasRendering && totalPages > 0;
+  if (saveAnnotBtn) saveAnnotBtn.disabled = !docLoaded;
+  if (saveFormBtn) saveFormBtn.disabled = !(docLoaded && hasFillableFields() && Module && Module._nanopdf_form_load);
+  if (saveEditableBtn) {
+    const ed = docLoaded && Module && Module._nanopdf_edit_load && editableMarkupCount().supported > 0;
+    saveEditableBtn.disabled = !ed;
+  }
 }
 
 function resetAnnotations() {
@@ -1661,6 +2731,7 @@ function resetAnnotations() {
   formFieldsByPage = {};
   selectedAnnotId = null;
   annotDraft = null;
+  pendingStampImage = null;
   annotIdCounter = 1;
   setAnnotTool('select');
   if (annotHtml) clearChildren(annotHtml);
@@ -1749,14 +2820,50 @@ function renderCurrentPage() {
 
 // ---- Text Extraction ----
 
-function extractText() {
+// Current content-export view: 'text' | 'md' | 'tables'.
+let textPanelFormat = 'text';
+
+function renderTextPanel() {
   if (!Module || totalPages <= 0) return;
-
-  const textPtr = Module._nanopdf_extract_text(currentPage);
-  const text = Module.UTF8ToString(textPtr);
-
-  textContent.textContent = text || '(No text extracted)';
+  let body = '', title = 'Extracted Text';
+  if (textPanelFormat === 'md') {
+    title = 'Markdown';
+    body = Module.UTF8ToString(Module._nanopdf_page_to_markdown(currentPage)) || '(No text extracted)';
+  } else if (textPanelFormat === 'tables') {
+    title = 'Tables (CSV)';
+    body = Module._nanopdf_extract_tables
+      ? Module.UTF8ToString(Module._nanopdf_extract_tables(currentPage, 0))
+      : '';
+    if (!body) body = '(No tables detected on this page)';
+  } else {
+    body = Module.UTF8ToString(Module._nanopdf_extract_text(currentPage)) || '(No text extracted)';
+  }
+  const titleEl = document.getElementById('text-panel-title');
+  if (titleEl) titleEl.textContent = `${title} — page ${currentPage + 1}`;
+  textContent.textContent = body;
+  document.querySelectorAll('.text-fmt').forEach(b => b.classList.remove('active'));
+  const active = { text: 'text-fmt-text', md: 'text-fmt-md', tables: 'text-fmt-tables' }[textPanelFormat];
+  const ab = document.getElementById(active);
+  if (ab) ab.classList.add('active');
   textPanel.style.display = 'block';
+}
+
+function extractText() {
+  textPanelFormat = 'text';
+  renderTextPanel();
+}
+
+function downloadTextPanel() {
+  const ext = { text: 'txt', md: 'md', tables: 'csv' }[textPanelFormat] || 'txt';
+  const mime = { text: 'text/plain', md: 'text/markdown', tables: 'text/csv' }[textPanelFormat] || 'text/plain';
+  const baseName = fileName.replace(/\.pdf$/i, '');
+  const blob = new Blob([textContent.textContent], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${baseName}_p${currentPage + 1}.${ext}`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // ---- Search ----
@@ -1883,6 +2990,7 @@ function beginTextSelection(e) {
   if (e.button !== 0) return;
   isSelectingText = true;
   currentSelection = null;
+  hideMarkupPopover();
   selectionStartPoint = overlayPointToPdf(e.clientX, e.clientY);
   selectionDragBox = { x: selectionStartPoint.screenX, y: selectionStartPoint.screenY, width: 0, height: 0 };
   textOverlay.setPointerCapture(e.pointerId);
@@ -1938,8 +3046,81 @@ function finishTextSelection(e) {
   renderTextOverlay();
   if (currentSelection && currentSelection.text) {
     setStatus(`Selected ${currentSelection.text.length} characters`);
+    showMarkupPopover();
+  } else {
+    hideMarkupPopover();
   }
   e.preventDefault();
+}
+
+// ---- Text markup (Highlight/Underline/Strike/Squiggly on a text selection) ----
+
+function selectionQuads() {
+  if (!currentSelection || !Array.isArray(currentSelection.segments)) return [];
+  return currentSelection.segments
+    .map((s) => s.quad)
+    .filter((q) => q && q.width > 0 && q.height > 0);
+}
+
+function showMarkupPopover() {
+  if (!markupPopover) return;
+  const quads = selectionQuads();
+  if (!quads.length || rotation !== 0) { hideMarkupPopover(); return; }
+  // Anchor above the top-center of the selection's bounding box (CSS px).
+  let minScreenY = Infinity, cx = 0, n = 0;
+  for (const q of quads) {
+    const s = pdfRectToScreen(q);
+    minScreenY = Math.min(minScreenY, s.y);
+    cx += s.x + s.width / 2; n++;
+  }
+  markupPopover.style.left = (cx / n) + 'px';
+  markupPopover.style.top = Math.max(8, minScreenY - 6) + 'px';
+  markupPopover.classList.remove('hidden');
+}
+
+function hideMarkupPopover() {
+  if (markupPopover) markupPopover.classList.add('hidden');
+}
+
+function markupSelection(kind) {
+  const quads = selectionQuads();
+  if (!quads.length) return;
+  const page = currentSelection.page != null ? currentSelection.page : currentPage;
+  const color = hexToRgb(annotColorHex);
+  const list = (annotations[page] = annotations[page] || []);
+  // markupKind + quad tag the annotation so "Save Editable" can write it as a
+  // real text-markup PDF annotation; the visual shape (line/ink) is unchanged.
+  for (const q of quads) {
+    const quad = { x: q.x, y: q.y, w: q.width, h: q.height };
+    if (kind === 'highlight') {
+      list.push({ id: annotIdCounter++, type: 'highlight', markupKind: 'highlight',
+        x: q.x, y: q.y, w: q.width, h: q.height, quad, color, alpha: 0.4 });
+    } else if (kind === 'underline' || kind === 'strike') {
+      const y = kind === 'strike' ? q.y + q.height * 0.5
+                                  : q.y + Math.max(0.5, q.height * 0.06);
+      list.push({ id: annotIdCounter++, type: 'line', markupKind: kind, quad,
+        x1: q.x, y1: y, x2: q.x + q.width, y2: y, color, lineWidth: 1.5, alpha: 1 });
+    } else if (kind === 'squiggly') {
+      const base = q.y + Math.max(0.5, q.height * 0.06);
+      const amp = Math.max(1, q.height * 0.09);
+      const step = Math.max(2, q.height * 0.3);
+      const pts = [];
+      let up = true;
+      for (let x = q.x; x <= q.x + q.width; x += step) {
+        pts.push({ x, y: base + (up ? amp : 0) });
+        up = !up;
+      }
+      pts.push({ x: q.x + q.width, y: base });
+      list.push({ id: annotIdCounter++, type: 'ink', markupKind: 'squiggly', quad,
+        points: pts, color, lineWidth: 1.2, alpha: 1 });
+    }
+  }
+  currentSelection = null;
+  hideMarkupPopover();
+  renderTextOverlay();
+  if (page === currentPage) renderAnnotations();
+  updateSaveAnnotState();
+  setStatus(`Added ${kind} markup`);
 }
 
 function copyCurrentSelection(e) {
@@ -2020,10 +3201,28 @@ async function loadPDF(arrayBuffer, name) {
     signatureData = null;
     editHistoryData = null;
 
-    // Reset view state
+    // Reset view state, then apply persisted preferences.
     zoomLevel = 1.0;
     rotation = 0;
     fitMode = 'width';
+    const savedView = loadViewState();
+    if (typeof savedView.zoom === 'number' && savedView.zoom > 0.05 && savedView.zoom <= 8) {
+      zoomLevel = savedView.zoom;
+    }
+    if (savedView.fitMode === 'width' || savedView.fitMode === 'page') {
+      fitMode = savedView.fitMode;
+    }
+    // Restore the backend if the saved one is available.
+    if (savedView.backend === BACKEND_LIGHTVG && renderBackends.lightvg) {
+      renderBackend = BACKEND_LIGHTVG;
+    } else if (savedView.backend === BACKEND_THORVG && renderBackends.thorvg) {
+      renderBackend = BACKEND_THORVG;
+    }
+    // Restore the last viewed page for this specific file.
+    if (savedView.pages && Number.isInteger(savedView.pages[name])) {
+      const p = savedView.pages[name];
+      if (p >= 0 && p < totalPages) currentPage = p;
+    }
     thumbnailCache = {};
     thumbnailRenderQueue = [];
     isThumbnailRendering = false;
@@ -2042,7 +3241,7 @@ async function loadPDF(arrayBuffer, name) {
     searchInfo.textContent = '';
     updateZoomDisplay();
     updateExportButton();
-    fitModeBtn.textContent = 'Fit Width';
+    fitModeBtn.textContent = fitMode === 'width' ? 'Fit Width' : 'Fit Page';
     canvas.style.transform = '';
     canvasWrapper.style.width = '';
     canvasWrapper.style.height = '';
@@ -2307,6 +3506,51 @@ function validateSignature(index) {
   }
 }
 
+// Prompt for a CA bundle (PEM) and validate the signer chain against it. With no
+// bundle the bridge reports "trust not checked" — integrity is separate.
+function checkSignatureTrust(index) {
+  if (!Module || !Module._nanopdf_verify_trust) return;
+  const target = document.getElementById(`signature-trust-${index}`);
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.pem,.crt,.cer,.ca-bundle,application/x-pem-file,application/x-x509-ca-cert';
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+    if (target) { target.textContent = 'Checking trust…'; target.className = 'signature-validation pending'; }
+    let pemPtr = 0;
+    try {
+      const pem = new Uint8Array(await file.arrayBuffer());
+      pemPtr = Module._nanopdf_malloc(pem.length);
+      Module.HEAPU8.set(pem, pemPtr);
+      const resStr = Module.UTF8ToString(Module._nanopdf_verify_trust(index, pemPtr, pem.length));
+      const r = JSON.parse(resStr);
+      if (!target) return;
+      if (r.error && !r.trustChecked) {
+        target.textContent = 'Trust: ' + r.error;
+        target.className = 'signature-validation error';
+        return;
+      }
+      const parts = [];
+      if (r.trusted) {
+        parts.push('Trust: chain valid');
+        if (r.anchorCN) parts.push(`Anchor: ${r.anchorCN}`);
+      } else {
+        parts.push('Trust: NOT trusted');
+        if (r.error) parts.push(r.error);
+      }
+      if (typeof r.certCount === 'number') parts.push(`${r.certCount} cert(s) in signature`);
+      target.textContent = parts.join(' | ');
+      target.className = `signature-validation ${r.trusted ? 'success' : 'error'}`;
+    } catch (e) {
+      if (target) { target.textContent = 'Trust check error: ' + e.message; target.className = 'signature-validation error'; }
+    } finally {
+      if (pemPtr) Module._nanopdf_free(pemPtr);
+    }
+  });
+  input.click();
+}
+
 // ---- PDF Export ----
 
 function canvasToJpegBytes(cvs) {
@@ -2412,16 +3656,29 @@ function buildPdf(pageImages) {
 }
 
 function downloadPdfBytes(pdfBytes, suffix, pages) {
+  const baseName = fileName.replace(/\.pdf$/i, '');
+  downloadNamedPdf(pdfBytes, `${baseName}_${suffix}_${pages.map(p => p + 1).join('-')}.pdf`);
+}
+
+// Download a PDF byte buffer under an explicit file name.
+function downloadNamedPdf(pdfBytes, filename) {
   const blob = new Blob([pdfBytes], { type: 'application/pdf' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  const baseName = fileName.replace(/\.pdf$/i, '');
-  a.download = `${baseName}_${suffix}_${pages.map(p => p + 1).join('-')}.pdf`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// Copy a WASM output buffer (ptr,size getters) into a detached Uint8Array.
+function copyWasmBuffer(getPtr, getSize) {
+  const ptr = getPtr();
+  const size = getSize();
+  if (!ptr || size <= 0) return null;
+  return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
 }
 
 // ---- Annotation baking (PDF points -> nanopdf_annot_* export API) ----
@@ -2484,7 +3741,22 @@ function bakeAnnotationForWorkPage(workIndex, a) {
         bakeTextLines(workIndex, a.text, a.x, a.y + a.h, a.fontSize || 14, c, alpha);
       }
       break;
+    case 'redact':
+      // Opaque black box. Because export flattens the page to a raster image
+      // first, the text underneath is gone (not just visually covered).
+      Module._nanopdf_annot_add_rect(workIndex, a.x, a.y, a.w, a.h, 0, 0, 0, 0, 1, 1);
+      break;
+    case 'image':
+      if (a.imageId != null && Module._nanopdf_annot_add_image) {
+        Module._nanopdf_annot_add_image(workIndex, a.x, a.y, a.w, a.h, a.imageId);
+      }
+      break;
   }
+}
+
+function formFieldBaked(f) {
+  if (f.kind === 'checkbox') return f.checked ? 'X' : '';
+  return (f.value || '').trim();
 }
 
 function bakeFormFieldsForWorkPage(workIndex, pageIndex) {
@@ -2492,17 +3764,18 @@ function bakeFormFieldsForWorkPage(workIndex, pageIndex) {
   if (!fields) return;
   const black = { r: 0, g: 0, b: 0 };
   for (const f of fields) {
-    if (!f.value || !f.value.trim()) continue;
+    const text = formFieldBaked(f);
+    if (!text) continue;
     const fs = Math.max(8, Math.min(f.rect.height * 0.7, 12));
     // Start the text near the top of the field box so multi-line content flows down.
-    bakeTextLines(workIndex, f.value, f.rect.x + 2, f.rect.y + f.rect.height - 2, fs, black, 1);
+    bakeTextLines(workIndex, text, f.rect.x + 2, f.rect.y + f.rect.height - 2, fs, black, 1);
   }
 }
 
 function pageHasBakeableContent(pageIndex) {
   if (annotations[pageIndex] && annotations[pageIndex].length) return true;
   const fields = formFieldsByPage[pageIndex];
-  return !!(fields && fields.some((f) => f.value && f.value.trim()));
+  return !!(fields && fields.some((f) => formFieldBaked(f)));
 }
 
 // Unified export through the C++ flatten path: rasterizes each page, draws
@@ -2598,13 +3871,360 @@ async function exportViaWasm(pages, { protect, suffix }) {
   }
 }
 
+// ---- Combine (merge) & Extract (split) ----
+
+async function combinePdfs(files) {
+  if (!Module || !Module._nanopdf_merge_start || !currentPdfBytes) {
+    setStatus('Combine not available', true);
+    return;
+  }
+  if (!files || !files.length) return;
+  showLoading(`Combining ${files.length + 1} PDF(s)...`);
+  await new Promise((r) => setTimeout(r, 30));
+  const addBytes = (bytes) => {
+    const ptr = Module._nanopdf_malloc(bytes.length);
+    Module.HEAPU8.set(bytes, ptr);
+    const r = Module._nanopdf_merge_add_pdf(ptr, bytes.length);
+    Module._nanopdf_free(ptr);
+    return r;
+  };
+  try {
+    Module._nanopdf_merge_start();
+    addBytes(currentPdfBytes);  // this document first
+    for (const f of files) {
+      addBytes(new Uint8Array(await f.arrayBuffer()));
+    }
+    if (Module._nanopdf_merge_finish() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Merge failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    if (!out) throw new Error('Empty merge output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_combined.pdf');
+    setStatus(`Combined ${files.length + 1} PDF(s)`);
+  } catch (err) {
+    setStatus('Combine error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function extractSelectedPages() {
+  if (!Module || !Module._nanopdf_split_pages) {
+    setStatus('Extract not available', true);
+    return;
+  }
+  if (selectedPages.size === 0) {
+    setStatus('Select pages in the Thumbnails sidebar to extract', true);
+    return;
+  }
+  const pages = [...selectedPages].sort((a, b) => a - b);
+  showLoading(`Extracting ${pages.length} page(s)...`);
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const jsonPtr = Module.stringToNewUTF8('[' + pages.join(',') + ']');
+    const ok = Module._nanopdf_split_pages(jsonPtr);
+    Module._free(jsonPtr);
+    if (ok !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Extract failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    if (!out) throw new Error('Empty extract output');
+    downloadPdfBytes(out, 'extracted', pages);
+    setStatus(`Extracted ${pages.length} page(s)`);
+  } catch (err) {
+    setStatus('Extract error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
+}
+
+// Which annotation kinds can be written as real (re-editable) PDF annotations.
+function editableMarkupCount() {
+  let supported = 0, unsupported = 0;
+  for (const k in annotations) {
+    for (const a of (annotations[k] || [])) {
+      if (a.markupKind || a.type === 'highlight' ||
+          (a.type === 'text' && a.text && a.text.trim())) supported++;
+      else unsupported++;
+    }
+  }
+  return { supported, unsupported };
+}
+
+// Map a markup annotation to nanopdf_edit_add_markup's type code.
+function markupTypeCode(a) {
+  const k = a.markupKind || (a.type === 'highlight' ? 'highlight' : null);
+  return { highlight: 0, underline: 1, squiggly: 2, strike: 3 }[k];
+}
+
+// Save highlights / text-markup / notes as REAL, re-editable PDF annotation
+// objects via an incremental update (vs the flattened "Save").
+async function saveEditableAnnotations() {
+  if (!Module || !Module._nanopdf_edit_load || !currentPdfBytes || !currentPdfBytes.length) {
+    setStatus('Editable annotation save not available', true);
+    return;
+  }
+  const counts = editableMarkupCount();
+  if (!counts.supported) {
+    setStatus('No highlights/markup/notes to save editably (use Save to flatten shapes)', true);
+    return;
+  }
+  showLoading('Saving editable annotations...');
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
+    Module.HEAPU8.set(currentPdfBytes, ptr);
+    const ok = Module._nanopdf_edit_load(ptr, currentPdfBytes.length);
+    Module._nanopdf_free(ptr);
+    if (ok !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load for editing');
+    }
+    let written = 0;
+    for (const k in annotations) {
+      const page = parseInt(k, 10);
+      for (const a of (annotations[k] || [])) {
+        const c = a.color || { r: 1, g: 1, b: 0 };
+        const code = markupTypeCode(a);
+        if (code != null) {
+          const q = a.quad || { x: a.x, y: a.y, w: a.w, h: a.h };
+          const alpha = code === 0 ? (a.alpha != null ? a.alpha : 0.4) : 1;
+          if (Module._nanopdf_edit_add_markup(page, code, q.x, q.y, q.w, q.h, c.r, c.g, c.b, alpha)) written++;
+        } else if (a.type === 'text' && a.text && a.text.trim()) {
+          const tp = Module.stringToNewUTF8(a.text);
+          if (Module._nanopdf_edit_add_note(page, a.x, a.y, a.w, a.h, tp)) written++;
+          Module._free(tp);
+        }
+      }
+    }
+    if (Module._nanopdf_edit_save() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Annotation save failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_edit_get_buffer, Module._nanopdf_edit_get_size);
+    if (!out) throw new Error('Empty output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_annotated.pdf');
+    setStatus(`Saved ${written} editable annotation(s)` +
+      (counts.unsupported ? ` — ${counts.unsupported} shape/ink/image need flattened "Save"` : ''));
+  } catch (err) {
+    setStatus('Editable save error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
+}
+
 // Save the whole document (all pages) with annotations + form fills baked in.
 async function saveAnnotatedPdf() {
   if (!Module || totalPages <= 0 || !hasRendering) return;
   const pages = [];
   for (let i = 0; i < totalPages; i++) pages.push(i);
+  // Redaction must burn pixels client-side to truly remove text. Password
+  // protection isn't applied on that path, so prefer security when both are set.
+  if (docHasRedaction()) {
+    if (protectExport.checked) {
+      setStatus('Redaction is applied without password protection (security takes priority)', false);
+    }
+    await saveFlattenedPdf(pages, 'redacted');
+    return;
+  }
   await exportViaWasm(pages, { protect: protectExport.checked, suffix: 'annotated' });
   renderCurrentPage();
+}
+
+// ---- Client-side flatten: burn annotations into the page raster ----
+// Used so redaction truly removes the underlying pixels (a vector box over a
+// page image would leave the text recoverable in the image).
+
+function rgbCss(c) {
+  c = c || { r: 0, g: 0, b: 0 };
+  return `rgb(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)})`;
+}
+
+async function preloadStampImages() {
+  const byId = {};
+  for (const k in annotations) {
+    for (const a of annotations[k]) {
+      if (a.type === 'image' && a.dataURL && byId[a.imageId] === undefined) byId[a.imageId] = a.dataURL;
+    }
+  }
+  const cache = {};
+  await Promise.all(Object.keys(byId).map((id) => new Promise((res) => {
+    const img = new Image();
+    img.onload = () => { cache[id] = img; res(); };
+    img.onerror = () => res();
+    img.src = byId[id];
+  })));
+  return cache;
+}
+
+// Draw a page's annotations + form-field values onto a canvas. sc = px/pt.
+function flattenAnnotationsToCanvas(ctx, pageIdx, sc, phPts, imgCache) {
+  const PX = (x) => x * sc;
+  const PY = (y) => (phPts - y) * sc;
+  const list = annotations[pageIdx] || [];
+  for (const a of list) {
+    ctx.save();
+    const css = rgbCss(a.color);
+    if (a.type === 'redact') {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc);
+    } else if (a.type === 'highlight') {
+      ctx.globalAlpha = a.alpha != null ? a.alpha : 0.4;
+      ctx.fillStyle = css;
+      ctx.fillRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc);
+    } else if (a.type === 'rect') {
+      ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc);
+      if (a.filled) { ctx.fillStyle = css; ctx.fillRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc); }
+      else { ctx.strokeStyle = css; ctx.strokeRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc); }
+    } else if (a.type === 'oval') {
+      ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc);
+      ctx.beginPath();
+      ctx.ellipse(PX(a.x + a.w / 2), PY(a.y + a.h / 2), (a.w / 2) * sc, (a.h / 2) * sc, 0, 0, Math.PI * 2);
+      if (a.filled) { ctx.fillStyle = css; ctx.fill(); } else { ctx.strokeStyle = css; ctx.stroke(); }
+    } else if (a.type === 'line' || a.type === 'arrow') {
+      ctx.strokeStyle = css; ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(PX(a.x1), PY(a.y1)); ctx.lineTo(PX(a.x2), PY(a.y2)); ctx.stroke();
+      if (a.type === 'arrow') {
+        for (const s of arrowHeadPdf(a.x1, a.y1, a.x2, a.y2)) {
+          ctx.beginPath(); ctx.moveTo(PX(s.x1), PY(s.y1)); ctx.lineTo(PX(s.x2), PY(s.y2)); ctx.stroke();
+        }
+      }
+    } else if (a.type === 'ink') {
+      ctx.strokeStyle = css; ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc);
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.beginPath();
+      a.points.forEach((p, i) => { const x = PX(p.x), y = PY(p.y); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.stroke();
+    } else if (a.type === 'text') {
+      if (a.text && a.text.trim()) {
+        const fs = (a.fontSize || 14) * sc;
+        ctx.fillStyle = css; ctx.font = `${fs}px Helvetica, Arial, sans-serif`; ctx.textBaseline = 'top';
+        let ty = PY(a.y + a.h);
+        for (const ln of a.text.split('\n')) { ctx.fillText(ln, PX(a.x), ty); ty += fs * 1.25; }
+      }
+    } else if (a.type === 'image') {
+      const img = imgCache[a.imageId];
+      if (img) ctx.drawImage(img, PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc);
+    }
+    ctx.restore();
+  }
+  // Form-field values (text/checkbox/dropdown) flattened as text.
+  for (const f of (formFieldsByPage[pageIdx] || [])) {
+    const txt = formFieldBaked(f);
+    if (!txt) continue;
+    const fs = Math.max(8, Math.min(f.rect.height * 0.7, 12)) * sc;
+    ctx.fillStyle = '#000'; ctx.font = `${fs}px Helvetica, Arial, sans-serif`; ctx.textBaseline = 'top';
+    let ty = PY(f.rect.y + f.rect.height) + 1;
+    for (const ln of String(txt).split('\n')) { ctx.fillText(ln, PX(f.rect.x) + 2, ty); ty += fs * 1.25; }
+  }
+}
+
+// Render one page (with its annotations + redaction burned in) to a 1-page
+// image PDF (Uint8Array), or null on failure.
+function flattenOnePageToImagePdf(pageIdx, imgCache) {
+  const pw = Module._nanopdf_get_page_width(pageIdx);
+  const ph = Module._nanopdf_get_page_height(pageIdx);
+  const scale = 150 / 72;
+  const width = Math.min(4096, Math.floor(pw * scale));
+  const height = Math.min(4096, Math.floor(ph * scale));
+  const dpi = 72 * (width / pw);
+  let ok = 0;
+  try { ok = Module._nanopdf_render_page(pageIdx, width, height, dpi); } catch (e) { return null; }
+  if (ok !== 1) return null;
+  const bufPtr = Module._nanopdf_get_render_buffer();
+  const bufSize = Module._nanopdf_get_render_buffer_size();
+  const rw = Module._nanopdf_get_render_width();
+  const rh = Module._nanopdf_get_render_height();
+  const cvs = document.createElement('canvas');
+  cvs.width = rw; cvs.height = rh;
+  const ctx = cvs.getContext('2d');
+  const imageData = ctx.createImageData(rw, rh);
+  imageData.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, bufPtr, bufSize));
+  ctx.putImageData(imageData, 0, 0);
+  flattenAnnotationsToCanvas(ctx, pageIdx, rw / pw, ph, imgCache);  // burns redaction
+  return buildPdf([{ jpegBytes: canvasToJpegBytes(cvs), imgWidth: rw, imgHeight: rh, pageWidth: pw, pageHeight: ph }]);
+}
+
+// Extract a contiguous run of original pages as a vector PDF (Uint8Array).
+function extractVectorRun(indices) {
+  if (!indices.length) return null;
+  const jp = Module.stringToNewUTF8('[' + indices.join(',') + ']');
+  const ok = Module._nanopdf_split_pages(jp);
+  Module._free(jp);
+  if (ok !== 1) return null;
+  return copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+}
+
+// Save with annotations baked in, rasterizing ONLY the pages that actually have
+// annotations / redaction; untouched pages are kept as vector. The result is
+// assembled by merging vector runs with single rasterized pages in order.
+async function saveFlattenedPdf(pages, suffix) {
+  if (!Module || !hasRendering) return;
+  showLoading(`Saving ${pages.length} page(s)...`);
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const imgCache = await preloadStampImages();
+    const parts = [];          // ordered PDF byte buffers
+    let vectorRun = [];        // accumulating consecutive vector page indices
+    let flattened = 0;
+    const flushVector = () => {
+      if (!vectorRun.length) return;
+      const b = extractVectorRun(vectorRun);   // uses + copies the merge buffer
+      if (b) parts.push(b);
+      vectorRun = [];
+    };
+    for (let idx = 0; idx < pages.length; idx++) {
+      const p = pages[idx];
+      loadingText.textContent = `Processing page ${idx + 1} / ${pages.length}...`;
+      if (pageHasBakeableContent(p)) {
+        flushVector();
+        const img = flattenOnePageToImagePdf(p, imgCache);
+        if (img) { parts.push(img); flattened++; }
+      } else {
+        vectorRun.push(p);
+      }
+      if (idx % 8 === 7) await new Promise((r) => setTimeout(r, 0));
+    }
+    flushVector();
+    if (!parts.length) { setStatus('Nothing to save', true); return; }
+
+    loadingText.textContent = 'Assembling PDF...';
+    await new Promise((r) => setTimeout(r, 30));
+    let out;
+    if (parts.length === 1) {
+      out = parts[0];
+    } else {
+      // Merge the ordered parts (vector runs + rasterized pages) into one PDF.
+      Module._nanopdf_merge_start();
+      for (const b of parts) {
+        const ptr = Module._nanopdf_malloc(b.length);
+        Module.HEAPU8.set(b, ptr);
+        Module._nanopdf_merge_add_pdf(ptr, b.length);
+        Module._nanopdf_free(ptr);
+      }
+      if (Module._nanopdf_merge_finish() !== 1) {
+        throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Merge failed');
+      }
+      out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    }
+    if (!out) throw new Error('Empty output');
+    downloadPdfBytes(out, suffix || 'flattened', pages);
+    setStatus(`Saved ${pages.length} page(s) — ${flattened} rasterized, ${pages.length - flattened} kept vector`);
+  } catch (err) {
+    setStatus('Save error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+    renderCurrentPage();
+  }
+}
+
+function docHasRedaction() {
+  for (const k in annotations) {
+    if ((annotations[k] || []).some((a) => a.type === 'redact')) return true;
+  }
+  return false;
 }
 
 async function exportSelectedPages() {
@@ -2612,6 +4232,12 @@ async function exportSelectedPages() {
 
   const pages = [...selectedPages].sort((a, b) => a - b);
 
+  // Redaction on any selected page requires the secure client-side burn.
+  const hasRedaction = pages.some((p) => (annotations[p] || []).some((a) => a.type === 'redact'));
+  if (hasRedaction && !protectExport.checked) {
+    await saveFlattenedPdf(pages, 'redacted');
+    return;
+  }
   // Route through the C++ flatten path when encryption is requested or any
   // selected page carries annotations / form-field fills, so they get baked in.
   const hasBakeable = pages.some(pageHasBakeableContent);
@@ -2718,6 +4344,19 @@ function onResize() {
 // File input
 openPdfBtn.addEventListener('click', () => pdfInput.click());
 openUrlBtn.addEventListener('click', promptOpenUrl);
+combineBtn.addEventListener('click', () => combineInput.click());
+combineInput.addEventListener('change', async (e) => {
+  const files = [...e.target.files];
+  combineInput.value = '';
+  if (files.length) await combinePdfs(files);
+});
+extractPagesBtn.addEventListener('click', extractSelectedPages);
+organizeBtn.addEventListener('click', openOrganize);
+if (signBtn) signBtn.addEventListener('click', openSign);
+const helpBtn = document.getElementById('help-btn');
+if (helpBtn) helpBtn.addEventListener('click', toggleShortcutHelp);
+const printBtn = document.getElementById('print-btn');
+if (printBtn) printBtn.addEventListener('click', printDocument);
 pdfInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -2830,9 +4469,49 @@ canvasScroll.addEventListener('auxclick', (e) => {
   if (e.button === 1) e.preventDefault();
 });
 
+// Pinch-to-zoom on touch devices. Two-finger gesture steps through the existing
+// zoom levels (reusing zoomIn/zoomOut so clamping, re-render, and state-persist
+// all apply). Single-touch is untouched, so pointer-based annotation drawing and
+// text selection keep working.
+let pinchActive = false;
+let pinchBaseDist = 0;
+function touchDistance(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.hypot(dx, dy);
+}
+canvasScroll.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2) {
+    pinchActive = true;
+    pinchBaseDist = touchDistance(e.touches);
+    e.preventDefault();  // suppress the browser's native page pinch-zoom
+  }
+}, { passive: false });
+canvasScroll.addEventListener('touchmove', (e) => {
+  if (!pinchActive || e.touches.length !== 2) return;
+  e.preventDefault();
+  const d = touchDistance(e.touches);
+  if (pinchBaseDist <= 0) { pinchBaseDist = d; return; }
+  const ratio = d / pinchBaseDist;
+  if (ratio > 1.2) { zoomIn(); pinchBaseDist = d; }
+  else if (ratio < 0.83) { zoomOut(); pinchBaseDist = d; }
+}, { passive: false });
+function endPinch(e) {
+  if (pinchActive && e.touches.length < 2) { pinchActive = false; pinchBaseDist = 0; }
+}
+canvasScroll.addEventListener('touchend', endPinch);
+canvasScroll.addEventListener('touchcancel', endPinch);
+
 // Keyboard navigation
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+  // Shortcut-help overlay: "?" toggles it; Esc closes it (highest priority).
+  if (shortcutHelpOpen()) {
+    if (e.key === 'Escape' || e.key === '?') { e.preventDefault(); hideShortcutHelp(); }
+    return;
+  }
+  if (e.key === '?') { e.preventDefault(); toggleShortcutHelp(); return; }
 
   // Revision diff overlay captures navigation keys while open.
   if (diffState.open) {
@@ -2870,6 +4549,8 @@ document.addEventListener('keydown', (e) => {
     if (!e.ctrlKey && !e.metaKey) {
       rotateClockwise();
     }
+  } else if ((e.key === 'p' || e.key === 'P') && !e.ctrlKey && !e.metaKey) {
+    if (totalPages > 0 && hasRendering) { e.preventDefault(); printDocument(); }
   } else if ((e.key === 'Delete' || e.key === 'Backspace') &&
              selectedAnnotId != null && annotEditingEnabled()) {
     e.preventDefault();
@@ -2894,6 +4575,19 @@ protectExport.addEventListener('change', updateExportButton);
 // Close text panel
 document.getElementById('text-panel-close').addEventListener('click', () => {
   textPanel.style.display = 'none';
+});
+
+// Content-export format switches + actions
+document.getElementById('text-fmt-text').addEventListener('click', () => { textPanelFormat = 'text'; renderTextPanel(); });
+document.getElementById('text-fmt-md').addEventListener('click', () => { textPanelFormat = 'md'; renderTextPanel(); });
+document.getElementById('text-fmt-tables').addEventListener('click', () => { textPanelFormat = 'tables'; renderTextPanel(); });
+document.getElementById('text-download').addEventListener('click', downloadTextPanel);
+document.getElementById('text-copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(textContent.textContent);
+    const b = document.getElementById('text-copy');
+    const prev = b.textContent; b.textContent = 'Copied'; setTimeout(() => { b.textContent = prev; }, 1000);
+  } catch (e) { /* clipboard blocked; ignore */ }
 });
 
 // Sidebar toggle
@@ -2953,9 +4647,17 @@ annotTools.querySelectorAll('.annot-tool').forEach((btn) => {
         : 'Open a PDF to annotate', true);
       return;
     }
+    if (btn.dataset.tool === 'image') { pickStampImage(); return; }
     setAnnotTool(btn.dataset.tool);
   });
 });
+if (stampInput) {
+  stampInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    stampInput.value = '';
+    if (file) await loadStampImage(file);
+  });
+}
 annotColor.addEventListener('input', () => {
   annotColorHex = annotColor.value;
   // Recolor the currently selected annotation, if any.
@@ -2975,6 +4677,15 @@ annotFill.addEventListener('change', () => {
 });
 annotDeleteBtn.addEventListener('click', deleteSelectedAnnot);
 saveAnnotBtn.addEventListener('click', saveAnnotatedPdf);
+saveEditableBtn.addEventListener('click', saveEditableAnnotations);
+saveFormBtn.addEventListener('click', saveEditableForm);
+
+if (markupPopover) {
+  markupPopover.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('pointerdown', (e) => e.preventDefault());  // keep selection
+    btn.addEventListener('click', () => markupSelection(btn.dataset.markup));
+  });
+}
 
 annotLayer.addEventListener('pointerdown', annotLayerPointerDown);
 annotLayer.addEventListener('pointermove', annotLayerPointerMove);

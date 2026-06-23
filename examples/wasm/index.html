@@ -23,7 +23,9 @@
     <div class="toolbar-separator"></div>
     <button type="button" id="open-pdf-btn" title="Open a PDF file">Open PDF</button>
     <button type="button" id="open-url-btn" title="Open a PDF from a URL">Open URL</button>
+    <button type="button" id="combine-btn" disabled title="Append other PDF files to this document">Combine</button>
     <input type="file" id="pdf-input" class="visually-hidden" accept=".pdf" tabindex="-1" aria-hidden="true" />
+    <input type="file" id="combine-input" class="visually-hidden" accept=".pdf" multiple tabindex="-1" aria-hidden="true" />
     <div class="toolbar-separator"></div>
     <div class="page-nav">
       <button id="prev-btn" disabled title="Previous page (Left arrow)">&larr;</button>
@@ -44,6 +46,10 @@
     <button id="render-btn" disabled title="Re-render current page">Render</button>
     <button id="backend-toggle-btn" class="backend-toggle" disabled title="Switch rendering backend">Backend</button>
     <button id="export-btn" disabled title="Export selected pages as PDF">Export</button>
+    <button id="extract-pages-btn" disabled title="Extract selected pages into a new PDF (preserves vector content)">Extract</button>
+    <button id="organize-btn" disabled title="Reorder, rotate, or delete pages">Organize</button>
+    <button id="sign-btn" disabled title="Digitally sign with a PKCS#12 (.p12/.pfx) certificate">Sign</button>
+    <button id="print-btn" disabled title="Print the document (P)">Print</button>
     <label class="protect-toggle" title="Password-protect exported PDF">
       <input type="checkbox" id="protect-export" disabled />
       Protect
@@ -63,10 +69,15 @@
       <button class="annot-tool" data-tool="line" disabled title="Draw a line">Line</button>
       <button class="annot-tool" data-tool="arrow" disabled title="Draw an arrow">Arrow</button>
       <button class="annot-tool" data-tool="ink" disabled title="Freehand sketch">Draw</button>
+      <button class="annot-tool" data-tool="redact" disabled title="Redact: black box; the underlying text is removed when you Save (flattened)">Redact</button>
+      <button class="annot-tool" data-tool="image" disabled title="Place an image / signature stamp">Image</button>
+      <input type="file" id="stamp-input" class="visually-hidden" accept="image/png,image/jpeg" tabindex="-1" aria-hidden="true" />
       <input type="color" id="annot-color" class="annot-color" value="#ffd54a" disabled title="Annotation color" />
       <label class="annot-fill" title="Fill shapes"><input type="checkbox" id="annot-fill" disabled />Fill</label>
       <button id="annot-delete" disabled title="Delete selected annotation (Delete)">Del</button>
-      <button id="save-annot-btn" disabled title="Save the whole document with annotations baked in">Save</button>
+      <button id="save-annot-btn" disabled title="Save the whole document with annotations baked in (flattened)">Save</button>
+      <button id="save-editable-btn" disabled title="Save highlights/markup/notes as real, re-editable PDF annotations (incremental update)">Save Editable</button>
+      <button id="save-form-btn" disabled title="Save filled form fields as an editable PDF (incremental update)">Save Form</button>
     </div>
 
     <!-- Search -->
@@ -76,6 +87,8 @@
       <button id="search-next-btn" disabled title="Next match">&darr;</button>
       <span id="search-info" class="search-info"></span>
     </div>
+
+    <button id="help-btn" class="help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
 
     <!-- Source repository -->
     <a class="github-link" href="https://github.com/lighttransport/nanopdf"
@@ -92,6 +105,7 @@
         <button data-tab="thumbs">Thumbs</button>
         <button data-tab="signatures">Signatures</button>
         <button data-tab="history">History</button>
+        <button data-tab="files">Files</button>
         <button data-tab="info">Info</button>
       </div>
       <div class="sidebar-content" id="sidebar-content">
@@ -114,13 +128,27 @@
             <svg id="annot-svg" class="annot-svg" xmlns="http://www.w3.org/2000/svg"></svg>
             <div id="annot-html" class="annot-html"></div>
           </div>
+          <!-- Floating text-markup popover (shown when text is selected) -->
+          <div id="markup-popover" class="markup-popover hidden">
+            <button data-markup="highlight" title="Highlight selected text">Highlight</button>
+            <button data-markup="underline" title="Underline selected text">Underline</button>
+            <button data-markup="strike" title="Strikethrough selected text">Strike</button>
+            <button data-markup="squiggly" title="Squiggly underline">Squiggly</button>
+          </div>
         </div>
       </div>
 
       <!-- Text extraction panel -->
       <div class="text-panel" id="text-panel">
         <div class="text-panel-header">
-          <span>Extracted Text</span>
+          <span id="text-panel-title">Extracted Text</span>
+          <span class="text-panel-actions">
+            <button id="text-fmt-text" class="text-fmt active" title="Plain text">Text</button>
+            <button id="text-fmt-md" class="text-fmt" title="Markdown">Markdown</button>
+            <button id="text-fmt-tables" class="text-fmt" title="Tables as CSV">Tables</button>
+            <button id="text-copy" title="Copy to clipboard">Copy</button>
+            <button id="text-download" title="Download">Download</button>
+          </span>
           <button id="text-panel-close" title="Close">&times;</button>
         </div>
         <div class="text-panel-content" id="text-content"></div>
