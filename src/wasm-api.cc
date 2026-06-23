@@ -25,6 +25,7 @@
 #include "pkcs12.hh"
 #include "rfc3161.hh"
 #include "crypto.hh"
+#include "x509.hh"
 #include <ctime>
 
 #ifdef NANOPDF_USE_BLEND2D
@@ -3494,6 +3495,76 @@ const char* nanopdf_validate_signature(int sig_index) {
     json += ",\"error\":\"" + json_escape(result.error) + "\"";
   json += "}";
 
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Validate the signer certificate chain of signature @sig_index against a
+// trust store built from the PEM CA bundle in @ca_pem (length @ca_len). Returns
+// JSON: {certCount, trustChecked, trusted, anchorCN, error}. With no CA bundle
+// (@ca_len == 0) trustChecked is false — the signer's integrity is still valid
+// (see nanopdf_validate_signature), but trust against a root store is "not
+// checked". This is path validation only: signature chain + validity period +
+// CA basic-constraints; CRL/OCSP revocation is out of scope.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_verify_trust(int sig_index, const uint8_t* ca_pem,
+                                 size_t ca_len) {
+  if (!g_pdf) {
+    g_text_buffer = "{\"error\":\"No PDF loaded\"}";
+    return g_text_buffer.c_str();
+  }
+  if (g_pdf->catalog.signature_fields.empty()) {
+    g_pdf->parse_signature_fields();
+  }
+  if (sig_index < 0 ||
+      sig_index >= static_cast<int>(g_pdf->catalog.signature_fields.size())) {
+    g_text_buffer = "{\"error\":\"Invalid signature index\"}";
+    return g_text_buffer.c_str();
+  }
+
+  const auto& sig = g_pdf->catalog.signature_fields[sig_index];
+  auto chain = nanopdf::cms::extract_certificates(sig.signature_contents);
+  if (chain.empty()) {
+    g_text_buffer =
+        "{\"certCount\":0,\"trustChecked\":false,"
+        "\"error\":\"no certificates embedded in signature\"}";
+    return g_text_buffer.c_str();
+  }
+
+  std::string json = "{\"certCount\":" + std::to_string(chain.size());
+
+  // No CA bundle supplied: integrity is checked elsewhere, trust is not.
+  if (!ca_pem || ca_len == 0) {
+    json += ",\"trustChecked\":false}";
+    g_text_buffer = json;
+    return g_text_buffer.c_str();
+  }
+
+  nanopdf::x509::TrustStore store;
+  std::string pem(reinterpret_cast<const char*>(ca_pem), ca_len);
+  for (const auto& der : nanopdf::cms::pem_to_certs(pem)) {
+    auto c = nanopdf::x509::parse(der.data(), der.size());
+    if (c.parsed) store.roots.push_back(std::move(c));
+  }
+  store.loaded = !store.roots.empty();
+  json += ",\"rootCount\":" + std::to_string(store.roots.size());
+  if (!store.loaded) {
+    json += ",\"trustChecked\":false,"
+            "\"error\":\"no valid certificates in the CA bundle\"}";
+    g_text_buffer = json;
+    return g_text_buffer.c_str();
+  }
+
+  // Hostname check is irrelevant for document signing -> pass empty.
+  int64_t now = static_cast<int64_t>(std::time(nullptr));
+  auto vr = nanopdf::x509::verify_chain(chain, store, "", now);
+  json += ",\"trustChecked\":true";
+  json += ",\"trusted\":" + std::string(vr.ok ? "true" : "false");
+  if (!vr.subject_cn.empty())
+    json += ",\"anchorCN\":\"" + json_escape(vr.subject_cn) + "\"";
+  if (!vr.ok && !vr.error.empty())
+    json += ",\"error\":\"" + json_escape(vr.error) + "\"";
+  json += "}";
   g_text_buffer = json;
   return g_text_buffer.c_str();
 }

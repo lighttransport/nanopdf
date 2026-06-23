@@ -356,7 +356,10 @@ function renderSignaturesTab() {
     html += `<section class="signature-card" data-signature-index="${index}">`;
     html += '<div class="signature-card-header">';
     html += `<div><div class="signature-name">${escapeHtml(name)}</div><div class="signature-status${statusClass}">${escapeHtml(status)}</div></div>`;
+    html += `<div style="display:flex;gap:6px;">`;
     html += `<button type="button" class="validate-signature-btn" data-signature-index="${index}" ${sig.signaturePresent ? '' : 'disabled'}>Validate</button>`;
+    html += `<button type="button" class="trust-signature-btn" data-signature-index="${index}" title="Check the signer chain against a CA bundle (PEM)" ${sig.signaturePresent ? '' : 'disabled'}>Check trust…</button>`;
+    html += `</div>`;
     html += '</div>';
     html += '<div class="signature-details">';
     html += renderSignatureDetail('Type', sig.isCertification ? 'Certification (DocMDP)' : 'Approval');
@@ -382,6 +385,7 @@ function renderSignaturesTab() {
     }
     html += '</div>';
     html += `<div class="signature-validation" id="signature-validation-${index}"></div>`;
+    html += `<div class="signature-validation" id="signature-trust-${index}"></div>`;
     html += '</section>';
   });
   html += '</div>';
@@ -389,6 +393,9 @@ function renderSignaturesTab() {
   sidebarContent.innerHTML = html;
   sidebarContent.querySelectorAll('.validate-signature-btn').forEach(btn => {
     btn.addEventListener('click', () => validateSignature(parseInt(btn.dataset.signatureIndex, 10)));
+  });
+  sidebarContent.querySelectorAll('.trust-signature-btn').forEach(btn => {
+    btn.addEventListener('click', () => checkSignatureTrust(parseInt(btn.dataset.signatureIndex, 10)));
   });
 }
 
@@ -3122,6 +3129,51 @@ function validateSignature(index) {
       target.className = 'signature-validation error';
     }
   }
+}
+
+// Prompt for a CA bundle (PEM) and validate the signer chain against it. With no
+// bundle the bridge reports "trust not checked" — integrity is separate.
+function checkSignatureTrust(index) {
+  if (!Module || !Module._nanopdf_verify_trust) return;
+  const target = document.getElementById(`signature-trust-${index}`);
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.pem,.crt,.cer,.ca-bundle,application/x-pem-file,application/x-x509-ca-cert';
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+    if (target) { target.textContent = 'Checking trust…'; target.className = 'signature-validation pending'; }
+    let pemPtr = 0;
+    try {
+      const pem = new Uint8Array(await file.arrayBuffer());
+      pemPtr = Module._nanopdf_malloc(pem.length);
+      Module.HEAPU8.set(pem, pemPtr);
+      const resStr = Module.UTF8ToString(Module._nanopdf_verify_trust(index, pemPtr, pem.length));
+      const r = JSON.parse(resStr);
+      if (!target) return;
+      if (r.error && !r.trustChecked) {
+        target.textContent = 'Trust: ' + r.error;
+        target.className = 'signature-validation error';
+        return;
+      }
+      const parts = [];
+      if (r.trusted) {
+        parts.push('Trust: chain valid');
+        if (r.anchorCN) parts.push(`Anchor: ${r.anchorCN}`);
+      } else {
+        parts.push('Trust: NOT trusted');
+        if (r.error) parts.push(r.error);
+      }
+      if (typeof r.certCount === 'number') parts.push(`${r.certCount} cert(s) in signature`);
+      target.textContent = parts.join(' | ');
+      target.className = `signature-validation ${r.trusted ? 'success' : 'error'}`;
+    } catch (e) {
+      if (target) { target.textContent = 'Trust check error: ' + e.message; target.className = 'signature-validation error'; }
+    } finally {
+      if (pemPtr) Module._nanopdf_free(pemPtr);
+    }
+  });
+  input.click();
 }
 
 // ---- PDF Export ----

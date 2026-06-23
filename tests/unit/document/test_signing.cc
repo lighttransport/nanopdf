@@ -9,6 +9,7 @@
 #include "pdf-writer.hh"
 #include "cms.hh"
 #include "pkcs12.hh"
+#include "x509.hh"
 #include "test_helpers.hh"
 
 #include <ctime>
@@ -134,6 +135,65 @@ TEST_CASE("CMS signature is deterministic for fixed signedAttrs") {
   REQUIRE_FALSE(sig1.empty());
   CHECK_EQ(sig1.size(), size_t(256));  // 2048-bit RSA
   CHECK(sig1 == sig2);
+}
+
+// Trust path (#16): the certificates embedded in a signed PDF's CMS verify
+// against the correct root and are rejected against an empty / wrong store.
+// Mirrors the nanopdf_verify_trust bridge (cms::extract_certificates +
+// x509::verify_chain).
+TEST_CASE("Signer chain validates against the right trust anchor only") {
+  std::vector<uint8_t> pdf_data, p12_data;
+  REQUIRE(test::read_file(fixture_path("textpage.pdf"), pdf_data));
+  REQUIRE(test::read_file(fixture_path("test_signer.p12"), p12_data));
+  auto bundle = pkcs12::parse(p12_data.data(), p12_data.size(), "testpass");
+  REQUIRE(bundle.valid);
+
+  // Produce a signed PDF.
+  PdfWriter writer;
+  std::string err;
+  REQUIRE(writer.load_existing(pdf_data, &err));
+  SignatureFieldConfig cfg;
+  cfg.name = "Signature1"; cfg.page = 0;
+  cfg.x = 36; cfg.y = 36; cfg.width = 200; cfg.height = 48;
+  REQUIRE_FALSE(writer.add_signature_field(cfg).empty());
+  std::vector<uint8_t> bytes;
+  REQUIRE(writer.write_incremental_for_signing(bytes, 32768).success);
+  const auto& phs = writer.get_signature_placeholders();
+  REQUIRE_EQ(phs.size(), size_t(1));
+  const std::vector<uint8_t> signer = bundle.certs[0];
+  std::vector<std::vector<uint8_t>> chain(bundle.certs.begin() + 1,
+                                          bundle.certs.end());
+  const std::string utc = utc_now();
+  SigningCallback cb =
+      [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    return cms::build_signed_data(data, signer, chain, bundle.key, utc);
+  };
+  REQUIRE(apply_signature(bytes, phs[0], cb).success);
+
+  // Re-parse and extract the embedded certificates from the signature.
+  Pdf pdf;
+  REQUIRE(parse_from_memory(bytes.data(), bytes.size(), &pdf));
+  REQUIRE(pdf.parse_signature_fields());
+  REQUIRE_EQ(pdf.catalog.signature_fields.size(), size_t(1));
+  auto certs = cms::extract_certificates(
+      pdf.catalog.signature_fields[0].signature_contents);
+  REQUIRE_EQ(certs.size(), size_t(1));
+
+  int64_t now = static_cast<int64_t>(std::time(nullptr));
+
+  // Correct root (the self-signed signer itself) -> trusted.
+  x509::TrustStore store;
+  auto root = x509::parse(bundle.certs[0].data(), bundle.certs[0].size());
+  REQUIRE(root.parsed);
+  store.roots.push_back(std::move(root));
+  store.loaded = true;
+  auto ok = x509::verify_chain(certs, store, "", now);
+  CHECK(ok.ok);
+  CHECK(ok.subject_cn.find("nanopdf Test Signer") != std::string::npos);
+
+  // Empty store -> cannot anchor.
+  x509::TrustStore empty;
+  CHECK_FALSE(x509::verify_chain(certs, empty, "", now).ok);
 }
 
 }  // namespace -> TEST_SUITE

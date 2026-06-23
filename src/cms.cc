@@ -374,6 +374,39 @@ void parse_tst(const Bytes& token, std::string* gen_time, std::string* tsa) {
 
 }  // namespace
 
+std::vector<Bytes> extract_certificates(const Bytes& cms) {
+  std::vector<Bytes> certs;
+  Reader top{cms.data(), cms.data() + cms.size(), true};
+  const uint8_t *vb, *ve, *ob, *oe;
+  if (read_tl(top, &vb, &ve) != TAG_SEQUENCE) return certs;
+  Reader ci = enter(vb, ve);
+  if (read_tl(ci, &ob, &oe) != TAG_OID) return certs;
+  if (read_tl(ci, &vb, &ve) != 0xA0) return certs;
+  Reader c0 = enter(vb, ve);
+  if (read_tl(c0, &vb, &ve) != TAG_SEQUENCE) return certs;
+  Reader sd = enter(vb, ve);
+  read_tl(sd, &vb, &ve);  // version
+  read_tl(sd, &vb, &ve);  // digestAlgorithms
+  read_tl(sd, &vb, &ve);  // encapContentInfo
+  while (sd.p < sd.end && sd.ok) {
+    uint8_t t = read_tl(sd, &vb, &ve);
+    if (t == 0xA0) {  // certificates
+      Reader cr{vb, ve, true};
+      const uint8_t *cb, *ce2;
+      while (cr.p < cr.end && cr.ok) {
+        const uint8_t* cstart = cr.p;
+        if (read_tl(cr, &cb, &ce2) != TAG_SEQUENCE) break;
+        certs.emplace_back(cstart, cr.p);
+      }
+      break;
+    } else if (t == TAG_SET || t == 0) {
+      break;  // signerInfos (no certs) or end
+    }
+    // [1] crls and anything else: ignored.
+  }
+  return certs;
+}
+
 VerifyInfo verify_signed_data(const Bytes& cms, const Bytes& content) {
   VerifyInfo vi;
   Reader top{cms.data(), cms.data() + cms.size(), true};
