@@ -67,6 +67,9 @@
       <button class="annot-tool" data-tool="line" disabled title="Draw a line">Line</button>
       <button class="annot-tool" data-tool="arrow" disabled title="Draw an arrow">Arrow</button>
       <button class="annot-tool" data-tool="ink" disabled title="Freehand sketch">Draw</button>
+      <button class="annot-tool" data-tool="redact" disabled title="Redact: black box; the underlying text is removed when you Save (flattened)">Redact</button>
+      <button class="annot-tool" data-tool="image" disabled title="Place an image / signature stamp">Image</button>
+      <input type="file" id="stamp-input" class="visually-hidden" accept="image/png,image/jpeg" tabindex="-1" aria-hidden="true" />
       <input type="color" id="annot-color" class="annot-color" value="#ffd54a" disabled title="Annotation color" />
       <label class="annot-fill" title="Fill shapes"><input type="checkbox" id="annot-fill" disabled />Fill</label>
       <button id="annot-delete" disabled title="Delete selected annotation (Delete)">Del</button>

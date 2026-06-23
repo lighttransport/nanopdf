@@ -60,6 +60,7 @@ let selectedAnnotId = null;
 let annotIdCounter = 1;
 let annotDraft = null;           // in-progress drawing
 let annotDragState = null;       // moving an existing annotation in select mode
+let pendingStampImage = null;    // { imageId, dataURL, aspect } awaiting placement
 // formFields[pageIndex] = [{name, type, value, rect:{x,y,width,height}, multiline, ...}]
 let formFieldsByPage = {};
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -122,6 +123,7 @@ const annotDeleteBtn = document.getElementById('annot-delete');
 const saveAnnotBtn = document.getElementById('save-annot-btn');
 const saveFormBtn = document.getElementById('save-form-btn');
 const markupPopover = document.getElementById('markup-popover');
+const stampInput = document.getElementById('stamp-input');
 
 function setStatus(msg, isError = false) {
   statusText.textContent = msg;
@@ -1724,9 +1726,20 @@ function drawAnnot(a) {
   const scale = getPageScale();
   const col = rgbToHex(a.color);
   if (a.type === 'text') { drawTextBox(a); return; }
+  if (a.type === 'image') { drawImageStamp(a); return; }
 
   let el;
-  if (a.type === 'highlight') {
+  if (a.type === 'redact') {
+    el = svgEl('rect');
+    const box = pdfBoxToScreen(a);
+    el.setAttribute('x', box.left); el.setAttribute('y', box.top);
+    el.setAttribute('width', Math.max(0, box.width));
+    el.setAttribute('height', Math.max(0, box.height));
+    el.setAttribute('fill', '#000');
+    el.setAttribute('stroke', '#e53935');     // red marker so users see redaction marks
+    el.setAttribute('stroke-width', '1.5');
+    el.setAttribute('stroke-dasharray', '4 2');
+  } else if (a.type === 'highlight') {
     el = svgEl('rect');
     const box = pdfBoxToScreen(a);
     el.setAttribute('x', box.left); el.setAttribute('y', box.top);
@@ -1826,19 +1839,25 @@ function startDraft(e) {
   const pos = annotPointerPos(e);
   const pdf = screenToPdf(pos.x, pos.y);
   const color = hexToRgb(annotColorHex);
+  const isRedact = annotTool === 'redact';
   annotDraft = {
     id: annotIdCounter++,
     type: annotTool,
-    color,
+    color: isRedact ? { r: 0, g: 0, b: 0 } : color,
     alpha: annotTool === 'highlight' ? 0.4 : 1,
     lineWidth: 2,
-    filled: annotFillShapes && (annotTool === 'rect' || annotTool === 'oval'),
+    filled: isRedact || (annotFillShapes && (annotTool === 'rect' || annotTool === 'oval')),
     _start: pdf,
   };
   if (annotTool === 'ink') annotDraft.points = [pdf];
   else if (annotTool === 'line' || annotTool === 'arrow') {
     annotDraft.x1 = pdf.x; annotDraft.y1 = pdf.y; annotDraft.x2 = pdf.x; annotDraft.y2 = pdf.y;
   } else { annotDraft.x = pdf.x; annotDraft.y = pdf.y; annotDraft.w = 0; annotDraft.h = 0; }
+  if (annotTool === 'image' && pendingStampImage) {
+    annotDraft.imageId = pendingStampImage.imageId;
+    annotDraft.dataURL = pendingStampImage.dataURL;
+    annotDraft._aspect = pendingStampImage.aspect || 1;
+  }
   renderAnnotations();
 }
 
@@ -1861,11 +1880,71 @@ function startTextBox(e) {
   updateSaveAnnotState();
 }
 
+// ---- Image / signature stamp ----
+
+function pickStampImage() {
+  if (stampInput) stampInput.click();
+}
+
+async function loadStampImage(file) {
+  if (!Module || !Module._nanopdf_register_stamp_image) {
+    setStatus('Image stamps need a rebuilt WASM module', true);
+    return;
+  }
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const dataURL = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = reject;
+      r.readAsDataURL(file);
+    });
+    // Natural size (for aspect ratio).
+    const aspect = await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img.naturalWidth / Math.max(1, img.naturalHeight));
+      img.onerror = () => resolve(1);
+      img.src = dataURL;
+    });
+    // Register the encoded bytes with the WASM module.
+    const ptr = Module._nanopdf_malloc(buf.length);
+    Module.HEAPU8.set(buf, ptr);
+    const id = Module._nanopdf_register_stamp_image(ptr, buf.length);
+    Module._nanopdf_free(ptr);
+    if (id < 0) {
+      setStatus('Could not load image: ' +
+        Module.UTF8ToString(Module._nanopdf_get_last_error()), true);
+      return;
+    }
+    pendingStampImage = { imageId: id, dataURL, aspect };
+    setAnnotTool('image');
+    setStatus('Click or drag on the page to place the image');
+  } catch (err) {
+    setStatus('Image load error: ' + err.message, true);
+  }
+}
+
+function drawImageStamp(a) {
+  const box = pdfBoxToScreen(a);
+  const el = svgEl('image');
+  el.setAttributeNS('http://www.w3.org/1999/xlink', 'href', a.dataURL);
+  el.setAttribute('href', a.dataURL);
+  el.setAttribute('x', box.left);
+  el.setAttribute('y', box.top);
+  el.setAttribute('width', Math.max(1, box.width));
+  el.setAttribute('height', Math.max(1, box.height));
+  el.setAttribute('preserveAspectRatio', 'none');
+  el.classList.add('annot-shape');
+  el.dataset.annotId = a.id;
+  annotSvg.appendChild(el);
+}
+
 function annotLayerPointerDown(e) {
   if (e.button !== 0) return;
   if (!annotEditingEnabled() || annotTool === 'select') return;
   e.preventDefault();
   if (annotTool === 'text') { startTextBox(e); return; }
+  if (annotTool === 'image' && !pendingStampImage) { pickStampImage(); return; }
   annotLayer.setPointerCapture?.(e.pointerId);
   startDraft(e);
 }
@@ -1895,9 +1974,21 @@ function annotLayerPointerUp(e) {
   let keep;
   if (d.type === 'ink') keep = d.points.length > 1;
   else if (d.type === 'line' || d.type === 'arrow') keep = Math.hypot(d.x2 - d.x1, d.y2 - d.y1) > 2;
-  else keep = d.w > 2 && d.h > 2;
+  else if (d.type === 'image') {
+    // A click (no real drag) places the image at a default size keeping aspect.
+    if (d.w <= 2 || d.h <= 2) {
+      const w = 160 / getPageScale();
+      d.w = w; d.h = w / (d._aspect || 1);
+      d.y = d._start.y - d.h;  // grow downward from the click point
+      d.x = d._start.x;
+    }
+    keep = true;
+    pendingStampImage = null;   // consume the pending image
+    setAnnotTool('select');
+  } else keep = d.w > 2 && d.h > 2;
   if (keep) {
     delete d._start;
+    delete d._aspect;
     pageAnnots().push(d);
     selectedAnnotId = d.id;
   }
@@ -2112,6 +2203,7 @@ function resetAnnotations() {
   formFieldsByPage = {};
   selectedAnnotId = null;
   annotDraft = null;
+  pendingStampImage = null;
   annotIdCounter = 1;
   setAnnotTool('select');
   if (annotHtml) clearChildren(annotHtml);
@@ -3019,6 +3111,16 @@ function bakeAnnotationForWorkPage(workIndex, a) {
         bakeTextLines(workIndex, a.text, a.x, a.y + a.h, a.fontSize || 14, c, alpha);
       }
       break;
+    case 'redact':
+      // Opaque black box. Because export flattens the page to a raster image
+      // first, the text underneath is gone (not just visually covered).
+      Module._nanopdf_annot_add_rect(workIndex, a.x, a.y, a.w, a.h, 0, 0, 0, 0, 1, 1);
+      break;
+    case 'image':
+      if (a.imageId != null && Module._nanopdf_annot_add_image) {
+        Module._nanopdf_annot_add_image(workIndex, a.x, a.y, a.w, a.h, a.imageId);
+      }
+      break;
   }
 }
 
@@ -3213,8 +3315,161 @@ async function saveAnnotatedPdf() {
   if (!Module || totalPages <= 0 || !hasRendering) return;
   const pages = [];
   for (let i = 0; i < totalPages; i++) pages.push(i);
+  // Redaction must burn pixels client-side to truly remove text. Password
+  // protection isn't applied on that path, so prefer security when both are set.
+  if (docHasRedaction()) {
+    if (protectExport.checked) {
+      setStatus('Redaction is applied without password protection (security takes priority)', false);
+    }
+    await saveFlattenedPdf(pages, 'redacted');
+    return;
+  }
   await exportViaWasm(pages, { protect: protectExport.checked, suffix: 'annotated' });
   renderCurrentPage();
+}
+
+// ---- Client-side flatten: burn annotations into the page raster ----
+// Used so redaction truly removes the underlying pixels (a vector box over a
+// page image would leave the text recoverable in the image).
+
+function rgbCss(c) {
+  c = c || { r: 0, g: 0, b: 0 };
+  return `rgb(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)})`;
+}
+
+async function preloadStampImages() {
+  const byId = {};
+  for (const k in annotations) {
+    for (const a of annotations[k]) {
+      if (a.type === 'image' && a.dataURL && byId[a.imageId] === undefined) byId[a.imageId] = a.dataURL;
+    }
+  }
+  const cache = {};
+  await Promise.all(Object.keys(byId).map((id) => new Promise((res) => {
+    const img = new Image();
+    img.onload = () => { cache[id] = img; res(); };
+    img.onerror = () => res();
+    img.src = byId[id];
+  })));
+  return cache;
+}
+
+// Draw a page's annotations + form-field values onto a canvas. sc = px/pt.
+function flattenAnnotationsToCanvas(ctx, pageIdx, sc, phPts, imgCache) {
+  const PX = (x) => x * sc;
+  const PY = (y) => (phPts - y) * sc;
+  const list = annotations[pageIdx] || [];
+  for (const a of list) {
+    ctx.save();
+    const css = rgbCss(a.color);
+    if (a.type === 'redact') {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc);
+    } else if (a.type === 'highlight') {
+      ctx.globalAlpha = a.alpha != null ? a.alpha : 0.4;
+      ctx.fillStyle = css;
+      ctx.fillRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc);
+    } else if (a.type === 'rect') {
+      ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc);
+      if (a.filled) { ctx.fillStyle = css; ctx.fillRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc); }
+      else { ctx.strokeStyle = css; ctx.strokeRect(PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc); }
+    } else if (a.type === 'oval') {
+      ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc);
+      ctx.beginPath();
+      ctx.ellipse(PX(a.x + a.w / 2), PY(a.y + a.h / 2), (a.w / 2) * sc, (a.h / 2) * sc, 0, 0, Math.PI * 2);
+      if (a.filled) { ctx.fillStyle = css; ctx.fill(); } else { ctx.strokeStyle = css; ctx.stroke(); }
+    } else if (a.type === 'line' || a.type === 'arrow') {
+      ctx.strokeStyle = css; ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(PX(a.x1), PY(a.y1)); ctx.lineTo(PX(a.x2), PY(a.y2)); ctx.stroke();
+      if (a.type === 'arrow') {
+        for (const s of arrowHeadPdf(a.x1, a.y1, a.x2, a.y2)) {
+          ctx.beginPath(); ctx.moveTo(PX(s.x1), PY(s.y1)); ctx.lineTo(PX(s.x2), PY(s.y2)); ctx.stroke();
+        }
+      }
+    } else if (a.type === 'ink') {
+      ctx.strokeStyle = css; ctx.lineWidth = Math.max(1, (a.lineWidth || 2) * sc);
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.beginPath();
+      a.points.forEach((p, i) => { const x = PX(p.x), y = PY(p.y); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.stroke();
+    } else if (a.type === 'text') {
+      if (a.text && a.text.trim()) {
+        const fs = (a.fontSize || 14) * sc;
+        ctx.fillStyle = css; ctx.font = `${fs}px Helvetica, Arial, sans-serif`; ctx.textBaseline = 'top';
+        let ty = PY(a.y + a.h);
+        for (const ln of a.text.split('\n')) { ctx.fillText(ln, PX(a.x), ty); ty += fs * 1.25; }
+      }
+    } else if (a.type === 'image') {
+      const img = imgCache[a.imageId];
+      if (img) ctx.drawImage(img, PX(a.x), PY(a.y + a.h), a.w * sc, a.h * sc);
+    }
+    ctx.restore();
+  }
+  // Form-field values (text/checkbox/dropdown) flattened as text.
+  for (const f of (formFieldsByPage[pageIdx] || [])) {
+    const txt = formFieldBaked(f);
+    if (!txt) continue;
+    const fs = Math.max(8, Math.min(f.rect.height * 0.7, 12)) * sc;
+    ctx.fillStyle = '#000'; ctx.font = `${fs}px Helvetica, Arial, sans-serif`; ctx.textBaseline = 'top';
+    let ty = PY(f.rect.y + f.rect.height) + 1;
+    for (const ln of String(txt).split('\n')) { ctx.fillText(ln, PX(f.rect.x) + 2, ty); ty += fs * 1.25; }
+  }
+}
+
+// Flatten the given pages to a downloadable image PDF with annotations burned in.
+async function saveFlattenedPdf(pages, suffix) {
+  if (!Module || !hasRendering) return;
+  showLoading(`Flattening ${pages.length} page(s)...`);
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const imgCache = await preloadStampImages();
+    const pageImages = [];
+    for (let idx = 0; idx < pages.length; idx++) {
+      const pageIdx = pages[idx];
+      loadingText.textContent = `Rendering page ${idx + 1} / ${pages.length}...`;
+      const pw = Module._nanopdf_get_page_width(pageIdx);
+      const ph = Module._nanopdf_get_page_height(pageIdx);
+      const scale = 150 / 72;
+      const width = Math.min(4096, Math.floor(pw * scale));
+      const height = Math.min(4096, Math.floor(ph * scale));
+      const dpi = 72 * (width / pw);
+      let ok = 0;
+      try { ok = Module._nanopdf_render_page(pageIdx, width, height, dpi); } catch (e) { continue; }
+      if (ok !== 1) continue;
+      const bufPtr = Module._nanopdf_get_render_buffer();
+      const bufSize = Module._nanopdf_get_render_buffer_size();
+      const rw = Module._nanopdf_get_render_width();
+      const rh = Module._nanopdf_get_render_height();
+      const cvs = document.createElement('canvas');
+      cvs.width = rw; cvs.height = rh;
+      const ctx = cvs.getContext('2d');
+      const imageData = ctx.createImageData(rw, rh);
+      imageData.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, bufPtr, bufSize));
+      ctx.putImageData(imageData, 0, 0);
+      // Burn annotations into the raster (sc = device px per PDF point).
+      flattenAnnotationsToCanvas(ctx, pageIdx, rw / pw, ph, imgCache);
+      pageImages.push({ jpegBytes: canvasToJpegBytes(cvs), imgWidth: rw, imgHeight: rh, pageWidth: pw, pageHeight: ph });
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    if (!pageImages.length) { setStatus('Nothing to save', true); return; }
+    loadingText.textContent = 'Building PDF...';
+    await new Promise((r) => setTimeout(r, 30));
+    downloadPdfBytes(buildPdf(pageImages), suffix || 'flattened', pages);
+    setStatus(`Saved ${pageImages.length} flattened page(s)`);
+  } catch (err) {
+    setStatus('Flatten error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+    renderCurrentPage();
+  }
+}
+
+function docHasRedaction() {
+  for (const k in annotations) {
+    if ((annotations[k] || []).some((a) => a.type === 'redact')) return true;
+  }
+  return false;
 }
 
 async function exportSelectedPages() {
@@ -3222,6 +3477,12 @@ async function exportSelectedPages() {
 
   const pages = [...selectedPages].sort((a, b) => a - b);
 
+  // Redaction on any selected page requires the secure client-side burn.
+  const hasRedaction = pages.some((p) => (annotations[p] || []).some((a) => a.type === 'redact'));
+  if (hasRedaction && !protectExport.checked) {
+    await saveFlattenedPdf(pages, 'redacted');
+    return;
+  }
   // Route through the C++ flatten path when encryption is requested or any
   // selected page carries annotations / form-field fills, so they get baked in.
   const hasBakeable = pages.some(pageHasBakeableContent);
@@ -3571,9 +3832,17 @@ annotTools.querySelectorAll('.annot-tool').forEach((btn) => {
         : 'Open a PDF to annotate', true);
       return;
     }
+    if (btn.dataset.tool === 'image') { pickStampImage(); return; }
     setAnnotTool(btn.dataset.tool);
   });
 });
+if (stampInput) {
+  stampInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    stampInput.value = '';
+    if (file) await loadStampImage(file);
+  });
+}
 annotColor.addEventListener('input', () => {
   annotColorHex = annotColor.value;
   // Recolor the currently selected annotation, if any.

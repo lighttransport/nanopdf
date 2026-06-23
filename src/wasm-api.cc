@@ -87,7 +87,7 @@ struct PageInfo {
 };
 
 struct Annotation {
-  int type;  // 0=text, 1=line, 2=rect, 3=oval, 4=highlight
+  int type;  // 0=text, 1=line, 2=rect, 3=oval, 4=highlight, 5=image
   double x1, y1, x2, y2;
   double r, g, b, a;
   double line_width;
@@ -95,7 +95,13 @@ struct Annotation {
   std::string font_name;
   double font_size;
   bool filled;
+  int image_id = -1;          // for type 5 (image stamp): id from register_stamp_image
+  std::string image_name;     // resolved page resource name during export
 };
+
+// Registered image stamps (encoded PNG/JPEG bytes), keyed by id.
+static std::map<int, std::vector<uint8_t>> g_stamp_images;
+static int g_next_stamp_id = 0;
 
 struct DocumentInfo {
   std::vector<uint8_t> data;
@@ -1252,6 +1258,52 @@ int nanopdf_annot_add_highlight(int page_index, float x, float y, float w, float
   return static_cast<int>(g_page_annotations[page_index].size() - 1);
 }
 
+// Register an image (PNG/JPEG bytes) for use as a stamp. Returns an id (>=0),
+// or -1 if the image cannot be decoded.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_register_stamp_image(const uint8_t* data, size_t len) {
+  if (!data || len == 0) {
+    g_last_error = "Invalid image data";
+    return -1;
+  }
+  // Validate it decodes before storing.
+  nanopdf::ImageData img = nanopdf::ImageData::FromMemory(data, len);
+  if (!img.valid()) {
+    g_last_error = "Unsupported or corrupt image";
+    return -1;
+  }
+  int id = g_next_stamp_id++;
+  g_stamp_images[id].assign(data, data + len);
+  return id;
+}
+
+// Add an image-stamp annotation. (x,y) is the lower-left corner; (w,h) the size
+// in page points. image_id comes from nanopdf_register_stamp_image.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_annot_add_image(int page_index, float x, float y, float w, float h,
+                            int image_id) {
+  if (page_index < 0 || page_index >= static_cast<int>(g_working_pages.size())) {
+    g_last_error = "Invalid page index";
+    return -1;
+  }
+  if (g_stamp_images.find(image_id) == g_stamp_images.end()) {
+    g_last_error = "Unknown image id";
+    return -1;
+  }
+  Annotation annot;
+  annot.type = 5;  // Image stamp
+  annot.x1 = x;
+  annot.y1 = y;
+  annot.x2 = w;
+  annot.y2 = h;
+  annot.r = annot.g = annot.b = annot.a = 1.0;
+  annot.line_width = 0;
+  annot.filled = false;
+  annot.image_id = image_id;
+  g_page_annotations[page_index].push_back(annot);
+  return static_cast<int>(g_page_annotations[page_index].size() - 1);
+}
+
 // Remove annotation
 EMSCRIPTEN_KEEPALIVE
 int nanopdf_annot_remove(int page_index, int annot_index) {
@@ -1522,6 +1574,24 @@ int nanopdf_export_pdf() {
       annots = &annot_it->second;
     }
 
+    // Pre-register image-stamp resources on the writer (PageBuilder cannot add
+    // resources, only draw them), recording the resolved name per annotation.
+    if (annots) {
+      for (auto& annot : *annots) {
+        if (annot.type == 5 && annot.image_name.empty()) {
+          auto sit = g_stamp_images.find(annot.image_id);
+          if (sit != g_stamp_images.end()) {
+            nanopdf::ImageData img =
+                nanopdf::ImageData::FromMemory(sit->second.data(), sit->second.size());
+            if (img.valid()) {
+              annot.image_name = img.has_alpha() ? g_writer->add_image_with_alpha(img)
+                                                 : g_writer->add_image(img);
+            }
+          }
+        }
+      }
+    }
+
     // Capture image name for this page
     std::string img_name = page_images[i];
     int rotation = pinfo.rotation;
@@ -1632,6 +1702,13 @@ int nanopdf_export_pdf() {
               builder.set_fill_color(annot.r, annot.g, annot.b);
               builder.rectangle(annot.x1, annot.y1, annot.x2, annot.y2);
               builder.fill();
+              break;
+
+            case 5:  // Image stamp (x1,y1 = lower-left; x2,y2 = w,h)
+              if (!annot.image_name.empty()) {
+                builder.draw_image(annot.image_name, annot.x1, annot.y1,
+                                   annot.x2, annot.y2);
+              }
               break;
           }
 
