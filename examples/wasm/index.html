@@ -23,7 +23,9 @@
     <div class="toolbar-separator"></div>
     <button type="button" id="open-pdf-btn" title="Open a PDF file">Open PDF</button>
     <button type="button" id="open-url-btn" title="Open a PDF from a URL">Open URL</button>
+    <button type="button" id="combine-btn" disabled title="Append other PDF files to this document">Combine</button>
     <input type="file" id="pdf-input" class="visually-hidden" accept=".pdf" tabindex="-1" aria-hidden="true" />
+    <input type="file" id="combine-input" class="visually-hidden" accept=".pdf" multiple tabindex="-1" aria-hidden="true" />
     <div class="toolbar-separator"></div>
     <div class="page-nav">
       <button id="prev-btn" disabled title="Previous page (Left arrow)">&larr;</button>
@@ -44,6 +46,8 @@
     <button id="render-btn" disabled title="Re-render current page">Render</button>
     <button id="backend-toggle-btn" class="backend-toggle" disabled title="Switch rendering backend">Backend</button>
     <button id="export-btn" disabled title="Export selected pages as PDF">Export</button>
+    <button id="extract-pages-btn" disabled title="Extract selected pages into a new PDF (preserves vector content)">Extract</button>
+    <button id="organize-btn" disabled title="Reorder, rotate, or delete pages">Organize</button>
     <label class="protect-toggle" title="Password-protect exported PDF">
       <input type="checkbox" id="protect-export" disabled />
       Protect
@@ -66,7 +70,8 @@
       <input type="color" id="annot-color" class="annot-color" value="#ffd54a" disabled title="Annotation color" />
       <label class="annot-fill" title="Fill shapes"><input type="checkbox" id="annot-fill" disabled />Fill</label>
       <button id="annot-delete" disabled title="Delete selected annotation (Delete)">Del</button>
-      <button id="save-annot-btn" disabled title="Save the whole document with annotations baked in">Save</button>
+      <button id="save-annot-btn" disabled title="Save the whole document with annotations baked in (flattened)">Save</button>
+      <button id="save-form-btn" disabled title="Save filled text fields as an editable PDF (incremental update). Use Save for checkbox/dropdown values.">Save Form</button>
     </div>
 
     <!-- Search -->
@@ -113,6 +118,13 @@
           <div id="annot-layer" class="annot-layer">
             <svg id="annot-svg" class="annot-svg" xmlns="http://www.w3.org/2000/svg"></svg>
             <div id="annot-html" class="annot-html"></div>
+          </div>
+          <!-- Floating text-markup popover (shown when text is selected) -->
+          <div id="markup-popover" class="markup-popover hidden">
+            <button data-markup="highlight" title="Highlight selected text">Highlight</button>
+            <button data-markup="underline" title="Underline selected text">Underline</button>
+            <button data-markup="strike" title="Strikethrough selected text">Strike</button>
+            <button data-markup="squiggly" title="Squiggly underline">Squiggly</button>
           </div>
         </div>
       </div>

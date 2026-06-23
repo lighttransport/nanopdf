@@ -75,6 +75,10 @@ const dropOverlay = document.getElementById('drop-overlay');
 const pdfInput = document.getElementById('pdf-input');
 const openPdfBtn = document.getElementById('open-pdf-btn');
 const openUrlBtn = document.getElementById('open-url-btn');
+const combineBtn = document.getElementById('combine-btn');
+const combineInput = document.getElementById('combine-input');
+const extractPagesBtn = document.getElementById('extract-pages-btn');
+const organizeBtn = document.getElementById('organize-btn');
 const renderBtn = document.getElementById('render-btn');
 const extractBtn = document.getElementById('extract-btn');
 const backendToggleBtn = document.getElementById('backend-toggle-btn');
@@ -116,6 +120,8 @@ const annotColor = document.getElementById('annot-color');
 const annotFill = document.getElementById('annot-fill');
 const annotDeleteBtn = document.getElementById('annot-delete');
 const saveAnnotBtn = document.getElementById('save-annot-btn');
+const saveFormBtn = document.getElementById('save-form-btn');
+const markupPopover = document.getElementById('markup-popover');
 
 function setStatus(msg, isError = false) {
   statusText.textContent = msg;
@@ -519,6 +525,28 @@ function composeDiffImage(ctx) {
     return out;
   }
 
+  if (diffState.mode === 'side') {
+    // Before | After in two synchronized panes (one image => scroll/zoom synced).
+    const gap = 14;
+    const W = w * 2 + gap;
+    const out2 = ctx.createImageData(W, h);
+    const o2 = out2.data;
+    o2.fill(255);
+    for (let i = 3; i < o2.length; i += 4) o2[i] = 255;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const si = (y * w + x) * 4;
+        if (A) {
+          const dl = (y * W + x) * 4;
+          o2[dl] = A[si]; o2[dl + 1] = A[si + 1]; o2[dl + 2] = A[si + 2]; o2[dl + 3] = 255;
+        }
+        const dr = (y * W + (w + gap) + x) * 4;
+        o2[dr] = B[si]; o2[dr + 1] = B[si + 1]; o2[dr + 2] = B[si + 2]; o2[dr + 3] = 255;
+      }
+    }
+    return out2;
+  }
+
   if (diffState.mode === 'swipe') {
     const splitX = Math.round(w * diffState.swipe);
     for (let y = 0; y < h; y++) {
@@ -571,6 +599,7 @@ function ensureDiffOverlay() {
         <div class="rev-diff-title" id="rev-diff-title">Revision changes</div>
         <div class="rev-diff-modes">
           <button data-mode="diff" class="active">Diff</button>
+          <button data-mode="side">Side-by-side</button>
           <button data-mode="before">Before</button>
           <button data-mode="after">After</button>
           <button data-mode="swipe">Swipe</button>
@@ -581,6 +610,7 @@ function ensureDiffOverlay() {
         <canvas id="rev-diff-canvas"></canvas>
         <div class="rev-diff-empty hidden" id="rev-diff-empty"></div>
       </div>
+      <div class="rev-diff-strip" id="rev-diff-strip"></div>
       <div class="rev-diff-footer">
         <div class="rev-diff-pagenav">
           <button id="rev-diff-prev" title="Previous page">&larr;</button>
@@ -669,10 +699,19 @@ function paintDiffCanvas() {
   if (noChange) empty.textContent = 'No visual changes on this page.';
   canvas.classList.toggle('dimmed', noChange);
   canvas.classList.remove('hidden');
+  const changedCount = diffState.changedComputed ? diffState.changed.size : null;
   document.getElementById('rev-diff-pageinfo').textContent =
-    `Page ${diffState.page + 1} / ${diffState.pageCount}`;
+    `Page ${diffState.page + 1} / ${diffState.pageCount}` +
+    (changedCount != null ? ` — ${changedCount} changed` : '');
   overlay.querySelector('#rev-diff-prev').disabled = diffState.page <= 0;
   overlay.querySelector('#rev-diff-next').disabled = diffState.page >= diffState.pageCount - 1;
+  // Keep the strip's "current" highlight in sync.
+  const strip = document.getElementById('rev-diff-strip');
+  if (strip) {
+    strip.querySelectorAll('.rev-diff-chip').forEach((c, i) => {
+      c.classList.toggle('current', i === diffState.page);
+    });
+  }
 }
 
 function stepDiffPage(delta) {
@@ -706,17 +745,48 @@ function openRevisionDiff(revIndex) {
   overlay.classList.remove('hidden');
   diffState.open = true;
 
-  // Jump to the first page that actually changed (cap the scan for big docs).
-  diffState.page = Math.min(currentPage, diffState.pageCount - 1);
-  const scanLimit = diffState.pageCount <= 30 ? diffState.pageCount : 0;
-  let landed = false;
+  // Precompute which pages changed (cap the scan for very large docs), and
+  // land on the first changed page.
+  diffState.changed = new Set();
+  const scanLimit = diffState.pageCount <= 60 ? diffState.pageCount : 0;
+  diffState.changedComputed = scanLimit > 0;
+  let first = -1;
   for (let p = 0; p < scanLimit; p++) {
     diffState.page = p;
     loadDiffPage();
-    if (diffPageChanged()) { landed = true; break; }
+    if (diffPageChanged()) { diffState.changed.add(p); if (first < 0) first = p; }
   }
-  if (!landed) { diffState.page = Math.min(currentPage, diffState.pageCount - 1); loadDiffPage(); }
+  diffState.page = first >= 0 ? first : Math.min(currentPage, diffState.pageCount - 1);
+  loadDiffPage();
+  renderDiffStrip();
   paintDiffCanvas();
+}
+
+// Footer strip of page chips; changed pages highlighted, click to jump.
+function renderDiffStrip() {
+  const strip = document.getElementById('rev-diff-strip');
+  if (!strip) return;
+  strip.innerHTML = '';
+  if (!diffState.changedComputed || diffState.pageCount <= 1) {
+    strip.classList.add('hidden');
+    return;
+  }
+  strip.classList.remove('hidden');
+  for (let p = 0; p < diffState.pageCount; p++) {
+    const chip = document.createElement('button');
+    chip.className = 'rev-diff-chip';
+    if (diffState.changed.has(p)) chip.classList.add('changed');
+    if (p === diffState.page) chip.classList.add('current');
+    chip.textContent = String(p + 1);
+    chip.title = `Page ${p + 1}${diffState.changed.has(p) ? ' (changed)' : ''}`;
+    chip.addEventListener('click', () => {
+      diffState.page = p;
+      loadDiffPage();
+      renderDiffStrip();
+      paintDiffCanvas();
+    });
+    strip.appendChild(chip);
+  }
 }
 
 function closeRevisionDiff() {
@@ -724,6 +794,193 @@ function closeRevisionDiff() {
   if (overlay) overlay.classList.add('hidden');
   diffState.open = false;
   diffState.before = diffState.after = null;
+}
+
+// ---- Page organizer (reorder / rotate / delete) ----
+
+// organizeModel: ordered array of { src: originalPageIndex, rot: 0|90|180|270 }
+let organizeModel = [];
+let organizeThumbCache = {};
+let organizeDragIndex = -1;
+
+function renderPageToCanvas(pageIdx, canvas, maxW) {
+  const pw = Module._nanopdf_get_page_width(pageIdx) || 612;
+  const ph = Module._nanopdf_get_page_height(pageIdx) || 792;
+  const scale = maxW / pw;
+  const w = Math.max(1, Math.round(pw * scale));
+  const h = Math.max(1, Math.round(ph * scale));
+  let ok = 0;
+  try { ok = Module._nanopdf_render_page(pageIdx, w, h, 72 * (w / pw)); } catch (e) { return false; }
+  if (ok !== 1) return false;
+  const ptr = Module._nanopdf_get_render_buffer();
+  const size = Module._nanopdf_get_render_buffer_size();
+  const rw = Module._nanopdf_get_render_width();
+  const rh = Module._nanopdf_get_render_height();
+  canvas.width = rw; canvas.height = rh;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(rw, rh);
+  img.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size));
+  ctx.putImageData(img, 0, 0);
+  return true;
+}
+
+function organizeThumb(src) {
+  if (organizeThumbCache[src]) return organizeThumbCache[src];
+  const c = document.createElement('canvas');
+  const url = renderPageToCanvas(src, c, 120) ? c.toDataURL('image/png') : '';
+  organizeThumbCache[src] = url;
+  return url;
+}
+
+function ensureOrganizeOverlay() {
+  let el = document.getElementById('organize-overlay');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'organize-overlay';
+  el.className = 'organize-overlay hidden';
+  el.innerHTML = `
+    <div class="organize-panel">
+      <div class="organize-header">
+        <div class="organize-title">Organize pages</div>
+        <button id="organize-reset">Reset</button>
+        <button id="organize-cancel">Cancel</button>
+      </div>
+      <div class="organize-grid" id="organize-grid"></div>
+      <div class="organize-footer">
+        <span id="organize-info" style="margin-right:auto;color:#666;font-size:13px;"></span>
+        <button class="primary" id="organize-save">Save reorganized PDF</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  el.querySelector('#organize-cancel').addEventListener('click', closeOrganize);
+  el.querySelector('#organize-reset').addEventListener('click', () => { openOrganize(); });
+  el.querySelector('#organize-save').addEventListener('click', saveOrganized);
+  el.addEventListener('click', (e) => { if (e.target === el) closeOrganize(); });
+  return el;
+}
+
+function openOrganize() {
+  if (!Module || totalPages <= 0 || !hasRendering) return;
+  organizeModel = [];
+  for (let i = 0; i < totalPages; i++) organizeModel.push({ src: i, rot: 0 });
+  organizeThumbCache = {};
+  const el = ensureOrganizeOverlay();
+  el.classList.remove('hidden');
+  renderOrganizeGrid();
+}
+
+function closeOrganize() {
+  const el = document.getElementById('organize-overlay');
+  if (el) el.classList.add('hidden');
+}
+
+function renderOrganizeGrid() {
+  const grid = document.getElementById('organize-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  organizeModel.forEach((entry, idx) => {
+    const card = document.createElement('div');
+    card.className = 'org-card';
+    card.draggable = true;
+    card.dataset.idx = idx;
+    const img = document.createElement('img');
+    img.src = organizeThumb(entry.src);
+    img.style.transform = entry.rot ? `rotate(${entry.rot}deg)` : '';
+    const label = document.createElement('div');
+    label.className = 'org-card-label';
+    label.textContent = `p.${entry.src + 1}`;
+    const actions = document.createElement('div');
+    actions.className = 'org-card-actions';
+    const mk = (txt, title, fn, cls) => {
+      const b = document.createElement('button');
+      b.textContent = txt; b.title = title; if (cls) b.className = cls;
+      b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+      return b;
+    };
+    actions.append(
+      mk('⟲', 'Rotate left', () => { entry.rot = ((entry.rot - 90) % 360 + 360) % 360; renderOrganizeGrid(); }),
+      mk('⟳', 'Rotate right', () => { entry.rot = (entry.rot + 90) % 360; renderOrganizeGrid(); }),
+      mk('🗑', 'Delete page', () => { organizeModel.splice(idx, 1); renderOrganizeGrid(); }, 'del'),
+    );
+    card.append(img, label, actions);
+
+    card.addEventListener('dragstart', () => { organizeDragIndex = idx; card.classList.add('dragging'); });
+    card.addEventListener('dragend', () => { organizeDragIndex = -1; card.classList.remove('dragging'); });
+    card.addEventListener('dragover', (e) => { e.preventDefault(); card.classList.add('drag-over'); });
+    card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+    card.addEventListener('drop', (e) => {
+      e.preventDefault();
+      card.classList.remove('drag-over');
+      const from = organizeDragIndex, to = idx;
+      if (from < 0 || from === to) return;
+      const [moved] = organizeModel.splice(from, 1);
+      organizeModel.splice(to, 0, moved);
+      renderOrganizeGrid();
+    });
+    grid.appendChild(card);
+  });
+  const info = document.getElementById('organize-info');
+  if (info) {
+    const anyRot = organizeModel.some((e) => e.rot % 360 !== 0);
+    info.textContent = `${organizeModel.length} page(s)` +
+      (anyRot ? ' — rotated pages are flattened on save' : ' — vector preserved');
+  }
+  const saveBtn = document.getElementById('organize-save');
+  if (saveBtn) saveBtn.disabled = organizeModel.length === 0;
+}
+
+async function exportOrganizedViaWork(model) {
+  const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
+  Module.HEAPU8.set(currentPdfBytes, ptr);
+  const docId = Module._nanopdf_doc_load(ptr, currentPdfBytes.length);
+  Module._nanopdf_free(ptr);
+  if (docId < 0) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load doc');
+  try {
+    Module._nanopdf_work_clear();
+    for (const e of model) {
+      const wi = Module._nanopdf_work_add_page(docId, e.src);
+      if (wi < 0) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to add page');
+      if (e.rot % 360 !== 0) Module._nanopdf_work_rotate_page(wi, ((e.rot % 360) + 360) % 360);
+    }
+    if (Module._nanopdf_export_pdf() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Export failed');
+    }
+    return copyWasmBuffer(Module._nanopdf_export_get_buffer, Module._nanopdf_export_get_size);
+  } finally {
+    Module._nanopdf_doc_close(docId);
+    Module._nanopdf_work_clear();
+  }
+}
+
+async function saveOrganized() {
+  if (!organizeModel.length) { setStatus('No pages to save', true); return; }
+  const order = organizeModel.map((e) => e.src);
+  const anyRot = organizeModel.some((e) => e.rot % 360 !== 0);
+  showLoading('Saving reorganized PDF...');
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    let out;
+    if (!anyRot && Module._nanopdf_split_pages) {
+      // Pure reorder/delete: vector-preserving via split.
+      const jp = Module.stringToNewUTF8('[' + order.join(',') + ']');
+      const ok = Module._nanopdf_split_pages(jp);
+      Module._free(jp);
+      if (ok !== 1) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Reorder failed');
+      out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    } else {
+      // Rotation present: route through the work/export path (flattened).
+      out = await exportOrganizedViaWork(organizeModel);
+    }
+    if (!out) throw new Error('Empty output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_organized.pdf');
+    setStatus(`Saved reorganized PDF (${organizeModel.length} page(s))`);
+    closeOrganize();
+  } catch (err) {
+    setStatus('Organize error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
 }
 
 // ---- Thumbnails ----
@@ -848,6 +1105,14 @@ function updateExportButton() {
   exportBtn.textContent = hasSelection
     ? `Export (${selectedPages.size})`
     : 'Export';
+
+  // Combine works on the whole document; Extract needs a page selection.
+  if (combineBtn) combineBtn.disabled = !(totalPages > 0 && Module && Module._nanopdf_merge_start);
+  if (extractPagesBtn) {
+    extractPagesBtn.disabled = !(hasSelection && Module && Module._nanopdf_split_pages);
+    extractPagesBtn.textContent = selectedPages.size > 0 ? `Extract (${selectedPages.size})` : 'Extract';
+  }
+  if (organizeBtn) organizeBtn.disabled = !docLoaded;
 
   // Guide the user when Protect is on but nothing is selected to export.
   if (protectExport.checked && !hasSelection && docLoaded) {
@@ -996,6 +1261,7 @@ function goToPage(pageIndex) {
   currentPage = pageIndex;
   selectedAnnotId = null;
   annotDraft = null;
+  hideMarkupPopover();
   updatePageDisplay();
   renderCurrentPage();
   clearSearch();
@@ -1596,6 +1862,12 @@ function deleteSelectedAnnot() {
 
 // ---- Form-field visual fill ----
 
+function isCheckboxOn(value) {
+  if (!value) return false;
+  const v = String(value).replace(/^\//, '').toLowerCase();
+  return v !== '' && v !== 'off';
+}
+
 function loadFormFields() {
   formFieldsByPage = {};
   if (!Module || !Module._nanopdf_get_form_fields) return;
@@ -1606,16 +1878,25 @@ function loadFormFields() {
   } catch (e) { return; }
   if (!json || !json.fields) return;
   for (const f of json.fields) {
-    if (f.type !== 'text' || f.readOnly) continue;  // visual fill: editable text fields
+    if (f.readOnly) continue;
+    // Map the field type to an editable control kind.
+    let kind = null;
+    if (f.type === 'text') kind = 'text';
+    else if (f.type === 'button' && f.buttonType === 'checkbox') kind = 'checkbox';
+    else if (f.type === 'choice') kind = 'choice';
+    if (!kind) continue;  // radios/pushbuttons/signatures not yet editable
     for (const w of (f.widgets || [])) {
       if (w.page == null || w.page < 0 || !w.rect) continue;
       if (!formFieldsByPage[w.page]) formFieldsByPage[w.page] = [];
       formFieldsByPage[w.page].push({
         name: f.fullName || f.name || '',
+        kind,
         rect: w.rect,
         value: f.value || '',
+        checked: kind === 'checkbox' ? isCheckboxOn(f.value) : false,
         multiline: !!f.multiline,
         password: !!f.password,
+        options: Array.isArray(f.options) ? f.options : [],
         fontSize: 12,
       });
     }
@@ -1630,30 +1911,114 @@ function renderFormFields() {
   if (!fields) return;
   for (const fld of fields) {
     const box = pdfBoxToScreen({ x: fld.rect.x, y: fld.rect.y, w: fld.rect.width, h: fld.rect.height });
-    const input = document.createElement(fld.multiline ? 'textarea' : 'input');
-    if (!fld.multiline) input.type = fld.password ? 'password' : 'text';
+    let input;
+    if (fld.kind === 'checkbox') {
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = fld.checked;
+      input.addEventListener('change', () => { fld.checked = input.checked; updateSaveAnnotState(); });
+    } else if (fld.kind === 'choice') {
+      input = document.createElement('select');
+      for (const opt of fld.options) {
+        const o = document.createElement('option');
+        o.value = opt; o.textContent = opt;
+        if (opt === fld.value) o.selected = true;
+        input.appendChild(o);
+      }
+      input.addEventListener('change', () => { fld.value = input.value; updateSaveAnnotState(); });
+    } else {
+      input = document.createElement(fld.multiline ? 'textarea' : 'input');
+      if (!fld.multiline) input.type = fld.password ? 'password' : 'text';
+      input.value = fld.value;
+      input.addEventListener('input', () => { fld.value = input.value; updateSaveAnnotState(); });
+    }
     input.className = 'annot-formfield';
     input.style.left = box.left + 'px';
     input.style.top = box.top + 'px';
     input.style.width = Math.max(8, box.width) + 'px';
     input.style.height = Math.max(12, box.height) + 'px';
-    input.style.fontSize = Math.max(8, Math.min(box.height * 0.7, 18)) + 'px';
-    input.value = fld.value;
+    if (fld.kind === 'text' || fld.kind === 'choice') {
+      input.style.fontSize = Math.max(8, Math.min(box.height * 0.7, 18)) + 'px';
+    }
     input.title = fld.name;
-    input.addEventListener('input', () => { fld.value = input.value; updateSaveAnnotState(); });
     annotHtml.appendChild(input);
   }
+}
+
+// Save filled form fields as a real editable PDF via incremental update.
+async function saveEditableForm() {
+  if (!Module || !Module._nanopdf_form_load || !currentPdfBytes || !currentPdfBytes.length) {
+    setStatus('Editable form save not available', true);
+    return;
+  }
+  showLoading('Saving filled form...');
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
+    Module.HEAPU8.set(currentPdfBytes, ptr);
+    const ok = Module._nanopdf_form_load(ptr, currentPdfBytes.length);
+    Module._nanopdf_free(ptr);
+    if (ok !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load form');
+    }
+    // A field can have widgets on multiple pages; set each unique field once.
+    // Only TEXT fields are written to the editable (incremental) path: it is
+    // verified reliable in the WASM build. set_field_checked/choice work in the
+    // native library but currently fail under WASM (a platform-specific parse
+    // fault for the widget objects — needs an ASan build to track down), so
+    // checkbox/dropdown values are persisted via the flattened "Save" instead.
+    const done = new Set();
+    let count = 0, skippedNonText = 0;
+    for (const page in formFieldsByPage) {
+      for (const f of formFieldsByPage[page]) {
+        const key = f.kind + ':' + f.name;
+        if (done.has(key)) continue;
+        done.add(key);
+        if (f.kind !== 'text') {
+          if (f.kind === 'choice' ? !!f.value : f.checked) skippedNonText++;
+          continue;
+        }
+        const namePtr = Module.stringToNewUTF8(f.name);
+        const vp = Module.stringToNewUTF8(f.value || '');
+        if (Module._nanopdf_form_set_text(namePtr, vp)) count++;
+        Module._free(vp);
+        Module._free(namePtr);
+      }
+    }
+    if (Module._nanopdf_form_save() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Form save failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_form_get_buffer, Module._nanopdf_form_get_size);
+    if (!out) throw new Error('Empty form output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_filled.pdf');
+    setStatus(`Saved editable form (${count} text field(s))` +
+      (skippedNonText ? ` — use flattened "Save" for ${skippedNonText} checkbox/dropdown value(s)` : ''));
+  } catch (err) {
+    setStatus('Form save error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
+}
+
+function hasFillableFields() {
+  for (const k in formFieldsByPage) {
+    if (formFieldsByPage[k] && formFieldsByPage[k].length) return true;
+  }
+  return false;
 }
 
 function hasAnyAnnotations() {
   for (const k in annotations) if (annotations[k] && annotations[k].length) return true;
   for (const k in formFieldsByPage) {
-    for (const f of formFieldsByPage[k]) if (f.value && f.value.trim()) return true;
+    for (const f of formFieldsByPage[k]) if (formFieldBaked(f)) return true;
   }
   return false;
 }
 function updateSaveAnnotState() {
-  if (saveAnnotBtn) saveAnnotBtn.disabled = !(hasRendering && totalPages > 0);
+  const docLoaded = hasRendering && totalPages > 0;
+  if (saveAnnotBtn) saveAnnotBtn.disabled = !docLoaded;
+  if (saveFormBtn) saveFormBtn.disabled = !(docLoaded && hasFillableFields() && Module && Module._nanopdf_form_load);
 }
 
 function resetAnnotations() {
@@ -1883,6 +2248,7 @@ function beginTextSelection(e) {
   if (e.button !== 0) return;
   isSelectingText = true;
   currentSelection = null;
+  hideMarkupPopover();
   selectionStartPoint = overlayPointToPdf(e.clientX, e.clientY);
   selectionDragBox = { x: selectionStartPoint.screenX, y: selectionStartPoint.screenY, width: 0, height: 0 };
   textOverlay.setPointerCapture(e.pointerId);
@@ -1938,8 +2304,78 @@ function finishTextSelection(e) {
   renderTextOverlay();
   if (currentSelection && currentSelection.text) {
     setStatus(`Selected ${currentSelection.text.length} characters`);
+    showMarkupPopover();
+  } else {
+    hideMarkupPopover();
   }
   e.preventDefault();
+}
+
+// ---- Text markup (Highlight/Underline/Strike/Squiggly on a text selection) ----
+
+function selectionQuads() {
+  if (!currentSelection || !Array.isArray(currentSelection.segments)) return [];
+  return currentSelection.segments
+    .map((s) => s.quad)
+    .filter((q) => q && q.width > 0 && q.height > 0);
+}
+
+function showMarkupPopover() {
+  if (!markupPopover) return;
+  const quads = selectionQuads();
+  if (!quads.length || rotation !== 0) { hideMarkupPopover(); return; }
+  // Anchor above the top-center of the selection's bounding box (CSS px).
+  let minScreenY = Infinity, cx = 0, n = 0;
+  for (const q of quads) {
+    const s = pdfRectToScreen(q);
+    minScreenY = Math.min(minScreenY, s.y);
+    cx += s.x + s.width / 2; n++;
+  }
+  markupPopover.style.left = (cx / n) + 'px';
+  markupPopover.style.top = Math.max(8, minScreenY - 6) + 'px';
+  markupPopover.classList.remove('hidden');
+}
+
+function hideMarkupPopover() {
+  if (markupPopover) markupPopover.classList.add('hidden');
+}
+
+function markupSelection(kind) {
+  const quads = selectionQuads();
+  if (!quads.length) return;
+  const page = currentSelection.page != null ? currentSelection.page : currentPage;
+  const color = hexToRgb(annotColorHex);
+  const list = (annotations[page] = annotations[page] || []);
+  for (const q of quads) {
+    if (kind === 'highlight') {
+      list.push({ id: annotIdCounter++, type: 'highlight',
+        x: q.x, y: q.y, w: q.width, h: q.height, color, alpha: 0.4 });
+    } else if (kind === 'underline' || kind === 'strike') {
+      const y = kind === 'strike' ? q.y + q.height * 0.5
+                                  : q.y + Math.max(0.5, q.height * 0.06);
+      list.push({ id: annotIdCounter++, type: 'line',
+        x1: q.x, y1: y, x2: q.x + q.width, y2: y, color, lineWidth: 1.5, alpha: 1 });
+    } else if (kind === 'squiggly') {
+      const base = q.y + Math.max(0.5, q.height * 0.06);
+      const amp = Math.max(1, q.height * 0.09);
+      const step = Math.max(2, q.height * 0.3);
+      const pts = [];
+      let up = true;
+      for (let x = q.x; x <= q.x + q.width; x += step) {
+        pts.push({ x, y: base + (up ? amp : 0) });
+        up = !up;
+      }
+      pts.push({ x: q.x + q.width, y: base });
+      list.push({ id: annotIdCounter++, type: 'ink', points: pts,
+        color, lineWidth: 1.2, alpha: 1 });
+    }
+  }
+  currentSelection = null;
+  hideMarkupPopover();
+  renderTextOverlay();
+  if (page === currentPage) renderAnnotations();
+  updateSaveAnnotState();
+  setStatus(`Added ${kind} markup`);
 }
 
 function copyCurrentSelection(e) {
@@ -2412,16 +2848,29 @@ function buildPdf(pageImages) {
 }
 
 function downloadPdfBytes(pdfBytes, suffix, pages) {
+  const baseName = fileName.replace(/\.pdf$/i, '');
+  downloadNamedPdf(pdfBytes, `${baseName}_${suffix}_${pages.map(p => p + 1).join('-')}.pdf`);
+}
+
+// Download a PDF byte buffer under an explicit file name.
+function downloadNamedPdf(pdfBytes, filename) {
   const blob = new Blob([pdfBytes], { type: 'application/pdf' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  const baseName = fileName.replace(/\.pdf$/i, '');
-  a.download = `${baseName}_${suffix}_${pages.map(p => p + 1).join('-')}.pdf`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// Copy a WASM output buffer (ptr,size getters) into a detached Uint8Array.
+function copyWasmBuffer(getPtr, getSize) {
+  const ptr = getPtr();
+  const size = getSize();
+  if (!ptr || size <= 0) return null;
+  return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
 }
 
 // ---- Annotation baking (PDF points -> nanopdf_annot_* export API) ----
@@ -2487,22 +2936,28 @@ function bakeAnnotationForWorkPage(workIndex, a) {
   }
 }
 
+function formFieldBaked(f) {
+  if (f.kind === 'checkbox') return f.checked ? 'X' : '';
+  return (f.value || '').trim();
+}
+
 function bakeFormFieldsForWorkPage(workIndex, pageIndex) {
   const fields = formFieldsByPage[pageIndex];
   if (!fields) return;
   const black = { r: 0, g: 0, b: 0 };
   for (const f of fields) {
-    if (!f.value || !f.value.trim()) continue;
+    const text = formFieldBaked(f);
+    if (!text) continue;
     const fs = Math.max(8, Math.min(f.rect.height * 0.7, 12));
     // Start the text near the top of the field box so multi-line content flows down.
-    bakeTextLines(workIndex, f.value, f.rect.x + 2, f.rect.y + f.rect.height - 2, fs, black, 1);
+    bakeTextLines(workIndex, text, f.rect.x + 2, f.rect.y + f.rect.height - 2, fs, black, 1);
   }
 }
 
 function pageHasBakeableContent(pageIndex) {
   if (annotations[pageIndex] && annotations[pageIndex].length) return true;
   const fields = formFieldsByPage[pageIndex];
-  return !!(fields && fields.some((f) => f.value && f.value.trim()));
+  return !!(fields && fields.some((f) => formFieldBaked(f)));
 }
 
 // Unified export through the C++ flatten path: rasterizes each page, draws
@@ -2594,6 +3049,75 @@ async function exportViaWasm(pages, { protect, suffix }) {
     }
     if (docId >= 0) Module._nanopdf_doc_close(docId);
     Module._nanopdf_work_clear();
+    hideLoading();
+  }
+}
+
+// ---- Combine (merge) & Extract (split) ----
+
+async function combinePdfs(files) {
+  if (!Module || !Module._nanopdf_merge_start || !currentPdfBytes) {
+    setStatus('Combine not available', true);
+    return;
+  }
+  if (!files || !files.length) return;
+  showLoading(`Combining ${files.length + 1} PDF(s)...`);
+  await new Promise((r) => setTimeout(r, 30));
+  const addBytes = (bytes) => {
+    const ptr = Module._nanopdf_malloc(bytes.length);
+    Module.HEAPU8.set(bytes, ptr);
+    const r = Module._nanopdf_merge_add_pdf(ptr, bytes.length);
+    Module._nanopdf_free(ptr);
+    return r;
+  };
+  try {
+    Module._nanopdf_merge_start();
+    addBytes(currentPdfBytes);  // this document first
+    for (const f of files) {
+      addBytes(new Uint8Array(await f.arrayBuffer()));
+    }
+    if (Module._nanopdf_merge_finish() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Merge failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    if (!out) throw new Error('Empty merge output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_combined.pdf');
+    setStatus(`Combined ${files.length + 1} PDF(s)`);
+  } catch (err) {
+    setStatus('Combine error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function extractSelectedPages() {
+  if (!Module || !Module._nanopdf_split_pages) {
+    setStatus('Extract not available', true);
+    return;
+  }
+  if (selectedPages.size === 0) {
+    setStatus('Select pages in the Thumbnails sidebar to extract', true);
+    return;
+  }
+  const pages = [...selectedPages].sort((a, b) => a - b);
+  showLoading(`Extracting ${pages.length} page(s)...`);
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const jsonPtr = Module.stringToNewUTF8('[' + pages.join(',') + ']');
+    const ok = Module._nanopdf_split_pages(jsonPtr);
+    Module._free(jsonPtr);
+    if (ok !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Extract failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    if (!out) throw new Error('Empty extract output');
+    downloadPdfBytes(out, 'extracted', pages);
+    setStatus(`Extracted ${pages.length} page(s)`);
+  } catch (err) {
+    setStatus('Extract error: ' + err.message, true);
+    console.error(err);
+  } finally {
     hideLoading();
   }
 }
@@ -2718,6 +3242,14 @@ function onResize() {
 // File input
 openPdfBtn.addEventListener('click', () => pdfInput.click());
 openUrlBtn.addEventListener('click', promptOpenUrl);
+combineBtn.addEventListener('click', () => combineInput.click());
+combineInput.addEventListener('change', async (e) => {
+  const files = [...e.target.files];
+  combineInput.value = '';
+  if (files.length) await combinePdfs(files);
+});
+extractPagesBtn.addEventListener('click', extractSelectedPages);
+organizeBtn.addEventListener('click', openOrganize);
 pdfInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -2975,6 +3507,14 @@ annotFill.addEventListener('change', () => {
 });
 annotDeleteBtn.addEventListener('click', deleteSelectedAnnot);
 saveAnnotBtn.addEventListener('click', saveAnnotatedPdf);
+saveFormBtn.addEventListener('click', saveEditableForm);
+
+if (markupPopover) {
+  markupPopover.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('pointerdown', (e) => e.preventDefault());  // keep selection
+    btn.addEventListener('click', () => markupSelection(btn.dataset.markup));
+  });
+}
 
 annotLayer.addEventListener('pointerdown', annotLayerPointerDown);
 annotLayer.addEventListener('pointermove', annotLayerPointerMove);
