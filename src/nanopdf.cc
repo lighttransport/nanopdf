@@ -10112,6 +10112,41 @@ std::unique_ptr<Annotation> parse_annotation(const Pdf& pdf, const Value& annot_
     }
   }
 
+  // Appearance streams (/AP). Store the normal (/N) appearance so the renderer
+  // draws it as a Form XObject. /AP and /N may be indirect references; the
+  // backend resolves the stored value, so keep N as-is (reference or stream).
+  // /N may also be a sub-dictionary keyed by appearance state (/AS) — pick the
+  // active state's stream in that case.
+  auto ap_it = dict.find("AP");
+  if (ap_it != dict.end()) {
+    const Value* ap = &ap_it->second;
+    Value resolved_ap;
+    if (ap->type == Value::REFERENCE) {
+      ResolvedObject r = resolve_reference(pdf, ap->ref_object_number,
+                                           ap->ref_generation_number);
+      if (r.success) { resolved_ap = std::move(r.value); ap = &resolved_ap; }
+    }
+    if (ap->type == Value::DICTIONARY) {
+      auto n_it = ap->dict.find("N");
+      if (n_it != ap->dict.end()) {
+        const Value& n = n_it->second;
+        // If /N is a stream/reference, use it directly. If it's a sub-dict of
+        // states, select by /AS.
+        if (n.type == Value::REFERENCE || n.type == Value::STREAM) {
+          annot->appearance_streams["N"] = n;
+        } else if (n.type == Value::DICTIONARY) {
+          auto as_it = dict.find("AS");
+          if (as_it != dict.end() && as_it->second.type == Value::NAME) {
+            auto state_it = n.dict.find(as_it->second.name);
+            if (state_it != n.dict.end()) {
+              annot->appearance_streams["N"] = state_it->second;
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Parse border
   auto border_it = dict.find("Border");
   if (border_it != dict.end() && border_it->second.type == Value::ARRAY) {

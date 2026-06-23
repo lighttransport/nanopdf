@@ -6404,6 +6404,9 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page,
     parse_pdf_content(merged);
   }
 
+  // Render page annotations (appearance streams + form-widget defaults).
+  render_annotations(pdf, page, page_width, page_height, scale);
+
   if (!end_scene()) {
     result.error = "Failed to end scene";
     finish_progress();
@@ -6580,7 +6583,24 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
     parse_pdf_content(merged);
   }
 
-  // Render page annotations (including form widgets)
+  // Render page annotations (appearance streams + form-widget defaults).
+  render_annotations(pdf, page, static_cast<float>(page_width),
+                     static_cast<float>(page_height), scale);
+
+  if (!end_scene()) {
+    result.error = "Failed to end scene";
+    finish_progress();
+    return result;
+  }
+
+  finish_progress();
+
+  return get_buffer();
+}
+
+void ThorVGBackend::render_annotations(const Pdf& pdf, const Page& page,
+                                       float page_width, float page_height,
+                                       float scale) {
   for (const auto& annot : page.annotations) {
     if (!annot) continue;
 
@@ -6611,24 +6631,87 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
       if (ap_stream.type == Value::STREAM) {
         auto decoded = decode_stream(pdf, ap_stream);
         if (decoded.success) {
-          // Save state and set up for appearance stream
+          // The appearance is a Form XObject: its content runs in user space
+          // (the page conversion applies scale + Y-flip), with a CTM that maps
+          // the form's /Matrix-transformed /BBox onto the annotation /Rect.
           GraphicsState saved_state = state_;
           state_ = GraphicsState();
           state_.page_width = page_width;
           state_.page_height = page_height;
           state_.scale = scale;
 
-          // Set up transformation for annotation rect
-          state_.transform.a = scale;
-          state_.transform.d = scale;
-          state_.transform.e = ax1;
-          state_.transform.f = ay1;
+          // Form /Matrix (default identity).
+          GraphicsState::Matrix mtx;
+          auto mtx_it = ap_stream.stream.dict.find("Matrix");
+          if (mtx_it != ap_stream.stream.dict.end() &&
+              mtx_it->second.type == Value::ARRAY &&
+              mtx_it->second.array.size() >= 6) {
+            mtx.a = static_cast<float>(mtx_it->second.array[0].number);
+            mtx.b = static_cast<float>(mtx_it->second.array[1].number);
+            mtx.c = static_cast<float>(mtx_it->second.array[2].number);
+            mtx.d = static_cast<float>(mtx_it->second.array[3].number);
+            mtx.e = static_cast<float>(mtx_it->second.array[4].number);
+            mtx.f = static_cast<float>(mtx_it->second.array[5].number);
+          }
+
+          // Map the /Matrix-transformed /BBox bounding box onto the Rect.
+          auto bbox_it = ap_stream.stream.dict.find("BBox");
+          if (bbox_it != ap_stream.stream.dict.end() &&
+              bbox_it->second.type == Value::ARRAY &&
+              bbox_it->second.array.size() >= 4) {
+            double bx0 = bbox_it->second.array[0].number;
+            double by0 = bbox_it->second.array[1].number;
+            double bx1 = bbox_it->second.array[2].number;
+            double by1 = bbox_it->second.array[3].number;
+            float cx[4] = {static_cast<float>(bx0), static_cast<float>(bx1),
+                           static_cast<float>(bx1), static_cast<float>(bx0)};
+            float cy[4] = {static_cast<float>(by0), static_cast<float>(by0),
+                           static_cast<float>(by1), static_cast<float>(by1)};
+            float tx0 = 1e30f, ty0 = 1e30f, tx1 = -1e30f, ty1 = -1e30f;
+            for (int i = 0; i < 4; ++i) {
+              float px = cx[i], py = cy[i];
+              mtx.transform(px, py);
+              tx0 = std::min(tx0, px); ty0 = std::min(ty0, py);
+              tx1 = std::max(tx1, px); ty1 = std::max(ty1, py);
+            }
+            double rw = annot->rect[2] - annot->rect[0];
+            double rh = annot->rect[3] - annot->rect[1];
+            double bw = tx1 - tx0, bh = ty1 - ty0;
+            GraphicsState::Matrix aa;
+            aa.a = (bw != 0.0) ? static_cast<float>(rw / bw) : 1.0f;
+            aa.d = (bh != 0.0) ? static_cast<float>(rh / bh) : 1.0f;
+            aa.e = static_cast<float>(annot->rect[0]) - aa.a * tx0;
+            aa.f = static_cast<float>(annot->rect[1]) - aa.d * ty0;
+            state_.transform = mtx * aa;  // apply form matrix, then BBox->Rect
+          } else {
+            // No BBox: just position at the rect's lower-left in user space.
+            state_.transform.e = static_cast<float>(annot->rect[0]);
+            state_.transform.f = static_cast<float>(annot->rect[1]);
+          }
+
+          // Push the form's /Resources so its ExtGState/fonts/images resolve.
+          bool pushed_res = false;
+          auto res_it = ap_stream.stream.dict.find("Resources");
+          if (res_it != ap_stream.stream.dict.end()) {
+            Value fr = res_it->second;
+            if (fr.type == Value::REFERENCE) {
+              auto r = resolve_reference(pdf, fr.ref_object_number, fr.ref_generation_number);
+              if (r.success && r.value.type == Value::DICTIONARY) {
+                form_resources_stack_.push_back(r.value.dict);
+                pushed_res = true;
+              }
+            } else if (fr.type == Value::DICTIONARY) {
+              form_resources_stack_.push_back(fr.dict);
+              pushed_res = true;
+            }
+          }
 
           bool progress_enabled = progress_.enabled;
           progress_.enabled = false;
           parse_pdf_content(decoded.data);
           progress_.enabled = progress_enabled;
 
+          if (pushed_res) form_resources_stack_.pop_back();
           state_ = saved_state;
           advance_progress();
         }
@@ -6694,16 +6777,6 @@ ThorVGRenderResult ThorVGBackend::render_page(const Pdf& pdf, const Page& page) 
     }
     // Other annotation types could be rendered here (links, highlights, etc.)
   }
-
-  if (!end_scene()) {
-    result.error = "Failed to end scene";
-    finish_progress();
-    return result;
-  }
-
-  finish_progress();
-
-  return get_buffer();
 }
 
 bool ThorVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) {
