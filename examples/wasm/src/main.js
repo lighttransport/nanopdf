@@ -511,6 +511,7 @@ const diffState = {
   mode: 'diff',          // 'diff' | 'before' | 'after' | 'swipe' | 'side' | 'text'
   swipe: 0.5,
   threshold: 28,         // luma diff sensitivity (higher = ignore more AA noise)
+  showBoxes: true,       // draw change-region bounding boxes in diff mode
   before: null,          // { data, w, h } or null (page absent in prev revision)
   after: null,
   byteAfter: 0,
@@ -661,6 +662,9 @@ function ensureDiffOverlay() {
           Threshold <span id="rev-diff-sens-val">28</span>
           <input type="range" id="rev-diff-sens-range" min="5" max="80" value="28" />
         </label>
+        <label class="rev-diff-boxes" id="rev-diff-boxes-label" title="Outline changed regions">
+          <input type="checkbox" id="rev-diff-boxes" checked /> Boxes
+        </label>
         <div class="rev-diff-legend">
           <span><i class="swatch added"></i>Added</span>
           <span><i class="swatch removed"></i>Removed</span>
@@ -679,8 +683,13 @@ function ensureDiffOverlay() {
       el.querySelector('#rev-diff-swipe').classList.toggle('hidden', diffState.mode !== 'swipe');
       el.querySelector('.rev-diff-legend').classList.toggle('hidden', diffState.mode !== 'diff');
       el.querySelector('#rev-diff-sens').classList.toggle('hidden', diffState.mode !== 'diff');
+      el.querySelector('#rev-diff-boxes-label').classList.toggle('hidden', diffState.mode !== 'diff');
       paintDiffCanvas();
     });
+  });
+  el.querySelector('#rev-diff-boxes').addEventListener('change', (e) => {
+    diffState.showBoxes = e.target.checked;
+    paintDiffCanvas();
   });
   el.querySelector('#rev-diff-prev').addEventListener('click', () => stepDiffPage(-1));
   el.querySelector('#rev-diff-next').addEventListener('click', () => stepDiffPage(1));
@@ -799,6 +808,65 @@ function rescanChangedPages() {
   return first;
 }
 
+// Cluster changed pixels into bounding boxes. Uses a coarse cell grid + 8-conn
+// connected components so a paragraph of changes becomes one box rather than
+// thousands of speckles. Each region is classified added (darker now) or
+// removed (lighter now) by its dominant pixel kind.
+function computeChangeRegions(before, after, threshold) {
+  if (!after) return [];
+  const w = after.w, h = after.h, bd = after.data;
+  const A = before && before.w === w && before.h === h ? before.data : null;
+  const cell = 8;
+  const cols = Math.ceil(w / cell), rows = Math.ceil(h / cell);
+  const addCnt = new Int32Array(cols * rows);
+  const delCnt = new Int32Array(cols * rows);
+  for (let y = 0; y < h; y++) {
+    const row = (y / cell | 0) * cols;
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const d = (A ? lum(A, i) : 255) - lum(bd, i);  // >0 added ink, <0 removed
+      if (d > threshold) addCnt[row + (x / cell | 0)]++;
+      else if (d < -threshold) delCnt[row + (x / cell | 0)]++;
+    }
+  }
+  const minPix = Math.max(3, (cell * cell * 0.06) | 0);
+  const kind = new Int8Array(cols * rows);   // 0 none, 1 add, 2 del
+  for (let c = 0; c < kind.length; c++) {
+    if (addCnt[c] + delCnt[c] >= minPix) kind[c] = addCnt[c] >= delCnt[c] ? 1 : 2;
+  }
+  const comp = new Int32Array(cols * rows).fill(-1);
+  const regions = [];
+  const stack = [];
+  for (let c0 = 0; c0 < kind.length; c0++) {
+    if (!kind[c0] || comp[c0] !== -1) continue;
+    const id = regions.length;
+    let minx = cols, miny = rows, maxx = 0, maxy = 0, addS = 0, delS = 0, cells = 0;
+    stack.push(c0); comp[c0] = id;
+    while (stack.length) {
+      const c = stack.pop();
+      const cx = c % cols, cy = (c / cols) | 0;
+      if (cx < minx) minx = cx; if (cy < miny) miny = cy;
+      if (cx > maxx) maxx = cx; if (cy > maxy) maxy = cy;
+      addS += addCnt[c]; delS += delCnt[c]; cells++;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        const nc = ny * cols + nx;
+        if (kind[nc] && comp[nc] === -1) { comp[nc] = id; stack.push(nc); }
+      }
+    }
+    if (cells < 2) continue;  // drop tiny specks
+    regions.push({
+      x: minx * cell, y: miny * cell,
+      w: Math.min(w, (maxx + 1) * cell) - minx * cell,
+      h: Math.min(h, (maxy + 1) * cell) - miny * cell,
+      kind: addS >= delS ? 'add' : 'del',
+    });
+  }
+  return regions;
+}
+
 function paintDiffCanvas() {
   const overlay = document.getElementById('rev-diff-overlay');
   const canvas = document.getElementById('rev-diff-canvas');
@@ -835,10 +903,24 @@ function paintDiffCanvas() {
   if (noChange) empty.textContent = 'No visual changes on this page.';
   canvas.classList.toggle('dimmed', noChange);
   canvas.classList.remove('hidden');
+
+  // Overlay change-region bounding boxes (Diff mode only).
+  let regionCount = null;
+  if (diffState.mode === 'diff' && diffState.showBoxes !== false && !noChange) {
+    const regions = computeChangeRegions(diffState.before, diffState.after, diffState.threshold);
+    regionCount = regions.length;
+    ctx.lineWidth = 2;
+    ctx.font = '11px sans-serif';
+    for (const r of regions) {
+      ctx.strokeStyle = r.kind === 'add' ? 'rgba(16,162,72,0.95)' : 'rgba(200,40,40,0.95)';
+      ctx.strokeRect(r.x + 0.5, r.y + 0.5, Math.max(2, r.w), Math.max(2, r.h));
+    }
+  }
   const changedCount = diffState.changedComputed ? diffState.changed.size : null;
   document.getElementById('rev-diff-pageinfo').textContent =
     `Page ${diffState.page + 1} / ${diffState.pageCount}` +
-    (changedCount != null ? ` — ${changedCount} changed` : '');
+    (changedCount != null ? ` — ${changedCount} changed` : '') +
+    (regionCount != null ? ` — ${regionCount} region${regionCount === 1 ? '' : 's'}` : '');
   overlay.querySelector('#rev-diff-prev').disabled = diffState.page <= 0;
   overlay.querySelector('#rev-diff-next').disabled = diffState.page >= diffState.pageCount - 1;
   // Keep the strip's "current" highlight in sync.
@@ -876,6 +958,7 @@ function openRevisionDiff(revIndex) {
   overlay.querySelector('#rev-diff-swipe').classList.add('hidden');
   overlay.querySelector('.rev-diff-legend').classList.remove('hidden');
   overlay.querySelector('#rev-diff-sens').classList.remove('hidden');
+  overlay.querySelector('#rev-diff-boxes-label').classList.remove('hidden');
   const signer = rev.signerName || rev.associatedSignature;
   overlay.querySelector('#rev-diff-title').textContent =
     `Revision ${rev.revision} changes` + (signer ? ` — signed by ${signer}` : '');
