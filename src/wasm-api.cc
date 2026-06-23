@@ -16,6 +16,7 @@
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
+#include "pdf-attachments.hh"
 #include "render-backend.hh"
 #include "string-parse.hh"
 #include "text-layout.hh"
@@ -3136,6 +3137,75 @@ const char* nanopdf_page_to_markdown(int page_index) {
 
   g_text_buffer = text_page->to_markdown();
   return g_text_buffer.c_str();
+}
+
+// ============================================================
+// Attachments (embedded files)
+// ============================================================
+
+static std::vector<uint8_t> g_attachment_buffer;
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_attachments_count() {
+  if (!g_pdf) return 0;
+  nanopdf::AttachmentExtractor ex(*g_pdf);
+  return ex.get_count();
+}
+
+// JSON: {"attachments":[{index,name,description,mimeType,size,creationDate,
+//        modDate,relationship}],"count":N}
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_attachments_list() {
+  if (!g_pdf) {
+    g_text_buffer = "{\"attachments\":[],\"count\":0}";
+    return g_text_buffer.c_str();
+  }
+  nanopdf::AttachmentExtractor ex(*g_pdf);
+  int n = ex.get_count();
+  std::string json = "{\"attachments\":[";
+  for (int i = 0; i < n; ++i) {
+    nanopdf::FileAttachment a = ex.get_attachment(i);
+    if (i) json += ",";
+    json += "{\"index\":" + std::to_string(i);
+    json += ",\"name\":\"" + json_escape(a.name) + "\"";
+    json += ",\"description\":\"" + json_escape(a.description) + "\"";
+    json += ",\"mimeType\":\"" + json_escape(a.mime_type) + "\"";
+    json += ",\"size\":" + std::to_string(a.success ? a.data.size() : a.size);
+    json += ",\"creationDate\":\"" + json_escape(a.creation_date) + "\"";
+    json += ",\"modDate\":\"" + json_escape(a.modification_date) + "\"";
+    json += ",\"relationship\":\"" + json_escape(a.relationship) + "\"}";
+  }
+  json += "],\"count\":" + std::to_string(n) + "}";
+  g_text_buffer = json;
+  return g_text_buffer.c_str();
+}
+
+// Extract one attachment's bytes into a buffer retrievable via the getters.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_attachment_extract(int index) {
+  g_attachment_buffer.clear();
+  if (!g_pdf) {
+    g_last_error = "No PDF loaded";
+    return 0;
+  }
+  nanopdf::AttachmentExtractor ex(*g_pdf);
+  nanopdf::FileAttachment a = ex.get_attachment(index);
+  if (!a.success) {
+    g_last_error = a.error.empty() ? "Failed to extract attachment" : a.error;
+    return 0;
+  }
+  g_attachment_buffer = std::move(a.data);
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_attachment_get_buffer() {
+  return g_attachment_buffer.empty() ? nullptr : g_attachment_buffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_attachment_get_size() {
+  return g_attachment_buffer.size();
 }
 
 // ============================================================

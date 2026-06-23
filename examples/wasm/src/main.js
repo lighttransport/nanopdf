@@ -606,6 +606,7 @@ function ensureDiffOverlay() {
         </div>
         <button class="rev-diff-close" id="rev-diff-close" title="Close">&times;</button>
       </div>
+      <div class="rev-diff-changeinfo" id="rev-diff-changeinfo"></div>
       <div class="rev-diff-body">
         <canvas id="rev-diff-canvas"></canvas>
         <div class="rev-diff-empty hidden" id="rev-diff-empty"></div>
@@ -744,6 +745,7 @@ function openRevisionDiff(revIndex) {
     `Revision ${rev.revision} changes` + (signer ? ` — signed by ${signer}` : '');
   overlay.classList.remove('hidden');
   diffState.open = true;
+  renderDiffChangeInfo(rev);
 
   // Precompute which pages changed (cap the scan for very large docs), and
   // land on the first changed page.
@@ -760,6 +762,35 @@ function openRevisionDiff(revIndex) {
   loadDiffPage();
   renderDiffStrip();
   paintDiffCanvas();
+}
+
+// Structural-change summary + DocMDP/tamper banner for the diff overlay.
+function renderDiffChangeInfo(rev) {
+  const el = document.getElementById('rev-diff-changeinfo');
+  if (!el) return;
+  const added = (rev.addedObjects || []).length;
+  const modified = (rev.modifiedObjects || []).length;
+  const deleted = (rev.deletedObjects || []).length;
+  const parts = [];
+  if (added) parts.push(`<span class="chg add">+${added} added</span>`);
+  if (modified) parts.push(`<span class="chg mod">~${modified} changed</span>`);
+  if (deleted) parts.push(`<span class="chg del">-${deleted} removed</span>`);
+  const objLine = parts.length
+    ? `<span class="chg-objs">Objects: ${parts.join(' ')}</span>`
+    : '';
+
+  let banner = '';
+  const violations = rev.docMDPViolations || [];
+  if (rev.hasDocMDP && rev.docMDPStatus === 'disallowed') {
+    banner = `<span class="chg-banner danger">⚠ Changes after signature are DISALLOWED by DocMDP` +
+      (violations.length ? `: ${violations[0]}` : '') + `</span>`;
+  } else if (rev.modifiedAfterSignature) {
+    banner = `<span class="chg-banner warn">Modified after signing` +
+      (rev.hasDocMDP ? ' (allowed by DocMDP)' : '') + `</span>`;
+  }
+
+  el.innerHTML = banner + objLine;
+  el.classList.toggle('hidden', !banner && !objLine);
 }
 
 // Footer strip of page chips; changed pages highlighted, click to jump.
@@ -1249,9 +1280,64 @@ function updateSidebar() {
     renderSignaturesTab();
   } else if (activeSidebarTab === 'history') {
     renderHistoryTab();
+  } else if (activeSidebarTab === 'files') {
+    renderAttachmentsTab();
   } else {
     renderInfoTab();
   }
+}
+
+// ---- Attachments (embedded files) tab ----
+
+function renderAttachmentsTab() {
+  if (!Module || totalPages <= 0) {
+    sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">No document loaded.</div>';
+    return;
+  }
+  if (!Module._nanopdf_attachments_list) {
+    sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">Attachment support needs a rebuilt WASM module.</div>';
+    return;
+  }
+  let data = { attachments: [], count: 0 };
+  try { data = JSON.parse(Module.UTF8ToString(Module._nanopdf_attachments_list())); } catch (e) {}
+  if (!data.count) {
+    sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">No embedded files.</div>';
+    return;
+  }
+  let html = '<div class="attach-list">';
+  for (const a of data.attachments) {
+    const kb = a.size ? ` · ${(a.size / 1024).toFixed(1)} KB` : '';
+    const meta = [a.mimeType, a.modDate || a.creationDate].filter(Boolean).join(' · ');
+    html += `<div class="attach-item">
+      <div class="attach-name" title="${escapeHtml(a.name)}">${escapeHtml(a.name || '(unnamed)')}</div>
+      <div class="attach-meta">${escapeHtml(meta)}${kb}</div>
+      ${a.description ? `<div class="attach-desc">${escapeHtml(a.description)}</div>` : ''}
+      <button class="attach-dl" data-index="${a.index}" data-name="${escapeHtml(a.name || 'attachment')}">Download</button>
+    </div>`;
+  }
+  html += '</div>';
+  sidebarContent.innerHTML = html;
+  sidebarContent.querySelectorAll('.attach-dl').forEach((btn) => {
+    btn.addEventListener('click', () => downloadAttachment(parseInt(btn.dataset.index, 10), btn.dataset.name));
+  });
+}
+
+function downloadAttachment(index, name) {
+  if (!Module._nanopdf_attachment_extract) return;
+  if (Module._nanopdf_attachment_extract(index) !== 1) {
+    setStatus('Failed to extract attachment: ' +
+      Module.UTF8ToString(Module._nanopdf_get_last_error()), true);
+    return;
+  }
+  const bytes = copyWasmBuffer(Module._nanopdf_attachment_get_buffer, Module._nanopdf_attachment_get_size);
+  if (!bytes) { setStatus('Attachment is empty', true); return; }
+  const blob = new Blob([bytes], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name || 'attachment';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  setStatus(`Downloaded "${name}" (${(bytes.length / 1024).toFixed(1)} KB)`);
 }
 
 // ---- Page Navigation ----

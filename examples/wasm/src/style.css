@@ -547,6 +547,28 @@ body {
 .annot-layer.drawing .annot-textbox,
 .annot-layer.drawing .annot-formfield { pointer-events: none; }
 
+/* Attachments (Files) sidebar tab */
+.attach-list { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.attach-item {
+  border: 1px solid #e2e2e2;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #fafafa;
+}
+.attach-name { font-size: 13px; font-weight: 600; color: #222; word-break: break-all; }
+.attach-meta { font-size: 11px; color: #888; margin-top: 2px; }
+.attach-desc { font-size: 12px; color: #555; margin-top: 4px; }
+.attach-dl {
+  margin-top: 6px;
+  padding: 4px 10px;
+  border: 1px solid #ccd;
+  border-radius: 4px;
+  background: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+.attach-dl:hover { background: #eef4ff; border-color: #9bb6e0; }
+
 /* Floating text-markup popover */
 .markup-popover {
   position: absolute;
@@ -1020,6 +1042,27 @@ body {
   color: #555;
 }
 .rev-diff-empty.hidden { display: none; }
+.rev-diff-changeinfo {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 8px 14px;
+  border-top: 1px solid #efefef;
+  font-size: 12px;
+}
+.rev-diff-changeinfo.hidden { display: none; }
+.rev-diff-changeinfo .chg-objs { color: #555; }
+.rev-diff-changeinfo .chg.add { color: #10a248; font-weight: 600; }
+.rev-diff-changeinfo .chg.mod { color: #b8860b; font-weight: 600; }
+.rev-diff-changeinfo .chg.del { color: #c82828; font-weight: 600; }
+.rev-diff-changeinfo .chg-banner {
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+.rev-diff-changeinfo .chg-banner.danger { background: #fdecea; color: #b3261e; }
+.rev-diff-changeinfo .chg-banner.warn { background: #fff4e5; color: #8a5300; }
 .rev-diff-strip {
   display: flex;
   gap: 4px;
