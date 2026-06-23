@@ -3416,48 +3416,99 @@ function flattenAnnotationsToCanvas(ctx, pageIdx, sc, phPts, imgCache) {
   }
 }
 
-// Flatten the given pages to a downloadable image PDF with annotations burned in.
+// Render one page (with its annotations + redaction burned in) to a 1-page
+// image PDF (Uint8Array), or null on failure.
+function flattenOnePageToImagePdf(pageIdx, imgCache) {
+  const pw = Module._nanopdf_get_page_width(pageIdx);
+  const ph = Module._nanopdf_get_page_height(pageIdx);
+  const scale = 150 / 72;
+  const width = Math.min(4096, Math.floor(pw * scale));
+  const height = Math.min(4096, Math.floor(ph * scale));
+  const dpi = 72 * (width / pw);
+  let ok = 0;
+  try { ok = Module._nanopdf_render_page(pageIdx, width, height, dpi); } catch (e) { return null; }
+  if (ok !== 1) return null;
+  const bufPtr = Module._nanopdf_get_render_buffer();
+  const bufSize = Module._nanopdf_get_render_buffer_size();
+  const rw = Module._nanopdf_get_render_width();
+  const rh = Module._nanopdf_get_render_height();
+  const cvs = document.createElement('canvas');
+  cvs.width = rw; cvs.height = rh;
+  const ctx = cvs.getContext('2d');
+  const imageData = ctx.createImageData(rw, rh);
+  imageData.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, bufPtr, bufSize));
+  ctx.putImageData(imageData, 0, 0);
+  flattenAnnotationsToCanvas(ctx, pageIdx, rw / pw, ph, imgCache);  // burns redaction
+  return buildPdf([{ jpegBytes: canvasToJpegBytes(cvs), imgWidth: rw, imgHeight: rh, pageWidth: pw, pageHeight: ph }]);
+}
+
+// Extract a contiguous run of original pages as a vector PDF (Uint8Array).
+function extractVectorRun(indices) {
+  if (!indices.length) return null;
+  const jp = Module.stringToNewUTF8('[' + indices.join(',') + ']');
+  const ok = Module._nanopdf_split_pages(jp);
+  Module._free(jp);
+  if (ok !== 1) return null;
+  return copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+}
+
+// Save with annotations baked in, rasterizing ONLY the pages that actually have
+// annotations / redaction; untouched pages are kept as vector. The result is
+// assembled by merging vector runs with single rasterized pages in order.
 async function saveFlattenedPdf(pages, suffix) {
   if (!Module || !hasRendering) return;
-  showLoading(`Flattening ${pages.length} page(s)...`);
+  showLoading(`Saving ${pages.length} page(s)...`);
   await new Promise((r) => setTimeout(r, 30));
   try {
     const imgCache = await preloadStampImages();
-    const pageImages = [];
+    const parts = [];          // ordered PDF byte buffers
+    let vectorRun = [];        // accumulating consecutive vector page indices
+    let flattened = 0;
+    const flushVector = () => {
+      if (!vectorRun.length) return;
+      const b = extractVectorRun(vectorRun);   // uses + copies the merge buffer
+      if (b) parts.push(b);
+      vectorRun = [];
+    };
     for (let idx = 0; idx < pages.length; idx++) {
-      const pageIdx = pages[idx];
-      loadingText.textContent = `Rendering page ${idx + 1} / ${pages.length}...`;
-      const pw = Module._nanopdf_get_page_width(pageIdx);
-      const ph = Module._nanopdf_get_page_height(pageIdx);
-      const scale = 150 / 72;
-      const width = Math.min(4096, Math.floor(pw * scale));
-      const height = Math.min(4096, Math.floor(ph * scale));
-      const dpi = 72 * (width / pw);
-      let ok = 0;
-      try { ok = Module._nanopdf_render_page(pageIdx, width, height, dpi); } catch (e) { continue; }
-      if (ok !== 1) continue;
-      const bufPtr = Module._nanopdf_get_render_buffer();
-      const bufSize = Module._nanopdf_get_render_buffer_size();
-      const rw = Module._nanopdf_get_render_width();
-      const rh = Module._nanopdf_get_render_height();
-      const cvs = document.createElement('canvas');
-      cvs.width = rw; cvs.height = rh;
-      const ctx = cvs.getContext('2d');
-      const imageData = ctx.createImageData(rw, rh);
-      imageData.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, bufPtr, bufSize));
-      ctx.putImageData(imageData, 0, 0);
-      // Burn annotations into the raster (sc = device px per PDF point).
-      flattenAnnotationsToCanvas(ctx, pageIdx, rw / pw, ph, imgCache);
-      pageImages.push({ jpegBytes: canvasToJpegBytes(cvs), imgWidth: rw, imgHeight: rh, pageWidth: pw, pageHeight: ph });
-      await new Promise((r) => setTimeout(r, 5));
+      const p = pages[idx];
+      loadingText.textContent = `Processing page ${idx + 1} / ${pages.length}...`;
+      if (pageHasBakeableContent(p)) {
+        flushVector();
+        const img = flattenOnePageToImagePdf(p, imgCache);
+        if (img) { parts.push(img); flattened++; }
+      } else {
+        vectorRun.push(p);
+      }
+      if (idx % 8 === 7) await new Promise((r) => setTimeout(r, 0));
     }
-    if (!pageImages.length) { setStatus('Nothing to save', true); return; }
-    loadingText.textContent = 'Building PDF...';
+    flushVector();
+    if (!parts.length) { setStatus('Nothing to save', true); return; }
+
+    loadingText.textContent = 'Assembling PDF...';
     await new Promise((r) => setTimeout(r, 30));
-    downloadPdfBytes(buildPdf(pageImages), suffix || 'flattened', pages);
-    setStatus(`Saved ${pageImages.length} flattened page(s)`);
+    let out;
+    if (parts.length === 1) {
+      out = parts[0];
+    } else {
+      // Merge the ordered parts (vector runs + rasterized pages) into one PDF.
+      Module._nanopdf_merge_start();
+      for (const b of parts) {
+        const ptr = Module._nanopdf_malloc(b.length);
+        Module.HEAPU8.set(b, ptr);
+        Module._nanopdf_merge_add_pdf(ptr, b.length);
+        Module._nanopdf_free(ptr);
+      }
+      if (Module._nanopdf_merge_finish() !== 1) {
+        throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Merge failed');
+      }
+      out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
+    }
+    if (!out) throw new Error('Empty output');
+    downloadPdfBytes(out, suffix || 'flattened', pages);
+    setStatus(`Saved ${pages.length} page(s) — ${flattened} rasterized, ${pages.length - flattened} kept vector`);
   } catch (err) {
-    setStatus('Flatten error: ' + err.message, true);
+    setStatus('Save error: ' + err.message, true);
     console.error(err);
   } finally {
     hideLoading();
