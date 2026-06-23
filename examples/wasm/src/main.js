@@ -35,6 +35,29 @@ let activeSidebarTab = 'outline';
 let zoomLevel = 1.0;
 let rotation = 0; // 0, 90, 180, 270
 let fitMode = 'width'; // 'width' or 'page'
+
+// Persisted view preferences (zoom, fit mode, backend) + per-file last page.
+const VIEW_STATE_KEY = 'nanopdf-view-state';
+function loadViewState() {
+  try { return JSON.parse(localStorage.getItem(VIEW_STATE_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+}
+function saveViewState() {
+  try {
+    const s = loadViewState();
+    s.zoom = zoomLevel;
+    s.fitMode = fitMode;
+    s.backend = renderBackend;
+    if (fileName) {
+      s.pages = s.pages || {};
+      s.pages[fileName] = currentPage;
+      // Bound the per-file page map so it can't grow without limit.
+      const keys = Object.keys(s.pages);
+      if (keys.length > 50) delete s.pages[keys[0]];
+    }
+    localStorage.setItem(VIEW_STATE_KEY, JSON.stringify(s));
+  } catch (e) { /* storage disabled/full: ignore */ }
+}
 // CSS-pixel display size of the page canvas (the bitmap is this * devicePixelRatio).
 // Overlay/coordinate math uses these, NOT canvas.width/height (which are device px).
 let pageDisplayWidth = 0;
@@ -222,6 +245,7 @@ function switchRenderBackend() {
   if (activeSidebarTab === 'info') renderInfoTab();
   if (activeSidebarTab === 'thumbs') updateSidebar();
   if (totalPages > 0) renderCurrentPage();
+  saveViewState();
 }
 
 // ---- Sidebar ----
@@ -1559,6 +1583,7 @@ function goToPage(pageIndex) {
   renderCurrentPage();
   clearSearch();
   updateThumbnailHighlight();
+  saveViewState();
 }
 
 window._jumpToPage = function(pageIndex) {
@@ -1610,6 +1635,7 @@ function zoomIn() {
   }
   updateZoomDisplay();
   renderCurrentPage();
+  saveViewState();
 }
 
 function zoomOut() {
@@ -1619,12 +1645,14 @@ function zoomOut() {
   }
   updateZoomDisplay();
   renderCurrentPage();
+  saveViewState();
 }
 
 function resetZoom() {
   zoomLevel = 1.0;
   updateZoomDisplay();
   renderCurrentPage();
+  saveViewState();
 }
 
 // ---- Rotation ----
@@ -1657,6 +1685,7 @@ function toggleFitMode() {
   fitMode = fitMode === 'width' ? 'page' : 'width';
   fitModeBtn.textContent = fitMode === 'width' ? 'Fit Width' : 'Fit Page';
   renderCurrentPage();
+  saveViewState();
 }
 
 // ---- Rendering ----
@@ -2880,10 +2909,28 @@ async function loadPDF(arrayBuffer, name) {
     signatureData = null;
     editHistoryData = null;
 
-    // Reset view state
+    // Reset view state, then apply persisted preferences.
     zoomLevel = 1.0;
     rotation = 0;
     fitMode = 'width';
+    const savedView = loadViewState();
+    if (typeof savedView.zoom === 'number' && savedView.zoom > 0.05 && savedView.zoom <= 8) {
+      zoomLevel = savedView.zoom;
+    }
+    if (savedView.fitMode === 'width' || savedView.fitMode === 'page') {
+      fitMode = savedView.fitMode;
+    }
+    // Restore the backend if the saved one is available.
+    if (savedView.backend === BACKEND_LIGHTVG && renderBackends.lightvg) {
+      renderBackend = BACKEND_LIGHTVG;
+    } else if (savedView.backend === BACKEND_THORVG && renderBackends.thorvg) {
+      renderBackend = BACKEND_THORVG;
+    }
+    // Restore the last viewed page for this specific file.
+    if (savedView.pages && Number.isInteger(savedView.pages[name])) {
+      const p = savedView.pages[name];
+      if (p >= 0 && p < totalPages) currentPage = p;
+    }
     thumbnailCache = {};
     thumbnailRenderQueue = [];
     isThumbnailRendering = false;
@@ -2902,7 +2949,7 @@ async function loadPDF(arrayBuffer, name) {
     searchInfo.textContent = '';
     updateZoomDisplay();
     updateExportButton();
-    fitModeBtn.textContent = 'Fit Width';
+    fitModeBtn.textContent = fitMode === 'width' ? 'Fit Width' : 'Fit Page';
     canvas.style.transform = '';
     canvasWrapper.style.width = '';
     canvasWrapper.style.height = '';
