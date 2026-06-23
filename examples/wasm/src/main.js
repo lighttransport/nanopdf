@@ -2499,14 +2499,50 @@ function renderCurrentPage() {
 
 // ---- Text Extraction ----
 
-function extractText() {
+// Current content-export view: 'text' | 'md' | 'tables'.
+let textPanelFormat = 'text';
+
+function renderTextPanel() {
   if (!Module || totalPages <= 0) return;
-
-  const textPtr = Module._nanopdf_extract_text(currentPage);
-  const text = Module.UTF8ToString(textPtr);
-
-  textContent.textContent = text || '(No text extracted)';
+  let body = '', title = 'Extracted Text';
+  if (textPanelFormat === 'md') {
+    title = 'Markdown';
+    body = Module.UTF8ToString(Module._nanopdf_page_to_markdown(currentPage)) || '(No text extracted)';
+  } else if (textPanelFormat === 'tables') {
+    title = 'Tables (CSV)';
+    body = Module._nanopdf_extract_tables
+      ? Module.UTF8ToString(Module._nanopdf_extract_tables(currentPage, 0))
+      : '';
+    if (!body) body = '(No tables detected on this page)';
+  } else {
+    body = Module.UTF8ToString(Module._nanopdf_extract_text(currentPage)) || '(No text extracted)';
+  }
+  const titleEl = document.getElementById('text-panel-title');
+  if (titleEl) titleEl.textContent = `${title} — page ${currentPage + 1}`;
+  textContent.textContent = body;
+  document.querySelectorAll('.text-fmt').forEach(b => b.classList.remove('active'));
+  const active = { text: 'text-fmt-text', md: 'text-fmt-md', tables: 'text-fmt-tables' }[textPanelFormat];
+  const ab = document.getElementById(active);
+  if (ab) ab.classList.add('active');
   textPanel.style.display = 'block';
+}
+
+function extractText() {
+  textPanelFormat = 'text';
+  renderTextPanel();
+}
+
+function downloadTextPanel() {
+  const ext = { text: 'txt', md: 'md', tables: 'csv' }[textPanelFormat] || 'txt';
+  const mime = { text: 'text/plain', md: 'text/markdown', tables: 'text/csv' }[textPanelFormat] || 'text/plain';
+  const baseName = fileName.replace(/\.pdf$/i, '');
+  const blob = new Blob([textContent.textContent], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${baseName}_p${currentPage + 1}.${ext}`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // ---- Search ----
@@ -4154,6 +4190,19 @@ protectExport.addEventListener('change', updateExportButton);
 // Close text panel
 document.getElementById('text-panel-close').addEventListener('click', () => {
   textPanel.style.display = 'none';
+});
+
+// Content-export format switches + actions
+document.getElementById('text-fmt-text').addEventListener('click', () => { textPanelFormat = 'text'; renderTextPanel(); });
+document.getElementById('text-fmt-md').addEventListener('click', () => { textPanelFormat = 'md'; renderTextPanel(); });
+document.getElementById('text-fmt-tables').addEventListener('click', () => { textPanelFormat = 'tables'; renderTextPanel(); });
+document.getElementById('text-download').addEventListener('click', downloadTextPanel);
+document.getElementById('text-copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(textContent.textContent);
+    const b = document.getElementById('text-copy');
+    const prev = b.textContent; b.textContent = 'Copied'; setTimeout(() => { b.textContent = prev; }, 1000);
+  } catch (e) { /* clipboard blocked; ignore */ }
 });
 
 // Sidebar toggle

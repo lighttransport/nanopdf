@@ -138,7 +138,14 @@
       <!-- Text extraction panel -->
       <div class="text-panel" id="text-panel">
         <div class="text-panel-header">
-          <span>Extracted Text</span>
+          <span id="text-panel-title">Extracted Text</span>
+          <span class="text-panel-actions">
+            <button id="text-fmt-text" class="text-fmt active" title="Plain text">Text</button>
+            <button id="text-fmt-md" class="text-fmt" title="Markdown">Markdown</button>
+            <button id="text-fmt-tables" class="text-fmt" title="Tables as CSV">Tables</button>
+            <button id="text-copy" title="Copy to clipboard">Copy</button>
+            <button id="text-download" title="Download">Download</button>
+          </span>
           <button id="text-panel-close" title="Close">&times;</button>
         </div>
         <div class="text-panel-content" id="text-content"></div>

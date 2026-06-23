@@ -3,12 +3,51 @@
 #include "table-extraction.hh"
 #include "text-layout.hh"
 #include "nanopdf.hh"
+#include "test_helpers.hh"
 
 #include <string>
+#include <vector>
 
 using namespace nanopdf;
 
+namespace {
+std::string table_fixture(const std::string& filename) {
+  std::string current_file = __FILE__;
+  size_t slash = current_file.find_last_of("/\\");
+  std::string dir = slash == std::string::npos ? std::string(".")
+                                               : current_file.substr(0, slash);
+  return dir + "/../../fixtures/" + filename;
+}
+}  // namespace
+
 TEST_SUITE("TableExtraction") {
+
+// End-to-end: a real PDF whose text is laid out in a grid -> parse -> layout ->
+// extract_tables -> CSV/Markdown serialization (covers the path the WASM
+// nanopdf_extract_tables bridge uses, which the synthetic-data case does not).
+TEST_CASE("Extract a table from a parsed PDF and serialize it") {
+  std::vector<uint8_t> data;
+  REQUIRE(test::read_file(table_fixture("table_grid.pdf"), data));
+  Pdf pdf;
+  REQUIRE(parse_from_memory(data.data(), data.size(), &pdf));
+  pdf.load_document_structure();
+  REQUIRE_FALSE(pdf.catalog.pages.empty());
+
+  auto text_page = extract_text_layout(pdf, pdf.catalog.pages[0]);
+  REQUIRE(text_page != nullptr);
+
+  auto tables = extract_tables(*text_page);
+  REQUIRE_FALSE(tables.empty());
+
+  std::string csv = tables[0].to_csv();
+  CHECK(csv.find("Name") != std::string::npos);
+  CHECK(csv.find("Apple") != std::string::npos);
+  CHECK(csv.find("1.20") != std::string::npos);
+
+  std::string md = tables[0].to_markdown();
+  CHECK(md.find('|') != std::string::npos);
+  CHECK(md.find("Banana") != std::string::npos);
+}
 
 TEST_CASE("Basic table extraction from synthetic data") {
   TextPage text_page;

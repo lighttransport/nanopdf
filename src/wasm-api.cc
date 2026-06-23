@@ -3666,6 +3666,46 @@ const char* nanopdf_page_to_markdown(int page_index) {
   return g_text_buffer.c_str();
 }
 
+// Detect tables on @page_index and serialize them in @format
+// (0=CSV, 1=HTML, 2=JSON, 3=Markdown). Multiple tables are concatenated (CSV/MD
+// separated by a blank line; JSON as an array). Returns "" if the page has no
+// detectable table.
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_extract_tables(int page_index, int format) {
+  g_text_buffer.clear();
+  if (!g_pdf || page_index < 0 ||
+      page_index >= static_cast<int>(g_pdf->catalog.pages.size())) {
+    return g_text_buffer.c_str();
+  }
+  const auto& page = g_pdf->catalog.pages[page_index];
+  auto text_page = nanopdf::extract_text_layout(*g_pdf, page);
+  if (!text_page) return g_text_buffer.c_str();
+
+  auto tables = nanopdf::extract_tables(*text_page);
+  if (tables.empty()) return g_text_buffer.c_str();
+
+  std::string out;
+  if (format == 2) {  // JSON array
+    out = "[";
+    for (size_t i = 0; i < tables.size(); ++i) {
+      if (i) out += ",";
+      out += tables[i].to_json();
+    }
+    out += "]";
+  } else {
+    for (size_t i = 0; i < tables.size(); ++i) {
+      if (i) out += "\n\n";
+      switch (format) {
+        case 1: out += tables[i].to_html(); break;
+        case 3: out += tables[i].to_markdown(); break;
+        default: out += tables[i].to_csv(); break;  // 0 = CSV
+      }
+    }
+  }
+  g_text_buffer = std::move(out);
+  return g_text_buffer.c_str();
+}
+
 // ============================================================
 // Attachments (embedded files)
 // ============================================================

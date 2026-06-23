@@ -726,6 +726,27 @@ body {
   color: #666;
   padding: 2px 6px;
 }
+.text-panel-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-left: auto;
+  margin-right: 8px;
+}
+.text-panel-actions button {
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid #d0d0d0;
+  border-radius: 4px;
+  background: #f7f7f7;
+  color: #333;
+  padding: 2px 8px;
+}
+.text-panel-actions button.active {
+  background: #007bff;
+  border-color: #0062cc;
+  color: #fff;
+}
 .text-panel-content {
   padding: 12px;
   font-family: 'SF Mono', Consolas, monospace;
