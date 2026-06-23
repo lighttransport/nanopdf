@@ -481,6 +481,92 @@ body {
   background: rgba(0, 123, 255, 0.10);
 }
 
+/* ---- Annotation tools + overlay ---- */
+.annot-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.annot-tools .annot-tool.active:not(:disabled) {
+  background: #007bff;
+  color: #fff;
+  border-color: #0062cc;
+}
+.annot-color {
+  width: 30px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  cursor: pointer;
+  background: none;
+}
+.annot-color:disabled { opacity: 0.45; }
+.annot-fill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.annot-layer {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;        /* pass-through: text selection works underneath */
+  transform-origin: center center;
+  transition: transform 0.3s ease;
+}
+/* While a drawing tool is active the whole layer captures pointer events. */
+.annot-layer.drawing { pointer-events: auto; cursor: crosshair; }
+.annot-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+/* Drawn shapes are individually clickable only in select mode (for move/delete). */
+.annot-shape { pointer-events: none; }
+.annot-layer.selecting .annot-shape { pointer-events: visiblePainted; cursor: move; }
+.annot-html {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+/* Text-box annotations and form-field inputs live here; interactive by default,
+   but ignore pointer events while drawing so you can draw over them. */
+.annot-textbox, .annot-formfield {
+  position: absolute;
+  pointer-events: auto;
+  box-sizing: border-box;
+  font-family: Helvetica, Arial, sans-serif;
+  margin: 0;
+}
+.annot-layer.drawing .annot-textbox,
+.annot-layer.drawing .annot-formfield { pointer-events: none; }
+.annot-textbox {
+  border: 1px dashed rgba(0, 86, 179, 0.6);
+  background: transparent;
+  color: #d32f2f;
+  resize: none;
+  overflow: hidden;
+  line-height: 1.1;
+  padding: 0;
+}
+.annot-textbox.selected { border-color: #007bff; border-style: solid; }
+.annot-formfield {
+  border: 1px solid rgba(0, 123, 255, 0.55);
+  background: rgba(0, 123, 255, 0.06);
+  color: #111;
+  padding: 0 2px;
+}
+.annot-formfield:focus {
+  outline: 2px solid rgba(0, 86, 179, 0.7);
+  background: rgba(255, 255, 255, 0.85);
+}
+
 /* Text output panel */
 .text-panel {
   border-top: 1px solid #ddd;

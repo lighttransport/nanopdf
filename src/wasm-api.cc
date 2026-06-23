@@ -2141,6 +2141,13 @@ const char* nanopdf_get_form_fields() {
     return g_text_buffer.c_str();
   }
 
+  // Map page object number -> 0-based page index so widget /P references can be
+  // resolved to a page the viewer can position an overlay on.
+  std::map<uint32_t, int> page_index_by_obj;
+  for (size_t i = 0; i < g_pdf->catalog.pages.size(); ++i) {
+    page_index_by_obj[g_pdf->catalog.pages[i].object_number] = static_cast<int>(i);
+  }
+
   std::string json = "{\"fields\":[";
   bool first = true;
 
@@ -2150,6 +2157,15 @@ const char* nanopdf_get_form_fields() {
 
     json += "{\"name\":\"" + json_escape(field->partial_name) + "\"";
     json += ",\"fullName\":\"" + json_escape(field->full_name) + "\"";
+
+    // Current field value as a string (text -> string, button -> state name).
+    std::string value_str;
+    if (field->field_value.type == nanopdf::Value::STRING) {
+      value_str = field->field_value.str;
+    } else if (field->field_value.type == nanopdf::Value::NAME) {
+      value_str = field->field_value.name;
+    }
+    json += ",\"value\":\"" + json_escape(value_str) + "\"";
 
     // Field type
     switch (field->type) {
@@ -2224,12 +2240,21 @@ const char* nanopdf_get_form_fields() {
         if (!first_w) json += ",";
         first_w = false;
         json += "{";
+        int widget_page = -1;
+        auto pidx_it = page_index_by_obj.find(widget->page_ref);
+        if (pidx_it != page_index_by_obj.end()) widget_page = pidx_it->second;
+        json += "\"page\":" + std::to_string(widget_page);
         if (widget->rect.size() >= 4) {
-          json += "\"rect\":{";
-          json += "\"x\":" + std::to_string(widget->rect[0]) + ",";
-          json += "\"y\":" + std::to_string(widget->rect[1]) + ",";
-          json += "\"width\":" + std::to_string(widget->rect[2] - widget->rect[0]) + ",";
-          json += "\"height\":" + std::to_string(widget->rect[3] - widget->rect[1]) + "}";
+          // Normalize so x/y is the lower-left corner regardless of rect order.
+          double x0 = std::min(widget->rect[0], widget->rect[2]);
+          double y0 = std::min(widget->rect[1], widget->rect[3]);
+          double w = std::abs(widget->rect[2] - widget->rect[0]);
+          double h = std::abs(widget->rect[3] - widget->rect[1]);
+          json += ",\"rect\":{";
+          json += "\"x\":" + std::to_string(x0) + ",";
+          json += "\"y\":" + std::to_string(y0) + ",";
+          json += "\"width\":" + std::to_string(w) + ",";
+          json += "\"height\":" + std::to_string(h) + "}";
         }
         json += "}";
       }

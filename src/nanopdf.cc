@@ -10354,11 +10354,50 @@ std::unique_ptr<FormField> parse_form_field(const Pdf& pdf, const Dictionary& fi
     field->default_value = dv_it->second;
   }
 
+  // Collect widget geometry (Rect + owning page) so callers can position
+  // overlays/appearances over each field. A field may itself carry the widget
+  // dict (merged field+widget, the common case) or own a /Kids array of widgets.
+  auto add_widget = [&](const Dictionary& wd) {
+    auto rect_it = wd.find("Rect");
+    if (rect_it == wd.end() || rect_it->second.type != Value::ARRAY) return;
+    auto widget = std::unique_ptr<WidgetAnnotation>(new WidgetAnnotation());
+    widget->field_type = field->type;
+    for (const auto& v : rect_it->second.array) {
+      if (v.type == Value::NUMBER) widget->rect.push_back(v.number);
+    }
+    auto p_it = wd.find("P");
+    if (p_it != wd.end() && p_it->second.type == Value::REFERENCE) {
+      widget->page_ref = p_it->second.ref_object_number;
+    }
+    field->widgets.push_back(std::move(widget));
+  };
+
+  auto kids_it = field_dict.find("Kids");
+  if (kids_it != field_dict.end() && kids_it->second.type == Value::ARRAY) {
+    for (const auto& kid_ref : kids_it->second.array) {
+      if (kid_ref.type == Value::REFERENCE) {
+        ResolvedObject r = resolve_reference(pdf, kid_ref.ref_object_number,
+                                             kid_ref.ref_generation_number);
+        if (r.success && r.value.type == Value::DICTIONARY) add_widget(r.value.dict);
+      } else if (kid_ref.type == Value::DICTIONARY) {
+        add_widget(kid_ref.dict);
+      }
+    }
+  } else {
+    // Field dict is itself the widget annotation.
+    add_widget(field_dict);
+  }
+
   return field;
 }
 
 // Parse AcroForm to extract all form fields
 void parse_acro_form(const Pdf& pdf, DocumentCatalog& catalog) {
+  // Idempotent: this can be reached more than once for a single document (eager
+  // metadata parse plus an explicit load_document_structure() call), so start
+  // from a clean slate to avoid duplicating every field.
+  catalog.form_fields.clear();
+
   if (catalog.acro_form.empty()) {
     return;
   }

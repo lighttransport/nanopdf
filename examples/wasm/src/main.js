@@ -35,6 +35,10 @@ let activeSidebarTab = 'outline';
 let zoomLevel = 1.0;
 let rotation = 0; // 0, 90, 180, 270
 let fitMode = 'width'; // 'width' or 'page'
+// CSS-pixel display size of the page canvas (the bitmap is this * devicePixelRatio).
+// Overlay/coordinate math uses these, NOT canvas.width/height (which are device px).
+let pageDisplayWidth = 0;
+let pageDisplayHeight = 0;
 let thumbnailCache = {}; // pageIndex -> ImageData
 let thumbnailRenderQueue = [];
 let isThumbnailRendering = false;
@@ -43,6 +47,22 @@ let thumbnailObserver = null;
 // Page selection state
 let selectedPages = new Set();
 let lastClickedPage = 0;
+
+// ---- Annotation state ----
+// annotations[pageIndex] = array of annotation objects. Geometry is stored in
+// PDF page points with a bottom-left origin so it survives zoom/rotation and
+// maps 1:1 to the nanopdf_annot_* export API.
+let annotations = {};
+let annotTool = 'select';        // select | highlight | text | rect | oval | line | arrow | ink
+let annotColorHex = '#ffd54a';
+let annotFillShapes = false;
+let selectedAnnotId = null;
+let annotIdCounter = 1;
+let annotDraft = null;           // in-progress drawing
+let annotDragState = null;       // moving an existing annotation in select mode
+// formFields[pageIndex] = [{name, type, value, rect:{x,y,width,height}, multiline, ...}]
+let formFieldsByPage = {};
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
 const BACKEND_LIGHTVG = 0;
@@ -54,6 +74,7 @@ const loadingText = document.getElementById('loading-text');
 const dropOverlay = document.getElementById('drop-overlay');
 const pdfInput = document.getElementById('pdf-input');
 const openPdfBtn = document.getElementById('open-pdf-btn');
+const openUrlBtn = document.getElementById('open-url-btn');
 const renderBtn = document.getElementById('render-btn');
 const extractBtn = document.getElementById('extract-btn');
 const backendToggleBtn = document.getElementById('backend-toggle-btn');
@@ -86,6 +107,15 @@ const exportBtn = document.getElementById('export-btn');
 const protectExport = document.getElementById('protect-export');
 const exportPassword = document.getElementById('export-password');
 const exportOwnerPassword = document.getElementById('export-owner-password');
+// Annotation tooling
+const annotTools = document.getElementById('annot-tools');
+const annotLayer = document.getElementById('annot-layer');
+const annotSvg = document.getElementById('annot-svg');
+const annotHtml = document.getElementById('annot-html');
+const annotColor = document.getElementById('annot-color');
+const annotFill = document.getElementById('annot-fill');
+const annotDeleteBtn = document.getElementById('annot-delete');
+const saveAnnotBtn = document.getElementById('save-annot-btn');
 
 function setStatus(msg, isError = false) {
   statusText.textContent = msg;
@@ -803,16 +833,28 @@ function updateSelectionUI() {
 }
 
 function updateExportButton() {
+  const docLoaded = totalPages > 0 && hasRendering;
   const hasSelection = selectedPages.size > 0 && hasRendering;
-  exportBtn.disabled = !hasSelection;
-  protectExport.disabled = !hasSelection;
-  const passwordEnabled = hasSelection && protectExport.checked;
+
+  // Protect + password fields are usable as soon as a document is loaded,
+  // independent of page selection (the Export button still needs a selection).
+  protectExport.disabled = !docLoaded;
+  const passwordEnabled = docLoaded && protectExport.checked;
   exportPassword.disabled = !passwordEnabled;
   exportOwnerPassword.disabled = !passwordEnabled;
+
+  exportBtn.disabled = !hasSelection;
   exportBtn.classList.toggle('has-selection', hasSelection);
   exportBtn.textContent = hasSelection
     ? `Export (${selectedPages.size})`
     : 'Export';
+
+  // Guide the user when Protect is on but nothing is selected to export.
+  if (protectExport.checked && !hasSelection && docLoaded) {
+    exportBtn.title = 'Select pages in the Thumbnails sidebar to export';
+  } else {
+    exportBtn.title = 'Export selected pages as PDF';
+  }
 }
 
 function setupThumbnailObserver() {
@@ -952,6 +994,8 @@ function updateSidebar() {
 function goToPage(pageIndex) {
   if (pageIndex < 0 || pageIndex >= totalPages) return;
   currentPage = pageIndex;
+  selectedAnnotId = null;
+  annotDraft = null;
   updatePageDisplay();
   renderCurrentPage();
   clearSearch();
@@ -1037,13 +1081,15 @@ function applyRotation() {
 
   // Adjust wrapper dimensions for 90/270 so scrolling works correctly
   if (rotation === 90 || rotation === 270) {
-    canvasWrapper.style.width = canvas.height + 'px';
-    canvasWrapper.style.height = canvas.width + 'px';
+    canvasWrapper.style.width = pageDisplayHeight + 'px';
+    canvasWrapper.style.height = pageDisplayWidth + 'px';
   } else {
     canvasWrapper.style.width = '';
     canvasWrapper.style.height = '';
   }
   renderTextOverlay();
+  renderAnnotations();
+  renderFormFields();
 }
 
 // ---- Fit Mode ----
@@ -1072,9 +1118,9 @@ function computeBaseScale(pageWidth, pageHeight) {
 }
 
 function getPageScale() {
-  if (!Module || totalPages <= 0 || canvas.width === 0) return 1;
+  if (!Module || totalPages <= 0 || pageDisplayWidth === 0) return 1;
   const pageWidth = Module._nanopdf_get_page_width(currentPage);
-  return canvas.width / pageWidth;
+  return pageDisplayWidth / pageWidth;
 }
 
 function pdfRectToScreen(rect) {
@@ -1094,8 +1140,8 @@ function overlayPointToPdf(clientX, clientY) {
   const rect = textOverlay.getBoundingClientRect();
   const scale = getPageScale();
   const pageHeight = Module._nanopdf_get_page_height(currentPage);
-  const x = Math.max(0, Math.min(canvas.width, clientX - rect.left));
-  const y = Math.max(0, Math.min(canvas.height, clientY - rect.top));
+  const x = Math.max(0, Math.min(pageDisplayWidth, clientX - rect.left));
+  const y = Math.max(0, Math.min(pageDisplayHeight, clientY - rect.top));
   return {
     screenX: x,
     screenY: y,
@@ -1117,8 +1163,8 @@ function appendOverlayRect(rect, className) {
 }
 
 function resizeTextOverlay() {
-  textOverlay.style.width = `${canvas.width}px`;
-  textOverlay.style.height = `${canvas.height}px`;
+  textOverlay.style.width = `${pageDisplayWidth}px`;
+  textOverlay.style.height = `${pageDisplayHeight}px`;
   textOverlay.style.display = canvas.style.display === 'block' ? 'block' : 'none';
   textOverlay.style.transform = canvas.style.transform || '';
 }
@@ -1158,6 +1204,469 @@ function renderTextOverlay() {
   }
 }
 
+// ===================== Annotation overlay =====================
+
+function hexToRgb(hex) {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '');
+  if (!m) return { r: 1, g: 0.835, b: 0.29 };
+  return {
+    r: parseInt(m[1], 16) / 255,
+    g: parseInt(m[2], 16) / 255,
+    b: parseInt(m[3], 16) / 255,
+  };
+}
+function rgbToHex(c) {
+  const h = (v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+  return `#${h(c.r)}${h(c.g)}${h(c.b)}`;
+}
+
+function currentPageHeightPts() {
+  if (!Module || totalPages <= 0) return 0;
+  return Module._nanopdf_get_page_height(currentPage);
+}
+
+// Screen CSS px (top-left, within overlay) -> PDF points (bottom-left origin).
+function screenToPdf(sx, sy) {
+  const scale = getPageScale();
+  return { x: sx / scale, y: currentPageHeightPts() - sy / scale };
+}
+// PDF points -> screen CSS px within the overlay.
+function pdfToScreen(px, py) {
+  const scale = getPageScale();
+  return { x: px * scale, y: (currentPageHeightPts() - py) * scale };
+}
+// PDF box {x,y(lower-left),w,h} -> screen {left,top,width,height}.
+function pdfBoxToScreen(b) {
+  const scale = getPageScale();
+  const tl = pdfToScreen(b.x, b.y + b.h);
+  return { left: tl.x, top: tl.y, width: b.w * scale, height: b.h * scale };
+}
+function annotPointerPos(e) {
+  const rect = annotLayer.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(pageDisplayWidth, e.clientX - rect.left)),
+    y: Math.max(0, Math.min(pageDisplayHeight, e.clientY - rect.top)),
+  };
+}
+
+function pageAnnots(page = currentPage) {
+  if (!annotations[page]) annotations[page] = [];
+  return annotations[page];
+}
+function findAnnot(id, page = currentPage) {
+  return pageAnnots(page).find((a) => a.id === id);
+}
+function annotEditingEnabled() {
+  // Drawing math assumes an un-rotated page; allow editing only at 0deg.
+  return hasRendering && totalPages > 0 && rotation === 0 &&
+         canvas.style.display === 'block';
+}
+
+function setAnnotTool(tool) {
+  annotTool = tool;
+  if (annotTools) {
+    annotTools.querySelectorAll('.annot-tool').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tool === tool);
+    });
+  }
+  updateAnnotLayerMode();
+}
+
+function updateAnnotLayerMode() {
+  const editing = annotEditingEnabled();
+  const drawing = editing && annotTool !== 'select';
+  annotLayer.classList.toggle('drawing', drawing);
+  annotLayer.classList.toggle('selecting', editing && annotTool === 'select');
+  if (annotDeleteBtn) annotDeleteBtn.disabled = !(editing && selectedAnnotId != null);
+}
+
+function setAnnotControlsEnabled(enabled) {
+  if (!annotTools) return;
+  annotTools.querySelectorAll('button, input').forEach((el) => {
+    el.disabled = !enabled;
+  });
+  if (enabled) {
+    annotDeleteBtn.disabled = selectedAnnotId == null;
+  }
+}
+
+function translateAnnot(a, dx, dy) {
+  if (a.type === 'line' || a.type === 'arrow') {
+    a.x1 += dx; a.y1 += dy; a.x2 += dx; a.y2 += dy;
+  } else if (a.type === 'ink') {
+    a.points = a.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+  } else {
+    a.x += dx; a.y += dy;
+  }
+}
+
+function annotScreenBBox(a) {
+  if (a.type === 'line' || a.type === 'arrow') {
+    const p1 = pdfToScreen(a.x1, a.y1), p2 = pdfToScreen(a.x2, a.y2);
+    return { left: Math.min(p1.x, p2.x), top: Math.min(p1.y, p2.y),
+             width: Math.abs(p2.x - p1.x), height: Math.abs(p2.y - p1.y) };
+  }
+  if (a.type === 'ink') {
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (const p of a.points) {
+      const s = pdfToScreen(p.x, p.y);
+      minx = Math.min(minx, s.x); miny = Math.min(miny, s.y);
+      maxx = Math.max(maxx, s.x); maxy = Math.max(maxy, s.y);
+    }
+    return { left: minx, top: miny, width: maxx - minx, height: maxy - miny };
+  }
+  return pdfBoxToScreen(a);
+}
+
+function svgEl(name) { return document.createElementNS(SVG_NS, name); }
+
+function arrowHeadSegments(p1, p2) {
+  const ang = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+  const len = Math.min(16, Math.hypot(p2.x - p1.x, p2.y - p1.y) * 0.4);
+  const a1 = ang + Math.PI - 0.5;
+  const a2 = ang + Math.PI + 0.5;
+  return [
+    { x1: p2.x, y1: p2.y, x2: p2.x + len * Math.cos(a1), y2: p2.y + len * Math.sin(a1) },
+    { x1: p2.x, y1: p2.y, x2: p2.x + len * Math.cos(a2), y2: p2.y + len * Math.sin(a2) },
+  ];
+}
+
+function clearChildren(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+function renderAnnotations() {
+  if (!annotSvg) return;
+  annotLayer.style.width = pageDisplayWidth + 'px';
+  annotLayer.style.height = pageDisplayHeight + 'px';
+  annotLayer.style.transform = canvas.style.transform || '';
+  annotSvg.setAttribute('viewBox', `0 0 ${pageDisplayWidth} ${pageDisplayHeight}`);
+  annotSvg.setAttribute('width', pageDisplayWidth);
+  annotSvg.setAttribute('height', pageDisplayHeight);
+
+  clearChildren(annotSvg);
+  annotHtml.querySelectorAll('.annot-textbox').forEach((n) => n.remove());
+
+  if (!Module || totalPages <= 0 || canvas.style.display !== 'block') return;
+
+  const list = pageAnnots();
+  const all = annotDraft ? list.concat([annotDraft]) : list;
+  for (const a of all) drawAnnot(a);
+
+  // Selection outline.
+  const sel = selectedAnnotId != null ? findAnnot(selectedAnnotId) : null;
+  if (sel) {
+    const bb = annotScreenBBox(sel);
+    const r = svgEl('rect');
+    r.setAttribute('x', bb.left - 3); r.setAttribute('y', bb.top - 3);
+    r.setAttribute('width', Math.max(0, bb.width) + 6);
+    r.setAttribute('height', Math.max(0, bb.height) + 6);
+    r.setAttribute('fill', 'none');
+    r.setAttribute('stroke', '#007bff');
+    r.setAttribute('stroke-width', '1');
+    r.setAttribute('stroke-dasharray', '4 3');
+    annotSvg.appendChild(r);
+  }
+  updateAnnotLayerMode();
+}
+
+function drawAnnot(a) {
+  const scale = getPageScale();
+  const col = rgbToHex(a.color);
+  if (a.type === 'text') { drawTextBox(a); return; }
+
+  let el;
+  if (a.type === 'highlight') {
+    el = svgEl('rect');
+    const box = pdfBoxToScreen(a);
+    el.setAttribute('x', box.left); el.setAttribute('y', box.top);
+    el.setAttribute('width', Math.max(0, box.width));
+    el.setAttribute('height', Math.max(0, box.height));
+    el.setAttribute('fill', col);
+    el.setAttribute('fill-opacity', a.alpha != null ? a.alpha : 0.4);
+  } else if (a.type === 'rect') {
+    el = svgEl('rect');
+    const box = pdfBoxToScreen(a);
+    el.setAttribute('x', box.left); el.setAttribute('y', box.top);
+    el.setAttribute('width', Math.max(0, box.width));
+    el.setAttribute('height', Math.max(0, box.height));
+    applyShapeStyle(el, a, col, scale);
+  } else if (a.type === 'oval') {
+    el = svgEl('ellipse');
+    const box = pdfBoxToScreen(a);
+    el.setAttribute('cx', box.left + box.width / 2);
+    el.setAttribute('cy', box.top + box.height / 2);
+    el.setAttribute('rx', Math.max(0, box.width / 2));
+    el.setAttribute('ry', Math.max(0, box.height / 2));
+    applyShapeStyle(el, a, col, scale);
+  } else if (a.type === 'line' || a.type === 'arrow') {
+    el = svgEl('g');
+    const p1 = pdfToScreen(a.x1, a.y1), p2 = pdfToScreen(a.x2, a.y2);
+    const segs = [{ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y }];
+    if (a.type === 'arrow') segs.push(...arrowHeadSegments(p1, p2));
+    for (const s of segs) {
+      const ln = svgEl('line');
+      ln.setAttribute('x1', s.x1); ln.setAttribute('y1', s.y1);
+      ln.setAttribute('x2', s.x2); ln.setAttribute('y2', s.y2);
+      ln.setAttribute('stroke', col);
+      ln.setAttribute('stroke-width', Math.max(1, a.lineWidth * scale));
+      ln.setAttribute('stroke-linecap', 'round');
+      el.appendChild(ln);
+    }
+  } else if (a.type === 'ink') {
+    el = svgEl('polyline');
+    el.setAttribute('points', a.points.map((p) => {
+      const s = pdfToScreen(p.x, p.y); return `${s.x},${s.y}`;
+    }).join(' '));
+    el.setAttribute('fill', 'none');
+    el.setAttribute('stroke', col);
+    el.setAttribute('stroke-width', Math.max(1, a.lineWidth * scale));
+    el.setAttribute('stroke-linejoin', 'round');
+    el.setAttribute('stroke-linecap', 'round');
+  }
+  if (!el) return;
+  el.classList.add('annot-shape');
+  el.dataset.annotId = a.id;
+  annotSvg.appendChild(el);
+}
+
+function applyShapeStyle(el, a, col, scale) {
+  if (a.filled) {
+    el.setAttribute('fill', col);
+    el.setAttribute('fill-opacity', a.alpha != null ? a.alpha : 1);
+    el.setAttribute('stroke', 'none');
+  } else {
+    el.setAttribute('fill', 'none');
+    el.setAttribute('stroke', col);
+    el.setAttribute('stroke-width', Math.max(1, a.lineWidth * scale));
+  }
+}
+
+function drawTextBox(a) {
+  const box = pdfBoxToScreen(a);
+  const scale = getPageScale();
+  const ta = document.createElement('textarea');
+  ta.className = 'annot-textbox' + (a.id === selectedAnnotId ? ' selected' : '');
+  ta.dataset.annotId = a.id;
+  ta.style.left = box.left + 'px';
+  ta.style.top = box.top + 'px';
+  ta.style.width = Math.max(40, box.width) + 'px';
+  ta.style.fontSize = (a.fontSize * scale) + 'px';
+  ta.style.color = rgbToHex(a.color);
+  ta.placeholder = 'Text…';
+  ta.value = a.text || '';
+  ta.addEventListener('input', () => { a.text = ta.value; autoGrowTextbox(ta, a); });
+  ta.addEventListener('focus', () => {
+    selectedAnnotId = a.id; updateAnnotLayerMode();
+  });
+  ta.addEventListener('pointerdown', (e) => e.stopPropagation());
+  annotHtml.appendChild(ta);
+  autoGrowTextbox(ta, a);
+}
+function autoGrowTextbox(ta, a) {
+  ta.style.height = 'auto';
+  ta.style.height = ta.scrollHeight + 'px';
+  a.h = ta.offsetHeight / getPageScale();
+  a.w = ta.offsetWidth / getPageScale();
+}
+
+// ---- Drawing / selecting interaction ----
+
+function startDraft(e) {
+  const pos = annotPointerPos(e);
+  const pdf = screenToPdf(pos.x, pos.y);
+  const color = hexToRgb(annotColorHex);
+  annotDraft = {
+    id: annotIdCounter++,
+    type: annotTool,
+    color,
+    alpha: annotTool === 'highlight' ? 0.4 : 1,
+    lineWidth: 2,
+    filled: annotFillShapes && (annotTool === 'rect' || annotTool === 'oval'),
+    _start: pdf,
+  };
+  if (annotTool === 'ink') annotDraft.points = [pdf];
+  else if (annotTool === 'line' || annotTool === 'arrow') {
+    annotDraft.x1 = pdf.x; annotDraft.y1 = pdf.y; annotDraft.x2 = pdf.x; annotDraft.y2 = pdf.y;
+  } else { annotDraft.x = pdf.x; annotDraft.y = pdf.y; annotDraft.w = 0; annotDraft.h = 0; }
+  renderAnnotations();
+}
+
+function startTextBox(e) {
+  const pos = annotPointerPos(e);
+  const pdf = screenToPdf(pos.x, pos.y);
+  const scale = getPageScale();
+  const h = 20 / scale, w = 140 / scale;
+  const a = {
+    id: annotIdCounter++, type: 'text',
+    x: pdf.x, y: pdf.y - h, w, h,
+    text: '', fontSize: 14, color: hexToRgb(annotColorHex),
+  };
+  pageAnnots().push(a);
+  selectedAnnotId = a.id;
+  setAnnotTool('select');
+  renderAnnotations();
+  const ta = annotHtml.querySelector(`.annot-textbox[data-annot-id="${a.id}"]`);
+  if (ta) ta.focus();
+  updateSaveAnnotState();
+}
+
+function annotLayerPointerDown(e) {
+  if (e.button !== 0) return;
+  if (!annotEditingEnabled() || annotTool === 'select') return;
+  e.preventDefault();
+  if (annotTool === 'text') { startTextBox(e); return; }
+  annotLayer.setPointerCapture?.(e.pointerId);
+  startDraft(e);
+}
+
+function annotLayerPointerMove(e) {
+  if (!annotDraft) return;
+  const pos = annotPointerPos(e);
+  const pdf = screenToPdf(pos.x, pos.y);
+  const s = annotDraft._start;
+  if (annotDraft.type === 'ink') {
+    annotDraft.points.push(pdf);
+  } else if (annotDraft.type === 'line' || annotDraft.type === 'arrow') {
+    annotDraft.x2 = pdf.x; annotDraft.y2 = pdf.y;
+  } else {
+    annotDraft.x = Math.min(s.x, pdf.x);
+    annotDraft.y = Math.min(s.y, pdf.y);
+    annotDraft.w = Math.abs(pdf.x - s.x);
+    annotDraft.h = Math.abs(pdf.y - s.y);
+  }
+  renderAnnotations();
+}
+
+function annotLayerPointerUp(e) {
+  if (!annotDraft) return;
+  const d = annotDraft;
+  annotDraft = null;
+  let keep;
+  if (d.type === 'ink') keep = d.points.length > 1;
+  else if (d.type === 'line' || d.type === 'arrow') keep = Math.hypot(d.x2 - d.x1, d.y2 - d.y1) > 2;
+  else keep = d.w > 2 && d.h > 2;
+  if (keep) {
+    delete d._start;
+    pageAnnots().push(d);
+    selectedAnnotId = d.id;
+  }
+  renderAnnotations();
+  updateSaveAnnotState();
+}
+
+function annotShapePointerDown(e) {
+  if (!annotEditingEnabled() || annotTool !== 'select') return;
+  const host = e.target.closest('[data-annot-id]');
+  if (!host) return;
+  e.stopPropagation();
+  e.preventDefault();
+  selectedAnnotId = Number(host.dataset.annotId);
+  const a = findAnnot(selectedAnnotId);
+  renderAnnotations();
+  if (!a || a.type === 'text') return;  // text boxes move via their own element
+  let last = annotPointerPos(e);
+  const onMove = (ev) => {
+    const pos = annotPointerPos(ev);
+    const dx = (pos.x - last.x) / getPageScale();
+    const dy = -(pos.y - last.y) / getPageScale();
+    translateAnnot(a, dx, dy);
+    last = pos;
+    renderAnnotations();
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    updateSaveAnnotState();
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+function deleteSelectedAnnot() {
+  if (selectedAnnotId == null) return;
+  const list = pageAnnots();
+  const i = list.findIndex((a) => a.id === selectedAnnotId);
+  if (i >= 0) {
+    list.splice(i, 1);
+    selectedAnnotId = null;
+    renderAnnotations();
+    updateAnnotLayerMode();
+    updateSaveAnnotState();
+  }
+}
+
+// ---- Form-field visual fill ----
+
+function loadFormFields() {
+  formFieldsByPage = {};
+  if (!Module || !Module._nanopdf_get_form_fields) return;
+  if (Module._nanopdf_has_form_fields && Module._nanopdf_has_form_fields() !== 1) return;
+  let json;
+  try {
+    json = JSON.parse(Module.UTF8ToString(Module._nanopdf_get_form_fields()));
+  } catch (e) { return; }
+  if (!json || !json.fields) return;
+  for (const f of json.fields) {
+    if (f.type !== 'text' || f.readOnly) continue;  // visual fill: editable text fields
+    for (const w of (f.widgets || [])) {
+      if (w.page == null || w.page < 0 || !w.rect) continue;
+      if (!formFieldsByPage[w.page]) formFieldsByPage[w.page] = [];
+      formFieldsByPage[w.page].push({
+        name: f.fullName || f.name || '',
+        rect: w.rect,
+        value: f.value || '',
+        multiline: !!f.multiline,
+        password: !!f.password,
+        fontSize: 12,
+      });
+    }
+  }
+}
+
+function renderFormFields() {
+  annotHtml.querySelectorAll('.annot-formfield').forEach((n) => n.remove());
+  if (!Module || totalPages <= 0 || canvas.style.display !== 'block') return;
+  if (rotation !== 0) return;
+  const fields = formFieldsByPage[currentPage];
+  if (!fields) return;
+  for (const fld of fields) {
+    const box = pdfBoxToScreen({ x: fld.rect.x, y: fld.rect.y, w: fld.rect.width, h: fld.rect.height });
+    const input = document.createElement(fld.multiline ? 'textarea' : 'input');
+    if (!fld.multiline) input.type = fld.password ? 'password' : 'text';
+    input.className = 'annot-formfield';
+    input.style.left = box.left + 'px';
+    input.style.top = box.top + 'px';
+    input.style.width = Math.max(8, box.width) + 'px';
+    input.style.height = Math.max(12, box.height) + 'px';
+    input.style.fontSize = Math.max(8, Math.min(box.height * 0.7, 18)) + 'px';
+    input.value = fld.value;
+    input.title = fld.name;
+    input.addEventListener('input', () => { fld.value = input.value; updateSaveAnnotState(); });
+    annotHtml.appendChild(input);
+  }
+}
+
+function hasAnyAnnotations() {
+  for (const k in annotations) if (annotations[k] && annotations[k].length) return true;
+  for (const k in formFieldsByPage) {
+    for (const f of formFieldsByPage[k]) if (f.value && f.value.trim()) return true;
+  }
+  return false;
+}
+function updateSaveAnnotState() {
+  if (saveAnnotBtn) saveAnnotBtn.disabled = !(hasRendering && totalPages > 0);
+}
+
+function resetAnnotations() {
+  annotations = {};
+  formFieldsByPage = {};
+  selectedAnnotId = null;
+  annotDraft = null;
+  annotIdCounter = 1;
+  setAnnotTool('select');
+  if (annotHtml) clearChildren(annotHtml);
+  if (annotSvg) clearChildren(annotSvg);
+}
+
 function renderCurrentPage() {
   if (!Module || totalPages <= 0) return;
   if (!hasRendering) {
@@ -1174,13 +1683,24 @@ function renderCurrentPage() {
 
   const baseScale = computeBaseScale(pageWidth, pageHeight);
   const effectiveScale = baseScale * zoomLevel;
-  // Cap maximum render dimensions to avoid WASM memory issues
+  // CSS-pixel layout size of the page.
+  const cssWidth = Math.floor(pageWidth * effectiveScale);
+  const cssHeight = Math.floor(pageHeight * effectiveScale);
+
+  // Render at device resolution so text stays crisp on HiDPI/Retina displays.
+  // The canvas bitmap is cssSize * devicePixelRatio; CSS keeps it at the layout size.
+  const dpr = window.devicePixelRatio || 1;
+  // Cap maximum render dimensions (device px) to avoid WASM memory issues.
   const maxDim = 4096;
-  const width = Math.min(maxDim, Math.floor(pageWidth * effectiveScale));
-  const height = Math.min(maxDim, Math.floor(pageHeight * effectiveScale));
+  const width = Math.min(maxDim, Math.round(cssWidth * dpr));
+  const height = Math.min(maxDim, Math.round(cssHeight * dpr));
 
   canvas.width = width;
   canvas.height = height;
+  canvas.style.width = `${cssWidth}px`;
+  canvas.style.height = `${cssHeight}px`;
+  pageDisplayWidth = cssWidth;
+  pageDisplayHeight = cssHeight;
 
   const dpi = 72 * (width / pageWidth);
 
@@ -1217,6 +1737,8 @@ function renderCurrentPage() {
   // Apply rotation
   applyRotation();
   renderTextOverlay();
+  renderAnnotations();
+  renderFormFields();
 
   const zoomPct = Math.round(zoomLevel * 100);
   setStatus(`Page ${currentPage + 1} / ${totalPages} | ${backendLabel(renderBackend)} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}`);
@@ -1429,6 +1951,50 @@ function copyCurrentSelection(e) {
 
 // ---- PDF Loading ----
 
+// Derive a reasonable file name from a URL's path (falls back to document.pdf).
+function fileNameFromUrl(url) {
+  try {
+    const path = new URL(url, window.location.href).pathname;
+    const last = decodeURIComponent(path.split('/').pop() || '');
+    if (last) return last.toLowerCase().endsWith('.pdf') ? last : last + '.pdf';
+  } catch (e) { /* ignore */ }
+  return 'document.pdf';
+}
+
+// Fetch a PDF from a URL and load it. Reports network/CORS/HTTP errors clearly.
+async function loadPdfFromUrl(url) {
+  if (!Module || !url) return;
+  url = url.trim();
+  if (!url) return;
+  showLoading('Fetching PDF...');
+  try {
+    const res = await fetch(url, { redirect: 'follow' });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    const arrayBuffer = await res.arrayBuffer();
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+      throw new Error('Empty response');
+    }
+    await loadPDF(arrayBuffer, fileNameFromUrl(url));
+  } catch (err) {
+    hideLoading();
+    const msg = (err && err.message) || String(err);
+    // fetch() rejects with a generic "Failed to fetch" on CORS / network errors.
+    const hint = /failed to fetch|load failed|networkerror/i.test(msg)
+      ? ' (network or CORS error — the server must allow cross-origin requests)'
+      : '';
+    setStatus('Could not load URL: ' + msg + hint, true);
+    console.error('loadPdfFromUrl failed:', err);
+  }
+}
+
+function promptOpenUrl() {
+  if (!Module) return;
+  const url = window.prompt('Enter the URL of a PDF to open:', '');
+  if (url) loadPdfFromUrl(url);
+}
+
 async function loadPDF(arrayBuffer, name) {
   if (!Module) return;
 
@@ -1494,6 +2060,12 @@ async function loadPDF(arrayBuffer, name) {
     fitModeBtn.disabled = !hasRendering;
     rotateBtn.disabled = !hasRendering;
     updateExportButton();
+
+    // Annotation tooling
+    resetAnnotations();
+    loadFormFields();
+    setAnnotControlsEnabled(hasRendering);
+    updateSaveAnnotState();
 
     updatePageDisplay();
 
@@ -1852,24 +2424,114 @@ function downloadPdfBytes(pdfBytes, suffix, pages) {
   URL.revokeObjectURL(url);
 }
 
-async function exportSelectedPagesProtected(pages) {
-  const userPassword = exportPassword.value;
-  const ownerPassword = exportOwnerPassword.value || userPassword;
-  if (!userPassword) {
-    setStatus('Protected export requires a user password', true);
-    exportPassword.focus();
-    return false;
+// ---- Annotation baking (PDF points -> nanopdf_annot_* export API) ----
+
+function arrowHeadPdf(x1, y1, x2, y2) {
+  const ang = Math.atan2(y2 - y1, x2 - x1);
+  const len = Math.min(12, Math.hypot(x2 - x1, y2 - y1) * 0.4);
+  const a1 = ang + Math.PI - 0.5, a2 = ang + Math.PI + 0.5;
+  return [
+    { x1: x2, y1: y2, x2: x2 + len * Math.cos(a1), y2: y2 + len * Math.sin(a1) },
+    { x1: x2, y1: y2, x2: x2 + len * Math.cos(a2), y2: y2 + len * Math.sin(a2) },
+  ];
+}
+
+function bakeTextLines(workIndex, text, x, topY, fontSize, c, alpha) {
+  const lines = String(text).split('\n');
+  const fontPtr = Module.stringToNewUTF8('Helvetica');
+  let baseline = topY - fontSize;
+  for (const line of lines) {
+    const txtPtr = Module.stringToNewUTF8(line);
+    Module._nanopdf_annot_add_text(workIndex, x, baseline, txtPtr, fontPtr,
+      fontSize, c.r, c.g, c.b, alpha);
+    Module._free(txtPtr);
+    baseline -= fontSize * 1.25;
   }
+  Module._free(fontPtr);
+}
+
+function bakeAnnotationForWorkPage(workIndex, a) {
+  const c = a.color || { r: 0, g: 0, b: 0 };
+  const lw = a.lineWidth || 2;
+  const alpha = a.alpha != null ? a.alpha : 1;
+  switch (a.type) {
+    case 'highlight':
+      Module._nanopdf_annot_add_highlight(workIndex, a.x, a.y, a.w, a.h, c.r, c.g, c.b, alpha);
+      break;
+    case 'rect':
+      Module._nanopdf_annot_add_rect(workIndex, a.x, a.y, a.w, a.h, lw, c.r, c.g, c.b, alpha, a.filled ? 1 : 0);
+      break;
+    case 'oval':
+      Module._nanopdf_annot_add_oval(workIndex, a.x + a.w / 2, a.y + a.h / 2, a.w / 2, a.h / 2, lw, c.r, c.g, c.b, alpha, a.filled ? 1 : 0);
+      break;
+    case 'line':
+      Module._nanopdf_annot_add_line(workIndex, a.x1, a.y1, a.x2, a.y2, lw, c.r, c.g, c.b, alpha);
+      break;
+    case 'arrow':
+      Module._nanopdf_annot_add_line(workIndex, a.x1, a.y1, a.x2, a.y2, lw, c.r, c.g, c.b, alpha);
+      for (const s of arrowHeadPdf(a.x1, a.y1, a.x2, a.y2)) {
+        Module._nanopdf_annot_add_line(workIndex, s.x1, s.y1, s.x2, s.y2, lw, c.r, c.g, c.b, alpha);
+      }
+      break;
+    case 'ink':
+      for (let i = 1; i < a.points.length; i++) {
+        const p = a.points[i - 1], q = a.points[i];
+        Module._nanopdf_annot_add_line(workIndex, p.x, p.y, q.x, q.y, lw, c.r, c.g, c.b, alpha);
+      }
+      break;
+    case 'text':
+      if (a.text && a.text.trim()) {
+        bakeTextLines(workIndex, a.text, a.x, a.y + a.h, a.fontSize || 14, c, alpha);
+      }
+      break;
+  }
+}
+
+function bakeFormFieldsForWorkPage(workIndex, pageIndex) {
+  const fields = formFieldsByPage[pageIndex];
+  if (!fields) return;
+  const black = { r: 0, g: 0, b: 0 };
+  for (const f of fields) {
+    if (!f.value || !f.value.trim()) continue;
+    const fs = Math.max(8, Math.min(f.rect.height * 0.7, 12));
+    // Start the text near the top of the field box so multi-line content flows down.
+    bakeTextLines(workIndex, f.value, f.rect.x + 2, f.rect.y + f.rect.height - 2, fs, black, 1);
+  }
+}
+
+function pageHasBakeableContent(pageIndex) {
+  if (annotations[pageIndex] && annotations[pageIndex].length) return true;
+  const fields = formFieldsByPage[pageIndex];
+  return !!(fields && fields.some((f) => f.value && f.value.trim()));
+}
+
+// Unified export through the C++ flatten path: rasterizes each page, draws
+// annotations + form-field text on top, optionally encrypts, and downloads.
+async function exportViaWasm(pages, { protect, suffix }) {
   if (!currentPdfBytes || currentPdfBytes.length === 0) {
-    setStatus('Protected export failed: no source PDF loaded', true);
+    setStatus('Export failed: no source PDF loaded', true);
     return false;
   }
-  if (!Module._nanopdf_export_set_passwords) {
-    setStatus('Protected export requires rebuilding the nanopdf WASM module', true);
+  if (!Module._nanopdf_doc_load || !Module._nanopdf_export_pdf) {
+    setStatus('Export requires rebuilding the nanopdf WASM module', true);
     return false;
+  }
+  let userPassword = '', ownerPassword = '';
+  if (protect) {
+    userPassword = exportPassword.value;
+    ownerPassword = exportOwnerPassword.value || userPassword;
+    if (!userPassword) {
+      setStatus('Protected export requires a user password', true);
+      exportPassword.focus();
+      return false;
+    }
+    if (!Module._nanopdf_export_set_passwords) {
+      setStatus('Protected export requires rebuilding the nanopdf WASM module', true);
+      return false;
+    }
   }
 
-  showLoading(`Exporting protected PDF (${pages.length} page(s))...`);
+  showLoading(`Exporting ${pages.length} page(s)...`);
   await new Promise(r => setTimeout(r, 50));
 
   let docId = -1;
@@ -1879,55 +2541,70 @@ async function exportSelectedPagesProtected(pages) {
     docId = Module._nanopdf_doc_load(ptr, currentPdfBytes.length);
     Module._nanopdf_free(ptr);
     if (docId < 0) {
-      const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
-      throw new Error(error || 'Failed to load source document for export');
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) ||
+        'Failed to load source document for export');
     }
 
     Module._nanopdf_work_clear();
-    for (const pageIdx of pages) {
+    pages.forEach((pageIdx) => {
       const workIndex = Module._nanopdf_work_add_page(docId, pageIdx);
       if (workIndex < 0) {
-        const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
-        throw new Error(error || `Failed to add page ${pageIdx + 1}`);
+        throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) ||
+          `Failed to add page ${pageIdx + 1}`);
       }
-    }
+      Module._nanopdf_annot_clear_page(workIndex);
+      for (const a of (annotations[pageIdx] || [])) {
+        bakeAnnotationForWorkPage(workIndex, a);
+      }
+      bakeFormFieldsForWorkPage(workIndex, pageIdx);
+    });
 
-    const userPtr = Module.stringToNewUTF8(userPassword);
-    const ownerPtr = Module.stringToNewUTF8(ownerPassword);
-    const passwordResult = Module._nanopdf_export_set_passwords(userPtr, ownerPtr, 3);
-    Module._free(userPtr);
-    Module._free(ownerPtr);
-    if (passwordResult !== 1) {
-      const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
-      throw new Error(error || 'Failed to configure password protection');
+    if (protect) {
+      const userPtr = Module.stringToNewUTF8(userPassword);
+      const ownerPtr = Module.stringToNewUTF8(ownerPassword);
+      const pr = Module._nanopdf_export_set_passwords(userPtr, ownerPtr, 3);
+      Module._free(userPtr);
+      Module._free(ownerPtr);
+      if (pr !== 1) {
+        throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) ||
+          'Failed to configure password protection');
+      }
     }
 
     const exportResult = Module._nanopdf_export_pdf();
     if (exportResult !== 1) {
-      const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
-      throw new Error(error || 'Protected export failed');
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Export failed');
     }
 
     const outPtr = Module._nanopdf_export_get_buffer();
     const outSize = Module._nanopdf_export_get_size();
     const pdfBytes = new Uint8Array(Module.HEAPU8.buffer, outPtr, outSize).slice();
-    downloadPdfBytes(pdfBytes, 'protected_pages', pages);
-    setStatus(`Exported ${pages.length} protected page(s) as PDF`);
+    downloadPdfBytes(pdfBytes, suffix || (protect ? 'protected' : 'annotated'), pages);
+    setStatus(`Exported ${pages.length} page(s)${protect ? ' (protected)' : ''}`);
     return true;
   } catch (err) {
-    setStatus('Protected export error: ' + err.message, true);
+    setStatus('Export error: ' + err.message, true);
     console.error(err);
     return false;
   } finally {
-    const emptyPtr = Module.stringToNewUTF8('');
-    Module._nanopdf_export_set_passwords(emptyPtr, emptyPtr, 3);
-    Module._free(emptyPtr);
-    if (docId >= 0) {
-      Module._nanopdf_doc_close(docId);
+    if (protect && Module._nanopdf_export_set_passwords) {
+      const emptyPtr = Module.stringToNewUTF8('');
+      Module._nanopdf_export_set_passwords(emptyPtr, emptyPtr, 3);
+      Module._free(emptyPtr);
     }
+    if (docId >= 0) Module._nanopdf_doc_close(docId);
     Module._nanopdf_work_clear();
     hideLoading();
   }
+}
+
+// Save the whole document (all pages) with annotations + form fills baked in.
+async function saveAnnotatedPdf() {
+  if (!Module || totalPages <= 0 || !hasRendering) return;
+  const pages = [];
+  for (let i = 0; i < totalPages; i++) pages.push(i);
+  await exportViaWasm(pages, { protect: protectExport.checked, suffix: 'annotated' });
+  renderCurrentPage();
 }
 
 async function exportSelectedPages() {
@@ -1935,8 +2612,14 @@ async function exportSelectedPages() {
 
   const pages = [...selectedPages].sort((a, b) => a - b);
 
-  if (protectExport.checked) {
-    await exportSelectedPagesProtected(pages);
+  // Route through the C++ flatten path when encryption is requested or any
+  // selected page carries annotations / form-field fills, so they get baked in.
+  const hasBakeable = pages.some(pageHasBakeableContent);
+  if (protectExport.checked || hasBakeable) {
+    await exportViaWasm(pages, {
+      protect: protectExport.checked,
+      suffix: protectExport.checked ? 'protected_pages' : 'pages',
+    });
     renderCurrentPage();
     return;
   }
@@ -2034,6 +2717,7 @@ function onResize() {
 
 // File input
 openPdfBtn.addEventListener('click', () => pdfInput.click());
+openUrlBtn.addEventListener('click', promptOpenUrl);
 pdfInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -2186,6 +2870,17 @@ document.addEventListener('keydown', (e) => {
     if (!e.ctrlKey && !e.metaKey) {
       rotateClockwise();
     }
+  } else if ((e.key === 'Delete' || e.key === 'Backspace') &&
+             selectedAnnotId != null && annotEditingEnabled()) {
+    e.preventDefault();
+    deleteSelectedAnnot();
+  } else if (e.key === 'Escape' && selectedAnnotId != null) {
+    selectedAnnotId = null;
+    renderAnnotations();
+    updateAnnotLayerMode();
+  } else if ((e.key === 'v' || e.key === 'V') && !e.ctrlKey && !e.metaKey &&
+             annotEditingEnabled()) {
+    setAnnotTool('select');
   }
 });
 
@@ -2249,6 +2944,44 @@ textOverlay.addEventListener('pointerup', finishTextSelection);
 textOverlay.addEventListener('pointercancel', finishTextSelection);
 document.addEventListener('copy', copyCurrentSelection);
 
+// Annotation tools
+annotTools.querySelectorAll('.annot-tool').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (!annotEditingEnabled()) {
+      setStatus(rotation !== 0
+        ? 'Reset rotation to 0° to edit annotations'
+        : 'Open a PDF to annotate', true);
+      return;
+    }
+    setAnnotTool(btn.dataset.tool);
+  });
+});
+annotColor.addEventListener('input', () => {
+  annotColorHex = annotColor.value;
+  // Recolor the currently selected annotation, if any.
+  if (selectedAnnotId != null) {
+    const a = findAnnot(selectedAnnotId);
+    if (a) { a.color = hexToRgb(annotColorHex); renderAnnotations(); }
+  }
+});
+annotFill.addEventListener('change', () => {
+  annotFillShapes = annotFill.checked;
+  if (selectedAnnotId != null) {
+    const a = findAnnot(selectedAnnotId);
+    if (a && (a.type === 'rect' || a.type === 'oval')) {
+      a.filled = annotFillShapes; renderAnnotations();
+    }
+  }
+});
+annotDeleteBtn.addEventListener('click', deleteSelectedAnnot);
+saveAnnotBtn.addEventListener('click', saveAnnotatedPdf);
+
+annotLayer.addEventListener('pointerdown', annotLayerPointerDown);
+annotLayer.addEventListener('pointermove', annotLayerPointerMove);
+annotLayer.addEventListener('pointerup', annotLayerPointerUp);
+annotLayer.addEventListener('pointercancel', annotLayerPointerUp);
+annotSvg.addEventListener('pointerdown', annotShapePointerDown);
+
 // Window resize
 window.addEventListener('resize', onResize);
 
@@ -2310,6 +3043,13 @@ async function init() {
     }
 
     console.log('nanopdf WASM loaded. Rendering:', hasRendering);
+
+    // Deep-link support: ?url=<pdf> (or ?pdf=<pdf>) auto-opens a remote PDF.
+    const params = new URLSearchParams(window.location.search);
+    const deepLink = params.get('url') || params.get('pdf');
+    if (deepLink) {
+      loadPdfFromUrl(deepLink);
+    }
   } catch (err) {
     hideLoading();
     setStatus('Failed to load WASM: ' + err.message, true);

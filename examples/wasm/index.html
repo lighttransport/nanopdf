@@ -22,6 +22,7 @@
     <h1>nanopdf</h1>
     <div class="toolbar-separator"></div>
     <button type="button" id="open-pdf-btn" title="Open a PDF file">Open PDF</button>
+    <button type="button" id="open-url-btn" title="Open a PDF from a URL">Open URL</button>
     <input type="file" id="pdf-input" class="visually-hidden" accept=".pdf" tabindex="-1" aria-hidden="true" />
     <div class="toolbar-separator"></div>
     <div class="page-nav">
@@ -49,6 +50,24 @@
     </label>
     <input type="password" id="export-password" class="export-password" placeholder="Password" disabled />
     <input type="password" id="export-owner-password" class="export-password" placeholder="Owner" disabled />
+
+    <div class="toolbar-separator"></div>
+
+    <!-- Annotation tools (macOS Preview-like) -->
+    <div class="annot-tools" id="annot-tools">
+      <button class="annot-tool active" data-tool="select" disabled title="Select / move / delete (V)">Select</button>
+      <button class="annot-tool" data-tool="highlight" disabled title="Highlight a rectangle">Highlight</button>
+      <button class="annot-tool" data-tool="text" disabled title="Add a text box">Text</button>
+      <button class="annot-tool" data-tool="rect" disabled title="Draw a rectangle">Rect</button>
+      <button class="annot-tool" data-tool="oval" disabled title="Draw an oval">Oval</button>
+      <button class="annot-tool" data-tool="line" disabled title="Draw a line">Line</button>
+      <button class="annot-tool" data-tool="arrow" disabled title="Draw an arrow">Arrow</button>
+      <button class="annot-tool" data-tool="ink" disabled title="Freehand sketch">Draw</button>
+      <input type="color" id="annot-color" class="annot-color" value="#ffd54a" disabled title="Annotation color" />
+      <label class="annot-fill" title="Fill shapes"><input type="checkbox" id="annot-fill" disabled />Fill</label>
+      <button id="annot-delete" disabled title="Delete selected annotation (Delete)">Del</button>
+      <button id="save-annot-btn" disabled title="Save the whole document with annotations baked in">Save</button>
+    </div>
 
     <!-- Search -->
     <div class="search-bar">
@@ -91,6 +110,10 @@
         <div class="canvas-wrapper" id="canvas-wrapper">
           <canvas id="pdf-canvas"></canvas>
           <div id="text-overlay" class="text-overlay" aria-hidden="true"></div>
+          <div id="annot-layer" class="annot-layer">
+            <svg id="annot-svg" class="annot-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div id="annot-html" class="annot-html"></div>
+          </div>
         </div>
       </div>
 
