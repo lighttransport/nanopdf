@@ -6637,10 +6637,15 @@ bool find_field_obj_by_name(const Pdf& pdf, const std::string& target_name,
     uint32_t obj_num = 0;
     uint16_t gen_num = 0;
 
+    // `resolved` must outlive `field_val` (which points into it) for the rest of
+    // this lambda, so it is declared here rather than inside the `if` block —
+    // otherwise field_val dangles (stack-use-after-scope) the moment the block
+    // ends, reading garbage for all but the first field.
+    ResolvedObject resolved;
     if (field_ref.type == Value::REFERENCE) {
       obj_num = field_ref.ref_object_number;
       gen_num = field_ref.ref_generation_number;
-      ResolvedObject resolved = resolve_reference(pdf, obj_num, gen_num);
+      resolved = resolve_reference(pdf, obj_num, gen_num);
       if (!resolved.success || resolved.value.type != Value::DICTIONARY) {
         return false;
       }

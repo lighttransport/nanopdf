@@ -2139,26 +2139,25 @@ async function saveEditableForm() {
       throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load form');
     }
     // A field can have widgets on multiple pages; set each unique field once.
-    // Only TEXT fields are written to the editable (incremental) path: it is
-    // verified reliable in the WASM build. set_field_checked/choice work in the
-    // native library but currently fail under WASM (a platform-specific parse
-    // fault for the widget objects — needs an ASan build to track down), so
-    // checkbox/dropdown values are persisted via the flattened "Save" instead.
     const done = new Set();
-    let count = 0, skippedNonText = 0;
+    let count = 0;
     for (const page in formFieldsByPage) {
       for (const f of formFieldsByPage[page]) {
         const key = f.kind + ':' + f.name;
         if (done.has(key)) continue;
         done.add(key);
-        if (f.kind !== 'text') {
-          if (f.kind === 'choice' ? !!f.value : f.checked) skippedNonText++;
-          continue;
-        }
         const namePtr = Module.stringToNewUTF8(f.name);
-        const vp = Module.stringToNewUTF8(f.value || '');
-        if (Module._nanopdf_form_set_text(namePtr, vp)) count++;
-        Module._free(vp);
+        if (f.kind === 'text') {
+          const vp = Module.stringToNewUTF8(f.value || '');
+          if (Module._nanopdf_form_set_text(namePtr, vp)) count++;
+          Module._free(vp);
+        } else if (f.kind === 'checkbox') {
+          if (Module._nanopdf_form_set_checkbox(namePtr, f.checked ? 1 : 0)) count++;
+        } else if (f.kind === 'choice') {
+          const vp = Module.stringToNewUTF8(f.value || '');
+          if (Module._nanopdf_form_set_choice(namePtr, vp)) count++;
+          Module._free(vp);
+        }
         Module._free(namePtr);
       }
     }
@@ -2168,8 +2167,7 @@ async function saveEditableForm() {
     const out = copyWasmBuffer(Module._nanopdf_form_get_buffer, Module._nanopdf_form_get_size);
     if (!out) throw new Error('Empty form output');
     downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_filled.pdf');
-    setStatus(`Saved editable form (${count} text field(s))` +
-      (skippedNonText ? ` — use flattened "Save" for ${skippedNonText} checkbox/dropdown value(s)` : ''));
+    setStatus(`Saved editable filled form (${count} field(s))`);
   } catch (err) {
     setStatus('Form save error: ' + err.message, true);
     console.error(err);

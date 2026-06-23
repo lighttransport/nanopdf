@@ -79,6 +79,7 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/backends/test_focal_radial_gradient.cc
     unit/filters/test_tiff_decode.cc
     unit/forms/test_form_manipulation.cc
+    unit/forms/test_form_writeback.cc
 )
 
 add_executable(nanopdf_unit_suite
