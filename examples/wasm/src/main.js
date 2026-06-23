@@ -1038,6 +1038,60 @@ function closeRevisionDiff() {
   diffState.before = diffState.after = null;
 }
 
+// ---- Print ----
+
+let printing = false;
+
+// Render every page to an image and print via the browser. A print stylesheet
+// shows only the #print-container (one image per page, each on its own sheet);
+// the container is removed when printing finishes.
+async function printDocument() {
+  if (!Module || totalPages <= 0 || !hasRendering || printing) return;
+  printing = true;
+  const printBtn = document.getElementById('print-btn');
+  if (printBtn) { printBtn.disabled = true; printBtn.textContent = 'Rendering…'; }
+
+  // Tear down any stale container, then build a fresh one.
+  const old = document.getElementById('print-container');
+  if (old) old.remove();
+  const container = document.createElement('div');
+  container.id = 'print-container';
+
+  const tmp = document.createElement('canvas');
+  try {
+    for (let p = 0; p < totalPages; p++) {
+      const pw = Module._nanopdf_get_page_width(p) || 612;
+      // ~150 DPI for crisp print output, bounded so huge pages stay reasonable.
+      const maxW = Math.min(2200, Math.round(pw * (150 / 72)));
+      if (!renderPageToCanvas(p, tmp, maxW)) continue;
+      const img = document.createElement('img');
+      img.src = tmp.toDataURL('image/png');
+      img.className = 'print-page';
+      container.appendChild(img);
+      if (printBtn) printBtn.textContent = `Rendering… ${p + 1}/${totalPages}`;
+      // Yield so the progress text paints and the UI doesn't lock up.
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    if (!container.childElementCount) { setStatus('Nothing to print', true); return; }
+    document.body.appendChild(container);
+
+    const cleanup = () => {
+      const c = document.getElementById('print-container');
+      if (c) c.remove();
+      window.removeEventListener('afterprint', cleanup);
+    };
+    window.addEventListener('afterprint', cleanup);
+    // Re-render the on-screen page (the shared render buffer was reused above).
+    renderCurrentPage();
+    window.print();
+    // Fallback cleanup for browsers that don't fire afterprint reliably.
+    setTimeout(cleanup, 60000);
+  } finally {
+    printing = false;
+    if (printBtn) { printBtn.disabled = false; printBtn.textContent = 'Print'; }
+  }
+}
+
 // ---- Keyboard shortcut help overlay ----
 
 function ensureShortcutHelp() {
@@ -1051,6 +1105,7 @@ function ensureShortcutHelp() {
     [`${mod} +  /  ${mod} −`, 'Zoom in / out'],
     [`${mod} 0`, 'Reset zoom'],
     ['R', 'Rotate page'],
+    ['P', 'Print'],
     ['V', 'Select / move tool'],
     ['Delete', 'Delete selected annotation'],
     ['Esc', 'Deselect / close overlay'],
@@ -1611,6 +1666,7 @@ function updateExportButton() {
   }
   if (organizeBtn) organizeBtn.disabled = !docLoaded;
   if (signBtn) signBtn.disabled = !(docLoaded && Module && Module._nanopdf_sign_pdf);
+  { const pb = document.getElementById('print-btn'); if (pb) pb.disabled = !(docLoaded && hasRendering); }
 
   // Guide the user when Protect is on but nothing is selected to export.
   if (protectExport.checked && !hasSelection && docLoaded) {
@@ -4299,6 +4355,8 @@ organizeBtn.addEventListener('click', openOrganize);
 if (signBtn) signBtn.addEventListener('click', openSign);
 const helpBtn = document.getElementById('help-btn');
 if (helpBtn) helpBtn.addEventListener('click', toggleShortcutHelp);
+const printBtn = document.getElementById('print-btn');
+if (printBtn) printBtn.addEventListener('click', printDocument);
 pdfInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -4491,6 +4549,8 @@ document.addEventListener('keydown', (e) => {
     if (!e.ctrlKey && !e.metaKey) {
       rotateClockwise();
     }
+  } else if ((e.key === 'p' || e.key === 'P') && !e.ctrlKey && !e.metaKey) {
+    if (totalPages > 0 && hasRendering) { e.preventDefault(); printDocument(); }
   } else if ((e.key === 'Delete' || e.key === 'Backspace') &&
              selectedAnnotId != null && annotEditingEnabled()) {
     e.preventDefault();

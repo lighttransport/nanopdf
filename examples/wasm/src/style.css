@@ -1264,6 +1264,30 @@ body {
   color: #333;
 }
 .kbd-row span { color: #444; }
+
+/* Print: show only the generated page images, one per sheet. */
+#print-container { display: none; }
+@media print {
+  body > *:not(#print-container) { display: none !important; }
+  #print-container {
+    display: block !important;
+    position: static;
+    margin: 0;
+    padding: 0;
+  }
+  #print-container .print-page {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    page-break-after: always;
+    break-after: page;
+  }
+  #print-container .print-page:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+  @page { margin: 0; }
+}
 .rev-diff-legend {
   display: flex;
   gap: 14px;
