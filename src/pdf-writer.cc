@@ -4196,7 +4196,37 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
         for (const auto* upd : updates) {
           if (upd->update_type == Impl::AnnotationUpdateType::Delete) continue;
 
+          // Pre-build markup config + allocate an appearance object so the
+          // markup actually renders (QuadPoints alone only show in viewers that
+          // synthesize appearances; nanopdf's renderer needs an /AP stream).
+          const bool is_markup =
+              (upd->update_type == Impl::AnnotationUpdateType::AddHighlight ||
+               upd->update_type == Impl::AnnotationUpdateType::AddTextMarkup);
+          TextMarkupConfig markup_cfg;
+          double mk_minx = 0, mk_miny = 0, mk_maxx = 0, mk_maxy = 0;
+          if (is_markup) {
+            if (upd->update_type == Impl::AnnotationUpdateType::AddHighlight) {
+              const auto& hc = upd->highlight_config;
+              markup_cfg.type = MarkupType::Highlight;
+              markup_cfg.quads = hc.quads;
+              markup_cfg.r = hc.r; markup_cfg.g = hc.g; markup_cfg.b = hc.b;
+              markup_cfg.alpha = hc.alpha;
+              markup_cfg.author = hc.author; markup_cfg.contents = hc.contents;
+              markup_cfg.print = hc.print;
+            } else {
+              markup_cfg = upd->text_markup_config;
+            }
+            mk_minx = 1e9; mk_miny = 1e9; mk_maxx = -1e9; mk_maxy = -1e9;
+            for (const auto& q : markup_cfg.quads) {
+              mk_minx = std::min({mk_minx, q.x1, q.x2, q.x3, q.x4});
+              mk_miny = std::min({mk_miny, q.y1, q.y2, q.y3, q.y4});
+              mk_maxx = std::max({mk_maxx, q.x1, q.x2, q.x3, q.x4});
+              mk_maxy = std::max({mk_maxy, q.y1, q.y2, q.y3, q.y4});
+            }
+          }
+
           int annot_obj_id = impl_->next_obj_id++;
+          const int ap_obj_id = is_markup ? impl_->next_obj_id++ : 0;
           new_annot_obj_ids.push_back(annot_obj_id);
 
           size_t annot_offset = base_offset + impl_->output.tellp();
@@ -4260,6 +4290,9 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
                 }
                 impl_->output << "/F " << (markup.print ? 4 : 0) << "\n";
                 impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
+                if (ap_obj_id) {
+                  impl_->output << "/AP << /N " << ap_obj_id << " 0 R >>\n";
+                }
               };
 
           if (upd->update_type == Impl::AnnotationUpdateType::AddText) {
@@ -4274,20 +4307,9 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
                           << "\n";
             impl_->output << "/F 4\n";  // Print flag
             impl_->output << "/P " << page_obj_num << " " << page_gen << " R\n";
-          } else if (upd->update_type == Impl::AnnotationUpdateType::AddHighlight) {
-            TextMarkupConfig markup;
-            markup.type = MarkupType::Highlight;
-            markup.quads = upd->highlight_config.quads;
-            markup.r = upd->highlight_config.r;
-            markup.g = upd->highlight_config.g;
-            markup.b = upd->highlight_config.b;
-            markup.alpha = upd->highlight_config.alpha;
-            markup.author = upd->highlight_config.author;
-            markup.contents = upd->highlight_config.contents;
-            markup.print = upd->highlight_config.print;
-            write_text_markup_annotation(markup);
-          } else if (upd->update_type == Impl::AnnotationUpdateType::AddTextMarkup) {
-            write_text_markup_annotation(upd->text_markup_config);
+          } else if (upd->update_type == Impl::AnnotationUpdateType::AddHighlight ||
+                     upd->update_type == Impl::AnnotationUpdateType::AddTextMarkup) {
+            write_text_markup_annotation(markup_cfg);
           } else if (upd->update_type == Impl::AnnotationUpdateType::AddLink) {
             const auto& lc = upd->link_config;
             impl_->output << "/Subtype /Link\n";
@@ -4321,6 +4343,69 @@ WriteResult PdfWriter::write_incremental_for_signing(std::vector<uint8_t>& outpu
 
           impl_->output << ">>\n";
           impl_->output << "endobj\n";
+
+          // Appearance stream (Form XObject) for the markup annotation. Drawn in
+          // BBox-local coordinates (origin = rect lower-left) with BBox [0 0 w h]
+          // so it maps onto the annotation Rect identically in nanopdf and
+          // spec-compliant viewers.
+          if (ap_obj_id) {
+            const double ox = mk_minx, oy = mk_miny;
+            std::ostringstream ap;
+            if (markup_cfg.type == MarkupType::Highlight) {
+              ap << format_number(markup_cfg.r) << " " << format_number(markup_cfg.g)
+                 << " " << format_number(markup_cfg.b) << " rg\n";
+              ap << "/GS gs\n";  // Multiply blend so highlighted text shows through
+              for (const auto& q : markup_cfg.quads) {
+                double x = std::min({q.x1, q.x2, q.x3, q.x4}) - ox;
+                double y = std::min({q.y1, q.y2, q.y3, q.y4}) - oy;
+                double w = std::max({q.x1, q.x2, q.x3, q.x4}) - std::min({q.x1, q.x2, q.x3, q.x4});
+                double h = std::max({q.y1, q.y2, q.y3, q.y4}) - std::min({q.y1, q.y2, q.y3, q.y4});
+                ap << format_number(x) << " " << format_number(y) << " "
+                   << format_number(w) << " " << format_number(h) << " re\n";
+              }
+              ap << "f\n";
+            } else {
+              ap << format_number(markup_cfg.r) << " " << format_number(markup_cfg.g)
+                 << " " << format_number(markup_cfg.b) << " RG\n1.2 w\n";
+              for (const auto& q : markup_cfg.quads) {
+                double x0 = std::min({q.x1, q.x2, q.x3, q.x4}) - ox;
+                double x1 = std::max({q.x1, q.x2, q.x3, q.x4}) - ox;
+                double yb = std::min({q.y1, q.y2, q.y3, q.y4}) - oy;
+                double yt = std::max({q.y1, q.y2, q.y3, q.y4}) - oy;
+                double ly = (markup_cfg.type == MarkupType::StrikeOut)
+                                ? (yb + yt) / 2.0 : yb + (yt - yb) * 0.08;
+                if (markup_cfg.type == MarkupType::Squiggly) {
+                  double amp = (yt - yb) * 0.12;
+                  double step = std::max(2.0, (yt - yb) * 0.4);
+                  ap << format_number(x0) << " " << format_number(ly) << " m\n";
+                  bool up = true;
+                  for (double xx = x0; xx <= x1; xx += step) {
+                    ap << format_number(xx) << " " << format_number(ly + (up ? amp : 0)) << " l\n";
+                    up = !up;
+                  }
+                  ap << "S\n";
+                } else {
+                  ap << format_number(x0) << " " << format_number(ly) << " m "
+                     << format_number(x1) << " " << format_number(ly) << " l S\n";
+                }
+              }
+            }
+            std::string ap_content = ap.str();
+            size_t ap_offset = base_offset + impl_->output.tellp();
+            new_obj_offsets.push_back({ap_obj_id, ap_offset});
+            impl_->output << ap_obj_id << " 0 obj\n<<\n";
+            impl_->output << "/Type /XObject /Subtype /Form /FormType 1\n";
+            impl_->output << "/BBox [0 0 " << format_number(mk_maxx - mk_minx)
+                          << " " << format_number(mk_maxy - mk_miny) << "]\n";
+            if (markup_cfg.type == MarkupType::Highlight) {
+              impl_->output << "/Resources << /ExtGState << /GS << /Type /ExtGState "
+                               "/BM /Multiply >> >> >>\n";
+            } else {
+              impl_->output << "/Resources << >>\n";
+            }
+            impl_->output << "/Length " << ap_content.size() << " >>\nstream\n"
+                          << ap_content << "endstream\nendobj\n";
+          }
         }
         for (int widget_obj_id : signature_widgets) {
           new_annot_obj_ids.push_back(widget_obj_id);

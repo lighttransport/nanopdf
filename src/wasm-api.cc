@@ -2896,6 +2896,88 @@ size_t nanopdf_form_get_size() {
 }
 
 // ============================================================
+// Incremental annotation editing (real, re-editable annotations)
+// ============================================================
+//
+// Unlike the flatten/export path, these add genuine PDF annotation objects to an
+// existing document via an incremental update, so they re-open as editable
+// annotations. Supports text markup (highlight/underline/squiggly/strikeout)
+// and sticky-note text annotations.
+
+static nanopdf::PdfWriter* g_edit_writer = nullptr;
+static std::vector<uint8_t> g_edit_output;
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_load(const uint8_t* data, size_t size) {
+  if (!data || size == 0) {
+    g_last_error = "Invalid input data";
+    return 0;
+  }
+  if (g_edit_writer) { delete g_edit_writer; g_edit_writer = nullptr; }
+  g_edit_writer = new nanopdf::PdfWriter();
+  std::vector<uint8_t> pdf_data(data, data + size);
+  std::string error;
+  if (!g_edit_writer->load_existing(pdf_data, &error)) {
+    g_last_error = "Failed to load PDF for editing: " + error;
+    delete g_edit_writer;
+    g_edit_writer = nullptr;
+    return 0;
+  }
+  return 1;
+}
+
+// Add a text-markup annotation over a rectangle (page points, lower-left origin).
+// markup_type: 0=highlight, 1=underline, 2=squiggly, 3=strikeout.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_add_markup(int page_index, int markup_type,
+                            float x, float y, float w, float h,
+                            float r, float g, float b, float a) {
+  if (!g_edit_writer) { g_last_error = "Edit writer not initialized"; return 0; }
+  nanopdf::TextMarkupConfig cfg;
+  cfg.page = page_index;
+  switch (markup_type) {
+    case 1: cfg.type = nanopdf::MarkupType::Underline; break;
+    case 2: cfg.type = nanopdf::MarkupType::Squiggly; break;
+    case 3: cfg.type = nanopdf::MarkupType::StrikeOut; break;
+    default: cfg.type = nanopdf::MarkupType::Highlight; break;
+  }
+  cfg.quads.push_back(nanopdf::quad_from_rect(x, y, w, h));
+  cfg.r = r; cfg.g = g; cfg.b = b; cfg.alpha = a;
+  return g_edit_writer->add_text_markup_to_existing_page(page_index, cfg) ? 1 : 0;
+}
+
+// Add a sticky-note text annotation.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_add_note(int page_index, float x, float y, float w, float h,
+                          const char* contents) {
+  if (!g_edit_writer) { g_last_error = "Edit writer not initialized"; return 0; }
+  return g_edit_writer->add_text_annotation_to_existing_page(
+             page_index, x, y, w, h, contents ? contents : "") ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_edit_save() {
+  if (!g_edit_writer) { g_last_error = "Edit writer not initialized"; return 0; }
+  g_edit_output.clear();
+  auto result = g_edit_writer->write_incremental(g_edit_output);
+  if (!result.success) {
+    g_last_error = "Annotation save failed: " + result.error;
+    return 0;
+  }
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_edit_get_buffer() {
+  return g_edit_output.empty() ? nullptr : g_edit_output.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_edit_get_size() {
+  return g_edit_output.size();
+}
+
+// ============================================================
 // PDF Merge / Split API
 // ============================================================
 

@@ -121,6 +121,7 @@ const annotColor = document.getElementById('annot-color');
 const annotFill = document.getElementById('annot-fill');
 const annotDeleteBtn = document.getElementById('annot-delete');
 const saveAnnotBtn = document.getElementById('save-annot-btn');
+const saveEditableBtn = document.getElementById('save-editable-btn');
 const saveFormBtn = document.getElementById('save-form-btn');
 const markupPopover = document.getElementById('markup-popover');
 const stampInput = document.getElementById('stamp-input');
@@ -2194,6 +2195,10 @@ function updateSaveAnnotState() {
   const docLoaded = hasRendering && totalPages > 0;
   if (saveAnnotBtn) saveAnnotBtn.disabled = !docLoaded;
   if (saveFormBtn) saveFormBtn.disabled = !(docLoaded && hasFillableFields() && Module && Module._nanopdf_form_load);
+  if (saveEditableBtn) {
+    const ed = docLoaded && Module && Module._nanopdf_edit_load && editableMarkupCount().supported > 0;
+    saveEditableBtn.disabled = !ed;
+  }
 }
 
 function resetAnnotations() {
@@ -2522,14 +2527,17 @@ function markupSelection(kind) {
   const page = currentSelection.page != null ? currentSelection.page : currentPage;
   const color = hexToRgb(annotColorHex);
   const list = (annotations[page] = annotations[page] || []);
+  // markupKind + quad tag the annotation so "Save Editable" can write it as a
+  // real text-markup PDF annotation; the visual shape (line/ink) is unchanged.
   for (const q of quads) {
+    const quad = { x: q.x, y: q.y, w: q.width, h: q.height };
     if (kind === 'highlight') {
-      list.push({ id: annotIdCounter++, type: 'highlight',
-        x: q.x, y: q.y, w: q.width, h: q.height, color, alpha: 0.4 });
+      list.push({ id: annotIdCounter++, type: 'highlight', markupKind: 'highlight',
+        x: q.x, y: q.y, w: q.width, h: q.height, quad, color, alpha: 0.4 });
     } else if (kind === 'underline' || kind === 'strike') {
       const y = kind === 'strike' ? q.y + q.height * 0.5
                                   : q.y + Math.max(0.5, q.height * 0.06);
-      list.push({ id: annotIdCounter++, type: 'line',
+      list.push({ id: annotIdCounter++, type: 'line', markupKind: kind, quad,
         x1: q.x, y1: y, x2: q.x + q.width, y2: y, color, lineWidth: 1.5, alpha: 1 });
     } else if (kind === 'squiggly') {
       const base = q.y + Math.max(0.5, q.height * 0.06);
@@ -2542,8 +2550,8 @@ function markupSelection(kind) {
         up = !up;
       }
       pts.push({ x: q.x + q.width, y: base });
-      list.push({ id: annotIdCounter++, type: 'ink', points: pts,
-        color, lineWidth: 1.2, alpha: 1 });
+      list.push({ id: annotIdCounter++, type: 'ink', markupKind: 'squiggly', quad,
+        points: pts, color, lineWidth: 1.2, alpha: 1 });
     }
   }
   currentSelection = null;
@@ -3308,6 +3316,80 @@ async function extractSelectedPages() {
   }
 }
 
+// Which annotation kinds can be written as real (re-editable) PDF annotations.
+function editableMarkupCount() {
+  let supported = 0, unsupported = 0;
+  for (const k in annotations) {
+    for (const a of (annotations[k] || [])) {
+      if (a.markupKind || a.type === 'highlight' ||
+          (a.type === 'text' && a.text && a.text.trim())) supported++;
+      else unsupported++;
+    }
+  }
+  return { supported, unsupported };
+}
+
+// Map a markup annotation to nanopdf_edit_add_markup's type code.
+function markupTypeCode(a) {
+  const k = a.markupKind || (a.type === 'highlight' ? 'highlight' : null);
+  return { highlight: 0, underline: 1, squiggly: 2, strike: 3 }[k];
+}
+
+// Save highlights / text-markup / notes as REAL, re-editable PDF annotation
+// objects via an incremental update (vs the flattened "Save").
+async function saveEditableAnnotations() {
+  if (!Module || !Module._nanopdf_edit_load || !currentPdfBytes || !currentPdfBytes.length) {
+    setStatus('Editable annotation save not available', true);
+    return;
+  }
+  const counts = editableMarkupCount();
+  if (!counts.supported) {
+    setStatus('No highlights/markup/notes to save editably (use Save to flatten shapes)', true);
+    return;
+  }
+  showLoading('Saving editable annotations...');
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
+    Module.HEAPU8.set(currentPdfBytes, ptr);
+    const ok = Module._nanopdf_edit_load(ptr, currentPdfBytes.length);
+    Module._nanopdf_free(ptr);
+    if (ok !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load for editing');
+    }
+    let written = 0;
+    for (const k in annotations) {
+      const page = parseInt(k, 10);
+      for (const a of (annotations[k] || [])) {
+        const c = a.color || { r: 1, g: 1, b: 0 };
+        const code = markupTypeCode(a);
+        if (code != null) {
+          const q = a.quad || { x: a.x, y: a.y, w: a.w, h: a.h };
+          const alpha = code === 0 ? (a.alpha != null ? a.alpha : 0.4) : 1;
+          if (Module._nanopdf_edit_add_markup(page, code, q.x, q.y, q.w, q.h, c.r, c.g, c.b, alpha)) written++;
+        } else if (a.type === 'text' && a.text && a.text.trim()) {
+          const tp = Module.stringToNewUTF8(a.text);
+          if (Module._nanopdf_edit_add_note(page, a.x, a.y, a.w, a.h, tp)) written++;
+          Module._free(tp);
+        }
+      }
+    }
+    if (Module._nanopdf_edit_save() !== 1) {
+      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Annotation save failed');
+    }
+    const out = copyWasmBuffer(Module._nanopdf_edit_get_buffer, Module._nanopdf_edit_get_size);
+    if (!out) throw new Error('Empty output');
+    downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_annotated.pdf');
+    setStatus(`Saved ${written} editable annotation(s)` +
+      (counts.unsupported ? ` — ${counts.unsupported} shape/ink/image need flattened "Save"` : ''));
+  } catch (err) {
+    setStatus('Editable save error: ' + err.message, true);
+    console.error(err);
+  } finally {
+    hideLoading();
+  }
+}
+
 // Save the whole document (all pages) with annotations + form fills baked in.
 async function saveAnnotatedPdf() {
   if (!Module || totalPages <= 0 || !hasRendering) return;
@@ -3911,6 +3993,7 @@ annotFill.addEventListener('change', () => {
 });
 annotDeleteBtn.addEventListener('click', deleteSelectedAnnot);
 saveAnnotBtn.addEventListener('click', saveAnnotatedPdf);
+saveEditableBtn.addEventListener('click', saveEditableAnnotations);
 saveFormBtn.addEventListener('click', saveEditableForm);
 
 if (markupPopover) {
