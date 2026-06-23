@@ -80,6 +80,7 @@ const combineBtn = document.getElementById('combine-btn');
 const combineInput = document.getElementById('combine-input');
 const extractPagesBtn = document.getElementById('extract-pages-btn');
 const organizeBtn = document.getElementById('organize-btn');
+const signBtn = document.getElementById('sign-btn');
 const renderBtn = document.getElementById('render-btn');
 const extractBtn = document.getElementById('extract-btn');
 const backendToggleBtn = document.getElementById('backend-toggle-btn');
@@ -830,6 +831,201 @@ function closeRevisionDiff() {
   diffState.before = diffState.after = null;
 }
 
+// ---- Digital signing (PKCS#12, in-browser, OpenSSL-free) ----
+
+let signP12Bytes = null;   // Uint8Array of the uploaded .p12/.pfx
+
+function ensureSignOverlay() {
+  let el = document.getElementById('sign-overlay');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'sign-overlay';
+  el.className = 'organize-overlay hidden';
+  el.innerHTML = `
+    <div class="organize-panel" style="width:460px;max-width:92vw;">
+      <div class="organize-header">
+        <div class="organize-title">Sign PDF</div>
+        <button id="sign-cancel">Cancel</button>
+      </div>
+      <div style="padding:18px 20px;display:flex;flex-direction:column;gap:12px;">
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Certificate (.p12 / .pfx)
+          <input type="file" id="sign-p12" accept=".p12,.pfx,application/x-pkcs12" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Certificate password
+          <input type="password" id="sign-pass" placeholder="PKCS#12 password" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Reason (optional)
+          <input type="text" id="sign-reason" placeholder="e.g. I approve this document" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Location (optional)
+          <input type="text" id="sign-location" placeholder="e.g. Tokyo, JP" />
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#444;">
+          <input type="checkbox" id="sign-visible" checked />
+          Visible signature on current page (bottom-left)
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#444;">
+          <input type="checkbox" id="sign-tsa" />
+          Add trusted timestamp (RFC 3161 / PAdES-T)
+        </label>
+        <label id="sign-tsa-url-row" style="display:none;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+          Timestamp authority URL
+          <input type="text" id="sign-tsa-url" value="https://freetsa.org/tsr" />
+          <span style="font-size:11px;color:#999;">The TSA must allow browser (CORS) requests; many don't. If it fails, signing falls back to no timestamp.</span>
+        </label>
+        <div id="sign-status" style="font-size:13px;color:#666;min-height:18px;"></div>
+      </div>
+      <div class="organize-footer">
+        <button class="primary" id="sign-go">Sign &amp; download</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  el.querySelector('#sign-cancel').addEventListener('click', closeSign);
+  el.addEventListener('click', (e) => { if (e.target === el) closeSign(); });
+  el.querySelector('#sign-p12').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) { signP12Bytes = null; return; }
+    signP12Bytes = new Uint8Array(await f.arrayBuffer());
+    setSignStatus(`Loaded ${f.name} (${signP12Bytes.length} bytes)`, '#2a7');
+  });
+  el.querySelector('#sign-go').addEventListener('click', doSign);
+  el.querySelector('#sign-tsa').addEventListener('change', (e) => {
+    el.querySelector('#sign-tsa-url-row').style.display = e.target.checked ? 'flex' : 'none';
+  });
+  return el;
+}
+
+function setSignStatus(msg, color) {
+  const s = document.getElementById('sign-status');
+  if (s) { s.textContent = msg; s.style.color = color || '#666'; }
+}
+
+function openSign() {
+  if (!Module || !Module._nanopdf_sign_pdf || !currentPdfBytes) return;
+  signP12Bytes = null;
+  const el = ensureSignOverlay();
+  el.querySelector('#sign-p12').value = '';
+  el.querySelector('#sign-pass').value = '';
+  setSignStatus('');
+  el.classList.remove('hidden');
+}
+
+function closeSign() {
+  const el = document.getElementById('sign-overlay');
+  if (el) el.classList.add('hidden');
+}
+
+function finishSign(suffix) {
+  const outPtr = Module._nanopdf_sign_get_buffer();
+  const outLen = Module._nanopdf_sign_get_size();
+  const signed = new Uint8Array(Module.HEAPU8.buffer, outPtr, outLen).slice();
+  const baseName = fileName.replace(/\.pdf$/i, '');
+  downloadNamedPdf(signed, `${baseName}_${suffix}.pdf`);
+  return outLen;
+}
+
+async function doSign() {
+  if (!signP12Bytes) { setSignStatus('Choose a .p12/.pfx certificate first.', '#c33'); return; }
+  const pass = document.getElementById('sign-pass').value || '';
+  const reason = document.getElementById('sign-reason').value || '';
+  const location = document.getElementById('sign-location').value || '';
+  const visible = document.getElementById('sign-visible').checked ? 1 : 0;
+  const wantTsa = document.getElementById('sign-tsa').checked;
+  const tsaUrl = (document.getElementById('sign-tsa-url').value || '').trim();
+  setSignStatus('Signing…');
+
+  // Signature rectangle: bottom-left of the current page (page points).
+  const x = 36, y = 36, w = 200, h = 48;
+
+  let pdfPtr = 0, p12Ptr = 0, passPtr = 0, reasonPtr = 0, locPtr = 0, contactPtr = 0;
+  const freeAll = () => {
+    if (pdfPtr) Module._nanopdf_free(pdfPtr);
+    if (p12Ptr) Module._nanopdf_free(p12Ptr);
+    if (passPtr) Module._free(passPtr);
+    if (reasonPtr) Module._free(reasonPtr);
+    if (locPtr) Module._free(locPtr);
+    if (contactPtr) Module._free(contactPtr);
+    pdfPtr = p12Ptr = passPtr = reasonPtr = locPtr = contactPtr = 0;
+  };
+  const lastErr = () => Module.UTF8ToString(Module._nanopdf_get_last_error());
+
+  try {
+    pdfPtr = Module._nanopdf_malloc(currentPdfBytes.length);
+    Module.HEAPU8.set(currentPdfBytes, pdfPtr);
+    p12Ptr = Module._nanopdf_malloc(signP12Bytes.length);
+    Module.HEAPU8.set(signP12Bytes, p12Ptr);
+    passPtr = Module.stringToNewUTF8(pass);
+    reasonPtr = Module.stringToNewUTF8(reason);
+    locPtr = Module.stringToNewUTF8(location);
+    contactPtr = Module.stringToNewUTF8('');
+
+    if (wantTsa && tsaUrl && Module._nanopdf_sign_prepare) {
+      // Phase A: build the deterministic signature + RFC 3161 request.
+      const nLo = (Math.random() * 0xffffffff) >>> 0;
+      const nHi = (Math.random() * 0xffffffff) >>> 0;
+      const okPrep = Module._nanopdf_sign_prepare(
+        pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
+        reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible, nLo, nHi);
+      if (!okPrep) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
+
+      const reqPtr = Module._nanopdf_sign_tsreq_buffer();
+      const reqLen = Module._nanopdf_sign_tsreq_size();
+      const tsReq = new Uint8Array(Module.HEAPU8.buffer, reqPtr, reqLen).slice();
+
+      setSignStatus('Requesting timestamp from TSA…');
+      let respBytes = null;
+      try {
+        const resp = await fetch(tsaUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/timestamp-query' },
+          body: tsReq,
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        respBytes = new Uint8Array(await resp.arrayBuffer());
+      } catch (netErr) {
+        // CORS / network failure: fall back to a non-timestamped signature.
+        setSignStatus('TSA unreachable (' + netErr.message + '); signing without timestamp…', '#c80');
+        const okPlain = Module._nanopdf_sign_pdf(
+          pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
+          reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible);
+        if (!okPlain) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
+        const n = finishSign('signed');
+        setSignStatus(`Signed without timestamp (${n} bytes). Downloaded.`, '#c80');
+        setTimeout(closeSign, 1400);
+        return;
+      }
+
+      // Phase B: embed the TSA token.
+      const respPtr = Module._nanopdf_malloc(respBytes.length);
+      Module.HEAPU8.set(respBytes, respPtr);
+      const okFin = Module._nanopdf_sign_finalize(respPtr, respBytes.length);
+      Module._nanopdf_free(respPtr);
+      if (!okFin) { setSignStatus('Timestamp failed: ' + lastErr(), '#c33'); return; }
+      const n = finishSign('signed_ts');
+      setSignStatus(`Signed + timestamped (${n} bytes). Downloaded.`, '#2a7');
+      setTimeout(closeSign, 900);
+      return;
+    }
+
+    // No timestamp: one-shot signing.
+    const ok = Module._nanopdf_sign_pdf(
+      pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
+      reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible);
+    if (!ok) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
+    const n = finishSign('signed');
+    setSignStatus(`Signed (${n} bytes). Downloaded.`, '#2a7');
+    setTimeout(closeSign, 900);
+  } catch (e) {
+    setSignStatus('Sign error: ' + e, '#c33');
+  } finally {
+    freeAll();
+  }
+}
+
 // ---- Page organizer (reorder / rotate / delete) ----
 
 // organizeModel: ordered array of { src: originalPageIndex, rot: 0|90|180|270 }
@@ -1147,6 +1343,7 @@ function updateExportButton() {
     extractPagesBtn.textContent = selectedPages.size > 0 ? `Extract (${selectedPages.size})` : 'Extract';
   }
   if (organizeBtn) organizeBtn.disabled = !docLoaded;
+  if (signBtn) signBtn.disabled = !(docLoaded && Module && Module._nanopdf_sign_pdf);
 
   // Guide the user when Protect is on but nothing is selected to export.
   if (protectExport.checked && !hasSelection && docLoaded) {
@@ -3728,6 +3925,7 @@ combineInput.addEventListener('change', async (e) => {
 });
 extractPagesBtn.addEventListener('click', extractSelectedPages);
 organizeBtn.addEventListener('click', openOrganize);
+if (signBtn) signBtn.addEventListener('click', openSign);
 pdfInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;

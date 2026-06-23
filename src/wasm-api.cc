@@ -21,6 +21,11 @@
 #include "string-parse.hh"
 #include "text-layout.hh"
 #include "table-extraction.hh"
+#include "cms.hh"
+#include "pkcs12.hh"
+#include "rfc3161.hh"
+#include "crypto.hh"
+#include <ctime>
 
 #ifdef NANOPDF_USE_BLEND2D
 #include "blend2d-backend.hh"
@@ -2975,6 +2980,298 @@ uint8_t* nanopdf_edit_get_buffer() {
 EMSCRIPTEN_KEEPALIVE
 size_t nanopdf_edit_get_size() {
   return g_edit_output.size();
+}
+
+// ============================================================
+// Digital signing API (in-browser, OpenSSL-free)
+//
+// Signs an existing PDF with an uploaded PKCS#12 (.p12/.pfx) bundle entirely
+// client-side: pkcs12::parse -> add_signature_field -> write_incremental_for_
+// signing -> cms::build_signed_data (detached PKCS#7, RSA+SHA-256) ->
+// apply_signature. The result is an incrementally-updated, signed PDF that
+// validates in nanopdf and spec-compliant viewers.
+//
+// RFC 3161 timestamping (PAdES-T) uses a prepare/finalize split because the TSA
+// network hop is an async JS fetch() while the C++ signing callback is
+// synchronous: nanopdf_sign_prepare() runs the (deterministic) signature and
+// returns a TimeStampReq DER; JS POSTs it to the TSA and hands the response to
+// nanopdf_sign_finalize(), which embeds the token as the id-aa-timeStampToken
+// unsigned attribute and writes the final /Contents. Because PKCS#1 v1.5 with
+// fixed signedAttrs is deterministic, the signature timestamped by the TSA is
+// byte-identical to the one finally embedded.
+// ============================================================
+
+static std::vector<uint8_t> g_sign_output;
+static std::vector<uint8_t> g_sign_tsreq;
+
+namespace {
+// Current time as a UTCTime string "YYMMDDhhmmssZ" for the CMS signingTime.
+std::string sign_utc_now() {
+  std::time_t t = std::time(nullptr);
+  std::tm tm_utc{};
+#if defined(_WIN32)
+  gmtime_s(&tm_utc, &t);
+#else
+  gmtime_r(&t, &tm_utc);
+#endif
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%02d%02d%02d%02d%02d%02dZ",
+                (tm_utc.tm_year + 1900) % 100, tm_utc.tm_mon + 1,
+                tm_utc.tm_mday, tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+  return std::string(buf);
+}
+
+// State carried between sign_prepare() and sign_finalize() for the TSA path.
+struct SignSession {
+  bool active = false;
+  std::vector<uint8_t> prepared;            // pristine write_for_signing bytes
+  nanopdf::SignaturePlaceholder placeholder;
+  std::vector<uint8_t> signer;
+  std::vector<std::vector<uint8_t>> chain;
+  nanopdf::crypto::RsaPrivateKey key;
+  std::string utc;
+};
+static SignSession g_sign_session;
+
+// Shared setup: parse the bundle, place the field, write_for_signing. On
+// success fills @signer/@chain/@key/@bytes/@placeholder and returns true.
+bool sign_prepare_common(const uint8_t* pdf, size_t pdf_len, const uint8_t* p12,
+                         size_t p12_len, const char* password,
+                         const char* reason, const char* location,
+                         const char* contact, int page, float x, float y,
+                         float w, float h, int visible,
+                         std::vector<uint8_t>& signer,
+                         std::vector<std::vector<uint8_t>>& chain,
+                         nanopdf::crypto::RsaPrivateKey& key,
+                         std::vector<uint8_t>& bytes,
+                         nanopdf::SignaturePlaceholder& placeholder) {
+  if (!pdf || pdf_len == 0) { g_last_error = "No PDF data to sign"; return false; }
+  if (!p12 || p12_len == 0) { g_last_error = "No PKCS#12 data"; return false; }
+
+  auto bundle = nanopdf::pkcs12::parse(p12, p12_len, password ? password : "");
+  if (!bundle.valid) {
+    g_last_error = "PKCS#12 parse failed (wrong password or unsupported "
+                   "format): " + bundle.error;
+    return false;
+  }
+  if (bundle.certs.empty()) {
+    g_last_error = "PKCS#12 contains no certificate";
+    return false;
+  }
+
+  nanopdf::PdfWriter writer;
+  std::vector<uint8_t> in(pdf, pdf + pdf_len);
+  std::string werr;
+  if (!writer.load_existing(in, &werr)) {
+    g_last_error = "load_existing failed: " + werr;
+    return false;
+  }
+
+  nanopdf::SignatureFieldConfig cfg;
+  cfg.name = "Signature1";
+  cfg.page = page;
+  cfg.x = x;
+  cfg.y = y;
+  cfg.width = w;
+  cfg.height = h;
+  cfg.visible = visible != 0;
+  cfg.reason = reason ? reason : "";
+  cfg.location = location ? location : "";
+  cfg.contact_info = contact ? contact : "";
+  if (writer.add_signature_field(cfg).empty()) {
+    g_last_error = "add_signature_field failed";
+    return false;
+  }
+
+  // Reserve generous space for the signer cert + chain (+ TSA token in /Contents).
+  auto wr = writer.write_incremental_for_signing(bytes, 32768);
+  if (!wr.success) {
+    g_last_error = "write_incremental_for_signing failed: " + wr.error;
+    return false;
+  }
+  const auto& phs = writer.get_signature_placeholders();
+  if (phs.empty()) {
+    g_last_error = "no signature placeholder produced";
+    return false;
+  }
+  placeholder = phs[0];
+  signer = bundle.certs[0];
+  chain.assign(bundle.certs.begin() + 1, bundle.certs.end());
+  key = bundle.key;
+  return true;
+}
+}  // namespace
+
+// Sign @pdf with the PKCS#12 bundle @p12 (unlocked by @password) WITHOUT a
+// timestamp. Places a signature field on @page at (@x,@y) sized @w x @h (page
+// points, lower-left origin); set @visible=0 for an invisible signature.
+// Returns 1 on success (signed bytes in g_sign_output) or 0 on failure.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_sign_pdf(const uint8_t* pdf, size_t pdf_len,
+                     const uint8_t* p12, size_t p12_len, const char* password,
+                     const char* reason, const char* location,
+                     const char* contact, int page, float x, float y, float w,
+                     float h, int visible) {
+  g_sign_output.clear();
+  g_sign_session.active = false;
+
+  std::vector<uint8_t> signer, bytes;
+  std::vector<std::vector<uint8_t>> chain;
+  nanopdf::crypto::RsaPrivateKey key;
+  nanopdf::SignaturePlaceholder ph;
+  if (!sign_prepare_common(pdf, pdf_len, p12, p12_len, password, reason,
+                           location, contact, page, x, y, w, h, visible, signer,
+                           chain, key, bytes, ph)) {
+    return 0;
+  }
+  const std::string utc = sign_utc_now();
+  nanopdf::SigningCallback cb =
+      [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    return nanopdf::cms::build_signed_data(data, signer, chain, key, utc);
+  };
+  auto ar = nanopdf::apply_signature(bytes, ph, cb);
+  if (!ar.success) {
+    g_last_error = "apply_signature failed: " + ar.error;
+    return 0;
+  }
+  g_sign_output = std::move(bytes);
+  return 1;
+}
+
+// Phase A of timestamped signing. Performs the (deterministic) signature and
+// builds an RFC 3161 TimeStampReq over it (SHA-256 message imprint). On success
+// returns 1; the request DER is available via nanopdf_sign_tsreq_buffer/size and
+// the session is held for nanopdf_sign_finalize(). @nonce_lo/@nonce_hi form the
+// 64-bit TSA nonce (any value; echoed back by the TSA).
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_sign_prepare(const uint8_t* pdf, size_t pdf_len, const uint8_t* p12,
+                         size_t p12_len, const char* password,
+                         const char* reason, const char* location,
+                         const char* contact, int page, float x, float y,
+                         float w, float h, int visible, uint32_t nonce_lo,
+                         uint32_t nonce_hi) {
+  g_sign_output.clear();
+  g_sign_tsreq.clear();
+  g_sign_session.active = false;
+
+  std::vector<uint8_t> signer, bytes;
+  std::vector<std::vector<uint8_t>> chain;
+  nanopdf::crypto::RsaPrivateKey key;
+  nanopdf::SignaturePlaceholder ph;
+  if (!sign_prepare_common(pdf, pdf_len, p12, p12_len, password, reason,
+                           location, contact, page, x, y, w, h, visible, signer,
+                           chain, key, bytes, ph)) {
+    return 0;
+  }
+  const std::string utc = sign_utc_now();
+
+  // Run a throwaway apply_signature to capture the deterministic signature, then
+  // build the TimeStampReq over SHA-256(signature). The TsaCallback returns {}
+  // so no token is embedded in this throwaway pass.
+  std::vector<uint8_t> captured_sig;
+  nanopdf::cms::TsaCallback capture =
+      [&](const std::vector<uint8_t>& signature) -> std::vector<uint8_t> {
+    captured_sig = signature;
+    return {};
+  };
+  nanopdf::SigningCallback cb =
+      [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    return nanopdf::cms::build_signed_data(data, signer, chain, key, utc,
+                                           capture);
+  };
+  std::vector<uint8_t> tmp = bytes;  // keep `bytes` pristine for finalize
+  auto ar = nanopdf::apply_signature(tmp, ph, cb);
+  if (!ar.success || captured_sig.empty()) {
+    g_last_error = ar.success ? "could not capture signature for timestamp"
+                              : ("apply_signature failed: " + ar.error);
+    return 0;
+  }
+
+  uint8_t imprint[nanopdf::crypto::SHA256::DIGEST_SIZE];
+  nanopdf::crypto::SHA256::hash(captured_sig.data(), captured_sig.size(),
+                                imprint);
+  uint64_t nonce = (static_cast<uint64_t>(nonce_hi) << 32) | nonce_lo;
+  g_sign_tsreq = nanopdf::rfc3161::build_request(
+      std::vector<uint8_t>(imprint, imprint + sizeof(imprint)),
+      nanopdf::rfc3161::hash_oid("sha256"), nonce, true);
+  if (g_sign_tsreq.empty()) {
+    g_last_error = "failed to build RFC 3161 timestamp request";
+    return 0;
+  }
+
+  g_sign_session.active = true;
+  g_sign_session.prepared = std::move(bytes);
+  g_sign_session.placeholder = ph;
+  g_sign_session.signer = std::move(signer);
+  g_sign_session.chain = std::move(chain);
+  g_sign_session.key = std::move(key);
+  g_sign_session.utc = utc;
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_sign_tsreq_buffer() {
+  return g_sign_tsreq.empty() ? nullptr : g_sign_tsreq.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_sign_tsreq_size() {
+  return g_sign_tsreq.size();
+}
+
+// Phase B of timestamped signing. @tsr is the TSA's DER TimeStampResp (from the
+// JS fetch of the request returned by nanopdf_sign_prepare). Extracts the token,
+// re-signs (deterministically) embedding it as the signature timestamp, writes
+// /Contents, and leaves the result in g_sign_output. Returns 1 on success.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_sign_finalize(const uint8_t* tsr, size_t tsr_len) {
+  g_sign_output.clear();
+  if (!g_sign_session.active) {
+    g_last_error = "no signing session — call nanopdf_sign_prepare first";
+    return 0;
+  }
+  if (!tsr || tsr_len == 0) {
+    g_last_error = "empty timestamp response";
+    g_sign_session.active = false;
+    return 0;
+  }
+  int status = 0;
+  std::vector<uint8_t> token = nanopdf::rfc3161::parse_response(
+      std::vector<uint8_t>(tsr, tsr + tsr_len), &status);
+  if (token.empty()) {
+    g_last_error = "TSA rejected the request (PKIStatus " +
+                   std::to_string(status) + ")";
+    g_sign_session.active = false;
+    return 0;
+  }
+
+  const auto& s = g_sign_session;
+  nanopdf::cms::TsaCallback embed =
+      [&](const std::vector<uint8_t>&) -> std::vector<uint8_t> { return token; };
+  nanopdf::SigningCallback cb =
+      [&](const std::vector<uint8_t>& data) -> std::vector<uint8_t> {
+    return nanopdf::cms::build_signed_data(data, s.signer, s.chain, s.key,
+                                           s.utc, embed);
+  };
+  std::vector<uint8_t> bytes = s.prepared;
+  auto ar = nanopdf::apply_signature(bytes, s.placeholder, cb);
+  g_sign_session.active = false;
+  if (!ar.success) {
+    g_last_error = "apply_signature failed: " + ar.error;
+    return 0;
+  }
+  g_sign_output = std::move(bytes);
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint8_t* nanopdf_sign_get_buffer() {
+  return g_sign_output.empty() ? nullptr : g_sign_output.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+size_t nanopdf_sign_get_size() {
+  return g_sign_output.size();
 }
 
 // ============================================================

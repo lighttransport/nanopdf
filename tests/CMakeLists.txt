@@ -75,6 +75,7 @@ set(NANOPDF_UNIT_TEST_SOURCES
     unit/document/test_pdfa_validation.cc
     unit/document/test_revision_history.cc
     unit/document/test_signature_validation.cc
+    unit/document/test_signing.cc
     unit/graphics/test_color_transform.cc
     unit/backends/test_render_progress.cc
     unit/backends/test_focal_radial_gradient.cc
