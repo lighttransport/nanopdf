@@ -63,8 +63,21 @@ body {
 .toolbar button:hover, .toolbar label:hover {
   background: #e8e8e8;
 }
-.toolbar .github-link {
+.toolbar .help-btn {
   margin-left: auto;
+  background: #f5f5f5;
+  border: 1px solid #ccc;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 14px;
+  font-weight: 700;
+  color: #333;
+  cursor: pointer;
+}
+.toolbar .help-btn:hover { background: #e8e8e8; }
+.toolbar .github-link {
+  margin-left: 8px;
   background: #f5f5f5;
   border: 1px solid #ccc;
   padding: 6px 12px;
@@ -1186,6 +1199,71 @@ body {
   white-space: nowrap;
 }
 .rev-diff-boxes.hidden { display: none; }
+
+/* Keyboard shortcut help overlay */
+.shortcut-help-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.shortcut-help-overlay.hidden { display: none; }
+.shortcut-help-panel {
+  background: #fff;
+  border-radius: 10px;
+  width: 420px;
+  max-width: 92vw;
+  max-height: 86vh;
+  overflow: auto;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.3);
+}
+.shortcut-help-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 18px;
+  font-weight: 600;
+  font-size: 15px;
+  border-bottom: 1px solid #eee;
+}
+.shortcut-help-header button {
+  background: none;
+  border: none;
+  font-size: 20px;
+  color: #666;
+  cursor: pointer;
+}
+.shortcut-help-body { padding: 12px 18px 18px; }
+.kbd-grouptitle {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #999;
+  margin: 14px 0 6px;
+}
+.kbd-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 0;
+  font-size: 13px;
+}
+.kbd-row kbd {
+  flex: 0 0 130px;
+  text-align: center;
+  font-family: 'SF Mono', Consolas, monospace;
+  font-size: 12px;
+  background: #f3f4f6;
+  border: 1px solid #d6d8db;
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 3px 6px;
+  color: #333;
+}
+.kbd-row span { color: #444; }
 .rev-diff-legend {
   display: flex;
   gap: 14px;

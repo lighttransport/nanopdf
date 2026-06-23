@@ -1038,6 +1038,66 @@ function closeRevisionDiff() {
   diffState.before = diffState.after = null;
 }
 
+// ---- Keyboard shortcut help overlay ----
+
+function ensureShortcutHelp() {
+  let el = document.getElementById('shortcut-help-overlay');
+  if (el) return el;
+  const mod = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
+  const rows = [
+    ['←  /  →', 'Previous / next page'],
+    ['Home  /  End', 'First / last page'],
+    [`${mod} F`, 'Focus search'],
+    [`${mod} +  /  ${mod} −`, 'Zoom in / out'],
+    [`${mod} 0`, 'Reset zoom'],
+    ['R', 'Rotate page'],
+    ['V', 'Select / move tool'],
+    ['Delete', 'Delete selected annotation'],
+    ['Esc', 'Deselect / close overlay'],
+    ['?', 'Show / hide this help'],
+  ];
+  const diffRows = [
+    ['←  /  →', 'Previous / next page (in diff)'],
+    ['Esc', 'Close diff'],
+  ];
+  const rowHtml = (list) => list.map(([k, d]) =>
+    `<div class="kbd-row"><kbd>${escapeHtml(k)}</kbd><span>${escapeHtml(d)}</span></div>`).join('');
+  el = document.createElement('div');
+  el.id = 'shortcut-help-overlay';
+  el.className = 'shortcut-help-overlay hidden';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-label', 'Keyboard shortcuts');
+  el.innerHTML = `
+    <div class="shortcut-help-panel">
+      <div class="shortcut-help-header">
+        <span>Keyboard shortcuts</span>
+        <button id="shortcut-help-close" title="Close (Esc)" aria-label="Close">&times;</button>
+      </div>
+      <div class="shortcut-help-body">
+        <div class="kbd-group">${rowHtml(rows)}</div>
+        <div class="kbd-grouptitle">Revision diff</div>
+        <div class="kbd-group">${rowHtml(diffRows)}</div>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  el.querySelector('#shortcut-help-close').addEventListener('click', hideShortcutHelp);
+  el.addEventListener('click', (e) => { if (e.target === el) hideShortcutHelp(); });
+  return el;
+}
+
+function toggleShortcutHelp() {
+  const el = ensureShortcutHelp();
+  el.classList.toggle('hidden');
+}
+function hideShortcutHelp() {
+  const el = document.getElementById('shortcut-help-overlay');
+  if (el) el.classList.add('hidden');
+}
+function shortcutHelpOpen() {
+  const el = document.getElementById('shortcut-help-overlay');
+  return el && !el.classList.contains('hidden');
+}
+
 // ---- Digital signing (PKCS#12, in-browser, OpenSSL-free) ----
 
 let signP12Bytes = null;   // Uint8Array of the uploaded .p12/.pfx
@@ -4237,6 +4297,8 @@ combineInput.addEventListener('change', async (e) => {
 extractPagesBtn.addEventListener('click', extractSelectedPages);
 organizeBtn.addEventListener('click', openOrganize);
 if (signBtn) signBtn.addEventListener('click', openSign);
+const helpBtn = document.getElementById('help-btn');
+if (helpBtn) helpBtn.addEventListener('click', toggleShortcutHelp);
 pdfInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -4352,6 +4414,13 @@ canvasScroll.addEventListener('auxclick', (e) => {
 // Keyboard navigation
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+  // Shortcut-help overlay: "?" toggles it; Esc closes it (highest priority).
+  if (shortcutHelpOpen()) {
+    if (e.key === 'Escape' || e.key === '?') { e.preventDefault(); hideShortcutHelp(); }
+    return;
+  }
+  if (e.key === '?') { e.preventDefault(); toggleShortcutHelp(); return; }
 
   // Revision diff overlay captures navigation keys while open.
   if (diffState.open) {
