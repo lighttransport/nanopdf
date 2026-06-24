@@ -31,10 +31,14 @@
       <button id="prev-btn" disabled title="Previous page (Left arrow)">&larr;</button>
       <span id="page-display" class="page-display" title="Click to jump to page">Page 0 / 0</span>
       <button id="next-btn" disabled title="Next page (Right arrow)">&rarr;</button>
+      <button id="bookmark-btn" class="bookmark-btn" disabled title="Bookmark this page (B)">&#9733;</button>
     </div>
     <div class="toolbar-separator"></div>
     <div class="zoom-controls">
       <button id="zoom-out-btn" disabled title="Zoom out (Ctrl+-)">&#x2212;</button>
+      <input type="range" id="zoom-slider" class="zoom-slider" min="25" max="400" step="1" value="100"
+             title="Drag to zoom (or use Ctrl +/-)" disabled
+             aria-label="Zoom level" />
       <span id="zoom-display" class="zoom-display" title="Current zoom level">100%</span>
       <button id="zoom-in-btn" disabled title="Zoom in (Ctrl++)">+</button>
     </div>
@@ -46,16 +50,23 @@
     <button id="render-btn" disabled title="Re-render current page">Render</button>
     <button id="backend-toggle-btn" class="backend-toggle" disabled title="Switch rendering backend">Backend</button>
     <button id="export-btn" disabled title="Export selected pages as PDF">Export</button>
-    <button id="extract-pages-btn" disabled title="Extract selected pages into a new PDF (preserves vector content)">Extract</button>
+    <button id="extract-pages-btn" disabled title="Extract selected pages into a new PDF (vector content preserved, annotations not baked in)">Extract</button>
     <button id="organize-btn" disabled title="Reorder, rotate, or delete pages">Organize</button>
     <button id="sign-btn" disabled title="Digitally sign with a PKCS#12 (.p12/.pfx) certificate">Sign</button>
     <button id="print-btn" disabled title="Print the document (P)">Print</button>
+    <select id="print-scope" class="print-scope" title="Pages to print" disabled>
+      <option value="all">All</option>
+      <option value="current">Current page</option>
+    </select>
     <label class="protect-toggle" title="Password-protect exported PDF">
       <input type="checkbox" id="protect-export" disabled />
       Protect
     </label>
-    <input type="password" id="export-password" class="export-password" placeholder="Password" disabled />
-    <input type="password" id="export-owner-password" class="export-password" placeholder="Owner" disabled />
+    <form id="export-password-form" class="export-password-form" autocomplete="off">
+      <input type="text" name="export-username" class="visually-hidden" autocomplete="username" tabindex="-1" aria-hidden="true" />
+      <input type="password" id="export-password" class="export-password" placeholder="Password" autocomplete="new-password" disabled />
+      <input type="password" id="export-owner-password" class="export-password" placeholder="Owner" autocomplete="new-password" disabled />
+    </form>
 
     <div class="toolbar-separator"></div>
 
@@ -70,10 +81,13 @@
       <button class="annot-tool" data-tool="arrow" disabled title="Draw an arrow">Arrow</button>
       <button class="annot-tool" data-tool="ink" disabled title="Freehand sketch">Draw</button>
       <button class="annot-tool" data-tool="redact" disabled title="Redact: black box; the underlying text is removed when you Save (flattened)">Redact</button>
+      <button class="annot-tool" data-tool="link" disabled title="Draw a link area: click another page in the dialog to set the destination">Link</button>
       <button class="annot-tool" data-tool="image" disabled title="Place an image / signature stamp">Image</button>
       <input type="file" id="stamp-input" class="visually-hidden" accept="image/png,image/jpeg" tabindex="-1" aria-hidden="true" />
       <input type="color" id="annot-color" class="annot-color" value="#ffd54a" disabled title="Annotation color" />
       <label class="annot-fill" title="Fill shapes"><input type="checkbox" id="annot-fill" disabled />Fill</label>
+      <button id="undo-btn" disabled title="Nothing to undo">Undo</button>
+      <button id="redo-btn" disabled title="Nothing to redo">Redo</button>
       <button id="annot-delete" disabled title="Delete selected annotation (Delete)">Del</button>
       <button id="save-annot-btn" disabled title="Save the whole document with annotations baked in (flattened)">Save</button>
       <button id="save-editable-btn" disabled title="Save highlights/markup/notes as real, re-editable PDF annotations (incremental update)">Save Editable</button>
@@ -85,8 +99,13 @@
       <input type="text" id="search-input" placeholder="Search text..." disabled />
       <button id="search-prev-btn" disabled title="Previous match">&uarr;</button>
       <button id="search-next-btn" disabled title="Next match">&darr;</button>
+      <label class="search-case" title="Match case exactly">
+        <input type="checkbox" id="search-case" /> Aa
+      </label>
       <span id="search-info" class="search-info"></span>
     </div>
+    <div class="search-pages hidden" id="search-pages" role="group" aria-label="Pages with matches"></div>
+    <div class="search-results hidden" id="search-results" role="listbox" aria-label="Search matches"></div>
 
     <button id="help-btn" class="help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
 
@@ -103,6 +122,7 @@
       <div class="sidebar-tabs">
         <button class="active" data-tab="outline">Outline</button>
         <button data-tab="thumbs">Thumbs</button>
+        <button data-tab="marks">Marks</button>
         <button data-tab="signatures">Signatures</button>
         <button data-tab="history">History</button>
         <button data-tab="files">Files</button>
@@ -157,7 +177,7 @@
   </div>
 
   <!-- Status bar -->
-  <div class="status-bar" id="status-bar">
+  <div class="status-bar" id="status-bar" role="status" aria-live="polite" aria-atomic="true">
     <span id="status-text">Initializing...</span>
     <span id="status-right"></span>
   </div>

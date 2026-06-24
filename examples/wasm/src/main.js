@@ -2,6 +2,26 @@ import './style.css';
 import createModule from 'nanopdf-wasm';
 import wasmUrl from 'nanopdf-wasm-bin';
 import { loadStandardFonts, loadCDNCJKFonts } from './font-loader.js';
+import {
+  annotLabel,
+  assertOkOrThrow,
+  chooseSelectedExportRoute,
+  clamp,
+  computeRenderSize,
+  dashToStrokeDasharray,
+  escapeHtml,
+  escapeRegExp,
+  formatFileSize,
+  formatPdfDate,
+  formatRecoveryAge,
+  getMdpPermissionLabel,
+  highlightContext,
+  outlineBranchMatches,
+  readWasmString,
+  renderPageIntoImageData,
+  resolvePdfDeepLink,
+  shouldRenderPageStatus,
+} from './viewer-utils.js';
 
 // External fonts live alongside the site under <base>/fonts. Derive the path
 // from Vite's BASE_URL so it works both at the dev-server root ('/') and under
@@ -19,11 +39,15 @@ let fileName = '';
 let fileSize = 0;
 let currentPdfBytes = null;
 let outlineData = null;
+let outlineFilter = '';   // case-insensitive substring filter on outline title
+// User-added bookmarks (per page). Cleared on document load.
+let userBookmarks = [];   // [{ id, page, title }]
 let signatureData = null;
 let editHistoryData = null;
 let searchResults = [];
 let currentSearchIndex = -1;
 let currentSearchTerm = '';
+let searchCaseSensitive = false;
 let currentSelection = null;
 let isSelectingText = false;
 let selectionStartPoint = null;
@@ -65,6 +89,12 @@ let pageDisplayHeight = 0;
 let thumbnailCache = {}; // pageIndex -> ImageData
 let thumbnailRenderQueue = [];
 let isThumbnailRendering = false;
+// Monotonic counter incremented on every main-canvas render. The thumbnail
+// queue records the counter at queue-start; if a user re-renders the main
+// page mid-queue, the recorded value is stale and the main canvas no longer
+// needs restoring when the queue drains.
+let mainRenderCounter = 0;
+let thumbnailQueueStartedBeforeMainRender = 0;
 let thumbnailObserver = null;
 
 // Page selection state
@@ -76,16 +106,99 @@ let lastClickedPage = 0;
 // PDF page points with a bottom-left origin so it survives zoom/rotation and
 // maps 1:1 to the nanopdf_annot_* export API.
 let annotations = {};
-let annotTool = 'select';        // select | highlight | text | rect | oval | line | arrow | ink
+let annotTool = 'select';        // select | highlight | text | rect | oval | line | arrow | ink | redact | link | image
 let annotColorHex = '#ffd54a';
 let annotFillShapes = false;
 let selectedAnnotId = null;
+let hoveredAnnotId = null;   // annotation under the cursor in select mode
 let annotIdCounter = 1;
 let annotDraft = null;           // in-progress drawing
 let annotDragState = null;       // moving an existing annotation in select mode
 let pendingStampImage = null;    // { imageId, dataURL, aspect } awaiting placement
 // formFields[pageIndex] = [{name, type, value, rect:{x,y,width,height}, multiline, ...}]
 let formFieldsByPage = {};
+
+// ---- Undo/redo ----
+// Snapshot-based: every discrete annotation or form-field change captures the
+// pre-change state and pushes it onto the undo stack. Coalesces high-frequency
+// text input (form fields) by waiting for blur.
+const MAX_UNDO = 50;
+const undoStack = [];
+const redoStack = [];
+let formFieldEditSnapshot = null;  // held during a focused form-field edit
+
+function snapshotState() {
+  return {
+    annotations: JSON.parse(JSON.stringify(annotations)),
+    formFields: JSON.parse(JSON.stringify(formFieldsByPage)),
+    selectedAnnotId,
+    hoveredAnnotId,
+  };
+}
+function pushUndo() {
+  undoStack.push(snapshotState());
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  redoStack.length = 0;
+  updateUndoRedoButtons();
+}
+function applySnapshot(s) {
+  annotations = s.annotations;
+  formFieldsByPage = s.formFields;
+  selectedAnnotId = s.selectedAnnotId;
+  hoveredAnnotId = s.hoveredAnnotId;
+  // Form-field cache is keyed by page+structure; force a rebuild.
+  renderedFormFieldsPage = -1;
+  renderedFormFieldsKey = '';
+  renderAnnotations();
+  renderFormFields();
+  updateAnnotLayerMode();
+  updateSaveAnnotState();
+}
+function undo() {
+  if (!undoStack.length) return false;
+  redoStack.push(snapshotState());
+  if (redoStack.length > MAX_UNDO) redoStack.shift();
+  const s = undoStack.pop();
+  applySnapshot(s);
+  updateUndoRedoButtons();
+  return true;
+}
+function redo() {
+  if (!redoStack.length) return false;
+  undoStack.push(snapshotState());
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  const s = redoStack.pop();
+  applySnapshot(s);
+  updateUndoRedoButtons();
+  return true;
+}
+function clearUndoHistory() {
+  undoStack.length = 0;
+  redoStack.length = 0;
+  formFieldEditSnapshot = null;
+  updateUndoRedoButtons();
+}
+function updateUndoRedoButtons() {
+  const ub = document.getElementById('undo-btn');
+  const rb = document.getElementById('redo-btn');
+  if (ub) {
+    ub.disabled = undoStack.length === 0;
+    ub.title = undoStack.length === 0
+      ? 'Nothing to undo'
+      : `Undo (${modKeyLabel('Z')}) — ${undoStack.length} step${undoStack.length === 1 ? '' : 's'}`;
+  }
+  if (rb) {
+    rb.disabled = redoStack.length === 0;
+    rb.title = redoStack.length === 0
+      ? 'Nothing to redo'
+      : `Redo (${modKeyLabel('Shift+Z')}) — ${redoStack.length} step${redoStack.length === 1 ? '' : 's'}`;
+  }
+}
+function modKeyLabel(key) {
+  const mod = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
+  return `${mod}+${key}`;
+}
+
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
@@ -109,6 +222,7 @@ const extractBtn = document.getElementById('extract-btn');
 const backendToggleBtn = document.getElementById('backend-toggle-btn');
 const prevBtn = document.getElementById('prev-btn');
 const nextBtn = document.getElementById('next-btn');
+const bookmarkBtn = document.getElementById('bookmark-btn');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const canvas = document.getElementById('pdf-canvas');
 const textOverlay = document.getElementById('text-overlay');
@@ -126,14 +240,17 @@ const searchInput = document.getElementById('search-input');
 const searchPrevBtn = document.getElementById('search-prev-btn');
 const searchNextBtn = document.getElementById('search-next-btn');
 const searchInfo = document.getElementById('search-info');
+const searchPages = document.getElementById('search-pages');
 const zoomInBtn = document.getElementById('zoom-in-btn');
 const zoomOutBtn = document.getElementById('zoom-out-btn');
 const zoomDisplay = document.getElementById('zoom-display');
+const zoomSlider = document.getElementById('zoom-slider');
 const fitModeBtn = document.getElementById('fit-mode-btn');
 const rotateBtn = document.getElementById('rotate-btn');
 const canvasScroll = document.getElementById('canvas-scroll');
 const exportBtn = document.getElementById('export-btn');
 const protectExport = document.getElementById('protect-export');
+const exportPasswordForm = document.getElementById('export-password-form');
 const exportPassword = document.getElementById('export-password');
 const exportOwnerPassword = document.getElementById('export-owner-password');
 // Annotation tooling
@@ -150,9 +267,34 @@ const saveFormBtn = document.getElementById('save-form-btn');
 const markupPopover = document.getElementById('markup-popover');
 const stampInput = document.getElementById('stamp-input');
 
-function setStatus(msg, isError = false) {
+// Tri-state status: kind ∈ 'info' (default) | 'success' | 'error'. `true` is
+// kept as a back-compat shorthand for 'error' so existing call sites that pass
+// `setStatus(msg, true)` still work.
+function setStatus(msg, kind = 'info') {
+  const k = kind === true ? 'error' : (kind || 'info');
   statusText.textContent = msg;
-  statusBar.className = 'status-bar' + (isError ? ' error' : '');
+  statusBar.className = 'status-bar' + (k === 'info' ? '' : ' ' + k);
+}
+
+// Cached helper: pulls the most-recent C-side error message, treating a NULL
+// pointer as the empty string. Reused across every WASM error site so we
+// never call UTF8ToString(0) (which is undefined behavior on Emscripten).
+function wasmLastError() {
+  if (!Module || !Module._nanopdf_get_last_error) return '';
+  return readWasmString(Module, Module._nanopdf_get_last_error());
+}
+
+let operationStatusHoldUntil = 0;
+function setOperationStatus(msg, kind = 'success', holdMs = 2500) {
+  // Cap the hold so rapid back-to-back operations don't keep the page-info
+  // status hidden for stacked intervals. If a hold is already active, the new
+  // message still shows up immediately, but the new hold is bounded by the
+  // remaining time on the existing one.
+  const now = Date.now();
+  const remaining = Math.max(0, operationStatusHoldUntil - now);
+  operationStatusHoldUntil = now + Math.min(holdMs, remaining > 0 ? remaining : holdMs);
+  // `true` is a back-compat shorthand for 'error'.
+  setStatus(msg, kind === true ? 'error' : kind);
 }
 
 function showLoading(msg) {
@@ -171,14 +313,12 @@ function updatePageDisplay() {
   nextBtn.disabled = currentPage >= totalPages - 1;
 }
 
-function formatFileSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-}
-
 function updateZoomDisplay() {
-  zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
+  const pct = Math.round(zoomLevel * 100);
+  zoomDisplay.textContent = pct + '%';
+  if (zoomSlider && Number(zoomSlider.value) !== pct) {
+    zoomSlider.value = String(pct);
+  }
 }
 
 function backendLabel(backendId) {
@@ -230,9 +370,7 @@ function switchRenderBackend() {
 
   const result = Module._nanopdf_set_render_backend(nextBackend);
   if (result !== 1) {
-    const error = Module._nanopdf_get_last_error
-      ? Module.UTF8ToString(Module._nanopdf_get_last_error())
-      : 'backend unavailable';
+    const error = wasmLastError() || 'backend unavailable';
     setStatus('Backend switch failed: ' + error, true);
     return;
   }
@@ -250,36 +388,102 @@ function switchRenderBackend() {
 
 // ---- Sidebar ----
 
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
 function renderOutlineTab() {
-  if (!outlineData || !outlineData.outline || outlineData.outline.length === 0) {
+  const hasNative = outlineData && outlineData.outline && outlineData.outline.length > 0;
+  const hasUser = userBookmarks.length > 0;
+  if (!hasNative && !hasUser) {
     sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">No bookmarks in this document.</div>';
     return;
   }
 
+  const q = outlineFilter.trim().toLowerCase();
+  const items = q
+    ? (hasNative ? outlineData.outline.filter((it) => outlineBranchMatches([it], q)) : [])
+    : (hasNative ? outlineData.outline : []);
+  const userItems = q
+    ? userBookmarks.filter((b) => b.title.toLowerCase().includes(q))
+    : userBookmarks;
+  const noMatch = q && items.length === 0 && userItems.length === 0;
+
   let html = '';
-  function renderItems(items, depth) {
-    for (const item of items) {
+  // Filter input.
+  html += '<div class="outline-filter">';
+  html += '<input type="text" id="outline-filter-input" placeholder="Filter bookmarks…" ' +
+          `value="${escapeHtml(outlineFilter)}" autocomplete="off" />`;
+  if (q) {
+    html += `<button type="button" id="outline-filter-clear" title="Clear filter">&times;</button>`;
+  }
+  html += '</div>';
+
+  if (noMatch) {
+    html += '<div class="outline-empty">No matches for &ldquo;' + escapeHtml(outlineFilter) + '&rdquo;.</div>';
+    sidebarContent.innerHTML = html;
+    wireOutlineFilter();
+    return;
+  }
+
+  if (userItems.length) {
+    html += '<div class="outline-section-header">My bookmarks</div>';
+    for (const b of userItems) {
+      const pageLabel = ` (p.${b.page + 1})`;
+      const title = q ? highlightContext(b.title, outlineFilter) : escapeHtml(b.title);
+      html += `<div class="outline-item outline-item-user" data-page="${b.page}" data-user-bookmark="1" style="padding-left:8px;" title="My bookmark${escapeHtml(pageLabel)}">${title}<span style="color:#999;font-size:11px;">${escapeHtml(pageLabel)}</span></div>`;
+    }
+  }
+
+  if (hasNative && items.length) {
+    if (userItems.length) html += '<div class="outline-section-header">Document outline</div>';
+  }
+
+  function renderItems(list, depth) {
+    for (const item of list) {
       const indent = depth * 16;
-      const pageLabel = item.page !== undefined ? ` (p.${item.page + 1})` : '';
-      const clickAttr = item.page !== undefined
-        ? `onclick="window._jumpToPage(${item.page})"` : '';
+      const page = Number.isInteger(item.page) ? item.page : null;
+      const pageLabel = page !== null ? ` (p.${page + 1})` : '';
+      const pageAttr = page !== null ? ` data-page="${page}"` : '';
       const style = `padding-left:${indent + 8}px`;
       const boldStyle = item.bold ? 'font-weight:600;' : '';
       const italicStyle = item.italic ? 'font-style:italic;' : '';
-      html += `<div class="outline-item" ${clickAttr} style="${style};${boldStyle}${italicStyle}" title="${escapeHtml(item.title)}${pageLabel}">${escapeHtml(item.title)}<span style="color:#999;font-size:11px;">${pageLabel}</span></div>`;
+      const title = q
+        ? highlightContext(item.title || '', outlineFilter)
+        : escapeHtml(item.title || '');
+      html += `<div class="outline-item"${pageAttr} style="${style};${boldStyle}${italicStyle}" title="${escapeHtml(item.title || '')}${escapeHtml(pageLabel)}">${title}<span style="color:#999;font-size:11px;">${escapeHtml(pageLabel)}</span></div>`;
       if (item.children && item.children.length > 0) {
-        renderItems(item.children, depth + 1);
+        const kids = q
+          ? item.children.filter((c) => outlineBranchMatches([c], q))
+          : item.children;
+        if (kids.length) renderItems(kids, depth + 1);
       }
     }
   }
-  renderItems(outlineData.outline, 0);
+  renderItems(items, 0);
   sidebarContent.innerHTML = html;
+  wireOutlineFilter();
+  sidebarContent.querySelectorAll('.outline-item[data-page]').forEach((item) => {
+    item.addEventListener('click', () => goToPage(parseInt(item.dataset.page, 10)));
+  });
+}
+
+function wireOutlineFilter() {
+  const input = document.getElementById('outline-filter-input');
+  if (input) {
+    input.addEventListener('input', (e) => {
+      outlineFilter = e.target.value;
+      renderOutlineTab();
+      // Restore focus + caret so the user can keep typing.
+      const el = document.getElementById('outline-filter-input');
+      if (el) {
+        el.focus();
+        const v = el.value;
+        el.setSelectionRange(v.length, v.length);
+      }
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { outlineFilter = ''; renderOutlineTab(); }
+    });
+  }
+  const clear = document.getElementById('outline-filter-clear');
+  if (clear) clear.addEventListener('click', () => { outlineFilter = ''; renderOutlineTab(); });
 }
 
 function renderInfoTab() {
@@ -316,26 +520,9 @@ function renderInfoTab() {
   }
 
   for (const item of info) {
-    html += `<div class="doc-info-item"><div class="label">${item.label}</div><div class="value">${item.value}</div></div>`;
+    html += `<div class="doc-info-item"><div class="label">${escapeHtml(item.label)}</div><div class="value">${escapeHtml(item.value)}</div></div>`;
   }
   sidebarContent.innerHTML = html;
-}
-
-function getMdpPermissionLabel(value) {
-  switch (value) {
-    case 1: return 'No changes allowed';
-    case 2: return 'Form fill and sign only';
-    case 3: return 'Form fill, sign, annotate';
-    default: return value ? `Unknown (${value})` : 'Not specified';
-  }
-}
-
-function formatPdfDate(value) {
-  if (!value) return '';
-  const match = /^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?/.exec(value);
-  if (!match) return value;
-  const [, year, month = '01', day = '01', hour = '00', minute = '00', second = '00'] = match;
-  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
 }
 
 function signatureStatusText(sig) {
@@ -455,7 +642,7 @@ function renderHistoryTab() {
     ].filter(Boolean).join(' ');
     html += `<section class="${className}">`;
     html += '<div class="history-card-header">';
-    html += `<div class="history-title">Revision ${rev.revision}</div>`;
+    html += `<div class="history-title">Revision ${escapeHtml(rev.revision)}</div>`;
     html += `<div class="history-size">${formatFileSize(rev.sizeBytes)}</div>`;
     html += '</div>';
     html += '<div class="history-details">';
@@ -502,6 +689,8 @@ function renderHistoryTab() {
 // content added by the revision is green, removed content is red, and unchanged
 // content fades to light gray for context. Before/After/Swipe modes show the
 // raw renders for comparison.
+
+let diffTrigger = null;   // element focused before the diff overlay opened
 
 const diffState = {
   open: false,
@@ -630,6 +819,9 @@ function ensureDiffOverlay() {
   el = document.createElement('div');
   el.id = 'rev-diff-overlay';
   el.className = 'rev-diff-overlay hidden';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', 'Revision changes');
   el.innerHTML = `
     <div class="rev-diff-panel">
       <div class="rev-diff-header">
@@ -770,8 +962,8 @@ function renderTextDiff() {
     host.innerHTML = '<div class="rev-diff-textmsg">Text diff unavailable in this build.</div>';
     return;
   }
-  const before = Module.UTF8ToString(Module._nanopdf_extract_revision_text(diffState.byteBefore, diffState.page));
-  const after = Module.UTF8ToString(Module._nanopdf_extract_revision_text(diffState.byteAfter, diffState.page));
+  const before = readWasmString(Module, Module._nanopdf_extract_revision_text(diffState.byteBefore, diffState.page));
+  const after = readWasmString(Module, Module._nanopdf_extract_revision_text(diffState.byteAfter, diffState.page));
   const parts = wordDiff(before, after);
   const added = parts.filter(p => p.t === 'add').length;
   const removed = parts.filter(p => p.t === 'del').length;
@@ -962,6 +1154,7 @@ function openRevisionDiff(revIndex) {
   const signer = rev.signerName || rev.associatedSignature;
   overlay.querySelector('#rev-diff-title').textContent =
     `Revision ${rev.revision} changes` + (signer ? ` — signed by ${signer}` : '');
+  diffTrigger = document.activeElement;
   overlay.classList.remove('hidden');
   diffState.open = true;
   renderDiffChangeInfo(rev);
@@ -994,7 +1187,7 @@ function renderDiffChangeInfo(rev) {
   const violations = rev.docMDPViolations || [];
   if (rev.hasDocMDP && rev.docMDPStatus === 'disallowed') {
     banner = `<span class="chg-banner danger">⚠ Changes after signature are DISALLOWED by DocMDP` +
-      (violations.length ? `: ${violations[0]}` : '') + `</span>`;
+      (violations.length ? `: ${escapeHtml(violations[0])}` : '') + `</span>`;
   } else if (rev.modifiedAfterSignature) {
     banner = `<span class="chg-banner warn">Modified after signing` +
       (rev.hasDocMDP ? ' (allowed by DocMDP)' : '') + `</span>`;
@@ -1036,6 +1229,10 @@ function closeRevisionDiff() {
   if (overlay) overlay.classList.add('hidden');
   diffState.open = false;
   diffState.before = diffState.after = null;
+  if (diffTrigger && typeof diffTrigger.focus === 'function') {
+    diffTrigger.focus();
+    diffTrigger = null;
+  }
 }
 
 // ---- Print ----
@@ -1049,7 +1246,9 @@ async function printDocument() {
   if (!Module || totalPages <= 0 || !hasRendering || printing) return;
   printing = true;
   const printBtn = document.getElementById('print-btn');
+  const printScope = document.getElementById('print-scope');
   if (printBtn) { printBtn.disabled = true; printBtn.textContent = 'Rendering…'; }
+  if (printScope) printScope.disabled = true;
 
   // Tear down any stale container, then build a fresh one.
   const old = document.getElementById('print-container');
@@ -1057,18 +1256,26 @@ async function printDocument() {
   const container = document.createElement('div');
   container.id = 'print-container';
 
+  // Build the page-index list based on the current scope selector.
+  const onlyCurrent = printScope && printScope.value === 'current';
+  const pageList = onlyCurrent ? [currentPage] : Array.from({ length: totalPages }, (_, i) => i);
+
   const tmp = document.createElement('canvas');
+  const failedPages = [];
   try {
-    for (let p = 0; p < totalPages; p++) {
+    for (const p of pageList) {
       const pw = Module._nanopdf_get_page_width(p) || 612;
       // ~150 DPI for crisp print output, bounded so huge pages stay reasonable.
       const maxW = Math.min(2200, Math.round(pw * (150 / 72)));
-      if (!renderPageToCanvas(p, tmp, maxW)) continue;
+      if (!renderPageToCanvas(p, tmp, maxW)) {
+        failedPages.push(p);
+        continue;
+      }
       const img = document.createElement('img');
       img.src = tmp.toDataURL('image/png');
       img.className = 'print-page';
       container.appendChild(img);
-      if (printBtn) printBtn.textContent = `Rendering… ${p + 1}/${totalPages}`;
+      if (printBtn) printBtn.textContent = `Rendering… ${p + 1}/${pageList.length}`;
       // Yield so the progress text paints and the UI doesn't lock up.
       await new Promise((r) => setTimeout(r, 0));
     }
@@ -1083,12 +1290,20 @@ async function printDocument() {
     window.addEventListener('afterprint', cleanup);
     // Re-render the on-screen page (the shared render buffer was reused above).
     renderCurrentPage();
+    if (failedPages.length) {
+      setOperationStatus(
+        `Printed ${container.childElementCount} / ${pageList.length} page(s) — ` +
+        `failed: ${failedPages.map((p) => p + 1).join(', ')}`,
+        true,
+      );
+    }
     window.print();
     // Fallback cleanup for browsers that don't fire afterprint reliably.
     setTimeout(cleanup, 60000);
   } finally {
     printing = false;
     if (printBtn) { printBtn.disabled = false; printBtn.textContent = 'Print'; }
+    if (printScope && hasRendering && totalPages > 0) printScope.disabled = false;
   }
 }
 
@@ -1106,8 +1321,12 @@ function ensureShortcutHelp() {
     [`${mod} 0`, 'Reset zoom'],
     ['R', 'Rotate page'],
     ['P', 'Print'],
+    ['B', 'Bookmark / un-bookmark current page'],
     ['V', 'Select / move tool'],
+    ['Tab  /  ⇧ Tab', 'Next / previous annotation'],
     ['Delete', 'Delete selected annotation'],
+    [`${mod} Z`, 'Undo'],
+    [`${mod} ⇧ Z  /  ${mod} Y`, 'Redo'],
     ['Esc', 'Deselect / close overlay'],
     ['?', 'Show / hide this help'],
   ];
@@ -1156,6 +1375,15 @@ function shortcutHelpOpen() {
 // ---- Digital signing (PKCS#12, in-browser, OpenSSL-free) ----
 
 let signP12Bytes = null;   // Uint8Array of the uploaded .p12/.pfx
+let signCloseTimer = 0;    // setTimeout id for auto-close after a successful sign
+
+function clearSignCloseTimer() {
+  if (signCloseTimer) { clearTimeout(signCloseTimer); signCloseTimer = 0; }
+}
+function scheduleSignClose(ms) {
+  clearSignCloseTimer();
+  signCloseTimer = setTimeout(() => { signCloseTimer = 0; closeSign(); }, ms);
+}
 
 function ensureSignOverlay() {
   let el = document.getElementById('sign-overlay');
@@ -1163,6 +1391,9 @@ function ensureSignOverlay() {
   el = document.createElement('div');
   el.id = 'sign-overlay';
   el.className = 'organize-overlay hidden';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', 'Sign PDF');
   el.innerHTML = `
     <div class="organize-panel" style="width:460px;max-width:92vw;">
       <div class="organize-header">
@@ -1174,10 +1405,13 @@ function ensureSignOverlay() {
           Certificate (.p12 / .pfx)
           <input type="file" id="sign-p12" accept=".p12,.pfx,application/x-pkcs12" />
         </label>
-        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
-          Certificate password
-          <input type="password" id="sign-pass" placeholder="PKCS#12 password" />
-        </label>
+        <form id="sign-password-form" autocomplete="off" style="margin:0;">
+          <input type="text" name="sign-username" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;" />
+          <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
+            Certificate password
+            <input type="password" id="sign-pass" placeholder="PKCS#12 password" autocomplete="new-password" />
+          </label>
+        </form>
         <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#444;">
           Reason (optional)
           <input type="text" id="sign-reason" placeholder="e.g. I approve this document" />
@@ -1210,11 +1444,16 @@ function ensureSignOverlay() {
   el.addEventListener('click', (e) => { if (e.target === el) closeSign(); });
   el.querySelector('#sign-p12').addEventListener('change', async (e) => {
     const f = e.target.files[0];
+    if (signP12Bytes) signP12Bytes.fill(0);
     if (!f) { signP12Bytes = null; return; }
     signP12Bytes = new Uint8Array(await f.arrayBuffer());
     setSignStatus(`Loaded ${f.name} (${signP12Bytes.length} bytes)`, '#2a7');
   });
   el.querySelector('#sign-go').addEventListener('click', doSign);
+  el.querySelector('#sign-password-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    doSign();
+  });
   el.querySelector('#sign-tsa').addEventListener('change', (e) => {
     el.querySelector('#sign-tsa-url-row').style.display = e.target.checked ? 'flex' : 'none';
   });
@@ -1226,28 +1465,64 @@ function setSignStatus(msg, color) {
   if (s) { s.textContent = msg; s.style.color = color || '#666'; }
 }
 
+// Track the trigger element so we can restore focus when an overlay closes.
+let signTrigger = null;
+
 function openSign() {
-  if (!Module || !Module._nanopdf_sign_pdf || !currentPdfBytes) return;
-  signP12Bytes = null;
+  if (!Module || !currentPdfBytes) return;
+  if (!Module._nanopdf_sign_pdf) {
+    setStatus('Sign requires rebuilding the nanopdf WASM module', true);
+    return;
+  }
+  clearSignCloseTimer();
+  clearSignSensitiveFields();
   const el = ensureSignOverlay();
   el.querySelector('#sign-p12').value = '';
   el.querySelector('#sign-pass').value = '';
   setSignStatus('');
   el.classList.remove('hidden');
+  signTrigger = document.activeElement;
+  // Focus the first focusable control so keyboard users land inside the dialog.
+  const first = el.querySelector('input, select, textarea, button');
+  if (first) first.focus();
 }
 
 function closeSign() {
+  clearSignCloseTimer();
   const el = document.getElementById('sign-overlay');
   if (el) el.classList.add('hidden');
+  clearSignSensitiveFields();
+  if (signTrigger && typeof signTrigger.focus === 'function') {
+    signTrigger.focus();
+    signTrigger = null;
+  }
 }
 
 function finishSign(suffix) {
   const outPtr = Module._nanopdf_sign_get_buffer();
   const outLen = Module._nanopdf_sign_get_size();
+  if (!outPtr || outLen <= 0) {
+    throw new Error(wasmLastError() || 'Sign produced an empty buffer');
+  }
   const signed = new Uint8Array(Module.HEAPU8.buffer, outPtr, outLen).slice();
   const baseName = fileName.replace(/\.pdf$/i, '');
   downloadNamedPdf(signed, `${baseName}_${suffix}.pdf`);
   return outLen;
+}
+
+function clearSignSensitiveFields() {
+  if (signP12Bytes) signP12Bytes.fill(0);
+  signP12Bytes = null;
+  const p12 = document.getElementById('sign-p12');
+  const pass = document.getElementById('sign-pass');
+  if (p12) p12.value = '';
+  if (pass) pass.value = '';
+}
+
+function secureRandomU32() {
+  const a = new Uint32Array(1);
+  globalThis.crypto.getRandomValues(a);
+  return a[0] >>> 0;
 }
 
 async function doSign() {
@@ -1273,7 +1548,7 @@ async function doSign() {
     if (contactPtr) Module._free(contactPtr);
     pdfPtr = p12Ptr = passPtr = reasonPtr = locPtr = contactPtr = 0;
   };
-  const lastErr = () => Module.UTF8ToString(Module._nanopdf_get_last_error());
+  const lastErr = () => readWasmString(Module, Module._nanopdf_get_last_error());
 
   try {
     pdfPtr = Module._nanopdf_malloc(currentPdfBytes.length);
@@ -1287,8 +1562,8 @@ async function doSign() {
 
     if (wantTsa && tsaUrl && Module._nanopdf_sign_prepare) {
       // Phase A: build the deterministic signature + RFC 3161 request.
-      const nLo = (Math.random() * 0xffffffff) >>> 0;
-      const nHi = (Math.random() * 0xffffffff) >>> 0;
+      const nLo = secureRandomU32();
+      const nHi = secureRandomU32();
       const okPrep = Module._nanopdf_sign_prepare(
         pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
         reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible, nLo, nHi);
@@ -1309,15 +1584,20 @@ async function doSign() {
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         respBytes = new Uint8Array(await resp.arrayBuffer());
       } catch (netErr) {
-        // CORS / network failure: fall back to a non-timestamped signature.
-        setSignStatus('TSA unreachable (' + netErr.message + '); signing without timestamp…', '#c80');
+        const allowFallback = window.confirm(
+          `Timestamp request failed (${netErr.message}). Sign without a trusted timestamp?`);
+        if (!allowFallback) {
+          setSignStatus('Signing canceled after timestamp failure.', '#c80');
+          return;
+        }
+        setSignStatus('Signing without timestamp…', '#c80');
         const okPlain = Module._nanopdf_sign_pdf(
           pdfPtr, currentPdfBytes.length, p12Ptr, signP12Bytes.length, passPtr,
           reasonPtr, locPtr, contactPtr, currentPage, x, y, w, h, visible);
         if (!okPlain) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
         const n = finishSign('signed');
         setSignStatus(`Signed without timestamp (${n} bytes). Downloaded.`, '#c80');
-        setTimeout(closeSign, 1400);
+        scheduleSignClose(1400);
         return;
       }
 
@@ -1329,7 +1609,7 @@ async function doSign() {
       if (!okFin) { setSignStatus('Timestamp failed: ' + lastErr(), '#c33'); return; }
       const n = finishSign('signed_ts');
       setSignStatus(`Signed + timestamped (${n} bytes). Downloaded.`, '#2a7');
-      setTimeout(closeSign, 900);
+      scheduleSignClose(900);
       return;
     }
 
@@ -1340,11 +1620,12 @@ async function doSign() {
     if (!ok) { setSignStatus('Sign failed: ' + lastErr(), '#c33'); return; }
     const n = finishSign('signed');
     setSignStatus(`Signed (${n} bytes). Downloaded.`, '#2a7');
-    setTimeout(closeSign, 900);
+    scheduleSignClose(900);
   } catch (e) {
     setSignStatus('Sign error: ' + e, '#c33');
   } finally {
     freeAll();
+    clearSignSensitiveFields();
   }
 }
 
@@ -1361,17 +1642,13 @@ function renderPageToCanvas(pageIdx, canvas, maxW) {
   const scale = maxW / pw;
   const w = Math.max(1, Math.round(pw * scale));
   const h = Math.max(1, Math.round(ph * scale));
-  let ok = 0;
-  try { ok = Module._nanopdf_render_page(pageIdx, w, h, 72 * (w / pw)); } catch (e) { return false; }
-  if (ok !== 1) return false;
-  const ptr = Module._nanopdf_get_render_buffer();
-  const size = Module._nanopdf_get_render_buffer_size();
-  const rw = Module._nanopdf_get_render_width();
-  const rh = Module._nanopdf_get_render_height();
+  const result = renderPageIntoImageData(Module, pageIdx, w, h, 72 * (w / pw));
+  if (!result.ok || !result.imageData) return false;
+  const { data, w: rw, h: rh } = result.imageData;
   canvas.width = rw; canvas.height = rh;
   const ctx = canvas.getContext('2d');
   const img = ctx.createImageData(rw, rh);
-  img.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size));
+  img.data.set(data);
   ctx.putImageData(img, 0, 0);
   return true;
 }
@@ -1390,6 +1667,9 @@ function ensureOrganizeOverlay() {
   el = document.createElement('div');
   el.id = 'organize-overlay';
   el.className = 'organize-overlay hidden';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', 'Organize pages');
   el.innerHTML = `
     <div class="organize-panel">
       <div class="organize-header">
@@ -1411,12 +1691,15 @@ function ensureOrganizeOverlay() {
   return el;
 }
 
+let organizeTrigger = null;
+
 function openOrganize() {
   if (!Module || totalPages <= 0 || !hasRendering) return;
   organizeModel = [];
   for (let i = 0; i < totalPages; i++) organizeModel.push({ src: i, rot: 0 });
   organizeThumbCache = {};
   const el = ensureOrganizeOverlay();
+  organizeTrigger = document.activeElement;
   el.classList.remove('hidden');
   renderOrganizeGrid();
 }
@@ -1424,6 +1707,10 @@ function openOrganize() {
 function closeOrganize() {
   const el = document.getElementById('organize-overlay');
   if (el) el.classList.add('hidden');
+  if (organizeTrigger && typeof organizeTrigger.focus === 'function') {
+    organizeTrigger.focus();
+    organizeTrigger = null;
+  }
 }
 
 function renderOrganizeGrid() {
@@ -1486,16 +1773,16 @@ async function exportOrganizedViaWork(model) {
   Module.HEAPU8.set(currentPdfBytes, ptr);
   const docId = Module._nanopdf_doc_load(ptr, currentPdfBytes.length);
   Module._nanopdf_free(ptr);
-  if (docId < 0) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load doc');
+  if (docId < 0) throw new Error(wasmLastError() || 'Failed to load doc');
   try {
     Module._nanopdf_work_clear();
     for (const e of model) {
       const wi = Module._nanopdf_work_add_page(docId, e.src);
-      if (wi < 0) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to add page');
+      if (wi < 0) throw new Error(wasmLastError() || 'Failed to add page');
       if (e.rot % 360 !== 0) Module._nanopdf_work_rotate_page(wi, ((e.rot % 360) + 360) % 360);
     }
     if (Module._nanopdf_export_pdf() !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Export failed');
+      throw new Error(wasmLastError() || 'Export failed');
     }
     return copyWasmBuffer(Module._nanopdf_export_get_buffer, Module._nanopdf_export_get_size);
   } finally {
@@ -1517,7 +1804,7 @@ async function saveOrganized() {
       const jp = Module.stringToNewUTF8('[' + order.join(',') + ']');
       const ok = Module._nanopdf_split_pages(jp);
       Module._free(jp);
-      if (ok !== 1) throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Reorder failed');
+      if (ok !== 1) throw new Error(wasmLastError() || 'Reorder failed');
       out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
     } else {
       // Rotation present: route through the work/export path (flattened).
@@ -1525,7 +1812,7 @@ async function saveOrganized() {
     }
     if (!out) throw new Error('Empty output');
     downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_organized.pdf');
-    setStatus(`Saved reorganized PDF (${organizeModel.length} page(s))`);
+    setOperationStatus(`Saved reorganized PDF (${organizeModel.length} page(s))`, 'success');
     closeOrganize();
   } catch (err) {
     setStatus('Organize error: ' + err.message, true);
@@ -1555,13 +1842,14 @@ function renderThumbnailsTab() {
   html += '<button id="clear-selection-btn">Clear</button>';
   html += '</div>';
 
-  html += '<div class="thumbnail-list">';
+  html += '<div class="thumbnail-list" role="listbox" aria-label="Pages">';
   for (let i = 0; i < totalPages; i++) {
     const classes = [];
     if (i === currentPage) classes.push('active');
     if (selectedPages.has(i)) classes.push('selected');
     const cls = classes.length > 0 ? ' ' + classes.join(' ') : '';
-    html += `<div class="thumbnail-item${cls}" data-page="${i}">`;
+    html += `<div class="thumbnail-item${cls}" data-page="${i}" role="option" tabindex="0" ` +
+      `aria-selected="${i === currentPage}" aria-label="Page ${i + 1}">`;
     html += '<div class="select-check">&#10003;</div>';
     html += `<canvas class="thumb-canvas" data-page="${i}" width="1" height="1"></canvas>`;
     html += `<div class="thumb-label">${i + 1}</div>`;
@@ -1589,6 +1877,45 @@ function renderThumbnailsTab() {
       handleThumbnailClick(page, e);
     });
   });
+
+  // Keyboard navigation: focus a thumbnail (Tab into the list) and use
+  // Up/Down/Home/End to move; Enter/Space is a click-equivalent; Spacebar
+  // toggles selection.
+  const list = sidebarContent.querySelector('.thumbnail-list');
+  if (list) {
+    list.addEventListener('keydown', (e) => {
+      const target = e.target.closest('.thumbnail-item');
+      if (!target) return;
+      const cur = parseInt(target.dataset.page, 10);
+      let next = cur;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowRight') next = Math.min(totalPages - 1, cur + 1);
+      else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') next = Math.max(0, cur - 1);
+      else if (e.key === 'Home') next = 0;
+      else if (e.key === 'End') next = totalPages - 1;
+      else if (e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        if (selectedPages.has(cur)) selectedPages.delete(cur);
+        else selectedPages.add(cur);
+        lastClickedPage = cur;
+        updateSelectionUI();
+        return;
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        selectedPages.clear();
+        lastClickedPage = cur;
+        updateSelectionUI();
+        goToPage(cur);
+        return;
+      } else return;
+      e.preventDefault();
+      if (next !== cur) {
+        goToPage(next);
+        const items = list.querySelectorAll('.thumbnail-item');
+        const item = items[next];
+        if (item) item.focus();
+      }
+    });
+  }
 
   // Lazy load with IntersectionObserver
   setupThumbnailObserver();
@@ -1661,12 +1988,20 @@ function updateExportButton() {
   // Combine works on the whole document; Extract needs a page selection.
   if (combineBtn) combineBtn.disabled = !(totalPages > 0 && Module && Module._nanopdf_merge_start);
   if (extractPagesBtn) {
-    extractPagesBtn.disabled = !(hasSelection && Module && Module._nanopdf_split_pages);
+    // Extract keeps vector content but ignores annotations. If any selected
+    // page has annotations/form-fill to bake, suggest Export instead.
+    const hasBakeableOnSelection = hasSelection &&
+      [...selectedPages].some(pageHasBakeableContent);
+    extractPagesBtn.disabled = !(hasSelection && Module && Module._nanopdf_split_pages) || hasBakeableOnSelection;
     extractPagesBtn.textContent = selectedPages.size > 0 ? `Extract (${selectedPages.size})` : 'Extract';
+    extractPagesBtn.title = hasBakeableOnSelection
+      ? 'Extract keeps vector content but ignores annotations — use Export to bake them in'
+      : 'Extract selected pages into a new PDF (vector content preserved, annotations not baked in)';
   }
   if (organizeBtn) organizeBtn.disabled = !docLoaded;
   if (signBtn) signBtn.disabled = !(docLoaded && Module && Module._nanopdf_sign_pdf);
   { const pb = document.getElementById('print-btn'); if (pb) pb.disabled = !(docLoaded && hasRendering); }
+  { const ps = document.getElementById('print-scope'); if (ps) ps.disabled = !(docLoaded && hasRendering); }
 
   // Guide the user when Protect is on but nothing is selected to export.
   if (protectExport.checked && !hasSelection && docLoaded) {
@@ -1725,6 +2060,11 @@ function queueThumbnailRender(pageIdx, canvasEl) {
     ctx.putImageData(thumbnailCache[pageIdx], 0, 0);
     return;
   }
+  if (thumbnailRenderQueue.length === 0) {
+    // First item in a fresh queue: snapshot the main-render counter so we
+    // can tell at drain-time whether the main canvas was clobbered.
+    thumbnailQueueStartedBeforeMainRender = mainRenderCounter;
+  }
   thumbnailRenderQueue.push({ pageIdx, canvasEl });
   processThumbnailQueue();
 }
@@ -1745,21 +2085,15 @@ function processThumbnailQueue() {
     const height = Math.floor(ph * thumbScale);
     const dpi = 72 * thumbScale;
 
-    const result = Module._nanopdf_render_page(pageIdx, width, height, dpi);
-
-    if (result === 1) {
-      const bufferPtr = Module._nanopdf_get_render_buffer();
-      const bufferSize = Module._nanopdf_get_render_buffer_size();
-      const renderWidth = Module._nanopdf_get_render_width();
-      const renderHeight = Module._nanopdf_get_render_height();
-
+    const result = renderPageIntoImageData(Module, pageIdx, width, height, dpi);
+    if (result.ok && result.imageData) {
+      const { data, w: renderWidth, h: renderHeight } = result.imageData;
       // Draw at display size by scaling
       canvasEl.width = renderWidth;
       canvasEl.height = renderHeight;
       const ctx = canvasEl.getContext('2d');
       const imageData = ctx.createImageData(renderWidth, renderHeight);
-      const srcData = new Uint8ClampedArray(Module.HEAPU8.buffer, bufferPtr, bufferSize);
-      imageData.data.set(srcData);
+      imageData.data.set(data);
       ctx.putImageData(imageData, 0, 0);
       thumbnailCache[pageIdx] = imageData;
     }
@@ -1770,11 +2104,15 @@ function processThumbnailQueue() {
   isThumbnailRendering = false;
 
   if (thumbnailRenderQueue.length > 0) {
-    // Use setTimeout to give WASM memory time to settle between renders
+    // Use rAF to let the browser paint between renders; the 50 ms backstop
+    // gives WASM memory time to settle on the first iteration.
     setTimeout(processThumbnailQueue, 50);
   } else {
-    // All visible thumbnails done, re-render current page to restore main canvas buffer
-    setTimeout(renderCurrentPage, 100);
+    // All visible thumbnails done; only re-render the main page if it was
+    // rendered *before* the queue started (i.e. it was clobbered by our work).
+    if (thumbnailQueueStartedBeforeMainRender) {
+      setTimeout(renderCurrentPage, 100);
+    }
   }
 }
 
@@ -1783,8 +2121,10 @@ function updateThumbnailHighlight() {
   const items = sidebarContent.querySelectorAll('.thumbnail-item');
   items.forEach(item => {
     const page = parseInt(item.dataset.page, 10);
-    item.classList.toggle('active', page === currentPage);
+    const isActive = page === currentPage;
+    item.classList.toggle('active', isActive);
     item.classList.toggle('selected', selectedPages.has(page));
+    item.setAttribute('aria-selected', isActive ? 'true' : 'false');
   });
 
   // Auto-scroll current thumbnail into view
@@ -1799,6 +2139,8 @@ function updateSidebar() {
     renderOutlineTab();
   } else if (activeSidebarTab === 'thumbs') {
     renderThumbnailsTab();
+  } else if (activeSidebarTab === 'marks') {
+    renderMarksTab();
   } else if (activeSidebarTab === 'signatures') {
     renderSignaturesTab();
   } else if (activeSidebarTab === 'history') {
@@ -1808,6 +2150,128 @@ function updateSidebar() {
   } else {
     renderInfoTab();
   }
+}
+
+// ---- Marks tab (annotation list / index) ----
+let marksFilter = '';
+
+function renderMarksTab() {
+  if (!Module || totalPages <= 0) {
+    sidebarContent.innerHTML = '<div style="padding:12px;color:#999;font-size:13px;">No document loaded.</div>';
+    return;
+  }
+  const q = marksFilter.trim().toLowerCase();
+  // Collect all annotations across pages, sorted by page then by id (creation order).
+  const all = [];
+  for (let p = 0; p < totalPages; p++) {
+    for (const a of (annotations[p] || [])) {
+      all.push({ a, page: p });
+    }
+  }
+  all.sort((x, y) => x.page - y.page || x.a.id - y.a.id);
+
+  let html = '<div class="outline-filter">';
+  html += '<input type="text" id="marks-filter-input" placeholder="Filter annotations…" ' +
+          `value="${escapeHtml(marksFilter)}" autocomplete="off" />`;
+  if (q) {
+    html += `<button type="button" id="marks-filter-clear" title="Clear filter">&times;</button>`;
+  }
+  html += '</div>';
+
+  const filtered = q
+    ? all.filter(({ a, page }) =>
+        annotLabel(a).toLowerCase().includes(q) ||
+        a.type.toLowerCase().includes(q) ||
+        ('p.' + (page + 1)).includes(q))
+    : all;
+
+  if (!filtered.length) {
+    html += '<div class="outline-empty">' +
+      (all.length
+        ? `No matches for &ldquo;${escapeHtml(marksFilter)}&rdquo;.`
+        : 'No annotations yet — draw one with the toolbar tools.') +
+      '</div>';
+    sidebarContent.innerHTML = html;
+    wireMarksFilter();
+    return;
+  }
+
+  html += '<div class="marks-list">';
+  let lastPage = -1;
+  for (const { a, page } of filtered) {
+    if (page !== lastPage) {
+      if (lastPage !== -1) html += '</div>';
+      html += `<div class="marks-page-group">`;
+      html += `<div class="marks-page-header">Page ${page + 1}</div>`;
+      lastPage = page;
+    }
+    const isSelected = a.id === selectedAnnotId && page === currentPage;
+    const isCurrentPage = page === currentPage;
+    html += `<div class="marks-row${isSelected ? ' selected' : ''}${isCurrentPage ? '' : ' offpage'}" data-annot-id="${a.id}" data-page="${page}">`;
+    html += `<span class="marks-type marks-type-${escapeHtml(a.type)}">${escapeHtml(annotLabel(a))}</span>`;
+    html += `<button class="marks-del" data-annot-id="${a.id}" data-page="${page}" title="Delete">&times;</button>`;
+    html += '</div>';
+  }
+  html += '</div></div>';
+
+  sidebarContent.innerHTML = html;
+  wireMarksFilter();
+  sidebarContent.querySelectorAll('.marks-row').forEach((row) => {
+    row.addEventListener('click', (e) => {
+      if (e.target.classList.contains('marks-del')) return;
+      const pid = parseInt(row.dataset.page, 10);
+      const aid = parseInt(row.dataset.annotId, 10);
+      if (pid !== currentPage) goToPage(pid);
+      // Selection in the list also selects the annotation so the user can
+      // immediately move/resize/delete via the toolbar.
+      selectedAnnotId = aid;
+      hoveredAnnotId = null;
+      setAnnotTool('select');
+      renderAnnotations();
+      renderMarksTab();
+    });
+  });
+  sidebarContent.querySelectorAll('.marks-del').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const pid = parseInt(btn.dataset.page, 10);
+      const aid = parseInt(btn.dataset.annotId, 10);
+      const list = annotations[pid] || [];
+      const idx = list.findIndex((a) => a.id === aid);
+      if (idx < 0) return;
+      pushUndo();
+      list.splice(idx, 1);
+      if (aid === selectedAnnotId && pid === currentPage) {
+        selectedAnnotId = null;
+        hoveredAnnotId = null;
+        renderAnnotations();
+        updateAnnotLayerMode();
+      }
+      updateSaveAnnotState();
+      renderMarksTab();
+    });
+  });
+}
+
+function wireMarksFilter() {
+  const input = document.getElementById('marks-filter-input');
+  if (input) {
+    input.addEventListener('input', (e) => {
+      marksFilter = e.target.value;
+      renderMarksTab();
+      const el = document.getElementById('marks-filter-input');
+      if (el) {
+        el.focus();
+        const v = el.value;
+        el.setSelectionRange(v.length, v.length);
+      }
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { marksFilter = ''; renderMarksTab(); }
+    });
+  }
+  const clear = document.getElementById('marks-filter-clear');
+  if (clear) clear.addEventListener('click', () => { marksFilter = ''; renderMarksTab(); });
 }
 
 // ---- Attachments (embedded files) tab ----
@@ -1831,11 +2295,12 @@ function renderAttachmentsTab() {
   for (const a of data.attachments) {
     const kb = a.size ? ` · ${(a.size / 1024).toFixed(1)} KB` : '';
     const meta = [a.mimeType, a.modDate || a.creationDate].filter(Boolean).join(' · ');
+    const index = Number.isInteger(a.index) ? a.index : -1;
     html += `<div class="attach-item">
       <div class="attach-name" title="${escapeHtml(a.name)}">${escapeHtml(a.name || '(unnamed)')}</div>
       <div class="attach-meta">${escapeHtml(meta)}${kb}</div>
       ${a.description ? `<div class="attach-desc">${escapeHtml(a.description)}</div>` : ''}
-      <button class="attach-dl" data-index="${a.index}" data-name="${escapeHtml(a.name || 'attachment')}">Download</button>
+      <button class="attach-dl" data-index="${index}" data-name="${escapeHtml(a.name || 'attachment')}">Download</button>
     </div>`;
   }
   html += '</div>';
@@ -1849,7 +2314,7 @@ function downloadAttachment(index, name) {
   if (!Module._nanopdf_attachment_extract) return;
   if (Module._nanopdf_attachment_extract(index) !== 1) {
     setStatus('Failed to extract attachment: ' +
-      Module.UTF8ToString(Module._nanopdf_get_last_error()), true);
+      wasmLastError(), true);
     return;
   }
   const bytes = copyWasmBuffer(Module._nanopdf_attachment_get_buffer, Module._nanopdf_attachment_get_size);
@@ -1869,12 +2334,14 @@ function goToPage(pageIndex) {
   if (pageIndex < 0 || pageIndex >= totalPages) return;
   currentPage = pageIndex;
   selectedAnnotId = null;
+  hoveredAnnotId = null;
   annotDraft = null;
   hideMarkupPopover();
   updatePageDisplay();
   renderCurrentPage();
   clearSearch();
   updateThumbnailHighlight();
+  updateBookmarkButton();
   saveViewState();
 }
 
@@ -1893,22 +2360,66 @@ function enterPageJump() {
   input.value = currentPage + 1;
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
-      const page = parseInt(input.value, 10) - 1;
-      exitPageJump();
-      if (page >= 0 && page < totalPages) {
-        goToPage(page);
+      const raw = input.value.trim();
+      const n = Number(raw);
+      if (!raw || !Number.isFinite(n) || n < 1 || n > totalPages || Math.floor(n) !== n) {
+        // Flash the input border red so the user knows the value was rejected.
+        input.classList.add('invalid');
+        setStatus(`Page must be a number between 1 and ${totalPages}`, true);
+        return;
       }
+      exitPageJump();
+      goToPage(n - 1);
     } else if (e.key === 'Escape') {
       exitPageJump();
     }
     e.stopPropagation();
   });
+  input.addEventListener('input', () => {
+    if (input.classList.contains('invalid')) input.classList.remove('invalid');
+  });
   input.addEventListener('blur', () => {
-    exitPageJump();
+    // Defer the exit so the invalid-flash class survives long enough to be seen
+    // if the user pressed Enter (which also blurs the input).
+    setTimeout(() => {
+      if (isPageJumpMode) exitPageJump();
+    }, 0);
   });
   pageDisplay.textContent = '';
   pageDisplay.appendChild(input);
   input.select();
+}
+
+// ---- User bookmarks ----
+function findBookmarkAt(page) {
+  return userBookmarks.find((b) => b.page === page);
+}
+function addBookmarkAtCurrent() {
+  if (!Module || totalPages <= 0) return;
+  if (findBookmarkAt(currentPage)) {
+    setStatus('Page already bookmarked', 'info');
+    return;
+  }
+  userBookmarks.push({ id: Date.now() + Math.random(), page: currentPage, title: `Page ${currentPage + 1}` });
+  userBookmarks.sort((a, b) => a.page - b.page);
+  updateBookmarkButton();
+  if (activeSidebarTab === 'outline') renderOutlineTab();
+  setStatus(`Bookmarked page ${currentPage + 1}`, 'success');
+}
+function removeBookmarkAt(page) {
+  const idx = userBookmarks.findIndex((b) => b.page === page);
+  if (idx < 0) return;
+  userBookmarks.splice(idx, 1);
+  updateBookmarkButton();
+  if (activeSidebarTab === 'outline') renderOutlineTab();
+}
+function updateBookmarkButton() {
+  if (!bookmarkBtn) return;
+  const here = findBookmarkAt(currentPage);
+  bookmarkBtn.classList.toggle('active', !!here);
+  bookmarkBtn.title = here
+    ? `Remove bookmark from page ${currentPage + 1} (B)`
+    : 'Bookmark this page (B)';
 }
 
 function exitPageJump() {
@@ -1918,26 +2429,36 @@ function exitPageJump() {
 
 // ---- Zoom ----
 
+// Clamp to the slider's range (25%–400%) and snap to integer percent so the
+// slider position stays in sync with the actual zoom value.
+function setZoom(level, opts = {}) {
+  const clamped = Math.max(0.25, Math.min(4.0, level));
+  zoomLevel = clamped;
+  updateZoomDisplay();
+  if (opts.render !== false) {
+    renderCurrentPage();
+  }
+  if (opts.persist !== false) {
+    saveViewState();
+  }
+}
+
 function zoomIn() {
   const nextStep = ZOOM_STEPS.find(s => s > zoomLevel + 0.001);
   if (nextStep) {
-    zoomLevel = nextStep;
-  } else if (zoomLevel < 4.0) {
-    zoomLevel = Math.min(4.0, zoomLevel + 0.25);
+    setZoom(nextStep);
+  } else {
+    setZoom(zoomLevel + 0.25);
   }
-  updateZoomDisplay();
-  renderCurrentPage();
-  saveViewState();
 }
 
 function zoomOut() {
   const prevSteps = ZOOM_STEPS.filter(s => s < zoomLevel - 0.001);
   if (prevSteps.length > 0) {
-    zoomLevel = prevSteps[prevSteps.length - 1];
+    setZoom(prevSteps[prevSteps.length - 1]);
+  } else {
+    setZoom(zoomLevel - 0.25);
   }
-  updateZoomDisplay();
-  renderCurrentPage();
-  saveViewState();
 }
 
 function resetZoom() {
@@ -2129,6 +2650,16 @@ function annotPointerPos(e) {
   };
 }
 
+// True when (clientX, clientY) lies within the page-canvas rectangle (so a
+// drag-and-release inside the canvas keeps the annotation; release outside
+// the canvas is the "drag-out to delete" cue).
+function isPointInPageCanvas(clientX, clientY) {
+  if (!canvas) return false;
+  const r = canvas.getBoundingClientRect();
+  return clientX >= r.left && clientX <= r.right &&
+         clientY >= r.top  && clientY <= r.bottom;
+}
+
 function pageAnnots(page = currentPage) {
   if (!annotations[page]) annotations[page] = [];
   return annotations[page];
@@ -2224,6 +2755,8 @@ function renderAnnotations() {
 
   clearChildren(annotSvg);
   annotHtml.querySelectorAll('.annot-textbox').forEach((n) => n.remove());
+  const oldPanel = annotHtml.querySelector('.annot-props');
+  if (oldPanel) oldPanel.remove();
 
   if (!Module || totalPages <= 0 || canvas.style.display !== 'block') return;
 
@@ -2244,8 +2777,38 @@ function renderAnnotations() {
     r.setAttribute('stroke-width', '1');
     r.setAttribute('stroke-dasharray', '4 3');
     annotSvg.appendChild(r);
+    // Resize handles on the selected shape (in select mode only).
+    if (annotTool === 'select' && annotEditingEnabled()) {
+      drawResizeHandles(sel);
+      drawPropsPanel(sel);
+    }
+  }
+  // Hover outline (only in select mode, only when not the selected one).
+  const hov = hoveredAnnotId != null ? findAnnot(hoveredAnnotId) : null;
+  if (hov && (!sel || hov.id !== sel.id)) {
+    const bb = annotScreenBBox(hov);
+    const r = svgEl('rect');
+    r.setAttribute('x', bb.left - 2); r.setAttribute('y', bb.top - 2);
+    r.setAttribute('width', Math.max(0, bb.width) + 4);
+    r.setAttribute('height', Math.max(0, bb.height) + 4);
+    r.setAttribute('fill', 'none');
+    r.setAttribute('stroke', '#007bff');
+    r.setAttribute('stroke-width', '1');
+    r.setAttribute('stroke-opacity', '0.45');
+    annotSvg.appendChild(r);
   }
   updateAnnotLayerMode();
+  // Keep the Marks tab in sync with selection / live edits.
+  if (activeSidebarTab === 'marks' && sidebarContent) {
+    const rows = sidebarContent.querySelectorAll('.marks-row');
+    if (rows.length) {
+      rows.forEach((r) => {
+        const pid = parseInt(r.dataset.page, 10);
+        const aid = parseInt(r.dataset.annotId, 10);
+        r.classList.toggle('selected', aid === selectedAnnotId && pid === currentPage);
+      });
+    }
+  }
 }
 
 function drawAnnot(a) {
@@ -2255,7 +2818,25 @@ function drawAnnot(a) {
   if (a.type === 'image') { drawImageStamp(a); return; }
 
   let el;
-  if (a.type === 'redact') {
+  if (a.type === 'link') {
+    // Translucent blue tint + dashed border; cursor hints it is clickable.
+    el = svgEl('rect');
+    const box = pdfBoxToScreen(a);
+    el.setAttribute('x', box.left); el.setAttribute('y', box.top);
+    el.setAttribute('width', Math.max(0, box.width));
+    el.setAttribute('height', Math.max(0, box.height));
+    el.setAttribute('fill', col);
+    el.setAttribute('fill-opacity', a.alpha != null ? a.alpha : 0.18);
+    el.setAttribute('stroke', col);
+    el.setAttribute('stroke-width', '1.5');
+    el.setAttribute('stroke-dasharray', '5 3');
+    el.classList.add('annot-link');
+    // Tooltip shows the destination; status bar surfaces it on hover.
+    const dp = a.destPage;
+    el.setAttribute('data-link-dest', String(dp));
+    el.appendChild(svgEl('title')).textContent =
+      dp != null ? `Link to page ${dp + 1}` : 'Link (no destination)';
+  } else if (a.type === 'redact') {
     el = svgEl('rect');
     const box = pdfBoxToScreen(a);
     el.setAttribute('x', box.left); el.setAttribute('y', box.top);
@@ -2293,6 +2874,7 @@ function drawAnnot(a) {
     const p1 = pdfToScreen(a.x1, a.y1), p2 = pdfToScreen(a.x2, a.y2);
     const segs = [{ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y }];
     if (a.type === 'arrow') segs.push(...arrowHeadSegments(p1, p2));
+    const da = dashToStrokeDasharray(a.dash);
     for (const s of segs) {
       const ln = svgEl('line');
       ln.setAttribute('x1', s.x1); ln.setAttribute('y1', s.y1);
@@ -2300,6 +2882,7 @@ function drawAnnot(a) {
       ln.setAttribute('stroke', col);
       ln.setAttribute('stroke-width', Math.max(1, a.lineWidth * scale));
       ln.setAttribute('stroke-linecap', 'round');
+      if (da) ln.setAttribute('stroke-dasharray', da);
       el.appendChild(ln);
     }
   } else if (a.type === 'ink') {
@@ -2312,11 +2895,358 @@ function drawAnnot(a) {
     el.setAttribute('stroke-width', Math.max(1, a.lineWidth * scale));
     el.setAttribute('stroke-linejoin', 'round');
     el.setAttribute('stroke-linecap', 'round');
+    const da = dashToStrokeDasharray(a.dash);
+    if (da) el.setAttribute('stroke-dasharray', da);
   }
   if (!el) return;
   el.classList.add('annot-shape');
   el.dataset.annotId = a.id;
   annotSvg.appendChild(el);
+}
+
+// ---- Resize handles ----
+// Handles consume pointer events before the underlying shape does. For bbox-
+// based annotations we draw 8 handles (4 corners + 4 edges). For line/arrow
+// we draw 2 endpoint handles (circles at x1,y1 and x2,y2). For ink we use the
+// same 8-handle layout and scale all points proportionally to the new bbox.
+const HANDLE = 8;        // half-size in CSS px
+const HANDLE_CORNER = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
+
+function handleCursor(name) {
+  // 8-direction cursor mapping.
+  if (name === 'nw' || name === 'se') return 'nwse-resize';
+  if (name === 'ne' || name === 'sw') return 'nesw-resize';
+  if (name === 'n' || name === 's') return 'ns-resize';
+  if (name === 'e' || name === 'w') return 'ew-resize';
+  if (name === 'start' || name === 'end') return 'move';
+  return 'default';
+}
+
+function drawResizeHandles(a) {
+  const bb = annotScreenBBox(a);
+  if (a.type === 'line' || a.type === 'arrow') {
+    // Two endpoint handles, drawn as small circles.
+    const p1 = pdfToScreen(a.x1, a.y1), p2 = pdfToScreen(a.x2, a.y2);
+    drawHandle(a, p1.x, p1.y, 'start');
+    drawHandle(a, p2.x, p2.y, 'end');
+    return;
+  }
+  // Bbox-based: 8 handles around the selection bbox.
+  const x = bb.left, y = bb.top, w = bb.width, h = bb.height;
+  const midX = x + w / 2, midY = y + h / 2;
+  const x2 = x + w, y2 = y + h;
+  const positions = {
+    nw: [x, y], n: [midX, y], ne: [x2, y],
+    e: [x2, midY], se: [x2, y2], s: [midX, y2],
+    sw: [x, y2], w: [x, midY],
+  };
+  for (const name of HANDLE_CORNER) {
+    const [px, py] = positions[name];
+    drawHandle(a, px, py, name);
+  }
+}
+
+// ---- Properties panel ----
+// A small floating panel anchored to the bottom-right of the selected
+// annotation, exposing color / line-width / font-size / delete controls.
+// Only relevant in select mode on a non-image annotation.
+function drawPropsPanel(a) {
+  if (!annotHtml) return;
+  if (a.type === 'image') return;   // image annots have no editable style here
+  const bb = annotScreenBBox(a);
+  // The panel may have 1 or 2 rows; the height below is the *upper bound* used
+  // to decide whether to flip up.
+  const PANEL_W = 196, PANEL_H = 64;
+  let left = Math.min(Math.max(0, bb.left + bb.width - PANEL_W), pageDisplayWidth - PANEL_W);
+  let top = bb.top + bb.height + 6;
+  if (top + PANEL_H > pageDisplayHeight) top = Math.max(0, bb.top - PANEL_H - 6);
+  if (top < 0) top = 4;
+
+  const panel = document.createElement('div');
+  panel.className = 'annot-props';
+  panel.style.left = left + 'px';
+  panel.style.top = top + 'px';
+
+  // First row: color, width / size, dash, dest.
+  const row1 = document.createElement('div');
+  row1.className = 'annot-props-row';
+
+  // Color swatch.
+  const colorWrap = document.createElement('label');
+  colorWrap.className = 'annot-props-field';
+  colorWrap.title = 'Color';
+  const colorInput = document.createElement('input');
+  colorInput.type = 'color';
+  colorInput.value = rgbToHex(a.color || { r: 1, g: 1, b: 1 });
+  colorInput.addEventListener('input', () => {
+    pushUndo();
+    a.color = hexToRgb(colorInput.value);
+    renderAnnotations();
+  });
+  colorInput.addEventListener('change', () => updateSaveAnnotState());
+  const colorSpan = document.createElement('span');
+  colorSpan.textContent = 'Color';
+  colorWrap.append(colorInput, colorSpan);
+  row1.appendChild(colorWrap);
+
+  // Line width (rect/oval/line/arrow/ink/highlight/redact).
+  if (a.type !== 'text') {
+    const lwWrap = document.createElement('label');
+    lwWrap.className = 'annot-props-field';
+    lwWrap.title = 'Stroke width';
+    const lwInput = document.createElement('input');
+    lwInput.type = 'number';
+    lwInput.min = '0.5';
+    lwInput.max = '20';
+    lwInput.step = '0.5';
+    lwInput.value = String(a.lineWidth != null ? a.lineWidth : 2);
+    lwInput.addEventListener('change', () => {
+      const n = Number(lwInput.value);
+      if (!Number.isFinite(n) || n < 0.5 || n > 20) { lwInput.value = String(a.lineWidth || 2); return; }
+      pushUndo();
+      a.lineWidth = n;
+      renderAnnotations();
+      updateSaveAnnotState();
+    });
+    const lwSpan = document.createElement('span');
+    lwSpan.textContent = 'Width';
+    lwWrap.append(lwInput, lwSpan);
+    row1.appendChild(lwWrap);
+  }
+
+  // Font size (text only).
+  if (a.type === 'text') {
+    const fsWrap = document.createElement('label');
+    fsWrap.className = 'annot-props-field';
+    fsWrap.title = 'Font size (pt)';
+    const fsInput = document.createElement('input');
+    fsInput.type = 'number';
+    fsInput.min = '6';
+    fsInput.max = '144';
+    fsInput.step = '1';
+    fsInput.value = String(a.fontSize || 14);
+    fsInput.addEventListener('change', () => {
+      const n = Number(fsInput.value);
+      if (!Number.isFinite(n) || n < 6 || n > 144) { fsInput.value = String(a.fontSize || 14); return; }
+      pushUndo();
+      a.fontSize = n;
+      renderAnnotations();
+      updateSaveAnnotState();
+    });
+    const fsSpan = document.createElement('span');
+    fsSpan.textContent = 'Size';
+    fsWrap.append(fsInput, fsSpan);
+    row1.appendChild(fsWrap);
+  }
+
+  // Dash style (rect/oval/line/arrow/ink — not text/image/redact/link).
+  if (['rect', 'oval', 'line', 'arrow', 'ink'].includes(a.type)) {
+    const dashWrap = document.createElement('label');
+    dashWrap.className = 'annot-props-field';
+    dashWrap.title = 'Stroke style';
+    const dashSel = document.createElement('select');
+    [['solid', '—  solid'], ['dashed', '- - dashed'], ['dotted', '· · dotted']]
+      .forEach(([v, label]) => {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = label;
+        if ((a.dash || 'solid') === v) o.selected = true;
+        dashSel.appendChild(o);
+      });
+    dashSel.addEventListener('change', () => {
+      pushUndo();
+      a.dash = dashSel.value;
+      renderAnnotations();
+      updateSaveAnnotState();
+    });
+    dashWrap.appendChild(dashSel);
+    row1.appendChild(dashWrap);
+  }
+
+  // Link destination page.
+  if (a.type === 'link') {
+    const destWrap = document.createElement('label');
+    destWrap.className = 'annot-props-field';
+    destWrap.title = 'Destination page';
+    const destInput = document.createElement('input');
+    destInput.type = 'number';
+    destInput.min = '1';
+    destInput.max = String(Math.max(1, totalPages));
+    destInput.step = '1';
+    destInput.value = String((a.destPage != null ? a.destPage : 0) + 1);
+    destInput.addEventListener('change', () => {
+      const n = parseInt(destInput.value, 10);
+      if (!Number.isFinite(n) || n < 1 || n > totalPages) {
+        destInput.value = String((a.destPage != null ? a.destPage : 0) + 1);
+        return;
+      }
+      pushUndo();
+      a.destPage = n - 1;
+      renderAnnotations();
+      updateSaveAnnotState();
+    });
+    const destSpan = document.createElement('span');
+    destSpan.textContent = 'Page';
+    destWrap.append(destInput, destSpan);
+    row1.appendChild(destWrap);
+  }
+
+  panel.appendChild(row1);
+
+  // Second row: opacity slider, delete button.
+  const row2 = document.createElement('div');
+  row2.className = 'annot-props-row';
+
+  // Opacity slider (highlight, link, or any annotation).
+  if (a.type !== 'image' && a.type !== 'ink') {
+    const opWrap = document.createElement('label');
+    opWrap.className = 'annot-props-field annot-props-opacity';
+    opWrap.title = 'Opacity';
+    const opInput = document.createElement('input');
+    opInput.type = 'range';
+    opInput.min = '0';
+    opInput.max = '100';
+    opInput.step = '1';
+    opInput.value = String(Math.round((a.alpha != null ? a.alpha : 1) * 100));
+    opInput.style.flex = '1';
+    opInput.addEventListener('input', () => {
+      a.alpha = clamp(Number(opInput.value), 0, 100) / 100;
+      renderAnnotations();
+    });
+    opInput.addEventListener('change', () => {
+      pushUndo();
+      updateSaveAnnotState();
+    });
+    const opSpan = document.createElement('span');
+    opSpan.textContent = `${opInput.value}%`;
+    opInput.addEventListener('input', () => { opSpan.textContent = `${opInput.value}%`; });
+    opWrap.append(opInput, opSpan);
+    row2.appendChild(opWrap);
+  }
+
+  // Delete button.
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'annot-props-del';
+  delBtn.textContent = '✕';
+  delBtn.title = 'Delete (Del)';
+  delBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    deleteSelectedAnnot();
+  });
+  delBtn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+  row2.appendChild(delBtn);
+
+  panel.appendChild(row2);
+
+  // Prevent panel clicks from deselecting the annotation.
+  panel.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+  annotHtml.appendChild(panel);
+}
+
+function drawHandle(a, px, py, name) {
+  const h = svgEl('rect');
+  h.setAttribute('x', px - HANDLE);
+  h.setAttribute('y', py - HANDLE);
+  h.setAttribute('width', HANDLE * 2);
+  h.setAttribute('height', HANDLE * 2);
+  h.setAttribute('fill', '#fff');
+  h.setAttribute('stroke', '#007bff');
+  h.setAttribute('stroke-width', '1.5');
+  h.classList.add('annot-handle');
+  h.dataset.annotId = a.id;
+  h.dataset.handle = name;
+  h.style.cursor = handleCursor(name);
+  annotSvg.appendChild(h);
+}
+
+// Snapshot of the annotation geometry needed to compute the post-resize state.
+// Storing this in annotResizeState means we don't have to read live values
+// during a drag (which would compound round-off errors).
+function captureResizeState(a) {
+  if (a.type === 'line' || a.type === 'arrow') {
+    return { type: a.type, x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2 };
+  }
+  if (a.type === 'ink') {
+    return { type: a.type, points: a.points.map((p) => ({ x: p.x, y: p.y })) };
+  }
+  return { type: a.type, x: a.x, y: a.y, w: a.w, h: a.h };
+}
+
+function applyResize(a, pre, handle, dx, dy) {
+  // dx, dy are in PDF points.
+  if (a.type === 'line' || a.type === 'arrow') {
+    if (handle === 'start') {
+      a.x1 = pre.x1 + dx; a.y1 = pre.y1 + dy;
+    } else if (handle === 'end') {
+      a.x2 = pre.x2 + dx; a.y2 = pre.y2 + dy;
+    }
+    return;
+  }
+  if (a.type === 'ink') {
+    // Scale all points proportionally to the new bbox.
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (const p of pre.points) {
+      if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
+      if (p.y < miny) miny = p.y; if (p.y > maxy) maxy = p.y;
+    }
+    const preW = maxx - minx || 1;
+    const preH = maxy - miny || 1;
+    let nx = pre.x, ny = pre.y, nw = pre.w, nh = pre.h;
+    if (handle.includes('e')) nw = pre.w + dx;
+    if (handle.includes('w')) { nx = pre.x + dx; nw = pre.w - dx; }
+    if (handle.includes('s')) nh = pre.h + dy;
+    if (handle.includes('n')) { ny = pre.y + dy; nh = pre.h - dy; }
+    const sx = nw / preW, sy = nh / preH;
+    a.points = pre.points.map((p) => ({
+      x: nx + (p.x - minx) * sx,
+      y: ny + (p.y - miny) * sy,
+    }));
+    a.x = nx; a.y = ny; a.w = nw; a.h = nh;
+    return;
+  }
+  // Bbox-based: standard 8-handle resize.
+  let nx = pre.x, ny = pre.y, nw = pre.w, nh = pre.h;
+  if (handle.includes('e')) nw = pre.w + dx;
+  if (handle.includes('w')) { nx = pre.x + dx; nw = pre.w - dx; }
+  if (handle.includes('s')) nh = pre.h + dy;
+  if (handle.includes('n')) { ny = pre.y + dy; nh = pre.h - dy; }
+  // Clamp to a minimum size so an annotation can't be resized below 2 pt.
+  if (nw < 2) { nw = 2; if (handle.includes('w')) nx = pre.x + pre.w - 2; }
+  if (nh < 2) { nh = 2; if (handle.includes('n')) ny = pre.y + pre.h - 2; }
+  a.x = nx; a.y = ny; a.w = nw; a.h = nh;
+}
+
+function annotHandlePointerDown(e, a, handle) {
+  if (!annotEditingEnabled() || annotTool !== 'select') return;
+  e.stopPropagation();
+  e.preventDefault();
+  const pre = captureResizeState(a);
+  let moved = false;
+  let last = annotPointerPos(e);
+  const onMove = (ev) => {
+    const pos = annotPointerPos(ev);
+    const dx = (pos.x - last.x) / getPageScale();
+    const dy = -(pos.y - last.y) / getPageScale();
+    if (dx !== 0 || dy !== 0) moved = true;
+    applyResize(a, pre, handle, dx, dy);
+    last = pos;
+    renderAnnotations();
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    if (moved) {
+      // Push the pre-resize snapshot to the undo stack manually (we already
+      // mutated the annotation in place).
+      undoStack.push(snapshotState());
+      if (undoStack.length > MAX_UNDO) undoStack.shift();
+      redoStack.length = 0;
+      updateUndoRedoButtons();
+    }
+    updateSaveAnnotState();
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
 }
 
 function applyShapeStyle(el, a, col, scale) {
@@ -2329,6 +3259,8 @@ function applyShapeStyle(el, a, col, scale) {
     el.setAttribute('stroke', col);
     el.setAttribute('stroke-width', Math.max(1, a.lineWidth * scale));
   }
+  const da = dashToStrokeDasharray(a.dash);
+  if (da && !a.filled) el.setAttribute('stroke-dasharray', da);
 }
 
 function drawTextBox(a) {
@@ -2372,6 +3304,7 @@ function startDraft(e) {
     color: isRedact ? { r: 0, g: 0, b: 0 } : color,
     alpha: annotTool === 'highlight' ? 0.4 : 1,
     lineWidth: 2,
+    dash: 'solid',
     filled: isRedact || (annotFillShapes && (annotTool === 'rect' || annotTool === 'oval')),
     _start: pdf,
   };
@@ -2392,6 +3325,7 @@ function startTextBox(e) {
   const pdf = screenToPdf(pos.x, pos.y);
   const scale = getPageScale();
   const h = 20 / scale, w = 140 / scale;
+  pushUndo();
   const a = {
     id: annotIdCounter++, type: 'text',
     x: pdf.x, y: pdf.y - h, w, h,
@@ -2439,7 +3373,7 @@ async function loadStampImage(file) {
     Module._nanopdf_free(ptr);
     if (id < 0) {
       setStatus('Could not load image: ' +
-        Module.UTF8ToString(Module._nanopdf_get_last_error()), true);
+        wasmLastError(), true);
       return;
     }
     pendingStampImage = { imageId: id, dataURL, aspect };
@@ -2513,10 +3447,29 @@ function annotLayerPointerUp(e) {
     setAnnotTool('select');
   } else keep = d.w > 2 && d.h > 2;
   if (keep) {
+    pushUndo();
     delete d._start;
     delete d._aspect;
+    if (d.type === 'link') {
+      // Prompt for the destination page. Default to the current page + 1.
+      const defaultPage = Math.min(totalPages, currentPage + 2);
+      const raw = window.prompt(
+        `Link destination page (1–${totalPages}, or 0 to cancel):`,
+        String(defaultPage),
+      );
+      if (raw === null) { renderAnnotations(); return; }
+      const n = parseInt(raw, 10);
+      if (!Number.isFinite(n) || n < 1 || n > totalPages) {
+        setStatus('Link cancelled (invalid page)', 'info');
+        renderAnnotations();
+        return;
+      }
+      d.destPage = n - 1;
+      d.alpha = 0.18;        // light tint so the underlying text shows through
+    }
     pageAnnots().push(d);
     selectedAnnotId = d.id;
+    if (d.type === 'link') setAnnotTool('select');
   }
   renderAnnotations();
   updateSaveAnnotState();
@@ -2524,26 +3477,77 @@ function annotLayerPointerUp(e) {
 
 function annotShapePointerDown(e) {
   if (!annotEditingEnabled() || annotTool !== 'select') return;
+  // Handles take priority over the underlying shape.
+  const handle = e.target.closest('.annot-handle');
+  if (handle) {
+    const a = findAnnot(Number(handle.dataset.annotId));
+    if (a) annotHandlePointerDown(e, a, handle.dataset.handle);
+    return;
+  }
   const host = e.target.closest('[data-annot-id]');
   if (!host) return;
   e.stopPropagation();
   e.preventDefault();
+  // Single click on a link navigates to its destination (no drag, no modifier).
+  // Drag to move; modifier to enter the resize handles flow.
+  const hostAnnot = findAnnot(Number(host.dataset.annotId));
+  if (hostAnnot && hostAnnot.type === 'link' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    if (Number.isInteger(hostAnnot.destPage) && hostAnnot.destPage >= 0 &&
+        hostAnnot.destPage < totalPages) {
+      goToPage(hostAnnot.destPage);
+      setStatus(`Link → page ${hostAnnot.destPage + 1}`, 'info');
+      return;
+    }
+  }
   selectedAnnotId = Number(host.dataset.annotId);
   const a = findAnnot(selectedAnnotId);
   renderAnnotations();
   if (!a || a.type === 'text') return;  // text boxes move via their own element
+  // Capture the pre-drag snapshot; we'll commit to the undo stack on pointerup
+  // only if the annotation actually moved (so a no-op click doesn't pollute
+  // the history).
+  const preDrag = snapshotState();
+  let moved = false;
   let last = annotPointerPos(e);
   const onMove = (ev) => {
     const pos = annotPointerPos(ev);
     const dx = (pos.x - last.x) / getPageScale();
     const dy = -(pos.y - last.y) / getPageScale();
+    if (dx !== 0 || dy !== 0) moved = true;
     translateAnnot(a, dx, dy);
     last = pos;
     renderAnnotations();
   };
-  const onUp = () => {
+  const onUp = (ev) => {
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
+    // Drag-out-to-delete: if the user released outside the page bounds and
+    // we actually moved, delete the annotation. The pre-drag snapshot is
+    // pushed so Undo restores it.
+    const overCanvas = isPointInPageCanvas(ev.clientX, ev.clientY);
+    if (moved && !overCanvas) {
+      // Don't push the (preDrag) state — we'll add a fresh snapshot of the
+      // current state minus this annotation, so Undo brings it back. We do
+      // it now while the annotation is still in the list.
+      undoStack.push(snapshotState());
+      if (undoStack.length > MAX_UNDO) undoStack.shift();
+      const list = pageAnnots();
+      const idx = list.findIndex((x) => x.id === a.id);
+      if (idx >= 0) list.splice(idx, 1);
+      selectedAnnotId = null;
+      hoveredAnnotId = null;
+      renderAnnotations();
+      updateAnnotLayerMode();
+      updateSaveAnnotState();
+      setStatus('Annotation deleted (drag-out)', 'info');
+      return;
+    }
+    if (moved) {
+      undoStack.push(preDrag);
+      if (undoStack.length > MAX_UNDO) undoStack.shift();
+      redoStack.length = 0;
+      updateUndoRedoButtons();
+    }
     updateSaveAnnotState();
   };
   window.addEventListener('pointermove', onMove);
@@ -2555,8 +3559,10 @@ function deleteSelectedAnnot() {
   const list = pageAnnots();
   const i = list.findIndex((a) => a.id === selectedAnnotId);
   if (i >= 0) {
+    pushUndo();
     list.splice(i, 1);
     selectedAnnotId = null;
+    hoveredAnnotId = null;
     renderAnnotations();
     updateAnnotLayerMode();
     updateSaveAnnotState();
@@ -2599,6 +3605,7 @@ function loadFormFields() {
         checked: kind === 'checkbox' ? isCheckboxOn(f.value) : false,
         multiline: !!f.multiline,
         password: !!f.password,
+        required: !!f.required,
         options: Array.isArray(f.options) ? f.options : [],
         fontSize: 12,
       });
@@ -2606,46 +3613,122 @@ function loadFormFields() {
   }
 }
 
-function renderFormFields() {
-  annotHtml.querySelectorAll('.annot-formfield').forEach((n) => n.remove());
-  if (!Module || totalPages <= 0 || canvas.style.display !== 'block') return;
-  if (rotation !== 0) return;
-  const fields = formFieldsByPage[currentPage];
-  if (!fields) return;
-  for (const fld of fields) {
-    const box = pdfBoxToScreen({ x: fld.rect.x, y: fld.rect.y, w: fld.rect.width, h: fld.rect.height });
-    let input;
-    if (fld.kind === 'checkbox') {
-      input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = fld.checked;
-      input.addEventListener('change', () => { fld.checked = input.checked; updateSaveAnnotState(); });
-    } else if (fld.kind === 'choice') {
-      input = document.createElement('select');
-      for (const opt of fld.options) {
-        const o = document.createElement('option');
-        o.value = opt; o.textContent = opt;
-        if (opt === fld.value) o.selected = true;
-        input.appendChild(o);
+// Rendered form-field controls are cached per page so that re-renders driven
+// by zoom/rotation only reposition existing inputs (no DOM teardown). The
+// cache is keyed by page index; on page change we rebuild.
+let renderedFormFieldsPage = -1;
+let renderedFormFieldsKey = '';
+
+function buildFormFieldControl(fld) {
+  let input;
+  if (fld.kind === 'checkbox') {
+    input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = fld.checked;
+    // For checkboxes we can treat each change as one undo step.
+    input.addEventListener('change', () => {
+      pushUndo();
+      fld.checked = input.checked;
+      updateSaveAnnotState();
+    });
+  } else if (fld.kind === 'choice') {
+    input = document.createElement('select');
+    for (const opt of fld.options) {
+      const o = document.createElement('option');
+      o.value = opt; o.textContent = opt;
+      if (opt === fld.value) o.selected = true;
+      input.appendChild(o);
+    }
+    input.addEventListener('change', () => {
+      pushUndo();
+      fld.value = input.value;
+      updateSaveAnnotState();
+    });
+  } else {
+    input = document.createElement(fld.multiline ? 'textarea' : 'input');
+    if (!fld.multiline) input.type = fld.password ? 'password' : 'text';
+    input.value = fld.value;
+    // For text inputs we capture one undo snapshot per focus session; typing
+    // any number of characters collapses into a single undo step.
+    input.addEventListener('focus', () => {
+      formFieldEditSnapshot = snapshotState();
+    });
+    input.addEventListener('input', () => { fld.value = input.value; updateSaveAnnotState(); });
+    input.addEventListener('blur', () => {
+      // Only push if the value actually changed during this focus session.
+      if (formFieldEditSnapshot) {
+        const after = snapshotState();
+        if (JSON.stringify(formFieldEditSnapshot.formFields) !== JSON.stringify(after.formFields)) {
+          undoStack.push(formFieldEditSnapshot);
+          if (undoStack.length > MAX_UNDO) undoStack.shift();
+          redoStack.length = 0;
+          updateUndoRedoButtons();
+        }
+        formFieldEditSnapshot = null;
       }
-      input.addEventListener('change', () => { fld.value = input.value; updateSaveAnnotState(); });
-    } else {
-      input = document.createElement(fld.multiline ? 'textarea' : 'input');
-      if (!fld.multiline) input.type = fld.password ? 'password' : 'text';
-      input.value = fld.value;
-      input.addEventListener('input', () => { fld.value = input.value; updateSaveAnnotState(); });
-    }
-    input.className = 'annot-formfield';
-    input.style.left = box.left + 'px';
-    input.style.top = box.top + 'px';
-    input.style.width = Math.max(8, box.width) + 'px';
-    input.style.height = Math.max(12, box.height) + 'px';
-    if (fld.kind === 'text' || fld.kind === 'choice') {
-      input.style.fontSize = Math.max(8, Math.min(box.height * 0.7, 18)) + 'px';
-    }
-    input.title = fld.name;
-    annotHtml.appendChild(input);
+    });
   }
+  input.className = 'annot-formfield';
+  input.title = fld.name + (fld.required ? ' (required)' : '');
+  if (fld.required) {
+    input.classList.add('annot-formfield-required');
+    input.setAttribute('aria-required', 'true');
+    // Placeholder hint makes the requirement visible even before the user
+    // focuses the field. Use a non-intrusive marker.
+    if (input.tagName === 'INPUT' || input.tagName === 'TEXTAREA') {
+      if (!input.placeholder) input.placeholder = '(required)';
+      else if (!input.placeholder.includes('required')) input.placeholder += ' *';
+    }
+  }
+  return input;
+}
+
+function positionFormField(input, fld) {
+  const box = pdfBoxToScreen({ x: fld.rect.x, y: fld.rect.y, w: fld.rect.width, h: fld.rect.height });
+  input.style.left = box.left + 'px';
+  input.style.top = box.top + 'px';
+  input.style.width = Math.max(8, box.width) + 'px';
+  input.style.height = Math.max(12, box.height) + 'px';
+  if (fld.kind === 'text' || fld.kind === 'choice') {
+    input.style.fontSize = Math.max(8, Math.min(box.height * 0.7, 18)) + 'px';
+  }
+}
+
+function clearFormFieldControls() {
+  annotHtml.querySelectorAll('.annot-formfield').forEach((n) => n.remove());
+  renderedFormFieldsPage = -1;
+  renderedFormFieldsKey = '';
+}
+
+function renderFormFields() {
+  if (!Module || totalPages <= 0 || canvas.style.display !== 'block') return;
+  if (rotation !== 0) {
+    // Rotated pages can't show overlay controls; just drop the cache.
+    if (renderedFormFieldsPage !== -1) clearFormFieldControls();
+    return;
+  }
+  const fields = formFieldsByPage[currentPage];
+  if (!fields || !fields.length) {
+    if (renderedFormFieldsPage !== -1) clearFormFieldControls();
+    return;
+  }
+  // Build a stable key from field set (name + kind + rect) so a value-only
+  // edit reuses the DOM but a structural change (different fields shown)
+  // triggers a rebuild.
+  const key = fields.map((f) =>
+    `${f.name}|${f.kind}|${f.rect.x},${f.rect.y},${f.rect.width},${f.rect.height}|${f.multiline ? 1 : 0}|${f.password ? 1 : 0}|${(f.options || []).join('\u0001')}`
+  ).join('\n');
+  if (renderedFormFieldsPage !== currentPage || renderedFormFieldsKey !== key) {
+    clearFormFieldControls();
+    for (const fld of fields) {
+      annotHtml.appendChild(buildFormFieldControl(fld));
+    }
+    renderedFormFieldsPage = currentPage;
+    renderedFormFieldsKey = key;
+  }
+  // Reposition on every call (zoom / rotation 0).
+  const inputs = annotHtml.querySelectorAll('.annot-formfield');
+  for (let i = 0; i < fields.length; i++) positionFormField(inputs[i], fields[i]);
 }
 
 // Save filled form fields as a real editable PDF via incremental update.
@@ -2656,13 +3739,17 @@ async function saveEditableForm() {
   }
   showLoading('Saving filled form...');
   await new Promise((r) => setTimeout(r, 30));
+  // Track every WASM allocation we make so a throw from any WASM call
+  // (e.g. form_save failing) still frees them in the finally block.
+  const alloced = [];
+  const freeAll = () => { for (const p of alloced) if (p) Module._free(p); };
   try {
     const ptr = Module._nanopdf_malloc(currentPdfBytes.length);
     Module.HEAPU8.set(currentPdfBytes, ptr);
     const ok = Module._nanopdf_form_load(ptr, currentPdfBytes.length);
     Module._nanopdf_free(ptr);
     if (ok !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load form');
+      throw new Error(wasmLastError() || 'Failed to load form');
     }
     // A field can have widgets on multiple pages; set each unique field once.
     const done = new Set();
@@ -2673,31 +3760,32 @@ async function saveEditableForm() {
         if (done.has(key)) continue;
         done.add(key);
         const namePtr = Module.stringToNewUTF8(f.name);
+        alloced.push(namePtr);
         if (f.kind === 'text') {
           const vp = Module.stringToNewUTF8(f.value || '');
+          alloced.push(vp);
           if (Module._nanopdf_form_set_text(namePtr, vp)) count++;
-          Module._free(vp);
         } else if (f.kind === 'checkbox') {
           if (Module._nanopdf_form_set_checkbox(namePtr, f.checked ? 1 : 0)) count++;
         } else if (f.kind === 'choice') {
           const vp = Module.stringToNewUTF8(f.value || '');
+          alloced.push(vp);
           if (Module._nanopdf_form_set_choice(namePtr, vp)) count++;
-          Module._free(vp);
         }
-        Module._free(namePtr);
       }
     }
     if (Module._nanopdf_form_save() !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Form save failed');
+      throw new Error(wasmLastError() || 'Form save failed');
     }
     const out = copyWasmBuffer(Module._nanopdf_form_get_buffer, Module._nanopdf_form_get_size);
     if (!out) throw new Error('Empty form output');
     downloadNamedPdf(out, fileName.replace(/\.pdf$/i, '') + '_filled.pdf');
-    setStatus(`Saved editable filled form (${count} field(s))`);
+    setStatus(`Saved editable filled form (${count} field(s))`, 'success');
   } catch (err) {
     setStatus('Form save error: ' + err.message, true);
     console.error(err);
   } finally {
+    freeAll();
     hideLoading();
   }
 }
@@ -2724,18 +3812,23 @@ function updateSaveAnnotState() {
     const ed = docLoaded && Module && Module._nanopdf_edit_load && editableMarkupCount().supported > 0;
     saveEditableBtn.disabled = !ed;
   }
+  // Marks tab is the canonical list; rebuild it when the doc set changes.
+  if (activeSidebarTab === 'marks' && sidebarContent) renderMarksTab();
 }
 
 function resetAnnotations() {
   annotations = {};
   formFieldsByPage = {};
   selectedAnnotId = null;
+  hoveredAnnotId = null;
   annotDraft = null;
   pendingStampImage = null;
   annotIdCounter = 1;
   setAnnotTool('select');
   if (annotHtml) clearChildren(annotHtml);
   if (annotSvg) clearChildren(annotSvg);
+  renderedFormFieldsPage = -1;
+  renderedFormFieldsKey = '';
 }
 
 function renderCurrentPage() {
@@ -2763,8 +3856,7 @@ function renderCurrentPage() {
   const dpr = window.devicePixelRatio || 1;
   // Cap maximum render dimensions (device px) to avoid WASM memory issues.
   const maxDim = 4096;
-  const width = Math.min(maxDim, Math.round(cssWidth * dpr));
-  const height = Math.min(maxDim, Math.round(cssHeight * dpr));
+  const { width, height } = computeRenderSize(pageWidth, pageHeight, effectiveScale * dpr, maxDim);
 
   canvas.width = width;
   canvas.height = height;
@@ -2775,30 +3867,18 @@ function renderCurrentPage() {
 
   const dpi = 72 * (width / pageWidth);
 
-  let result;
-  try {
-    result = Module._nanopdf_render_page(currentPage, width, height, dpi);
-  } catch (e) {
-    console.error('Render crashed:', e);
-    setStatus('Render error: WASM memory issue', true);
+  const result = renderPageIntoImageData(Module, currentPage, width, height, dpi);
+  if (!result.ok || !result.imageData) {
+    setStatus('Render error: ' + (result.error || 'unknown'), true);
     return;
   }
 
-  if (result !== 1) {
-    const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
-    setStatus('Render error: ' + error, true);
-    return;
-  }
-
-  const bufferPtr = Module._nanopdf_get_render_buffer();
-  const bufferSize = Module._nanopdf_get_render_buffer_size();
-  const renderWidth = Module._nanopdf_get_render_width();
-  const renderHeight = Module._nanopdf_get_render_height();
+  const { data, w: renderWidth, h: renderHeight } = result.imageData;
+  mainRenderCounter++;
 
   const ctx = canvas.getContext('2d');
   const imageData = ctx.createImageData(renderWidth, renderHeight);
-  const srcData = new Uint8ClampedArray(Module.HEAPU8.buffer, bufferPtr, bufferSize);
-  imageData.data.set(srcData);
+  imageData.data.set(data);
   ctx.putImageData(imageData, 0, 0);
 
   emptyState.style.display = 'none';
@@ -2812,7 +3892,9 @@ function renderCurrentPage() {
   renderFormFields();
 
   const zoomPct = Math.round(zoomLevel * 100);
-  setStatus(`Page ${currentPage + 1} / ${totalPages} | ${backendLabel(renderBackend)} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}`);
+  if (shouldRenderPageStatus(Date.now(), operationStatusHoldUntil)) {
+    setStatus(`Page ${currentPage + 1} / ${totalPages} | ${backendLabel(renderBackend)} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}`);
+  }
   statusRight.textContent = fileName;
 
   if (activeSidebarTab === 'info') renderInfoTab();
@@ -2828,15 +3910,15 @@ function renderTextPanel() {
   let body = '', title = 'Extracted Text';
   if (textPanelFormat === 'md') {
     title = 'Markdown';
-    body = Module.UTF8ToString(Module._nanopdf_page_to_markdown(currentPage)) || '(No text extracted)';
+    body = readWasmString(Module, Module._nanopdf_page_to_markdown(currentPage)) || '(No text extracted)';
   } else if (textPanelFormat === 'tables') {
     title = 'Tables (CSV)';
     body = Module._nanopdf_extract_tables
-      ? Module.UTF8ToString(Module._nanopdf_extract_tables(currentPage, 0))
+      ? readWasmString(Module, Module._nanopdf_extract_tables(currentPage, 0))
       : '';
     if (!body) body = '(No tables detected on this page)';
   } else {
-    body = Module.UTF8ToString(Module._nanopdf_extract_text(currentPage)) || '(No text extracted)';
+    body = readWasmString(Module, Module._nanopdf_extract_text(currentPage)) || '(No text extracted)';
   }
   const titleEl = document.getElementById('text-panel-title');
   if (titleEl) titleEl.textContent = `${title} — page ${currentPage + 1}`;
@@ -2886,7 +3968,7 @@ function performSearch(term) {
   const termPtr = Module.stringToNewUTF8(term);
   const pagesPtr = Module.stringToNewUTF8('all');
   const resultPtr = Module._nanopdf_search_text
-    ? Module._nanopdf_search_text(termPtr, pagesPtr, 0, 0, -1)
+    ? Module._nanopdf_search_text(termPtr, pagesPtr, searchCaseSensitive ? 1 : 0, 0, -1)
     : Module._nanopdf_batch_find_text(termPtr, pagesPtr);
   const resultStr = Module.UTF8ToString(resultPtr);
   Module._free(termPtr);
@@ -2930,6 +4012,23 @@ function performSearch(term) {
   } catch (e) {
     console.error('Search parse error:', e);
   }
+  // The legacy _nanopdf_batch_find_text path is case-insensitive only;
+  // filter on the client when the user opts into case-sensitive search so
+  // the WASM-new and WASM-old build paths behave the same way.
+  if (searchCaseSensitive && searchResults.length > 0) {
+    const t = currentSearchTerm;
+    searchResults = searchResults.filter((r) => {
+      const text = (r.context || '').toLowerCase();
+      // Cheap heuristic: if the lowercased term is the term itself the
+      // filter is a no-op (we'd keep everything). Otherwise the term has
+      // some uppercase letter, so check that *some* position in the page
+      // text contains the exact-case term. We don't have page text here,
+      // so fall back to dropping matches whose context doesn't contain
+      // the term case-sensitively.
+      if (t && (r.context || '').includes(t)) return true;
+      return false;
+    });
+  }
 
   if (searchResults.length > 0) {
     currentSearchIndex = 0;
@@ -2938,11 +4037,15 @@ function performSearch(term) {
       goToPage(firstPage);
     }
     updateSearchInfo();
+    renderSearchPageChips();
+    showSearchResultsDropdown();
     searchPrevBtn.disabled = false;
     searchNextBtn.disabled = false;
     renderTextOverlay();
   } else {
     searchInfo.textContent = 'No matches';
+    renderSearchPageChips();
+    hideSearchResultsDropdown();
     searchPrevBtn.disabled = true;
     searchNextBtn.disabled = true;
     renderTextOverlay();
@@ -2957,6 +4060,104 @@ function updateSearchInfo() {
   searchInfo.textContent = `${currentSearchIndex + 1} / ${searchResults.length}`;
 }
 
+// Compact page-jump strip under the search bar. One chip per page that
+// has at least one match; the current page's chip is highlighted. Capped
+// at 60 chips to keep the toolbar from overflowing on huge docs.
+function renderSearchPageChips() {
+  if (!searchPages) return;
+  searchPages.replaceChildren();
+  if (searchResults.length === 0) {
+    searchPages.classList.add('hidden');
+    return;
+  }
+  // Group results by page and count.
+  const byPage = new Map();
+  for (const r of searchResults) {
+    byPage.set(r.page, (byPage.get(r.page) || 0) + 1);
+  }
+  const pages = [...byPage.keys()].sort((a, b) => a - b);
+  const cap = 60;
+  const visible = pages.length > cap ? pages.slice(0, cap) : pages;
+  for (const p of visible) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'search-page-chip';
+    if (p === currentPage) chip.classList.add('current');
+    chip.textContent = `${p + 1}${byPage.get(p) > 1 ? ` (${byPage.get(p)})` : ''}`;
+    chip.title = `Page ${p + 1} — ${byPage.get(p)} match${byPage.get(p) === 1 ? '' : 'es'}`;
+    chip.addEventListener('click', () => {
+      // Jump to the first match on that page (preserve next/prev flow).
+      const idx = searchResults.findIndex((r) => r.page === p);
+      if (idx >= 0) {
+        currentSearchIndex = idx;
+        if (p !== currentPage) goToPage(p);
+        updateSearchInfo();
+        renderTextOverlay();
+      }
+    });
+    searchPages.appendChild(chip);
+  }
+  if (pages.length > cap) {
+    const more = document.createElement('span');
+    more.className = 'search-page-more';
+    more.textContent = `+${pages.length - cap} more`;
+    searchPages.appendChild(more);
+  }
+  searchPages.classList.remove('hidden');
+}
+
+// Floating dropdown of the top N matches with surrounding context. Click a row
+// to jump straight to that match. Hidden by default; only shown when the
+// search input is focused or has results and the user is typing.
+const searchResultsEl = document.getElementById('search-results');
+const SEARCH_RESULTS_CAP = 12;
+
+function showSearchResultsDropdown() {
+  if (!searchResultsEl) return;
+  if (searchResults.length === 0 || !currentSearchTerm) {
+    searchResultsEl.classList.add('hidden');
+    searchResultsEl.replaceChildren();
+    return;
+  }
+  const cap = Math.min(SEARCH_RESULTS_CAP, searchResults.length);
+  searchResultsEl.replaceChildren();
+  for (let i = 0; i < cap; i++) {
+    const r = searchResults[i];
+    const row = document.createElement('div');
+    row.className = 'search-result-row';
+    row.setAttribute('role', 'option');
+    row.dataset.idx = String(i);
+    const pageLabel = document.createElement('span');
+    pageLabel.className = 'search-result-page';
+    pageLabel.textContent = `p.${r.page + 1}`;
+    const ctx = document.createElement('span');
+    ctx.className = 'search-result-ctx';
+    ctx.innerHTML = highlightContext(r.context || '…', currentSearchTerm);
+    row.append(pageLabel, ctx);
+    row.addEventListener('click', () => {
+      currentSearchIndex = i;
+      if (r.page !== currentPage) goToPage(r.page);
+      updateSearchInfo();
+      renderSearchPageChips();
+      renderTextOverlay();
+      hideSearchResultsDropdown();
+      searchInput.focus();
+    });
+    searchResultsEl.appendChild(row);
+  }
+  if (searchResults.length > cap) {
+    const more = document.createElement('div');
+    more.className = 'search-result-more';
+    more.textContent = `+${searchResults.length - cap} more — use ↑ / ↓ / Enter`;
+    searchResultsEl.appendChild(more);
+  }
+  searchResultsEl.classList.remove('hidden');
+}
+function hideSearchResultsDropdown() {
+  if (!searchResultsEl) return;
+  searchResultsEl.classList.add('hidden');
+}
+
 function nextSearchResult() {
   if (searchResults.length === 0) return;
   currentSearchIndex = (currentSearchIndex + 1) % searchResults.length;
@@ -2965,6 +4166,7 @@ function nextSearchResult() {
     goToPage(result.page);
   }
   updateSearchInfo();
+  renderSearchPageChips();
   renderTextOverlay();
 }
 
@@ -2976,6 +4178,7 @@ function prevSearchResult() {
     goToPage(result.page);
   }
   updateSearchInfo();
+  renderSearchPageChips();
   renderTextOverlay();
 }
 
@@ -3088,6 +4291,7 @@ function markupSelection(kind) {
   const page = currentSelection.page != null ? currentSelection.page : currentPage;
   const color = hexToRgb(annotColorHex);
   const list = (annotations[page] = annotations[page] || []);
+  pushUndo();
   // markupKind + quad tag the annotation so "Save Editable" can write it as a
   // real text-markup PDF annotation; the visual shape (line/ink) is unchanged.
   for (const q of quads) {
@@ -3190,7 +4394,7 @@ async function loadPDF(arrayBuffer, name) {
     Module._nanopdf_free(ptr);
 
     if (totalPages <= 0) {
-      const error = Module.UTF8ToString(Module._nanopdf_get_last_error());
+      const error = wasmLastError();
       throw new Error(error || 'Failed to load PDF');
     }
 
@@ -3234,7 +4438,17 @@ async function loadPDF(arrayBuffer, name) {
     searchResults = [];
     currentSearchIndex = -1;
     currentSearchTerm = '';
+    outlineFilter = '';
+    marksFilter = '';
+    userBookmarks = [];
+    clearUndoHistory();
     currentSelection = null;
+    // Start an auto-recovery stash for this document. Clear any prior
+    // stashes first so we only ever persist the most recent file.
+    clearRecovery().finally(() => {
+      recoveryActiveName = name;
+      scheduleRecoverySave();
+    });
     selectionStartPoint = null;
     selectionDragBox = null;
     searchInput.value = '';
@@ -3252,10 +4466,13 @@ async function loadPDF(arrayBuffer, name) {
     extractBtn.disabled = false;
     prevBtn.disabled = false;
     nextBtn.disabled = false;
+    if (bookmarkBtn) bookmarkBtn.disabled = !(totalPages > 0);
     sidebarToggleBtn.disabled = false;
     searchInput.disabled = false;
+    if (searchCaseToggle) searchCaseToggle.disabled = false;
     zoomInBtn.disabled = !hasRendering;
     zoomOutBtn.disabled = !hasRendering;
+    if (zoomSlider) zoomSlider.disabled = !hasRendering;
     fitModeBtn.disabled = !hasRendering;
     rotateBtn.disabled = !hasRendering;
     updateExportButton();
@@ -3773,7 +4990,8 @@ function bakeFormFieldsForWorkPage(workIndex, pageIndex) {
 }
 
 function pageHasBakeableContent(pageIndex) {
-  if (annotations[pageIndex] && annotations[pageIndex].length) return true;
+  // Links are viewer-only; they don't get baked into a flattened export.
+  if (annotations[pageIndex] && annotations[pageIndex].some((a) => a.type !== 'link')) return true;
   const fields = formFieldsByPage[pageIndex];
   return !!(fields && fields.some((f) => formFieldBaked(f)));
 }
@@ -3814,7 +5032,7 @@ async function exportViaWasm(pages, { protect, suffix }) {
     docId = Module._nanopdf_doc_load(ptr, currentPdfBytes.length);
     Module._nanopdf_free(ptr);
     if (docId < 0) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) ||
+      throw new Error(wasmLastError() ||
         'Failed to load source document for export');
     }
 
@@ -3822,7 +5040,7 @@ async function exportViaWasm(pages, { protect, suffix }) {
     pages.forEach((pageIdx) => {
       const workIndex = Module._nanopdf_work_add_page(docId, pageIdx);
       if (workIndex < 0) {
-        throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) ||
+        throw new Error(wasmLastError() ||
           `Failed to add page ${pageIdx + 1}`);
       }
       Module._nanopdf_annot_clear_page(workIndex);
@@ -3839,21 +5057,21 @@ async function exportViaWasm(pages, { protect, suffix }) {
       Module._free(userPtr);
       Module._free(ownerPtr);
       if (pr !== 1) {
-        throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) ||
+        throw new Error(wasmLastError() ||
           'Failed to configure password protection');
       }
     }
 
     const exportResult = Module._nanopdf_export_pdf();
     if (exportResult !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Export failed');
+      throw new Error(wasmLastError() || 'Export failed');
     }
 
     const outPtr = Module._nanopdf_export_get_buffer();
     const outSize = Module._nanopdf_export_get_size();
     const pdfBytes = new Uint8Array(Module.HEAPU8.buffer, outPtr, outSize).slice();
     downloadPdfBytes(pdfBytes, suffix || (protect ? 'protected' : 'annotated'), pages);
-    setStatus(`Exported ${pages.length} page(s)${protect ? ' (protected)' : ''}`);
+    setOperationStatus(`Exported ${pages.length} page(s)${protect ? ' (protected)' : ''}`, 'success');
     return true;
   } catch (err) {
     setStatus('Export error: ' + err.message, true);
@@ -3895,7 +5113,7 @@ async function combinePdfs(files) {
       addBytes(new Uint8Array(await f.arrayBuffer()));
     }
     if (Module._nanopdf_merge_finish() !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Merge failed');
+      throw new Error(wasmLastError() || 'Merge failed');
     }
     const out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
     if (!out) throw new Error('Empty merge output');
@@ -3926,7 +5144,7 @@ async function extractSelectedPages() {
     const ok = Module._nanopdf_split_pages(jsonPtr);
     Module._free(jsonPtr);
     if (ok !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Extract failed');
+      throw new Error(wasmLastError() || 'Extract failed');
     }
     const out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
     if (!out) throw new Error('Empty extract output');
@@ -3979,7 +5197,7 @@ async function saveEditableAnnotations() {
     const ok = Module._nanopdf_edit_load(ptr, currentPdfBytes.length);
     Module._nanopdf_free(ptr);
     if (ok !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Failed to load for editing');
+      throw new Error(wasmLastError() || 'Failed to load for editing');
     }
     let written = 0;
     for (const k in annotations) {
@@ -3999,7 +5217,7 @@ async function saveEditableAnnotations() {
       }
     }
     if (Module._nanopdf_edit_save() !== 1) {
-      throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Annotation save failed');
+      throw new Error(wasmLastError() || 'Annotation save failed');
     }
     const out = copyWasmBuffer(Module._nanopdf_edit_get_buffer, Module._nanopdf_edit_get_size);
     if (!out) throw new Error('Empty output');
@@ -4022,10 +5240,13 @@ async function saveAnnotatedPdf() {
   // Redaction must burn pixels client-side to truly remove text. Password
   // protection isn't applied on that path, so prefer security when both are set.
   if (docHasRedaction()) {
-    if (protectExport.checked) {
-      setStatus('Redaction is applied without password protection (security takes priority)', false);
-    }
-    await saveFlattenedPdf(pages, 'redacted');
+    await saveFlattenedPdf(
+      pages,
+      'redacted',
+      protectExport.checked
+        ? `Saved redacted PDF without password protection (${pages.length} page(s))`
+        : null,
+    );
     return;
   }
   await exportViaWasm(pages, { protect: protectExport.checked, suffix: 'annotated' });
@@ -4126,27 +5347,22 @@ function flattenOnePageToImagePdf(pageIdx, imgCache) {
   const pw = Module._nanopdf_get_page_width(pageIdx);
   const ph = Module._nanopdf_get_page_height(pageIdx);
   const scale = 150 / 72;
-  const width = Math.min(4096, Math.floor(pw * scale));
-  const height = Math.min(4096, Math.floor(ph * scale));
+  const { width, height } = computeRenderSize(pw, ph, scale, 4096);
   const dpi = 72 * (width / pw);
-  let ok = 0;
-  try { ok = Module._nanopdf_render_page(pageIdx, width, height, dpi); } catch (e) { return null; }
-  if (ok !== 1) return null;
-  const bufPtr = Module._nanopdf_get_render_buffer();
-  const bufSize = Module._nanopdf_get_render_buffer_size();
-  const rw = Module._nanopdf_get_render_width();
-  const rh = Module._nanopdf_get_render_height();
+  const result = renderPageIntoImageData(Module, pageIdx, width, height, dpi);
+  if (!result.ok || !result.imageData) return null;
+  const { data, w: rw, h: rh } = result.imageData;
   const cvs = document.createElement('canvas');
   cvs.width = rw; cvs.height = rh;
   const ctx = cvs.getContext('2d');
   const imageData = ctx.createImageData(rw, rh);
-  imageData.data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, bufPtr, bufSize));
+  imageData.data.set(data);
   ctx.putImageData(imageData, 0, 0);
   flattenAnnotationsToCanvas(ctx, pageIdx, rw / pw, ph, imgCache);  // burns redaction
   return buildPdf([{ jpegBytes: canvasToJpegBytes(cvs), imgWidth: rw, imgHeight: rh, pageWidth: pw, pageHeight: ph }]);
 }
 
-// Extract a contiguous run of original pages as a vector PDF (Uint8Array).
+// Extract original pages as a vector PDF (Uint8Array), preserving requested order.
 function extractVectorRun(indices) {
   if (!indices.length) return null;
   const jp = Module.stringToNewUTF8('[' + indices.join(',') + ']');
@@ -4159,7 +5375,7 @@ function extractVectorRun(indices) {
 // Save with annotations baked in, rasterizing ONLY the pages that actually have
 // annotations / redaction; untouched pages are kept as vector. The result is
 // assembled by merging vector runs with single rasterized pages in order.
-async function saveFlattenedPdf(pages, suffix) {
+async function saveFlattenedPdf(pages, suffix, successMessage = null) {
   if (!Module || !hasRendering) return;
   showLoading(`Saving ${pages.length} page(s)...`);
   await new Promise((r) => setTimeout(r, 30));
@@ -4171,7 +5387,8 @@ async function saveFlattenedPdf(pages, suffix) {
     const flushVector = () => {
       if (!vectorRun.length) return;
       const b = extractVectorRun(vectorRun);   // uses + copies the merge buffer
-      if (b) parts.push(b);
+      if (!b) throw new Error(`Could not extract vector pages ${vectorRun.map(p => p + 1).join(', ')}`);
+      parts.push(b);
       vectorRun = [];
     };
     for (let idx = 0; idx < pages.length; idx++) {
@@ -4180,14 +5397,16 @@ async function saveFlattenedPdf(pages, suffix) {
       if (pageHasBakeableContent(p)) {
         flushVector();
         const img = flattenOnePageToImagePdf(p, imgCache);
-        if (img) { parts.push(img); flattened++; }
+        if (!img) throw new Error(`Could not render page ${p + 1}`);
+        parts.push(img);
+        flattened++;
       } else {
         vectorRun.push(p);
       }
       if (idx % 8 === 7) await new Promise((r) => setTimeout(r, 0));
     }
     flushVector();
-    if (!parts.length) { setStatus('Nothing to save', true); return; }
+    if (!parts.length) { setOperationStatus('Nothing to save', true); return false; }
 
     loadingText.textContent = 'Assembling PDF...';
     await new Promise((r) => setTimeout(r, 30));
@@ -4200,20 +5419,29 @@ async function saveFlattenedPdf(pages, suffix) {
       for (const b of parts) {
         const ptr = Module._nanopdf_malloc(b.length);
         Module.HEAPU8.set(b, ptr);
-        Module._nanopdf_merge_add_pdf(ptr, b.length);
+        const ok = Module._nanopdf_merge_add_pdf(ptr, b.length);
         Module._nanopdf_free(ptr);
+        if (ok !== 1) {
+          throw new Error(wasmLastError() || 'Merge input failed');
+        }
       }
       if (Module._nanopdf_merge_finish() !== 1) {
-        throw new Error(Module.UTF8ToString(Module._nanopdf_get_last_error()) || 'Merge failed');
+        throw new Error(wasmLastError() || 'Merge failed');
       }
       out = copyWasmBuffer(Module._nanopdf_merge_get_buffer, Module._nanopdf_merge_get_size);
     }
     if (!out) throw new Error('Empty output');
     downloadPdfBytes(out, suffix || 'flattened', pages);
-    setStatus(`Saved ${pages.length} page(s) — ${flattened} rasterized, ${pages.length - flattened} kept vector`);
+    setOperationStatus(
+      successMessage ||
+        `Saved ${pages.length} page(s) — ${flattened} rasterized, ${pages.length - flattened} kept vector`,
+      'success',
+    );
+    return true;
   } catch (err) {
-    setStatus('Save error: ' + err.message, true);
+    setOperationStatus('Save error: ' + err.message, true);
     console.error(err);
+    return false;
   } finally {
     hideLoading();
     renderCurrentPage();
@@ -4232,16 +5460,30 @@ async function exportSelectedPages() {
 
   const pages = [...selectedPages].sort((a, b) => a - b);
 
-  // Redaction on any selected page requires the secure client-side burn.
   const hasRedaction = pages.some((p) => (annotations[p] || []).some((a) => a.type === 'redact'));
-  if (hasRedaction && !protectExport.checked) {
-    await saveFlattenedPdf(pages, 'redacted');
+  const hasBakeable = pages.some(pageHasBakeableContent);
+  const route = chooseSelectedExportRoute({
+    hasRedaction,
+    protect: protectExport.checked,
+    hasBakeable,
+    canSplit: !!Module._nanopdf_split_pages,
+  });
+
+  // Redaction on any selected page requires the secure client-side burn.
+  if (route === 'burn-redaction') {
+    await saveFlattenedPdf(
+      pages,
+      'redacted',
+      protectExport.checked
+        ? `Exported redacted PDF without password protection (${pages.length} page(s))`
+        : null,
+    );
     return;
   }
+
   // Route through the C++ flatten path when encryption is requested or any
   // selected page carries annotations / form-field fills, so they get baked in.
-  const hasBakeable = pages.some(pageHasBakeableContent);
-  if (protectExport.checked || hasBakeable) {
+  if (route === 'wasm-flatten') {
     await exportViaWasm(pages, {
       protect: protectExport.checked,
       suffix: protectExport.checked ? 'protected_pages' : 'pages',
@@ -4250,80 +5492,25 @@ async function exportSelectedPages() {
     return;
   }
 
-  showLoading(`Exporting ${pages.length} page(s)...`);
-
-  // Small delay so loading overlay can render
-  await new Promise(r => setTimeout(r, 50));
-
-  const pageImages = [];
-
-  for (let idx = 0; idx < pages.length; idx++) {
-    const pageIdx = pages[idx];
-    loadingText.textContent = `Rendering page ${idx + 1} / ${pages.length}...`;
-
-    const pw = Module._nanopdf_get_page_width(pageIdx);
-    const ph = Module._nanopdf_get_page_height(pageIdx);
-
-    // Render at 150 DPI (2x 72 DPI) for good quality
-    const scale = 150 / 72;
-    const width = Math.min(4096, Math.floor(pw * scale));
-    const height = Math.min(4096, Math.floor(ph * scale));
-    const dpi = 72 * (width / pw);
-
-    let result;
+  if (route === 'vector-split') {
+    showLoading(`Exporting ${pages.length} page(s)...`);
+    await new Promise(r => setTimeout(r, 30));
     try {
-      result = Module._nanopdf_render_page(pageIdx, width, height, dpi);
-    } catch (e) {
-      console.error('Export render failed for page', pageIdx, e);
-      continue;
+      const out = extractVectorRun(pages);
+      if (!out) throw new Error(wasmLastError() || 'Vector export failed');
+      downloadPdfBytes(out, 'pages', pages);
+      setOperationStatus(`Exported ${pages.length} page(s) as vector PDF`, 'success');
+    } catch (err) {
+      setStatus('Export error: ' + err.message, true);
+      console.error(err);
+    } finally {
+      hideLoading();
     }
-    if (result !== 1) continue;
-
-    const bufferPtr = Module._nanopdf_get_render_buffer();
-    const bufferSize = Module._nanopdf_get_render_buffer_size();
-    const renderWidth = Module._nanopdf_get_render_width();
-    const renderHeight = Module._nanopdf_get_render_height();
-
-    const tmpCanvas = document.createElement('canvas');
-    tmpCanvas.width = renderWidth;
-    tmpCanvas.height = renderHeight;
-    const ctx = tmpCanvas.getContext('2d');
-    const imageData = ctx.createImageData(renderWidth, renderHeight);
-    const srcData = new Uint8ClampedArray(Module.HEAPU8.buffer, bufferPtr, bufferSize);
-    imageData.data.set(srcData);
-    ctx.putImageData(imageData, 0, 0);
-
-    const jpegBytes = canvasToJpegBytes(tmpCanvas);
-    pageImages.push({
-      jpegBytes,
-      imgWidth: renderWidth,
-      imgHeight: renderHeight,
-      pageWidth: pw,
-      pageHeight: ph,
-    });
-
-    // Yield to UI between pages
-    await new Promise(r => setTimeout(r, 10));
-  }
-
-  if (pageImages.length === 0) {
-    hideLoading();
-    setStatus('Export failed: no pages could be rendered', true);
     return;
   }
 
-  loadingText.textContent = 'Building PDF...';
-  await new Promise(r => setTimeout(r, 50));
-
-  const pdfBytes = buildPdf(pageImages);
-
-  downloadPdfBytes(pdfBytes, 'pages', pages);
-
-  hideLoading();
-
-  // Re-render current page to restore main canvas
-  renderCurrentPage();
-  setStatus(`Exported ${pageImages.length} page(s) as PDF`);
+  setStatus('Export requires rebuilding the nanopdf WASM module', true);
+  return;
 }
 
 // ---- Window Resize ----
@@ -4407,10 +5594,29 @@ nextBtn.addEventListener('click', () => {
   if (currentPage < totalPages - 1) goToPage(currentPage + 1);
 });
 pageDisplay.addEventListener('click', enterPageJump);
+if (bookmarkBtn) {
+  bookmarkBtn.addEventListener('click', () => {
+    if (findBookmarkAt(currentPage)) removeBookmarkAt(currentPage);
+    else addBookmarkAtCurrent();
+  });
+}
 
 // Zoom buttons
 zoomInBtn.addEventListener('click', zoomIn);
 zoomOutBtn.addEventListener('click', zoomOut);
+// Zoom slider: input updates the displayed percent as the user drags; the
+// expensive re-render only fires on change (release), so dragging the
+// thumb stays smooth even on huge pages.
+if (zoomSlider) {
+  zoomSlider.addEventListener('input', () => {
+    zoomDisplay.textContent = zoomSlider.value + '%';
+  });
+  zoomSlider.addEventListener('change', () => {
+    setZoom(Number(zoomSlider.value) / 100);
+  });
+  // Double-click resets to 100%.
+  zoomSlider.addEventListener('dblclick', () => { setZoom(1.0); });
+}
 
 // Fit mode toggle
 fitModeBtn.addEventListener('click', toggleFitMode);
@@ -4503,6 +5709,20 @@ canvasScroll.addEventListener('touchend', endPinch);
 canvasScroll.addEventListener('touchcancel', endPinch);
 
 // Keyboard navigation
+// Cycle to the next/previous annotation on the current page in select mode.
+function cycleAnnotationSelection(delta) {
+  const list = pageAnnots();
+  if (!list.length) return false;
+  const idx = list.findIndex((a) => a.id === selectedAnnotId);
+  let next = idx + delta;
+  if (idx < 0) next = delta > 0 ? 0 : list.length - 1;
+  next = ((next % list.length) + list.length) % list.length;
+  selectedAnnotId = list[next].id;
+  hoveredAnnotId = null;
+  renderAnnotations();
+  return true;
+}
+
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
@@ -4551,6 +5771,11 @@ document.addEventListener('keydown', (e) => {
     }
   } else if ((e.key === 'p' || e.key === 'P') && !e.ctrlKey && !e.metaKey) {
     if (totalPages > 0 && hasRendering) { e.preventDefault(); printDocument(); }
+  } else if ((e.key === 'b' || e.key === 'B') && !e.ctrlKey && !e.metaKey) {
+    // B toggles a bookmark on the current page.
+    e.preventDefault();
+    if (findBookmarkAt(currentPage)) removeBookmarkAt(currentPage);
+    else addBookmarkAtCurrent();
   } else if ((e.key === 'Delete' || e.key === 'Backspace') &&
              selectedAnnotId != null && annotEditingEnabled()) {
     e.preventDefault();
@@ -4562,6 +5787,19 @@ document.addEventListener('keydown', (e) => {
   } else if ((e.key === 'v' || e.key === 'V') && !e.ctrlKey && !e.metaKey &&
              annotEditingEnabled()) {
     setAnnotTool('select');
+  } else if (e.key === 'Tab' && annotTool === 'select' && annotEditingEnabled()) {
+    // Tab / Shift+Tab cycle through the annotations on the current page.
+    e.preventDefault();
+    cycleAnnotationSelection(e.shiftKey ? -1 : 1);
+  } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') &&
+             !e.shiftKey) {
+    // Undo (no INPUT/TEXTAREA focus thanks to the early return above).
+    e.preventDefault();
+    if (undo()) setStatus('Undo', 'info');
+  } else if ((e.ctrlKey || e.metaKey) && ((e.key === 'z' || e.key === 'Z') && e.shiftKey || e.key === 'y' || e.key === 'Y')) {
+    // Redo (Cmd/Ctrl+Shift+Z or Cmd/Ctrl+Y).
+    e.preventDefault();
+    if (redo()) setStatus('Redo', 'info');
   }
 });
 
@@ -4571,6 +5809,10 @@ backendToggleBtn.addEventListener('click', switchRenderBackend);
 extractBtn.addEventListener('click', extractText);
 exportBtn.addEventListener('click', exportSelectedPages);
 protectExport.addEventListener('change', updateExportButton);
+exportPasswordForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (!exportBtn.disabled) exportSelectedPages();
+});
 
 // Close text panel
 document.getElementById('text-panel-close').addEventListener('click', () => {
@@ -4612,9 +5854,19 @@ document.querySelectorAll('.sidebar-tabs button').forEach(btn => {
 // Search
 searchInput.addEventListener('input', (e) => {
   clearTimeout(searchDebounce);
+  // If the user is typing, the dropdown is already open with the previous
+  // results. We reopen it explicitly after the new search completes.
   searchDebounce = setTimeout(() => {
     performSearch(e.target.value.trim());
+    showSearchResultsDropdown();
   }, 300);
+});
+searchInput.addEventListener('focus', () => {
+  if (searchResults.length > 0) showSearchResultsDropdown();
+});
+searchInput.addEventListener('blur', () => {
+  // Defer so a click on a dropdown row is processed before the dropdown hides.
+  setTimeout(hideSearchResultsDropdown, 150);
 });
 searchInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
@@ -4625,11 +5877,26 @@ searchInput.addEventListener('keydown', (e) => {
       nextSearchResult();
     }
   } else if (e.key === 'Escape') {
+    hideSearchResultsDropdown();
     searchInput.blur();
+  } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    // Move the cursor in the input but don't propagate to the global handler
+    // (which would navigate pages).
+    e.stopPropagation();
   }
 });
 searchPrevBtn.addEventListener('click', prevSearchResult);
 searchNextBtn.addEventListener('click', nextSearchResult);
+const searchCaseToggle = document.getElementById('search-case');
+if (searchCaseToggle) {
+  searchCaseToggle.addEventListener('change', () => {
+    searchCaseSensitive = searchCaseToggle.checked;
+    if (currentSearchTerm) {
+      performSearch(currentSearchTerm);
+      showSearchResultsDropdown();
+    }
+  });
+}
 
 // Text selection overlay
 textOverlay.addEventListener('pointerdown', beginTextSelection);
@@ -4676,6 +5943,10 @@ annotFill.addEventListener('change', () => {
   }
 });
 annotDeleteBtn.addEventListener('click', deleteSelectedAnnot);
+const undoBtn = document.getElementById('undo-btn');
+const redoBtn = document.getElementById('redo-btn');
+if (undoBtn) undoBtn.addEventListener('click', () => { if (undo()) setStatus('Undo'); });
+if (redoBtn) redoBtn.addEventListener('click', () => { if (redo()) setStatus('Redo'); });
 saveAnnotBtn.addEventListener('click', saveAnnotatedPdf);
 saveEditableBtn.addEventListener('click', saveEditableAnnotations);
 saveFormBtn.addEventListener('click', saveEditableForm);
@@ -4693,8 +5964,174 @@ annotLayer.addEventListener('pointerup', annotLayerPointerUp);
 annotLayer.addEventListener('pointercancel', annotLayerPointerUp);
 annotSvg.addEventListener('pointerdown', annotShapePointerDown);
 
+// Hover tracking for select-mode outlines. Re-rendering on every pointermove
+// would be too expensive, so we use pointerover/pointerout (which fire only
+// when the cursor crosses a child element boundary) and bail out if the
+// hovered id hasn't changed.
+function annotShapePointerOver(e) {
+  if (annotTool !== 'select' || !annotEditingEnabled()) return;
+  const host = e.target.closest('[data-annot-id]');
+  if (!host) return;
+  const id = Number(host.dataset.annotId);
+  if (id === selectedAnnotId || id === hoveredAnnotId) return;
+  hoveredAnnotId = id;
+  renderAnnotations();
+}
+function annotShapePointerOut(e) {
+  // Only clear if the cursor actually left the hovered shape (not into a child).
+  if (hoveredAnnotId == null) return;
+  const related = e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest('[data-annot-id]');
+  if (related) return;
+  hoveredAnnotId = null;
+  renderAnnotations();
+}
+annotSvg.addEventListener('pointerover', annotShapePointerOver);
+annotSvg.addEventListener('pointerout', annotShapePointerOut);
+
 // Window resize
 window.addEventListener('resize', onResize);
+
+// ---- Auto-recovery to IndexedDB ----
+// Stash the most-recently-opened PDF so a page reload (or accidental tab
+// close) can offer to restore it. The stash is keyed by file name + a session
+// id; if the user opens a different document, the old one is discarded.
+const RECOVERY_DB = 'nanopdf-recovery';
+const RECOVERY_STORE = 'snapshots';
+const RECOVERY_MAX_BYTES = 50 * 1024 * 1024;     // hard cap per stash
+let recoveryDbPromise = null;
+let recoverySaveTimer = 0;
+let recoveryActiveName = null;
+
+function openRecoveryDb() {
+  if (recoveryDbPromise) return recoveryDbPromise;
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  recoveryDbPromise = new Promise((resolve) => {
+    const req = indexedDB.open(RECOVERY_DB, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(RECOVERY_STORE)) {
+        db.createObjectStore(RECOVERY_STORE, { keyPath: 'name' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  });
+  return recoveryDbPromise;
+}
+
+async function stashRecovery(name, bytes) {
+  if (!name || !(bytes instanceof Uint8Array) || bytes.length > RECOVERY_MAX_BYTES) return;
+  const db = await openRecoveryDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(RECOVERY_STORE, 'readwrite');
+    tx.objectStore(RECOVERY_STORE).put({
+      name,
+      bytes,
+      savedAt: Date.now(),
+    });
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) {
+    console.warn('Recovery stash failed:', e);
+  }
+}
+
+function scheduleRecoverySave() {
+  if (!currentPdfBytes || !recoveryActiveName) return;
+  clearTimeout(recoverySaveTimer);
+  // Snapshot the bytes immediately (a Uint8Array reference is cheap to copy).
+  // Debounce the actual write so a flurry of edits only writes once.
+  const name = recoveryActiveName;
+  const bytes = currentPdfBytes;
+  recoverySaveTimer = setTimeout(() => stashRecovery(name, bytes), 1500);
+}
+
+async function clearRecovery() {
+  const db = await openRecoveryDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(RECOVERY_STORE, 'readwrite');
+    tx.objectStore(RECOVERY_STORE).clear();
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) {
+    console.warn('Recovery clear failed:', e);
+  }
+}
+
+async function readRecovery() {
+  const db = await openRecoveryDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    const tx = db.transaction(RECOVERY_STORE, 'readonly');
+    const req = tx.objectStore(RECOVERY_STORE).getAll();
+    req.onsuccess = () => {
+      const items = req.result || [];
+      if (!items.length) return resolve(null);
+      items.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+      resolve(items[0]);
+    };
+    req.onerror = () => resolve(null);
+  });
+}
+
+function ensureRecoveryBanner() {
+  let el = document.getElementById('recovery-banner');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'recovery-banner';
+  el.className = 'recovery-banner hidden';
+  el.setAttribute('role', 'alert');
+  document.body.appendChild(el);
+  return el;
+}
+
+async function offerRecovery() {
+  const item = await readRecovery();
+  if (!item || !item.bytes || !item.name) return;
+  const el = ensureRecoveryBanner();
+  const ago = formatRecoveryAge(Date.now() - (item.savedAt || 0));
+  el.innerHTML = '';
+  const msg = document.createElement('span');
+  msg.className = 'recovery-msg';
+  msg.textContent = `Resume "${item.name}" from ${ago}?`;
+  const restore = document.createElement('button');
+  restore.type = 'button';
+  restore.className = 'recovery-btn primary';
+  restore.textContent = 'Restore';
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = 'recovery-btn';
+  dismiss.textContent = 'Discard';
+  el.append(msg, restore, dismiss);
+  el.classList.remove('hidden');
+  restore.addEventListener('click', async () => {
+    hideRecoveryBanner();
+    try {
+      // Copy into a fresh ArrayBuffer so the consumer can transfer it.
+      const ab = new ArrayBuffer(item.bytes.byteLength);
+      new Uint8Array(ab).set(item.bytes);
+      await loadPDF(ab, item.name);
+      setStatus(`Restored "${item.name}"`, 'success');
+    } catch (e) {
+      setStatus('Could not restore the previous document: ' + e.message, true);
+    }
+  });
+  dismiss.addEventListener('click', async () => {
+    hideRecoveryBanner();
+    await clearRecovery();
+  });
+}
+
+function hideRecoveryBanner() {
+  const el = document.getElementById('recovery-banner');
+  if (el) el.classList.add('hidden');
+}
 
 // ---- Initialize ----
 
@@ -4755,11 +6192,15 @@ async function init() {
 
     console.log('nanopdf WASM loaded. Rendering:', hasRendering);
 
-    // Deep-link support: ?url=<pdf> (or ?pdf=<pdf>) auto-opens a remote PDF.
-    const params = new URLSearchParams(window.location.search);
-    const deepLink = params.get('url') || params.get('pdf');
+    // Deep-link support: ?pdf=<pdf>, #pdf=<pdf>, or #url=<pdf>.
+    // Avoid ?url= because Vite dev treats that as an import URL query.
+    const deepLink = resolvePdfDeepLink(window.location.search, window.location.hash);
     if (deepLink) {
       loadPdfFromUrl(deepLink);
+    } else {
+      // No deep link: check for an auto-recovery stash from a previous visit
+      // and offer to restore it.
+      offerRecovery();
     }
   } catch (err) {
     hideLoading();
