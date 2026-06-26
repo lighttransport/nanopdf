@@ -726,6 +726,7 @@ function renderRevisionPixels(byteLen, pageIdx, width, height, dpi) {
   // Copy out — the buffer is reused by the next render call.
   const data = new Uint8ClampedArray(size);
   data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size));
+  if (Module._nanopdf_release_render_buffer) Module._nanopdf_release_render_buffer();
   return { data, w, h };
 }
 

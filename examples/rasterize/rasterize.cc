@@ -476,6 +476,15 @@ bool save_rgba_pixels(const std::string& filename,
   return false;
 }
 
+static int normalized_page_rotation(const nanopdf::Page& page) {
+  int rotation = static_cast<int>(page.rotate) % 360;
+  if (rotation < 0) rotation += 360;
+  if (rotation == 90 || rotation == 180 || rotation == 270) {
+    return rotation;
+  }
+  return 0;
+}
+
 bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_num,
                 const RasterizeOptions& options, const std::string& output_file) {
   // Get page dimensions from media_box [left, bottom, right, top]
@@ -486,36 +495,65 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     page_height = page.media_box[3] - page.media_box[1];
   }
 
+  const int page_rotation = normalized_page_rotation(page);
+  const bool page_swaps_axes =
+      (page_rotation == 90 || page_rotation == 270);
+  const double visible_page_width = page_swaps_axes ? page_height : page_width;
+  const double visible_page_height = page_swaps_axes ? page_width : page_height;
+
   if (options.verbose) {
     std::cout << "  Page " << page_num << " dimensions: "
               << page_width << " x " << page_height << " pts\n";
+    if (page_rotation != 0) {
+      std::cout << "  Page rotation: " << page_rotation
+                << " degrees, visible dimensions: " << visible_page_width
+                << " x " << visible_page_height << " pts\n";
+    }
   }
 
-  // Calculate output dimensions
-  int output_width = options.width;
-  int output_height = options.height;
+  // Calculate final visible output dimensions. The backend renders into the
+  // unrotated page coordinate system, then applies page /Rotate to pixels.
+  int final_output_width = options.width;
+  int final_output_height = options.height;
 
   // Priority: --scale > explicit --width/--height > --dpi (defaults to 150).
   // PDF user space is 72 pt per inch; output px = page_pt * dpi / 72.
   if (options.scale > 0) {
-    output_width = static_cast<int>(page_width * options.scale);
-    output_height = static_cast<int>(page_height * options.scale);
+    final_output_width = static_cast<int>(visible_page_width * options.scale);
+    final_output_height = static_cast<int>(visible_page_height * options.scale);
   } else if (options.width_set || options.height_set) {
-    float aspect_ratio = page_width / page_height;
+    float aspect_ratio = static_cast<float>(visible_page_width / visible_page_height);
     if (options.width_set && !options.height_set) {
-      output_height = static_cast<int>(output_width / aspect_ratio);
+      final_output_height = static_cast<int>(final_output_width / aspect_ratio);
     } else if (options.height_set && !options.width_set) {
-      output_width = static_cast<int>(output_height * aspect_ratio);
+      final_output_width = static_cast<int>(final_output_height * aspect_ratio);
     }
     // If both are set, honor the canvas size verbatim.
   } else {
     float dpi_scale = options.dpi / 72.0f;
-    output_width = static_cast<int>(page_width * dpi_scale);
-    output_height = static_cast<int>(page_height * dpi_scale);
+    final_output_width = static_cast<int>(visible_page_width * dpi_scale);
+    final_output_height = static_cast<int>(visible_page_height * dpi_scale);
+  }
+
+  int output_width = final_output_width;
+  int output_height = final_output_height;
+  if (page_swaps_axes) {
+    output_width = final_output_height;
+    output_height = final_output_width;
   }
 
   if (options.verbose) {
-    std::cout << "  Output dimensions: " << output_width << " x " << output_height << " px\n";
+    std::cout << "  Render canvas dimensions: " << output_width << " x "
+              << output_height << " px\n";
+    if (page_rotation != 0 || options.rotation != 0) {
+      std::cout << "  Final output dimensions: ";
+      int final_w = final_output_width;
+      int final_h = final_output_height;
+      if (options.rotation == 90 || options.rotation == 270) {
+        std::swap(final_w, final_h);
+      }
+      std::cout << final_w << " x " << final_h << " px\n";
+    }
   }
 
   // Create selected backend.
@@ -557,7 +595,8 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
               << "'...\n";
   }
 
-  const bool direct_backend_save = (options.rotation == 0 && !options.grayscale);
+  const bool direct_backend_save =
+      (page_rotation == 0 && options.rotation == 0 && !options.grayscale);
   const bool direct_tga_save =
       direct_backend_save &&
       options.output_format == nanopdf::RenderOptions::Format::TGA;
@@ -583,7 +622,18 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     int final_width = buffer.width;
     int final_height = buffer.height;
 
-    // Apply grayscale conversion first (before rotation to work on smaller data if rotated)
+    // Apply the PDF page dictionary's /Rotate first. The no-options backend
+    // render path draws the unrotated page into the canvas; the CLI owns the
+    // visible-page orientation when it retrieves pixels for post-processing.
+    if (page_rotation != 0) {
+      if (options.verbose) {
+        std::cout << "  Applying page rotation " << page_rotation << " degrees...\n";
+      }
+      pixels = rotate_pixels(pixels, final_width, final_height,
+                             page_rotation, final_width, final_height);
+    }
+
+    // Apply grayscale conversion before any caller-requested extra rotation.
     if (options.grayscale) {
       if (options.verbose) {
         std::cout << "  Converting to grayscale...\n";
@@ -591,7 +641,7 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
       convert_to_grayscale(pixels);
     }
 
-    // Apply rotation
+    // Apply caller-requested extra rotation.
     if (options.rotation != 0) {
       if (options.verbose) {
         std::cout << "  Rotating " << options.rotation << " degrees...\n";

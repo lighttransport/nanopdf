@@ -76,6 +76,12 @@ static nanopdf::EncryptionConfig g_export_encryption_config;
 // Font buffer (for embedded fonts)
 static std::vector<uint8_t> g_font_buffer;
 
+static void release_render_buffer_storage() {
+  std::vector<uint8_t>().swap(g_render_buffer);
+  g_render_width = 0;
+  g_render_height = 0;
+}
+
 // ============================================================
 // Global state for PDF writing / editing
 // ============================================================
@@ -143,7 +149,7 @@ void nanopdf_shutdown() {
     g_pdf = nullptr;
   }
   g_pdf_data.clear();
-  g_render_buffer.clear();
+  release_render_buffer_storage();
 
   // Clean up writer
   if (g_writer) {
@@ -250,6 +256,8 @@ static bool render_page_with_selected_backend(const nanopdf::Pdf& pdf,
                                               const nanopdf::Page& page,
                                               int width, int height,
                                               float dpi) {
+  release_render_buffer_storage();
+
   auto backend = nanopdf::make_backend(g_render_backend);
   if (!backend) {
     g_last_error = std::string("Rendering backend not available: ") +
@@ -407,6 +415,11 @@ uint8_t* nanopdf_get_render_buffer() {
 EMSCRIPTEN_KEEPALIVE
 size_t nanopdf_get_render_buffer_size() {
   return g_render_buffer.size();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void nanopdf_release_render_buffer() {
+  release_render_buffer_storage();
 }
 
 EMSCRIPTEN_KEEPALIVE

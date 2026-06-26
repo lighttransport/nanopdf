@@ -434,6 +434,7 @@ private:
   const Page* current_page_{nullptr};
   RenderProgressConfig progress_config_;
   RenderProgressState progress_;
+  bool rendering_soft_mask_group_{false};
 
   // Form XObject resource stack for nested Form XObjects
   // Each entry contains resources from a Form XObject

@@ -477,6 +477,7 @@ private:
   bool result_pixels_enabled_{true};
   bool clear_canvas_on_draw_{true};
   bool direct_bgra_output_enabled_{false};
+  bool rendering_soft_mask_group_{false};
 
   // Form XObject resource stack for nested Form XObjects
   // Each entry contains resources from a Form XObject

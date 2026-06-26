@@ -115,6 +115,9 @@ class NanoPDF {
       bufferPtr,
       bufferSize
     ).slice(); // Make a copy since WASM memory may be invalidated
+    if (this._module._nanopdf_release_render_buffer) {
+      this._module._nanopdf_release_render_buffer();
+    }
 
     return new ImageData(rgbaData, renderWidth, renderHeight);
   }
@@ -502,6 +505,9 @@ class NanoPDF {
     const rgbaData = new Uint8ClampedArray(
       this._module.HEAPU8.buffer, bufferPtr, bufferSize
     ).slice();
+    if (this._module._nanopdf_release_render_buffer) {
+      this._module._nanopdf_release_render_buffer();
+    }
 
     return new ImageData(rgbaData, renderWidth, renderHeight);
   }

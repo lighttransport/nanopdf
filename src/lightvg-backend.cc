@@ -2813,7 +2813,25 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
       // plus a CID->GID map (legacy behavior).
       cff_cid_to_gid = cff_wrapper::build_cid_to_gid_map(
           decoded.data.data(), decoded.data.size());
-      wrapped = cff_wrapper::wrap_cff_in_opentype(decoded.data);
+      if (cff_ok && cff_data.is_cid && cff_data.num_glyphs > 0) {
+        // CID CFF subsets usually have no cmap, but ttf_parse still needs the
+        // sfnt metric tables before it can draw glyphs by CID-derived GID.
+        uint16_t upem = 1000;
+        if (cff_data.font_matrix.size() >= 1 &&
+            cff_data.font_matrix[0] > 0.0) {
+          double u = 1.0 / cff_data.font_matrix[0];
+          if (u >= 16.0 && u <= 65535.0) {
+            upem = static_cast<uint16_t>(u + 0.5);
+          }
+        }
+        wrapped = cff_wrapper::build_simple_cff_opentype(
+            decoded.data,
+            std::vector<std::pair<uint32_t, uint16_t>>{{0, 0}},
+            static_cast<uint16_t>(cff_data.num_glyphs), upem);
+      }
+      if (wrapped.empty()) {
+        wrapped = cff_wrapper::wrap_cff_in_opentype(decoded.data);
+      }
     }
     if (wrapped.empty()) {
       return load_fallback_font_with_hint(font_name, font);
@@ -4230,6 +4248,9 @@ bool LightVGBackend::apply_extgstate_dict(const Dictionary& gs_dict) {
 
   auto smask_it = gs_dict.find("SMask");
   if (smask_it != gs_dict.end()) {
+    if (rendering_soft_mask_group_) {
+      return true;
+    }
     const Value& smask = smask_it->second;
     if (smask.type == Value::NAME && smask.name == "None") {
       state_.has_soft_mask = false;
@@ -8849,6 +8870,21 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
 
   if (mask_width == 0) mask_width = width_;
   if (mask_height == 0) mask_height = height_;
+  uint64_t mask_pixels =
+      static_cast<uint64_t>(mask_width) * static_cast<uint64_t>(mask_height);
+  uint64_t max_mask_pixels =
+      static_cast<uint64_t>(std::max<uint32_t>(1, width_)) *
+      static_cast<uint64_t>(std::max<uint32_t>(1, height_));
+  max_mask_pixels = std::max<uint64_t>(max_mask_pixels, 1024u * 1024u);
+  if (mask_pixels > max_mask_pixels) {
+    double downscale =
+        std::sqrt(static_cast<double>(max_mask_pixels) /
+                  static_cast<double>(mask_pixels));
+    mask_width = std::max<uint32_t>(
+        1, static_cast<uint32_t>(std::floor(mask_width * downscale)));
+    mask_height = std::max<uint32_t>(
+        1, static_cast<uint32_t>(std::floor(mask_height * downscale)));
+  }
 
   // Decode the XObject stream content
   auto decoded = decode_stream(*current_pdf_, xobject_value);
@@ -8918,7 +8954,10 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   // Parse and render the XObject content to the mask canvas
   bool progress_enabled = progress_.enabled;
   progress_.enabled = false;
+  bool saved_rendering_soft_mask_group = rendering_soft_mask_group_;
+  rendering_soft_mask_group_ = true;
   parse_pdf_content(decoded.data);
+  rendering_soft_mask_group_ = saved_rendering_soft_mask_group;
   progress_.enabled = progress_enabled;
 
   // Finalize rendering
