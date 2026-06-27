@@ -36,6 +36,7 @@ using namespace nanostl;
 
 #include "nanopdf.hh"
 #include "render-backend.hh"
+#include "type1-parser.hh"
 
 namespace nanopdf {
 
@@ -247,6 +248,8 @@ private:
     // ttf_parse context for kerning lookup (supports GPOS kerning)
     bool has_ttf_parse{false};
     ttf_font_t ttf{};                 // Zero-init POD; only read when has_ttf_parse is true
+    bool has_type1{false};
+    Type1FontData type1;
 
     // Small integer id assigned at load time, used as the glyph-cache key
     // instead of the font name so per-glyph cache probes avoid string hashing.
@@ -342,6 +345,9 @@ private:
   bool render_type3_glyph(const Type3Font* type3_font, const std::string& glyph_name,
                           float x, float y, float size,
                           uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+  bool draw_type1_glyph_by_name(FontCache* font, const std::string& glyph_name,
+                                float x, float y, float size,
+                                uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
   // Load font from PDF FontDescriptor
   bool load_font(const Pdf& pdf, const std::string& font_name, const BaseFont* font);

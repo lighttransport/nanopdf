@@ -67,6 +67,21 @@ static uint32_t pack_argb32(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
          static_cast<uint32_t>(b);
 }
 
+static uint32_t normalize_render_codepoint(uint32_t cp) {
+  if (cp <= 0x10FFFFu) return cp;
+  uint32_t hi = (cp >> 16) & 0xFFFFu;
+  uint32_t lo = cp & 0xFFFFu;
+  if (hi >= 0xD800u && hi <= 0xDBFFu &&
+      lo >= 0xDC00u && lo <= 0xDFFFu) {
+    return 0x10000u + ((hi - 0xD800u) << 10) + (lo - 0xDC00u);
+  }
+  if (hi == 'f' && lo == 'f') return 0xFB00u;
+  if (hi == 'f' && lo == 'i') return 0xFB01u;
+  if (hi == 'f' && lo == 'l') return 0xFB02u;
+  if (hi >= 0x20u && hi <= 0x7Eu) return hi;
+  return cp;
+}
+
 static bool bgra_pixels_equal(const uint8_t* a, const uint8_t* b) {
   uint32_t pa, pb;
   std::memcpy(&pa, a, sizeof(pa));
@@ -1828,6 +1843,105 @@ bool LightVGBackend::render_type3_glyph(const Type3Font* type3_font, const std::
   return true;
 }
 
+bool LightVGBackend::draw_type1_glyph_by_name(FontCache* font,
+                                              const std::string& glyph_name,
+                                              float x, float y, float size,
+                                              uint8_t r, uint8_t g, uint8_t b,
+                                              uint8_t a) {
+  if (!scene_ || !font || !font->has_type1 || glyph_name.empty() ||
+      glyph_name == ".notdef") {
+    return false;
+  }
+
+  ttf_outline_t outline{};
+  if (t1_glyph_outline(font->type1, glyph_name, &outline) != 0) {
+    return false;
+  }
+
+  double units_per_em_d = 1000.0;
+  if (font->type1.font_matrix[0] > 0.0) {
+    units_per_em_d = 1.0 / font->type1.font_matrix[0];
+  }
+  float scale = size / static_cast<float>(units_per_em_d);
+
+  float font_scale_tm = std::sqrt(state_.text_matrix.a * state_.text_matrix.a +
+                                  state_.text_matrix.b * state_.text_matrix.b);
+  float cos_theta = 1.0f, sin_theta = 0.0f;
+  if (font_scale_tm > 0.01f) {
+    cos_theta = state_.text_matrix.a / font_scale_tm;
+    sin_theta = state_.text_matrix.b / font_scale_tm;
+  }
+
+  auto shape = lvg::Shape::gen();
+  if (!shape) {
+    ttf_outline_free(&outline);
+    return false;
+  }
+
+  int render_mode = state_.text_render_mode;
+  bool do_fill = (render_mode == 0 || render_mode == 2 ||
+                  render_mode == 4 || render_mode == 6);
+  bool do_stroke = (render_mode == 1 || render_mode == 2 ||
+                    render_mode == 5 || render_mode == 6);
+  bool invisible = (render_mode == 3);
+  bool add_to_clip = (render_mode >= 4 && render_mode <= 7);
+
+  auto emit_move = [&](float cx, float cy) {
+    shape->moveTo(cx, cy);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(lvg::PathCommand::MoveTo);
+      state_.text_clip_points.push_back({cx, cy});
+    }
+  };
+  auto emit_line = [&](float cx, float cy) {
+    shape->lineTo(cx, cy);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(lvg::PathCommand::LineTo);
+      state_.text_clip_points.push_back({cx, cy});
+    }
+  };
+  auto emit_cubic = [&](float c1x, float c1y, float c2x, float c2y,
+                        float ex, float ey) {
+    shape->cubicTo(c1x, c1y, c2x, c2y, ex, ey);
+    if (add_to_clip) {
+      state_.text_clip_commands.push_back(lvg::PathCommand::CubicTo);
+      state_.text_clip_points.push_back({c1x, c1y});
+      state_.text_clip_points.push_back({c2x, c2y});
+      state_.text_clip_points.push_back({ex, ey});
+    }
+  };
+  auto emit_close = [&]() {
+    shape->close();
+    if (add_to_clip) state_.text_clip_commands.push_back(lvg::PathCommand::Close);
+  };
+
+  if (add_to_clip) state_.text_clip_active = true;
+  decompose_ttf_outline_to_path(outline, scale, x, y, cos_theta, sin_theta,
+                                emit_move, emit_line, emit_cubic, emit_close);
+  ttf_outline_free(&outline);
+
+  if (render_mode == 7 || invisible) return true;
+
+  if (do_fill) shape->fill(r, g, b, a);
+  if (do_stroke) {
+    float stroke_width = state_.stroke_width * state_.scale;
+    if (state_.stroke_width == 0.0f) stroke_width = 1.0f;
+    shape->strokeWidth(stroke_width);
+    uint8_t stroke_alpha = static_cast<uint8_t>(state_.stroke_a * state_.stroke_opacity);
+    shape->strokeFill(state_.stroke_r, state_.stroke_g, state_.stroke_b, stroke_alpha);
+    lvg::StrokeCap cap = lvg::StrokeCap::Butt;
+    if (state_.line_cap == 1) cap = lvg::StrokeCap::Round;
+    else if (state_.line_cap == 2) cap = lvg::StrokeCap::Square;
+    shape->strokeCap(cap);
+    lvg::StrokeJoin join = lvg::StrokeJoin::Miter;
+    if (state_.line_join == 1) join = lvg::StrokeJoin::Round;
+    else if (state_.line_join == 2) join = lvg::StrokeJoin::Bevel;
+    shape->strokeJoin(join);
+  }
+
+  return push_with_clip(shape);
+}
+
 bool LightVGBackend::draw_text(float x, float y, const std::string& text, float size,
                              uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
   if (!scene_) {
@@ -1902,9 +2016,17 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
   FontCache* font = get_font(current_font_name_);
 
   if (font) {
+    if (!font->has_type1 && !font->has_ttf_parse && font->font_info.data == nullptr) {
+      font = nullptr;
+    }
+  }
+
+  if (font) {
     // Render each character using glyph outlines
     float cursor_x = x;
-    float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
+    float scale = font->has_type1
+        ? size * static_cast<float>(font->type1.font_matrix[0])
+        : stbtt_ScaleForPixelHeight(&font->font_info, size);
 
     // Use outer text direction variables for cursor advance
     float cos_tm = cos_tm_outer;
@@ -2063,6 +2185,65 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
           // Do not apply font kerning here: PDF content streams already encode
           // text positioning via Tj/TJ adjustments and text state tracking.
         }
+        i += bytes_consumed;
+        continue;
+      }
+
+      if (font->has_type1) {
+        std::string glyph_name;
+        if (current_font_) {
+          auto diff_it = current_font_->encoding_differences.find(char_code);
+          if (diff_it != current_font_->encoding_differences.end()) {
+            glyph_name = diff_it->second;
+          }
+        }
+        if (glyph_name.empty() && char_code < font->type1.encoding.size()) {
+          glyph_name = font->type1.encoding[char_code];
+        }
+
+        if (!glyph_name.empty() && glyph_name != ".notdef") {
+          if (!draw_type1_glyph_by_name(font, glyph_name, cursor_x, cursor_y,
+                                        size, r, g, b, a)) {
+            uint32_t codepoint = glyph_name_to_unicode(glyph_name);
+            if (codepoint != 0 &&
+                !try_draw_glyph_fallback(static_cast<int>(codepoint),
+                                         cursor_x, cursor_y, size, r, g, b, a)) {
+              draw_missing_glyph_placeholder(cursor_x, cursor_y, size, r, g, b, a);
+            }
+          }
+        }
+
+        float adv = -1.0f;
+        if (current_font_ && !current_font_->widths.empty()) {
+          int first_char = current_font_->first_char;
+          int last_char = current_font_->last_char;
+          if (static_cast<int>(char_code) >= first_char &&
+              static_cast<int>(char_code) <= last_char) {
+            size_t idx = static_cast<size_t>(char_code - first_char);
+            if (idx < current_font_->widths.size()) {
+              adv = current_font_->widths[idx] / 1000.0f * size;
+            }
+          }
+        }
+        if (adv < 0.0f && !glyph_name.empty()) {
+          auto width_it = font->type1.char_widths.find(glyph_name);
+          if (width_it != font->type1.char_widths.end()) {
+            adv = width_it->second / 1000.0f * size;
+          }
+        }
+        if (adv < 0.0f) adv = size * 0.6f;
+
+        float tc_canvas2 = 0.0f;
+        if (std::abs(state_.font_size) > 0.001f) {
+          tc_canvas2 = state_.char_spacing * size / state_.font_size;
+        }
+        float tw_canvas = 0.0f;
+        if (char_code == 32 && std::abs(state_.font_size) > 0.001f) {
+          tw_canvas = state_.word_spacing * size / state_.font_size;
+        }
+        adv += tc_canvas2 + tw_canvas;
+        cursor_x += (adv * hscale) * cos_tm;
+        cursor_y -= (adv * hscale) * sin_tm;
         i += bytes_consumed;
         continue;
       }
@@ -2769,12 +2950,29 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     return load_fallback_font_with_hint(font_name, font);
   }
 
-  if (decoded.data.size() >= 14 &&
-      std::memcmp(decoded.data.data(), "%!PS-AdobeFont", 14) == 0) {
-    NANOPDF_LOG_WARN("LightVG",
-                     "Embedded Type1 font '%s' is not supported by stbtt/ttf_parse; using fallback",
-                     font_name.c_str());
-    return load_fallback_font_with_hint(font_name, font);
+  if (desc->font_file_type == FontFileType::FontFile) {
+    Type1Parser parser;
+    FontCache cache;
+    if (!parser.Parse(decoded.data.data(), decoded.data.size(), cache.type1, true)) {
+      NANOPDF_LOG_WARN("LightVG",
+                       "Embedded Type1 font '%s' parse failed: %s; using fallback",
+                       font_name.c_str(), parser.GetError().c_str());
+      return load_fallback_font_with_hint(font_name, font);
+    }
+    if (cache.type1.char_strings.empty()) {
+      NANOPDF_LOG_WARN("LightVG",
+                       "Embedded Type1 font '%s' has no parsed CharStrings; using fallback",
+                       font_name.c_str());
+      return load_fallback_font_with_hint(font_name, font);
+    }
+    cache.font_data = std::move(decoded.data);
+    cache.initialized = true;
+    cache.is_embedded = true;
+    cache.has_type1 = true;
+    NANOPDF_LOG_INFO("LightVG", "Loaded embedded Type1 font '%s' (%zu glyphs)",
+                     font_name.c_str(), cache.type1.char_strings.size());
+    font_cache_[font_name] = std::move(cache);
+    return true;
   }
 
   // Check for raw CFF data (stb_truetype can't parse raw CFF directly,
@@ -5938,6 +6136,8 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   if (!scene_) {
     return false;
   }
+  codepoint = static_cast<int>(
+      normalize_render_codepoint(static_cast<uint32_t>(codepoint)));
 
   auto draw_bullet_fallback = [&]() -> bool {
     if (codepoint != 0x2022 && codepoint != 0x30FB) return false;

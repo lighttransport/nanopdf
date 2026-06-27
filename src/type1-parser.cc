@@ -861,14 +861,12 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
     return false;
   }
 
-  // Skip past eexec and any whitespace/newline
+  // FindName returns just after the eexec token. Skip only whitespace before
+  // the encrypted payload; skipping another full line drops payload bytes,
+  // especially for PFB binary eexec sections.
   const char* p = eexec_pos;
   const char* end = data + size;
   while (p < end && (*p <= ' ' || *p == '\n' || *p == '\r')) p++;
-  // Skip the line break after "eexec"
-  while (p < end && *p != '\n' && *p != '\r') p++;
-  if (p < end) p++;  // skip newline
-  while (p < end && (*p == '\n' || *p == '\r')) p++;
 
   if (p >= end) return false;
 

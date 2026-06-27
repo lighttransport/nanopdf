@@ -684,9 +684,15 @@ body {
   flex: 1;
   overflow: auto;
   display: flex;
-  justify-content: center;
-  padding: 20px;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 20px;
+  scroll-padding-top: var(--canvas-scroll-slack, 0px);
   background: #e8eaed;
+}
+.canvas-scroll-spacer {
+  flex: 0 0 var(--canvas-scroll-slack, 0px);
+  width: 1px;
 }
 /* While panning with the middle mouse button. */
 .canvas-scroll.panning {

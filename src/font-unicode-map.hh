@@ -533,6 +533,7 @@ inline uint32_t glyph_name_to_unicode(const std::string& name) {
       {"parenleft", 0x0028},    {"parenright", 0x0029},
       {"bracketleft", 0x005B},  {"bracketright", 0x005D},
       {"braceleft", 0x007B},    {"braceright", 0x007D},
+      {"bardbl", 0x2016},       {"bardblex", 0x2016},
       {"angbracketleft", 0x27E8}, {"angbracketright", 0x27E9},
       {"ceilingleft", 0x2308},  {"ceilingright", 0x2309},
       {"floorleft", 0x230A},    {"floorright", 0x230B},

@@ -35,6 +35,8 @@ let totalPages = 0;
 let hasRendering = false;
 let renderBackend = 1; // 0 = LightVG, 1 = ThorVG
 let renderBackends = { lightvg: false, thorvg: false };
+let pendingPageScrollPlacement = null;
+let wheelPageTurnLocked = false;
 let fileName = '';
 let fileSize = 0;
 let currentPdfBytes = null;
@@ -2346,6 +2348,37 @@ function goToPage(pageIndex) {
   saveViewState();
 }
 
+function canvasScrollSlack() {
+  return Math.max(0, Math.round(canvasScroll.clientHeight * 0.5));
+}
+
+function updateCanvasScrollSlack() {
+  canvasScroll.style.setProperty('--canvas-scroll-slack', `${canvasScrollSlack()}px`);
+}
+
+function placeCanvasScroll(mode) {
+  if (!mode) return;
+  requestAnimationFrame(() => {
+    updateCanvasScrollSlack();
+    const slack = canvasScrollSlack();
+    const maxTop = Math.max(0, canvasScroll.scrollHeight - canvasScroll.clientHeight);
+    const maxLeft = Math.max(0, canvasScroll.scrollWidth - canvasScroll.clientWidth);
+    const top = mode === 'bottom'
+      ? Math.max(0, maxTop - slack)
+      : Math.min(slack, maxTop);
+    canvasScroll.scrollTo({
+      top,
+      left: Math.min(canvasScroll.scrollLeft, maxLeft),
+      behavior: 'auto',
+    });
+  });
+}
+
+function goToPageWithScroll(pageIndex, placement = 'top') {
+  pendingPageScrollPlacement = placement;
+  goToPage(pageIndex);
+}
+
 window._jumpToPage = function(pageIndex) {
   goToPage(pageIndex);
 };
@@ -3884,6 +3917,7 @@ function renderCurrentPage() {
 
   emptyState.style.display = 'none';
   canvas.style.display = 'block';
+  updateCanvasScrollSlack();
   resizeTextOverlay();
 
   // Apply rotation
@@ -3899,6 +3933,12 @@ function renderCurrentPage() {
   statusRight.textContent = fileName;
 
   if (activeSidebarTab === 'info') renderInfoTab();
+
+  if (pendingPageScrollPlacement) {
+    const placement = pendingPageScrollPlacement;
+    pendingPageScrollPlacement = null;
+    placeCanvasScroll(placement);
+  }
 }
 
 // ---- Text Extraction ----
@@ -4508,6 +4548,7 @@ async function loadPDF(arrayBuffer, name) {
 
     // Render first page
     if (hasRendering) {
+      pendingPageScrollPlacement = 'top';
       renderCurrentPage();
     } else {
       emptyState.style.display = 'none';
@@ -5521,6 +5562,7 @@ let resizeDebounce = null;
 function onResize() {
   clearTimeout(resizeDebounce);
   resizeDebounce = setTimeout(() => {
+    updateCanvasScrollSlack();
     if (hasRendering && totalPages > 0) {
       renderCurrentPage();
     }
@@ -5625,7 +5667,41 @@ fitModeBtn.addEventListener('click', toggleFitMode);
 // Rotate button
 rotateBtn.addEventListener('click', rotateClockwise);
 
-// Ctrl+scroll wheel zoom
+function normalizeWheelDeltaY(e) {
+  if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) return e.deltaY * 40;
+  if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) return e.deltaY * canvasScroll.clientHeight;
+  return e.deltaY;
+}
+
+function onWheelPageTurn(deltaY) {
+  if (!Module || totalPages <= 0 || Math.abs(deltaY) < 1) return false;
+  if (wheelPageTurnLocked) return true;
+
+  updateCanvasScrollSlack();
+  const slack = canvasScrollSlack();
+  const maxTop = Math.max(0, canvasScroll.scrollHeight - canvasScroll.clientHeight);
+  const pageTop = Math.min(slack, maxTop);
+  const pageBottom = Math.max(0, maxTop - slack);
+  const atTop = canvasScroll.scrollTop <= pageTop + 2;
+  const atBottom = canvasScroll.scrollTop >= pageBottom - 2;
+
+  if (deltaY < 0 && atTop && currentPage > 0) {
+    wheelPageTurnLocked = true;
+    goToPageWithScroll(currentPage - 1, 'bottom');
+    setTimeout(() => { wheelPageTurnLocked = false; }, 180);
+    return true;
+  }
+  if (deltaY > 0 && atBottom && currentPage < totalPages - 1) {
+    wheelPageTurnLocked = true;
+    goToPageWithScroll(currentPage + 1, 'top');
+    setTimeout(() => { wheelPageTurnLocked = false; }, 180);
+    return true;
+  }
+  return false;
+}
+
+// Ctrl+scroll wheel zoom; plain wheel scrolls the current page and advances to
+// the next/previous page once the scroll container reaches an edge.
 canvasScroll.addEventListener('wheel', (e) => {
   if (e.ctrlKey || e.metaKey) {
     e.preventDefault();
@@ -5634,6 +5710,11 @@ canvasScroll.addEventListener('wheel', (e) => {
     } else {
       zoomOut();
     }
+    return;
+  }
+
+  if (onWheelPageTurn(normalizeWheelDeltaY(e))) {
+    e.preventDefault();
   }
 }, { passive: false });
 
