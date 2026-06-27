@@ -22,6 +22,17 @@ inline bool try_map_tounicode(uint32_t char_code, const BaseFont* font,
   return true;
 }
 
+inline bool try_map_tounicode_sequence(
+    uint32_t char_code, const BaseFont* font,
+    const std::vector<uint32_t>** sequence_out) {
+  if (!font || !sequence_out) return false;
+  auto it = font->to_unicode_cmap.code_to_unicode_sequence.find(char_code);
+  if (it == font->to_unicode_cmap.code_to_unicode_sequence.end()) return false;
+  if (it->second.size() <= 1) return false;
+  *sequence_out = &it->second;
+  return true;
+}
+
 inline bool is_identity_cmap(const Type0Font* type0_font) {
   if (!type0_font) return false;
   const std::string& cmap_name = type0_font->encoding_cmap.name;

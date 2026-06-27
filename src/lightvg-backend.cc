@@ -82,6 +82,77 @@ static uint32_t normalize_render_codepoint(uint32_t cp) {
   return cp;
 }
 
+static std::vector<std::string> type1_glyph_name_candidates_for_unicode(uint32_t cp) {
+  cp = normalize_render_codepoint(cp);
+  std::vector<std::string> names;
+  switch (cp) {
+    case 0x0028:
+      names = {"parenleft", "parenleftbig", "parenleftBig",
+               "parenlefttp", "parenleftbt", "parenleftex"};
+      break;
+    case 0x0029:
+      names = {"parenright", "parenrightbig", "parenrightBig",
+               "parenrighttp", "parenrightbt", "parenrightex"};
+      break;
+    case 0x002B: names = {"plus"}; break;
+    case 0x002C: names = {"comma"}; break;
+    case 0x002E: names = {"period"}; break;
+    case 0x002F: names = {"slash"}; break;
+    case 0x003D: names = {"equal"}; break;
+    case 0x005B:
+      names = {"bracketleft", "bracketlefttp", "bracketleftbt",
+               "bracketleftex", "bracketleftbig"};
+      break;
+    case 0x005D:
+      names = {"bracketright", "bracketrighttp", "bracketrightbt",
+               "bracketrightex", "bracketrightbig"};
+      break;
+    case 0x007B:
+      names = {"braceleft", "bracelefttp", "braceleftmid", "braceleftbt",
+               "braceleftex", "braceleftbig", "braceleftbigg"};
+      break;
+    case 0x007D:
+      names = {"braceright", "bracerighttp", "bracerightmid", "bracerightbt",
+               "bracerightex", "bracerightbig", "bracerightbigg"};
+      break;
+    case 0x007C: names = {"bar", "vert", "uni007C", "bar1", "barex"}; break;
+    case 0x00B7: names = {"periodcentered"}; break;
+    case 0x03A9: names = {"Omega", "uni03A9"}; break;
+    case 0x2190: names = {"arrowleft"}; break;
+    case 0x2192: names = {"arrowright"}; break;
+    case 0x2207: names = {"nabla"}; break;
+    case 0x2211: names = {"summationdisplay.1", "summationtext.1", "summation"}; break;
+    case 0x2212: names = {"minus"}; break;
+    case 0x221A: names = {"radical"}; break;
+    case 0x2223: names = {"bar"}; break;
+    case 0x2225: names = {"bardbl", "bardblex"}; break;
+    case 0x222B: names = {"integraldisplay", "integraltext", "integral"}; break;
+    case 0x2264: names = {"lessequal"}; break;
+    case 0x2286: names = {"subsetorequal"}; break;
+    case 0x2295: names = {"circleplus"}; break;
+    case 0x230A: names = {"floorleft"}; break;
+    case 0x230B: names = {"floorright"}; break;
+    case 0x2308: names = {"ceilingleft"}; break;
+    case 0x2309: names = {"ceilingright"}; break;
+    case 0x27E8: names = {"angleleft"}; break;
+    case 0x27E9: names = {"angleright"}; break;
+    default: break;
+  }
+  if (cp >= 'A' && cp <= 'Z') names.push_back(std::string(1, static_cast<char>(cp)));
+  if (cp >= 'a' && cp <= 'z') names.push_back(std::string(1, static_cast<char>(cp)));
+  if (cp > 0xFFFFu && cp <= 0x10FFFFu) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "u%04X", cp);
+    names.push_back(buf);
+  }
+  if (cp > 0 && cp <= 0xFFFFu) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "uni%04X", cp);
+    names.push_back(buf);
+  }
+  return names;
+}
+
 static bool bgra_pixels_equal(const uint8_t* a, const uint8_t* b) {
   uint32_t pa, pb;
   std::memcpy(&pa, a, sizeof(pa));
@@ -2040,6 +2111,59 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
     // For vertical mode, track cursor_y separately
     float cursor_y = y;
 
+    auto draw_unicode_sequence = [&](const std::vector<uint32_t>& sequence,
+                                    float px, float py,
+                                    float target_advance) -> bool {
+      if (sequence.empty()) return false;
+
+      std::vector<float> component_advances;
+      component_advances.reserve(sequence.size());
+
+      float natural_total = 0.0f;
+      float em_scale = (font->ttf.units_per_em > 0)
+          ? (size / static_cast<float>(font->ttf.units_per_em))
+          : scale;
+
+      for (uint32_t cp : sequence) {
+        if (cp >= 0xFE00u && cp <= 0xFE0Fu) continue;
+        float component_adv = size * 0.32f;
+        if (font->has_ttf_parse) {
+          uint16_t g = ttf_cmap_lookup(&font->ttf, cp);
+          component_adv = glyph_advance_units(font, g) * em_scale;
+        } else {
+          int component_width = 0;
+          int component_lsb = 0;
+          stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(cp),
+                                    &component_width, &component_lsb);
+          component_adv = component_width * em_scale;
+        }
+        if (component_adv <= 0.0f) component_adv = size * 0.32f;
+        component_advances.push_back(component_adv);
+        natural_total += component_adv;
+      }
+
+      float fit_scale = (natural_total > 0.001f && target_advance > 0.001f)
+          ? std::min(1.0f, target_advance / natural_total)
+          : 1.0f;
+
+      bool drew_any = false;
+      float sx = px;
+      float sy = py;
+      size_t advance_index = 0;
+      for (uint32_t cp : sequence) {
+        if (cp >= 0xFE00u && cp <= 0xFE0Fu) continue;
+        drew_any = draw_glyph(static_cast<int>(cp), sx, sy, size,
+                             r, g, b, a) || drew_any;
+        float step = (advance_index < component_advances.size())
+            ? component_advances[advance_index] * fit_scale
+            : 0.0f;
+        ++advance_index;
+        sx += (step * hscale) * cos_tm;
+        sy -= (step * hscale) * sin_tm;
+      }
+      return drew_any;
+    };
+
     for (size_t i = 0; i < text.length(); ) {
       uint32_t char_code;
       size_t bytes_consumed = 1;
@@ -2062,6 +2186,45 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
         uint32_t mapped_unicode = 0;
         bool has_mapped_unicode =
             try_map_tounicode(char_code, current_font_, &mapped_unicode);
+        const std::vector<uint32_t>* unicode_sequence = nullptr;
+        bool has_unicode_sequence =
+            try_map_tounicode_sequence(char_code, current_font_,
+                                       &unicode_sequence);
+        const bool has_rich_sequence =
+            has_unicode_sequence && unicode_sequence && unicode_sequence->size() > 1;
+        const uint32_t fallback_unicode =
+            has_mapped_unicode ? mapped_unicode : map_char_to_unicode(char_code, current_font_);
+
+        // Character spacing (Tc) is common to both single glyph and sequence
+        // drawing and must be added to advance calculations for text positions.
+        float tc_canvas = 0.0f;
+        if (std::abs(state_.font_size) > 0.001f) {
+          tc_canvas = state_.char_spacing * size / state_.font_size;
+        }
+
+        float sequence_advance = 0.0f;
+        if (is_vertical) {
+          sequence_advance = type0_font->default_width / 1000.0f * size + tc_canvas;
+        } else {
+          auto width_it = type0_font->cid_widths.find(char_code);
+          if (width_it != type0_font->cid_widths.end()) {
+            sequence_advance = width_it->second / 1000.0f * size + tc_canvas;
+          } else if (!using_embedded && font->has_ttf_parse) {
+            uint32_t lookup = char_code;
+            if (!type0_font->to_unicode_cmap.code_to_unicode.empty()) {
+              lookup = type0_font->to_unicode_cmap.map_code_to_unicode(char_code);
+            }
+            uint16_t fgid = ttf_cmap_lookup(&font->ttf, lookup);
+            if (fgid == 0 && lookup != char_code) {
+              fgid = ttf_cmap_lookup(&font->ttf, char_code);
+            }
+            uint16_t fadv_units = glyph_advance_units(font, fgid);
+            uint16_t upem = font->ttf.units_per_em ? font->ttf.units_per_em : 1000;
+            sequence_advance = (static_cast<float>(fadv_units) / upem) * size + tc_canvas;
+          } else {
+            sequence_advance = type0_font->default_width / 1000.0f * size + tc_canvas;
+          }
+        }
 
         // Compute glyph draw position
         // For vertical mode: uses cursor_y with v_x centering
@@ -2119,28 +2282,32 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
           if (!drawn && is_identity_cmap(type0_font)) {
             drawn = try_draw_gid(char_code);
           }
-          if (!drawn && has_mapped_unicode) {
-            draw_glyph(static_cast<int>(mapped_unicode), draw_x, draw_y, size,
-                       r, g, b, a);
-            drawn = true;
-          }
           if (!drawn) {
-            uint32_t unicode = map_char_to_unicode(char_code, current_font_);
-            draw_glyph(static_cast<int>(unicode), draw_x, draw_y, size, r, g, b, a);
+            if (has_rich_sequence) {
+              drawn = draw_unicode_sequence(*unicode_sequence, draw_x, draw_y,
+                                            sequence_advance);
+            }
+            if (!drawn && has_mapped_unicode) {
+              draw_glyph(static_cast<int>(mapped_unicode), draw_x, draw_y, size,
+                         r, g, b, a);
+              drawn = true;
+            }
+            if (!drawn) {
+              draw_glyph(static_cast<int>(fallback_unicode), draw_x, draw_y, size,
+                         r, g, b, a);
+            }
           }
         } else {
           // Fallback font: always draw by Unicode semantics.
-          uint32_t unicode =
-              has_mapped_unicode ? mapped_unicode
-                                 : map_char_to_unicode(char_code, current_font_);
-          draw_glyph(static_cast<int>(unicode), draw_x, draw_y, size, r, g, b, a);
-        }
-
-        // Compute character spacing (Tc) in canvas space
-        // Tc is in text space; canvas = Tc * font_scale * scale = Tc * size / Tfs
-        float tc_canvas = 0.0f;
-        if (std::abs(state_.font_size) > 0.001f) {
-          tc_canvas = state_.char_spacing * size / state_.font_size;
+          bool drawn = false;
+          if (has_rich_sequence) {
+            drawn = draw_unicode_sequence(*unicode_sequence, draw_x, draw_y,
+                                         sequence_advance);
+          }
+          if (!drawn) {
+            draw_glyph(static_cast<int>(fallback_unicode), draw_x, draw_y, size,
+                       r, g, b, a);
+          }
         }
 
         if (is_vertical) {
@@ -2158,27 +2325,7 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
           cursor_y += static_cast<float>(-w1_y) / 1000.0f * size - tc_canvas;
         } else {
           // Horizontal mode: advance cursor in text direction using horizontal widths
-          auto width_it = type0_font->cid_widths.find(char_code);
-          float adv;
-          if (width_it != type0_font->cid_widths.end()) {
-            adv = width_it->second / 1000.0f * size + tc_canvas;
-          } else if (!using_embedded && font && font->has_ttf_parse) {
-            // Substitute font: look up advance from the fallback font's hmtx
-            // rather than trusting DW=1000 which gives 1-em spacing per glyph.
-            uint32_t lookup = char_code;
-            if (!type0_font->to_unicode_cmap.code_to_unicode.empty()) {
-              lookup = type0_font->to_unicode_cmap.map_code_to_unicode(char_code);
-            }
-            uint16_t fgid = ttf_cmap_lookup(&font->ttf, lookup);
-            if (fgid == 0 && lookup != char_code) {
-              fgid = ttf_cmap_lookup(&font->ttf, char_code);
-            }
-            uint16_t fadv_units = glyph_advance_units(font, fgid);
-            uint16_t upem = font->ttf.units_per_em ? font->ttf.units_per_em : 1000;
-            adv = (static_cast<float>(fadv_units) / upem) * size + tc_canvas;
-          } else {
-            adv = type0_font->default_width / 1000.0f * size + tc_canvas;
-          }
+          float adv = sequence_advance;
           cursor_x += (adv * hscale) * cos_tm;
           cursor_y -= (adv * hscale) * sin_tm;  // canvas y = -(PDF y), so subtract sin
 
@@ -2199,6 +2346,31 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
         }
         if (glyph_name.empty() && char_code < font->type1.encoding.size()) {
           glyph_name = font->type1.encoding[char_code];
+        }
+        if (current_font_) {
+          std::string base_lower = current_font_->base_font;
+          for (char& c : base_lower) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          }
+          if (base_lower.find("txex") != std::string::npos) {
+            if (glyph_name == "parenleftBig") glyph_name = "parenleftbig";
+            else if (glyph_name == "parenrightBig") glyph_name = "parenrightbig";
+          }
+        }
+        if ((glyph_name.empty() || glyph_name == ".notdef" ||
+             font->type1.char_strings.find(glyph_name) == font->type1.char_strings.end()) &&
+            current_font_) {
+          uint32_t mapped_unicode = 0;
+          if (try_map_tounicode(char_code, current_font_, &mapped_unicode)) {
+            for (const std::string& mapped_name :
+                 type1_glyph_name_candidates_for_unicode(mapped_unicode)) {
+              if (!mapped_name.empty() &&
+                  font->type1.char_strings.find(mapped_name) != font->type1.char_strings.end()) {
+                glyph_name = mapped_name;
+                break;
+              }
+            }
+          }
         }
 
         if (!glyph_name.empty() && glyph_name != ".notdef") {
@@ -2252,6 +2424,9 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
       // ttf_parse (from lightui) covers both the legacy `kern` table and GPOS
       // PairPos (kern feature), matching what HarfBuzz does for Latin kerning.
       uint32_t codepoint = map_char_to_unicode(char_code, current_font_);
+      const std::vector<uint32_t>* unicode_sequence = nullptr;
+      bool has_unicode_sequence =
+          try_map_tounicode_sequence(char_code, current_font_, &unicode_sequence);
 
       // Resolve glyph ID via ttf_parse cmap when available; fall back to stbtt.
       uint16_t gid = 0;
@@ -2266,10 +2441,6 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
                                    &advance_width, &lsb);
       }
 
-      // Draw the glyph
-      draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
-
-      // Advance cursor in text direction
       // Add character spacing (Tc) in canvas space
       float tc_canvas2 = 0.0f;
       if (std::abs(state_.font_size) > 0.001f) {
@@ -2301,6 +2472,53 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
             : scale;
         adv = advance_width * em_scale;
       }
+
+      if (has_unicode_sequence && unicode_sequence) {
+        std::vector<float> component_advances;
+        component_advances.reserve(unicode_sequence->size());
+        float natural_total = 0.0f;
+        float em_scale = (font->ttf.units_per_em > 0)
+            ? (size / static_cast<float>(font->ttf.units_per_em))
+            : scale;
+        for (uint32_t cp : *unicode_sequence) {
+          if (cp >= 0xFE00u && cp <= 0xFE0Fu) continue;
+          float component_adv = size * 0.3f;
+          if (font->has_ttf_parse) {
+            uint16_t component_gid = ttf_cmap_lookup(&font->ttf, cp);
+            component_adv = glyph_advance_units(font, component_gid) * em_scale;
+          } else {
+            int component_width = 0, component_lsb = 0;
+            stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(cp),
+                                       &component_width, &component_lsb);
+            component_adv = component_width * em_scale;
+          }
+          if (component_adv <= 0.0f) component_adv = size * 0.3f;
+          component_advances.push_back(component_adv);
+          natural_total += component_adv;
+        }
+        float fit_scale = (natural_total > 0.001f && adv > 0.001f)
+            ? std::min(1.0f, adv / natural_total)
+            : 1.0f;
+        float sequence_x = cursor_x;
+        float sequence_y = cursor_y;
+        size_t advance_index = 0;
+        for (size_t si = 0; si < unicode_sequence->size(); ++si) {
+          uint32_t cp = (*unicode_sequence)[si];
+          if (cp >= 0xFE00u && cp <= 0xFE0Fu) continue;
+          draw_glyph(static_cast<int>(cp), sequence_x,
+                     sequence_y, size, r, g, b, a);
+          float step = (advance_index < component_advances.size())
+              ? component_advances[advance_index] * fit_scale
+              : 0.0f;
+          advance_index++;
+          sequence_x += (step * hscale) * cos_tm;
+          sequence_y -= (step * hscale) * sin_tm;
+        }
+      } else {
+        draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
+      }
+
+      // Advance cursor in text direction
       adv += tc_canvas2 + tw_canvas;
       cursor_x += (adv * hscale) * cos_tm;
       cursor_y -= (adv * hscale) * sin_tm;
@@ -2466,6 +2684,7 @@ static int get_lightvg_font_category(const std::string& font_name) {
 
   // Check for monospace/typewriter fonts
   if (lower_name.find("courier") != std::string::npos ||
+      lower_name.find("inconsolata") != std::string::npos ||
       lower_name.find("mono") != std::string::npos ||
       lower_name.find("typewriter") != std::string::npos ||
       lower_name.find("consol") != std::string::npos ||
@@ -2473,8 +2692,23 @@ static int get_lightvg_font_category(const std::string& font_name) {
     return 1;  // Monospace
   }
 
+  // Check for symbol/dingbat fonts
+  if (lower_name.find("symbol") != std::string::npos ||
+      lower_name.find("math") != std::string::npos ||
+      lower_name.find("txmia") != std::string::npos ||
+      lower_name.find("txsys") != std::string::npos ||
+      lower_name.find("txsym") != std::string::npos ||
+      lower_name.find("txex") != std::string::npos ||
+      lower_name.find("dingbat") != std::string::npos ||
+      lower_name.find("wingding") != std::string::npos ||
+      lower_name.find("zapf") != std::string::npos) {
+    return 3;  // Symbol
+  }
+
   // Check for serif fonts
   if (lower_name.find("times") != std::string::npos ||
+      lower_name.find("linlibertine") != std::string::npos ||
+      lower_name.find("libertine") != std::string::npos ||
       lower_name.find("serif") != std::string::npos ||
       lower_name.find("roman") != std::string::npos ||
       lower_name.find("garamond") != std::string::npos ||
@@ -2484,12 +2718,12 @@ static int get_lightvg_font_category(const std::string& font_name) {
     return 2;  // Serif
   }
 
-  // Check for symbol/dingbat fonts
-  if (lower_name.find("symbol") != std::string::npos ||
-      lower_name.find("dingbat") != std::string::npos ||
-      lower_name.find("wingding") != std::string::npos ||
-      lower_name.find("zapf") != std::string::npos) {
-    return 3;  // Symbol
+  if (lower_name.find("linbiolinum") != std::string::npos ||
+      lower_name.find("biolinum") != std::string::npos ||
+      lower_name.find("helvetica") != std::string::npos ||
+      lower_name.find("arial") != std::string::npos ||
+      lower_name.find("sans") != std::string::npos) {
+    return 0;  // Sans-serif
   }
 
   // Default to sans-serif (most common)
@@ -2530,6 +2764,11 @@ static std::pair<int, bool> parse_font_weight_style(const std::string& name) {
   for (char c : name) {
     lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
+  std::string family_name = lower;
+  size_t subset_pos = family_name.find('+');
+  if (subset_pos != std::string::npos) {
+    family_name = family_name.substr(subset_pos + 1);
+  }
 
   int weight = 400;
   bool italic = false;
@@ -2546,6 +2785,22 @@ static std::pair<int, bool> parse_font_weight_style(const std::string& name) {
   if (lower.find("italic") != std::string::npos ||
       lower.find("oblique") != std::string::npos) {
     italic = true;
+  }
+  if (family_name.find("linlibertine") != std::string::npos ||
+      family_name.find("linbiolinum") != std::string::npos) {
+    if (family_name.size() >= 2 &&
+        family_name.compare(family_name.size() - 2, 2, "ti") == 0) {
+      italic = true;
+    }
+    if (family_name.size() >= 2 &&
+        family_name.compare(family_name.size() - 2, 2, "tb") == 0) {
+      weight = 700;
+    }
+    if (family_name.size() >= 3 &&
+        family_name.compare(family_name.size() - 3, 3, "tbi") == 0) {
+      weight = 700;
+      italic = true;
+    }
   }
 
   return {weight, italic};
@@ -2873,6 +3128,8 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   return false;
 }
 
+static bool should_use_embedded_type1_for_lightvg(const BaseFont* font);
+
 bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, const BaseFont* font) {
   if (font_cache_.count(font_name)) {
     return font_cache_[font_name].initialized;
@@ -2951,6 +3208,9 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
   }
 
   if (desc->font_file_type == FontFileType::FontFile) {
+    if (!should_use_embedded_type1_for_lightvg(font)) {
+      return load_fallback_font_with_hint(font_name, font);
+    }
     Type1Parser parser;
     FontCache cache;
     if (!parser.Parse(decoded.data.data(), decoded.data.size(), cache.type1, true)) {
@@ -3131,6 +3391,22 @@ std::string LightVGBackend::font_cache_key(const BaseFont* font) const {
   // the same base name maps to the same substitute — a safe shared identity.
   if (!font->base_font.empty()) return "F" + font->base_font;
   return std::string();
+}
+
+static bool should_use_embedded_type1_for_lightvg(const BaseFont* font) {
+  if (!font) return false;
+  std::string name = font->base_font;
+  size_t subset = name.find('+');
+  if (subset != std::string::npos) name = name.substr(subset + 1);
+  std::string lower;
+  for (char c : name) {
+    lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return lower.find("math") != std::string::npos ||
+         lower.find("txmia") != std::string::npos ||
+         lower.find("txsys") != std::string::npos ||
+         lower.find("txsym") != std::string::npos ||
+         lower.find("txex") != std::string::npos;
 }
 
 uint16_t LightVGBackend::glyph_advance_units(FontCache* font, uint16_t gid) {
@@ -6136,8 +6412,44 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   if (!scene_) {
     return false;
   }
+  uint32_t raw_codepoint = static_cast<uint32_t>(codepoint);
+  if (raw_codepoint > 0x10FFFFu) {
+    uint32_t hi = (raw_codepoint >> 16) & 0xFFFFu;
+    uint32_t lo = raw_codepoint & 0xFFFFu;
+    bool surrogate_pair = hi >= 0xD800u && hi <= 0xDBFFu &&
+                          lo >= 0xDC00u && lo <= 0xDFFFu;
+    bool known_ligature = hi == 'f' && (lo == 'f' || lo == 'i' || lo == 'l');
+    if (!surrogate_pair && !known_ligature &&
+        hi >= 0x20u && hi <= 0x7Eu && lo >= 0x20u && lo <= 0x7Eu) {
+      bool a_ok = draw_glyph(static_cast<int>(hi), x, y, size, r, g, b, a);
+      bool b_ok = draw_glyph(static_cast<int>(lo), x + size * 0.52f, y, size, r, g, b, a);
+      return a_ok || b_ok;
+    }
+  }
   codepoint = static_cast<int>(
       normalize_render_codepoint(static_cast<uint32_t>(codepoint)));
+
+  auto draw_ligature_fallback = [&]() -> bool {
+    const char* letters = nullptr;
+    switch (codepoint) {
+      case 0xFB00: letters = "ff"; break;
+      case 0xFB01: letters = "fi"; break;
+      case 0xFB02: letters = "fl"; break;
+      case 0xFB03: letters = "ffi"; break;
+      case 0xFB04: letters = "ffl"; break;
+      default: break;
+    }
+    if (!letters) return false;
+    bool drew_any = false;
+    float dx = 0.0f;
+    for (const char* p = letters; *p; ++p) {
+      if (draw_glyph(static_cast<int>(*p), x + dx, y, size, r, g, b, a)) {
+        drew_any = true;
+      }
+      dx += size * 0.28f;
+    }
+    return drew_any;
+  };
 
   auto draw_bullet_fallback = [&]() -> bool {
     if (codepoint != 0x2022 && codepoint != 0x30FB) return false;
@@ -6170,6 +6482,7 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   // Get current font
   FontCache* font = get_font(current_font_name_);
   if (!font) {
+    if (draw_ligature_fallback()) return true;
     if (draw_bullet_fallback()) return true;
     if (draw_checkmark_fallback()) return true;
     // Fallback to tofu box placeholder
@@ -6214,6 +6527,7 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
         codepoint == 0x0D || codepoint == 0x00A0) {
       return true;
     }
+    if (draw_ligature_fallback()) return true;
     if (draw_bullet_fallback()) return true;
     if (draw_checkmark_fallback()) return true;
     if (try_draw_glyph_fallback(codepoint, x, y, size, r, g, b, a)) return true;
@@ -6274,6 +6588,7 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
           codepoint == 0x0D || codepoint == 0x00A0) {
         return true;
       }
+      if (draw_ligature_fallback()) return true;
       if (draw_bullet_fallback()) return true;
       if (draw_checkmark_fallback()) return true;
       if (try_draw_glyph_fallback(codepoint, x, y, size, r, g, b, a)) return true;

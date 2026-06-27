@@ -1574,17 +1574,74 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
     float cursor_x = x;
     float scale = stbtt_ScaleForPixelHeight(&font->font_info, size);
 
-    // Use outer text direction variables for cursor advance
-    float cos_tm = cos_tm_outer;
-    float sin_tm = sin_tm_outer;
+  // Use outer text direction variables for cursor advance
+  float cos_tm = cos_tm_outer;
+  float sin_tm = sin_tm_outer;
 
-    // Check if this is a Type0/CID font that uses two-byte encoding
-    auto* type0_font = as_type0_font(current_font_);
-    bool is_two_byte_cid = type0_font ? type0_font->is_two_byte_cid : false;
-    bool is_vertical = type0_font ? type0_font->is_vertical : false;
+  // Check if this is a Type0/CID font that uses two-byte encoding
+  auto* type0_font = as_type0_font(current_font_);
+  bool is_two_byte_cid = type0_font ? type0_font->is_two_byte_cid : false;
+  bool is_vertical = type0_font ? type0_font->is_vertical : false;
 
-    // For vertical mode, track cursor_y separately
-    float cursor_y = y;
+  auto draw_unicode_sequence = [&](const std::vector<uint32_t>& sequence,
+                                  float x, float y,
+                                  float target_advance) -> bool {
+    if (sequence.empty()) return false;
+
+    std::vector<float> component_advances;
+    component_advances.reserve(sequence.size());
+
+    float em_scale = (font->ttf.units_per_em > 0)
+                         ? (size / static_cast<float>(font->ttf.units_per_em))
+                         : stbtt_ScaleForPixelHeight(&font->font_info, size);
+
+    float natural_total = 0.0f;
+    for (size_t si = 0; si < sequence.size(); ++si) {
+      uint32_t cp = sequence[si];
+      if (cp >= 0xFE00u && cp <= 0xFE0Fu) continue;
+
+      float component_adv = size * 0.32f;
+      if (font->has_ttf_parse) {
+        uint16_t g = ttf_cmap_lookup(&font->ttf, cp);
+        component_adv = ttf_hmtx_advance(&font->ttf, g) * em_scale;
+      } else {
+        int cp_adv = 0;
+        int cp_lsb = 0;
+        stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(cp), &cp_adv,
+                                  &cp_lsb);
+        component_adv = cp_adv * em_scale;
+      }
+      if (component_adv <= 0.0f) component_adv = size * 0.30f;
+      component_advances.push_back(component_adv);
+      natural_total += component_adv;
+    }
+
+    float fit_scale = (natural_total > 0.001f && target_advance > 0.001f)
+                          ? std::min(1.0f, target_advance / natural_total)
+                          : 1.0f;
+
+    bool drew_any = false;
+    float sx = x;
+    float sy = y;
+    size_t advance_index = 0;
+    for (size_t si = 0; si < sequence.size(); ++si) {
+      uint32_t cp = sequence[si];
+      if (cp >= 0xFE00u && cp <= 0xFE0Fu) continue;
+      if (draw_glyph(static_cast<int>(cp), sx, sy, size, r, g, b, a)) {
+        drew_any = true;
+      }
+      float step = (advance_index < component_advances.size())
+                       ? component_advances[advance_index] * fit_scale
+                       : 0.0f;
+      ++advance_index;
+      sx += (step * cos_tm);
+      sy -= (step * sin_tm);
+    }
+    return drew_any;
+  };
+
+  // For vertical mode, track cursor_y separately
+  float cursor_y = y;
 
     for (size_t i = 0; i < text.length(); ) {
       uint32_t char_code;
@@ -1608,6 +1665,45 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
         uint32_t mapped_unicode = 0;
         bool has_mapped_unicode =
             try_map_tounicode(char_code, current_font_, &mapped_unicode);
+        const std::vector<uint32_t>* unicode_sequence = nullptr;
+        bool has_unicode_sequence =
+            try_map_tounicode_sequence(char_code, current_font_, &unicode_sequence);
+        const bool has_rich_sequence =
+            has_unicode_sequence && unicode_sequence && unicode_sequence->size() > 1;
+        const uint32_t fallback_unicode =
+            has_mapped_unicode ? mapped_unicode
+                               : map_char_to_unicode(char_code, current_font_);
+
+        // Character spacing (Tc) is common to both single glyph and sequence
+        // drawing and must be added to advance calculations for text positions.
+        float tc_canvas = 0.0f;
+        if (std::abs(state_.font_size) > 0.001f) {
+          tc_canvas = state_.char_spacing * size / state_.font_size;
+        }
+
+        float sequence_advance = 0.0f;
+        if (is_vertical) {
+          sequence_advance = type0_font->default_width / 1000.0f * size + tc_canvas;
+        } else {
+          auto width_it = type0_font->cid_widths.find(char_code);
+          if (width_it != type0_font->cid_widths.end()) {
+            sequence_advance = width_it->second / 1000.0f * size + tc_canvas;
+          } else if (!using_embedded && font->has_ttf_parse) {
+            uint32_t lookup = char_code;
+            if (!type0_font->to_unicode_cmap.code_to_unicode.empty()) {
+              lookup = type0_font->to_unicode_cmap.map_code_to_unicode(char_code);
+            }
+            uint16_t fgid = ttf_cmap_lookup(&font->ttf, lookup);
+            if (fgid == 0 && lookup != char_code) {
+              fgid = ttf_cmap_lookup(&font->ttf, char_code);
+            }
+            uint16_t fadv_units = ttf_hmtx_advance(&font->ttf, fgid);
+            uint16_t upem = font->ttf.units_per_em ? font->ttf.units_per_em : 1000;
+            sequence_advance = (static_cast<float>(fadv_units) / upem) * size + tc_canvas;
+          } else {
+            sequence_advance = type0_font->default_width / 1000.0f * size + tc_canvas;
+          }
+        }
 
         // Compute glyph draw position
         // For vertical mode: uses cursor_y with v_x centering
@@ -1665,28 +1761,31 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
           if (!drawn && is_identity_cmap(type0_font)) {
             drawn = try_draw_gid(char_code);
           }
+          if (!drawn && has_rich_sequence) {
+            drawn = draw_unicode_sequence(*unicode_sequence, draw_x, draw_y,
+                                         sequence_advance);
+          }
           if (!drawn && has_mapped_unicode) {
             draw_glyph(static_cast<int>(mapped_unicode), draw_x, draw_y, size,
                        r, g, b, a);
             drawn = true;
           }
           if (!drawn) {
-            uint32_t unicode = map_char_to_unicode(char_code, current_font_);
-            draw_glyph(static_cast<int>(unicode), draw_x, draw_y, size, r, g, b, a);
+            draw_glyph(static_cast<int>(fallback_unicode), draw_x, draw_y, size,
+                       r, g, b, a);
           }
         } else {
           // Fallback font: always draw by Unicode semantics.
-          uint32_t unicode =
-              has_mapped_unicode ? mapped_unicode
-                                 : map_char_to_unicode(char_code, current_font_);
-          draw_glyph(static_cast<int>(unicode), draw_x, draw_y, size, r, g, b, a);
-        }
-
-        // Compute character spacing (Tc) in canvas space
-        // Tc is in text space; canvas = Tc * font_scale * scale = Tc * size / Tfs
-        float tc_canvas = 0.0f;
-        if (std::abs(state_.font_size) > 0.001f) {
-          tc_canvas = state_.char_spacing * size / state_.font_size;
+          if (has_rich_sequence) {
+            if (!draw_unicode_sequence(*unicode_sequence, draw_x, draw_y,
+                                      sequence_advance)) {
+              draw_glyph(static_cast<int>(fallback_unicode), draw_x, draw_y, size,
+                         r, g, b, a);
+            }
+          } else {
+            draw_glyph(static_cast<int>(fallback_unicode), draw_x, draw_y, size,
+                       r, g, b, a);
+          }
         }
 
         if (is_vertical) {
@@ -1704,29 +1803,8 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
           cursor_y += static_cast<float>(-w1_y) / 1000.0f * size - tc_canvas;
         } else {
           // Horizontal mode: advance cursor in text direction using horizontal widths
-          auto width_it = type0_font->cid_widths.find(char_code);
-          float adv;
-          if (width_it != type0_font->cid_widths.end()) {
-            adv = width_it->second / 1000.0f * size + tc_canvas;
-          } else if (!using_embedded && font && font->has_ttf_parse) {
-            // Substitute font: look up advance from the fallback font's hmtx
-            // rather than trusting DW=1000 which gives 1-em spacing per glyph.
-            uint32_t lookup = char_code;
-            if (!type0_font->to_unicode_cmap.code_to_unicode.empty()) {
-              lookup = type0_font->to_unicode_cmap.map_code_to_unicode(char_code);
-            }
-            uint16_t fgid = ttf_cmap_lookup(&font->ttf, lookup);
-            if (fgid == 0 && lookup != char_code) {
-              fgid = ttf_cmap_lookup(&font->ttf, char_code);
-            }
-            uint16_t fadv_units = ttf_hmtx_advance(&font->ttf, fgid);
-            uint16_t upem = font->ttf.units_per_em ? font->ttf.units_per_em : 1000;
-            adv = (static_cast<float>(fadv_units) / upem) * size + tc_canvas;
-          } else {
-            adv = type0_font->default_width / 1000.0f * size + tc_canvas;
-          }
-          cursor_x += adv * cos_tm;
-          cursor_y -= adv * sin_tm;  // canvas y = -(PDF y), so subtract sin
+          cursor_x += sequence_advance * cos_tm;
+          cursor_y -= sequence_advance * sin_tm;  // canvas y = -(PDF y), so subtract sin
 
           // Do not apply font kerning here: PDF content streams already encode
           // text positioning via Tj/TJ adjustments and text state tracking.
@@ -1752,9 +1830,6 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
                                    static_cast<int>(codepoint),
                                    &advance_width, &lsb);
       }
-
-      // Draw the glyph
-      draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
 
       // Advance cursor in text direction
       // Add character spacing (Tc) in canvas space
@@ -1788,6 +1863,56 @@ bool ThorVGBackend::draw_text(float x, float y, const std::string& text, float s
             : scale;
         adv = advance_width * em_scale;
       }
+
+      const std::vector<uint32_t>* unicode_sequence = nullptr;
+      bool has_unicode_sequence =
+          try_map_tounicode_sequence(char_code, current_font_, &unicode_sequence);
+
+      if (has_unicode_sequence && unicode_sequence && unicode_sequence->size() > 1) {
+        std::vector<float> component_advances;
+        component_advances.reserve(unicode_sequence->size());
+        float natural_total = 0.0f;
+        float em_scale = (font->ttf.units_per_em > 0)
+                             ? (size / static_cast<float>(font->ttf.units_per_em))
+                             : scale;
+        for (uint32_t sequence_cp : *unicode_sequence) {
+          if (sequence_cp >= 0xFE00u && sequence_cp <= 0xFE0Fu) continue;
+          float component_adv = size * 0.3f;
+          if (font->has_ttf_parse) {
+            uint16_t component_gid = ttf_cmap_lookup(&font->ttf, sequence_cp);
+            component_adv = ttf_hmtx_advance(&font->ttf, component_gid) * em_scale;
+          } else {
+            int component_width = 0, component_lsb = 0;
+            stbtt_GetCodepointHMetrics(&font->font_info,
+                                       static_cast<int>(sequence_cp),
+                                       &component_width, &component_lsb);
+            component_adv = component_width * em_scale;
+          }
+          if (component_adv <= 0.0f) component_adv = size * 0.3f;
+          component_advances.push_back(component_adv);
+          natural_total += component_adv;
+        }
+        float fit_scale = (natural_total > 0.001f && adv > 0.001f)
+                             ? std::min(1.0f, adv / natural_total)
+                             : 1.0f;
+        float sequence_x = cursor_x;
+        float sequence_y = cursor_y;
+        size_t advance_index = 0;
+        for (size_t si = 0; si < unicode_sequence->size(); ++si) {
+          uint32_t cp = (*unicode_sequence)[si];
+          if (cp >= 0xFE00u && cp <= 0xFE0Fu) continue;
+          draw_glyph(static_cast<int>(cp), sequence_x, sequence_y, size, r, g, b, a);
+          float step = (advance_index < component_advances.size())
+                           ? component_advances[advance_index] * fit_scale
+                           : 0.0f;
+          ++advance_index;
+          sequence_x += (step * cos_tm);
+          sequence_y -= (step * sin_tm);
+        }
+      } else {
+        draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
+      }
+
       adv += tc_canvas2 + tw_canvas;
       cursor_x += adv * cos_tm;
       cursor_y -= adv * sin_tm;
@@ -1941,6 +2066,7 @@ static int get_thorvg_font_category(const std::string& font_name) {
 
   // Check for monospace/typewriter fonts
   if (lower_name.find("courier") != std::string::npos ||
+      lower_name.find("inconsolata") != std::string::npos ||
       lower_name.find("mono") != std::string::npos ||
       lower_name.find("typewriter") != std::string::npos ||
       lower_name.find("consol") != std::string::npos ||
@@ -1961,6 +2087,11 @@ static int get_thorvg_font_category(const std::string& font_name) {
 
   // Check for symbol/dingbat fonts
   if (lower_name.find("symbol") != std::string::npos ||
+      lower_name.find("math") != std::string::npos ||
+      lower_name.find("txmia") != std::string::npos ||
+      lower_name.find("txsys") != std::string::npos ||
+      lower_name.find("txsym") != std::string::npos ||
+      lower_name.find("txex") != std::string::npos ||
       lower_name.find("dingbat") != std::string::npos ||
       lower_name.find("wingding") != std::string::npos ||
       lower_name.find("zapf") != std::string::npos) {
@@ -2006,6 +2137,12 @@ static std::pair<int, bool> parse_font_weight_style(const std::string& name) {
     lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
 
+  std::string family_name = lower;
+  size_t subset_pos = family_name.find('+');
+  if (subset_pos != std::string::npos) {
+    family_name = family_name.substr(subset_pos + 1);
+  }
+
   int weight = 400;
   bool italic = false;
 
@@ -2021,6 +2158,23 @@ static std::pair<int, bool> parse_font_weight_style(const std::string& name) {
   if (lower.find("italic") != std::string::npos ||
       lower.find("oblique") != std::string::npos) {
     italic = true;
+  }
+
+  if (family_name.find("linlibertine") != std::string::npos ||
+      family_name.find("linbiolinum") != std::string::npos) {
+    if (family_name.size() >= 2 &&
+        family_name.compare(family_name.size() - 2, 2, "ti") == 0) {
+      italic = true;
+    }
+    if (family_name.size() >= 2 &&
+        family_name.compare(family_name.size() - 2, 2, "tb") == 0) {
+      weight = 700;
+    }
+    if (family_name.size() >= 3 &&
+        family_name.compare(family_name.size() - 3, 3, "tbi") == 0) {
+      weight = 700;
+      italic = true;
+    }
   }
 
   return {weight, italic};

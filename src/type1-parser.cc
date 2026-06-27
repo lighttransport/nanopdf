@@ -23,15 +23,17 @@ namespace {
 
 // Standard Type 1 eexec key.
 static const uint16_t kEexecKey = 55665;
+static const uint16_t kCharStringKey = 4330;
 
 // Decrypt (or encrypt — same operation) len bytes in-place using the
 // Adobe Type 1 standard cipher (keyed XOR with feedback).
 //   plain[i] = cipher[i] ^ (key >> 8)
-//   key = (key + plain[i]) * 52845 + 22719  (mod 65536)
+//   key = (key + cipher[i]) * 52845 + 22719  (mod 65536)
 void t1_crypt_inplace(uint8_t* buf, uint32_t len, uint16_t key) {
   for (uint32_t i = 0; i < len; i++) {
-    uint8_t plain = static_cast<uint8_t>(buf[i] ^ static_cast<uint8_t>(key >> 8));
-    key = static_cast<uint16_t>((static_cast<uint32_t>(key) + plain) * 52845 + 22719);
+    uint8_t cipher = buf[i];
+    uint8_t plain = static_cast<uint8_t>(cipher ^ static_cast<uint8_t>(key >> 8));
+    key = static_cast<uint16_t>((static_cast<uint32_t>(key) + cipher) * 52845 + 22719);
     buf[i] = plain;
   }
 }
@@ -45,14 +47,20 @@ static bool extract_rd_binary(
     const char* src, size_t src_len, int count, int lenIV,
     std::vector<uint8_t>& out) {
   if (count <= 0) return false;
+  if (static_cast<size_t>(count) > src_len) return false;
+
+  std::vector<uint8_t> decrypted(reinterpret_cast<const uint8_t*>(src),
+                                 reinterpret_cast<const uint8_t*>(src) + count);
+  t1_crypt_inplace(decrypted.data(), static_cast<uint32_t>(decrypted.size()),
+                   kCharStringKey);
+
   int skip = (std::min)(lenIV, count);
   int actual = count - skip;
   if (actual <= 0) {
     out.clear();
     return true;  // empty glyph (e.g. space with no outlines)
   }
-  out.assign(reinterpret_cast<const uint8_t*>(src) + skip,
-             reinterpret_cast<const uint8_t*>(src) + count);
+  out.assign(decrypted.begin() + skip, decrypted.end());
   return true;
 }
 
@@ -359,10 +367,13 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         break;
       }
 
-      case 4: { // sbw (set both widths)
-        if (ti->sp >= 2) {
-          // stack: wx wy (or with preceding hint values)
-          // The last two stack values are the widths
+      case 4: { // sbw: sidebearing x/y and width x/y
+        if (ti->sp >= 4) {
+          // Stack: sbx sby wx wy, possibly after hint values. The last four
+          // operands carry the metrics; TeX extensible symbols use sby for
+          // vertical delimiter placement.
+          ti->x = ti->stack[ti->sp - 4];
+          ti->y = ti->stack[ti->sp - 3];
           ti->width_set = 1;
         }
         ti->sp = 0;
@@ -402,10 +413,80 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
       break;
     }
 
-    case 13: // hschar (deprecated hint substitution, treat as no-op)
-    case 14: // vhchar (deprecated)
+    case 13: { // hsbw: horizontal sidebearing and width
+      if (ti->sp >= 2) {
+        ti->x = ti->stack[ti->sp - 2];
+        ti->y = 0.0f;
+        ti->width_set = 1;
+      }
       ti->sp = 0;
       break;
+    }
+
+    case 14: // endchar
+      t1_close_contour(ti);
+      ti->sp = 0;
+      return 0;
+
+    case 21: { // rmoveto
+      if (!ti->width_set && ti->sp > 2) ti->width_set = 1;
+      t1_close_contour(ti);
+      float dx = (ti->sp >= 2) ? ti->stack[ti->sp - 2] : 0.0f;
+      float dy = (ti->sp >= 1) ? ti->stack[ti->sp - 1] : 0.0f;
+      ti->x += dx;
+      ti->y += dy;
+      t1_ob_add_point(ti, ti->x, ti->y, 1);
+      ti->started = 1;
+      ti->sp = 0;
+      break;
+    }
+
+    case 22: { // hmoveto
+      if (!ti->width_set && ti->sp > 1) ti->width_set = 1;
+      t1_close_contour(ti);
+      float dx = (ti->sp >= 1) ? ti->stack[ti->sp - 1] : 0.0f;
+      ti->x += dx;
+      t1_ob_add_point(ti, ti->x, ti->y, 1);
+      ti->started = 1;
+      ti->sp = 0;
+      break;
+    }
+
+    case 30: { // vhcurveto
+      int i = 0;
+      while (i + 3 < ti->sp) {
+        float x1 = ti->x;
+        float y1 = ti->y + ti->stack[i];
+        float x2 = x1 + ti->stack[i + 1];
+        float y2 = y1 + ti->stack[i + 2];
+        ti->x = x2 + ti->stack[i + 3];
+        ti->y = y2;
+        t1_ob_add_point(ti, x1, y1, 2);
+        t1_ob_add_point(ti, x2, y2, 2);
+        t1_ob_add_point(ti, ti->x, ti->y, 1);
+        i += 4;
+      }
+      ti->sp = 0;
+      break;
+    }
+
+    case 31: { // hvcurveto
+      int i = 0;
+      while (i + 3 < ti->sp) {
+        float x1 = ti->x + ti->stack[i];
+        float y1 = ti->y;
+        float x2 = x1 + ti->stack[i + 1];
+        float y2 = y1 + ti->stack[i + 2];
+        ti->x = x2;
+        ti->y = y2 + ti->stack[i + 3];
+        t1_ob_add_point(ti, x1, y1, 2);
+        t1_ob_add_point(ti, x2, y2, 2);
+        t1_ob_add_point(ti, ti->x, ti->y, 1);
+        i += 4;
+      }
+      ti->sp = 0;
+      break;
+    }
 
     default:
       // Unknown operator: clear stack
@@ -866,7 +947,12 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
   // especially for PFB binary eexec sections.
   const char* p = eexec_pos;
   const char* end = data + size;
-  while (p < end && (*p <= ' ' || *p == '\n' || *p == '\r')) p++;
+  auto is_ps_space = [](char ch) {
+    unsigned char c = static_cast<unsigned char>(ch);
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+           c == '\0';
+  };
+  while (p < end && is_ps_space(*p)) p++;
 
   if (p >= end) return false;
 
@@ -875,10 +961,18 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
   const char* enc_start = p;
   size_t enc_len = static_cast<size_t>(end - p);
   bool is_hex = true;
-  for (size_t i = 0; i < std::min(enc_len, size_t(100)); i++) {
+  size_t hex_digits = 0;
+  for (size_t i = 0; i < std::min(enc_len, size_t(256)); i++) {
     unsigned char c = static_cast<unsigned char>(enc_start[i]);
-    if (c == 0 || c > 127) { is_hex = false; break; }
+    if (std::isspace(c)) continue;
+    if (std::isxdigit(c)) {
+      hex_digits++;
+      continue;
+    }
+    is_hex = false;
+    break;
   }
+  if (hex_digits < 16) is_hex = false;
 
   std::vector<uint8_t> binary;
   if (is_hex) {
@@ -886,10 +980,10 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
     binary.reserve(enc_len / 2);
     const char* hp = enc_start;
     while (hp < end) {
-      while (hp < end && (*hp <= ' ' || *hp == '\n' || *hp == '\r')) hp++;
+      while (hp < end && is_ps_space(*hp)) hp++;
       if (hp >= end) break;
       char hi = *hp++;
-      while (hp < end && (*hp <= ' ' || *hp == '\n' || *hp == '\r')) hp++;
+      while (hp < end && is_ps_space(*hp)) hp++;
       if (hp >= end) break;
       char lo = *hp++;
       auto hex = [](char c) -> int {
@@ -912,9 +1006,9 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
   // Decrypt with key 55665 (Adobe Type 1 eexec key)
   t1_crypt_inplace(binary.data(), static_cast<uint32_t>(binary.size()), kEexecKey);
 
-  // Skip lenIV random bytes from the decrypted stream to synchronise the
-  // cipher.  In most fonts lenIV=4, but some use 0.
-  int skip = result.lenIV;
+  // eexec has its own four random synchronization bytes. This is independent
+  // from CharString lenIV, which is parsed from the decrypted Private dict.
+  int skip = 4;
   if (static_cast<int>(binary.size()) > skip) {
     binary.erase(binary.begin(), binary.begin() + skip);
   }
@@ -926,6 +1020,15 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
   const char* dec_end = dec + binary.size();
   const char* dp = dec;
 
+  if (const char* len_iv_pos =
+          FindName(dec, static_cast<size_t>(dec_end - dec), "/lenIV")) {
+    const char* lp = SkipWhitespaceAndComments(len_iv_pos, dec_end);
+    int parsed_len_iv = result.lenIV;
+    if (ParseInteger(lp, dec_end, parsed_len_iv)) {
+      result.lenIV = (std::max)(0, parsed_len_iv);
+    }
+  }
+
   bool in_charstrings = false;
   bool in_subrs = false;
   std::string pending_name;
@@ -936,8 +1039,7 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
 
   while (dp < dec_end) {
     // Skip whitespace
-    while (dp < dec_end && (*dp <= ' ' || *dp == '\n' || *dp == '\r' ||
-                             *dp == '\t' || *dp == '\f')) dp++;
+    while (dp < dec_end && is_ps_space(*dp)) dp++;
     if (dp >= dec_end) break;
 
     // If we're in a parenthesized string, skip it
@@ -987,21 +1089,19 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
     if (state == kWantRD && pending_count >= 0) {
       if (token == "RD" || token == "-|") {
         // Read pending_count bytes of raw (already-decrypted) data
-        while (dp < dec_end && (*dp <= ' ' || *dp == '\n' ||
-                                 *dp == '\r')) dp++;
+        while (dp < dec_end && is_ps_space(*dp)) dp++;
         int count = pending_count;
-        int skip2 = result.lenIV;
-        if (dp + count <= dec_end && count > skip2) {
-          const uint8_t* cs_start = reinterpret_cast<const uint8_t*>(dp) + skip2;
-          int cs_len = count - skip2;
+        if (dp + count <= dec_end) {
           if (in_charstrings && !pending_name.empty()) {
-            result.char_strings[pending_name].assign(cs_start, cs_start + cs_len);
+            extract_rd_binary(dp, static_cast<size_t>(dec_end - dp), count,
+                              result.lenIV, result.char_strings[pending_name]);
           } else if (in_subrs && pending_subr_idx >= 0) {
             size_t idx = static_cast<size_t>(pending_subr_idx);
             if (idx >= result.subrs.size()) {
               result.subrs.resize(idx + 1);
             }
-            result.subrs[idx].assign(cs_start, cs_start + cs_len);
+            extract_rd_binary(dp, static_cast<size_t>(dec_end - dp), count,
+                              result.lenIV, result.subrs[idx]);
           }
         }
         // Advance past the binary data
@@ -1039,7 +1139,7 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
       // Next token should be the subr index
       pending_subr_idx = -1;
       // Read next token as index
-      while (dp < dec_end && (*dp <= ' ' || *dp == '\n' || *dp == '\r')) dp++;
+      while (dp < dec_end && is_ps_space(*dp)) dp++;
       if (dp < dec_end && std::isdigit(static_cast<unsigned char>(*dp))) {
         const char* num_start = dp;
         while (dp < dec_end && std::isdigit(static_cast<unsigned char>(*dp))) dp++;

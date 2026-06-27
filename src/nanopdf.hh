@@ -361,6 +361,7 @@ struct CMap {
 
   // Code to Unicode mappings
   std::map<uint32_t, uint32_t> code_to_unicode;
+  std::map<uint32_t, std::vector<uint32_t>> code_to_unicode_sequence;
   std::map<std::pair<uint32_t, uint32_t>, uint32_t> range_mappings;
 
   uint32_t map_code_to_unicode(uint32_t code) const {

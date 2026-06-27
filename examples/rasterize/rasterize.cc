@@ -16,7 +16,7 @@
 //   -w, --width <n>    Output width in pixels (preserves aspect if height omitted)
 //   -h, --height <n>   Output height in pixels (preserves aspect if width omitted)
 //   -s, --scale <f>    Scale factor (overrides width/height)
-//   --dpi <n>          DPI for rendering (default: 150, same as pdftoppm)
+//   --dpi <n>          DPI for rendering (default: 300)
 //   -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)
 //   -g, --grayscale    Convert output to grayscale
 //   --format <name>    Output format: png, jpg, bmp, or tga
@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <set>
@@ -54,9 +55,8 @@ struct RasterizeOptions {
   int width = 800;
   int height = 600;
   float scale = 0.0f;  // 0 means auto-calculate
-  // Default DPI matches pdftoppm's default so that output dimensions line up
-  // with the common "poppler at 150 dpi" baseline used by visual-diff tooling.
-  float dpi = 150.0f;
+  // Default DPI for clearer text in equations and small symbols.
+  float dpi = 300.0f;
   bool width_set = false;
   bool height_set = false;
   int rotation = 0;    // 0, 90, 180, 270 degrees
@@ -83,7 +83,7 @@ void print_usage(const char* program_name) {
   std::cout << "  -w, --width <n>    Output width in pixels (preserves aspect if height omitted)\n";
   std::cout << "  -h, --height <n>   Output height in pixels (preserves aspect if width omitted)\n";
   std::cout << "  -s, --scale <f>    Scale factor (overrides width/height)\n";
-  std::cout << "  --dpi <n>          DPI for rendering (default: 150, same as pdftoppm)\n";
+  std::cout << "  --dpi <n>          DPI for rendering (default: 300)\n";
   std::cout << "  -r, --rotate <n>   Rotation angle: 0, 90, 180, 270 (default: 0)\n";
   std::cout << "  -g, --grayscale    Convert output to grayscale\n";
   std::cout << "  --format <name>    Output format: png, jpg, bmp, or tga (default: png)\n";
@@ -98,7 +98,7 @@ void print_usage(const char* program_name) {
   std::cout << "  " << program_name << " document.pdf output.png\n";
   std::cout << "  " << program_name << " document.pdf output.png -p 2 -w 1024 -h 768\n";
   std::cout << "  " << program_name << " document.pdf output.png --pages 1-3,7,10\n";
-  std::cout << "  " << program_name << " document.pdf output.png --all --dpi 150\n";
+  std::cout << "  " << program_name << " document.pdf output.png --all --dpi 300\n";
   std::cout << "  " << program_name << " document.pdf output.png -s 2.0\n";
   std::cout << "  " << program_name << " document.pdf output.png -r 90 --grayscale\n";
   std::cout << "  " << program_name << " document.pdf output.jpg --format jpg --jpeg-quality 85\n";
@@ -519,20 +519,20 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
   // Priority: --scale > explicit --width/--height > --dpi (defaults to 150).
   // PDF user space is 72 pt per inch; output px = page_pt * dpi / 72.
   if (options.scale > 0) {
-    final_output_width = static_cast<int>(visible_page_width * options.scale);
-    final_output_height = static_cast<int>(visible_page_height * options.scale);
+    final_output_width = static_cast<int>(std::ceil(visible_page_width * options.scale));
+    final_output_height = static_cast<int>(std::ceil(visible_page_height * options.scale));
   } else if (options.width_set || options.height_set) {
     float aspect_ratio = static_cast<float>(visible_page_width / visible_page_height);
     if (options.width_set && !options.height_set) {
-      final_output_height = static_cast<int>(final_output_width / aspect_ratio);
+      final_output_height = static_cast<int>(std::ceil(final_output_width / aspect_ratio));
     } else if (options.height_set && !options.width_set) {
-      final_output_width = static_cast<int>(final_output_height * aspect_ratio);
+      final_output_width = static_cast<int>(std::ceil(final_output_height * aspect_ratio));
     }
     // If both are set, honor the canvas size verbatim.
   } else {
     float dpi_scale = options.dpi / 72.0f;
-    final_output_width = static_cast<int>(visible_page_width * dpi_scale);
-    final_output_height = static_cast<int>(visible_page_height * dpi_scale);
+    final_output_width = static_cast<int>(std::ceil(visible_page_width * dpi_scale));
+    final_output_height = static_cast<int>(std::ceil(visible_page_height * dpi_scale));
   }
 
   int output_width = final_output_width;

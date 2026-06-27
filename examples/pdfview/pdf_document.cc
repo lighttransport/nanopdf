@@ -345,10 +345,10 @@ const RenderedPage* PdfDocument::render_into(
     raw_w = page.media_box[2] - page.media_box[0];
     raw_h = page.media_box[3] - page.media_box[1];
   }
-  // Truncate (not round) to match examples/rasterize's px = pt * scale, so the
-  // two paths produce identical buffers for the same scale.
-  int out_w = std::max(1, (int)(raw_w * scale));
-  int out_h = std::max(1, (int)(raw_h * scale));
+  // Use ceil to keep the full PDF page covered when point-to-pixel conversion
+  // lands between pixels, matching the DPI render backend and rasterize CLI.
+  int out_w = std::max(1, (int)std::ceil(raw_w * scale));
+  int out_h = std::max(1, (int)std::ceil(raw_h * scale));
 
   if (!backend_->initialize((uint32_t)out_w, (uint32_t)out_h)) {
     error_ = "backend initialize failed";

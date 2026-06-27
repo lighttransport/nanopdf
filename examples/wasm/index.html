@@ -137,6 +137,9 @@
     <div class="canvas-area">
       <div class="canvas-scroll" id="canvas-scroll">
         <div class="canvas-scroll-spacer" aria-hidden="true"></div>
+        <div class="page-preview-wrapper" id="prev-page-wrapper" aria-hidden="true">
+          <canvas id="prev-page-canvas" class="page-preview-canvas"></canvas>
+        </div>
         <div class="empty-state" id="empty-state">
           <div class="icon">PDF</div>
           <div>No PDF loaded</div>
@@ -156,6 +159,9 @@
             <button data-markup="strike" title="Strikethrough selected text">Strike</button>
             <button data-markup="squiggly" title="Squiggly underline">Squiggly</button>
           </div>
+        </div>
+        <div class="page-preview-wrapper" id="next-page-wrapper" aria-hidden="true">
+          <canvas id="next-page-canvas" class="page-preview-canvas"></canvas>
         </div>
         <div class="canvas-scroll-spacer" aria-hidden="true"></div>
       </div>

@@ -8537,6 +8537,36 @@ bool parse_hex_string_token(const std::string& token, uint32_t* out) {
   return parse_hex_uint(hex, out);
 }
 
+std::vector<uint32_t> parse_hex_utf16_sequence_token(const std::string& token) {
+  std::vector<uint32_t> values;
+  if (token.size() < 2 || token.front() != '<') {
+    return values;
+  }
+  size_t end_pos = token.find('>');
+  if (end_pos == std::string::npos) {
+    return values;
+  }
+  std::string hex;
+  for (size_t i = 1; i < end_pos; ++i) {
+    char c = token[i];
+    if (!std::isspace(static_cast<unsigned char>(c))) {
+      hex += c;
+    }
+  }
+  if (hex.size() < 4 || (hex.size() & 3) != 0) {
+    return values;
+  }
+  for (size_t i = 0; i + 3 < hex.size(); i += 4) {
+    uint32_t value = 0;
+    if (!parse_hex_uint(hex.substr(i, 4), &value)) {
+      values.clear();
+      return values;
+    }
+    values.push_back(value);
+  }
+  return values;
+}
+
 std::vector<uint32_t> parse_hex_array_token(const std::string& token) {
   std::vector<uint32_t> values;
   size_t i = 0;
@@ -9045,8 +9075,13 @@ bool parse_cmap_content(const std::string& content, CMap* cmap) {
           continue;
         }
         if (entry_tokens[1].front() == '<') {
+          std::vector<uint32_t> sequence =
+              parse_hex_utf16_sequence_token(entry_tokens[1]);
           uint32_t dst = 0;
-          if (parse_hex_string_token(entry_tokens[1], &dst)) {
+          if (sequence.size() > 1) {
+            cmap->code_to_unicode[src] = sequence[0];
+            cmap->code_to_unicode_sequence[src] = std::move(sequence);
+          } else if (parse_hex_string_token(entry_tokens[1], &dst)) {
             cmap->code_to_unicode[src] = dst;
           }
         }
@@ -9078,13 +9113,36 @@ bool parse_cmap_content(const std::string& content, CMap* cmap) {
         }
         if (entry_tokens[2].front() == '[') {
           auto values = parse_hex_array_token(entry_tokens[2]);
+          std::vector<std::vector<uint32_t>> sequences;
+          size_t pos = 0;
+          while (pos < entry_tokens[2].size()) {
+            size_t start = entry_tokens[2].find('<', pos);
+            if (start == std::string::npos) break;
+            size_t end = entry_tokens[2].find('>', start);
+            if (end == std::string::npos) break;
+            sequences.push_back(parse_hex_utf16_sequence_token(
+                entry_tokens[2].substr(start, end - start + 1)));
+            pos = end + 1;
+          }
           for (size_t idx = 0; idx < values.size(); ++idx) {
-            cmap->code_to_unicode[start_code + static_cast<uint32_t>(idx)] =
-                values[idx];
+            uint32_t code = start_code + static_cast<uint32_t>(idx);
+            cmap->code_to_unicode[code] = values[idx];
+            if (idx < sequences.size() && sequences[idx].size() > 1) {
+              cmap->code_to_unicode_sequence[code] = std::move(sequences[idx]);
+            }
           }
         } else if (entry_tokens[2].front() == '<') {
+          std::vector<uint32_t> sequence =
+              parse_hex_utf16_sequence_token(entry_tokens[2]);
           uint32_t dst = 0;
-          if (parse_hex_string_token(entry_tokens[2], &dst)) {
+          if (sequence.size() > 1) {
+            for (uint32_t code = start_code; code <= end_code; ++code) {
+              std::vector<uint32_t> code_sequence = sequence;
+              code_sequence[0] += (code - start_code);
+              cmap->code_to_unicode[code] = code_sequence[0];
+              cmap->code_to_unicode_sequence[code] = std::move(code_sequence);
+            }
+          } else if (parse_hex_string_token(entry_tokens[2], &dst)) {
             for (uint32_t code = start_code; code <= end_code; ++code) {
               cmap->code_to_unicode[code] = dst + (code - start_code);
             }
@@ -9116,7 +9174,12 @@ bool parse_cmap_content(const std::string& content, CMap* cmap) {
         }
         uint32_t dst = 0;
         if (entry_tokens[1].front() == '<') {
-          if (parse_hex_string_token(entry_tokens[1], &dst)) {
+          std::vector<uint32_t> sequence =
+              parse_hex_utf16_sequence_token(entry_tokens[1]);
+          if (sequence.size() > 1) {
+            cmap->code_to_unicode[src] = sequence[0];
+            cmap->code_to_unicode_sequence[src] = std::move(sequence);
+          } else if (parse_hex_string_token(entry_tokens[1], &dst)) {
             cmap->code_to_unicode[src] = dst;
           }
         } else if (parse_literal_number(entry_tokens[1], &dst)) {
@@ -9150,7 +9213,16 @@ bool parse_cmap_content(const std::string& content, CMap* cmap) {
         }
         uint32_t dst = 0;
         if (entry_tokens[2].front() == '<') {
-          if (parse_hex_string_token(entry_tokens[2], &dst)) {
+          std::vector<uint32_t> sequence =
+              parse_hex_utf16_sequence_token(entry_tokens[2]);
+          if (sequence.size() > 1) {
+            for (uint32_t code = start_code; code <= end_code; ++code) {
+              std::vector<uint32_t> code_sequence = sequence;
+              code_sequence[0] += (code - start_code);
+              cmap->code_to_unicode[code] = code_sequence[0];
+              cmap->code_to_unicode_sequence[code] = std::move(code_sequence);
+            }
+          } else if (parse_hex_string_token(entry_tokens[2], &dst)) {
             for (uint32_t code = start_code; code <= end_code; ++code) {
               cmap->code_to_unicode[code] = dst + (code - start_code);
             }

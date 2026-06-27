@@ -2519,6 +2519,17 @@ function resetZoom() {
   saveViewState();
 }
 
+function setRenderBackendIfAvailable(backendId) {
+  if (!Module || !hasRendering || !Module._nanopdf_set_render_backend) return false;
+  const available = backendId === BACKEND_LIGHTVG
+    ? renderBackends.lightvg
+    : renderBackends.thorvg;
+  if (!available) return false;
+  if (Module._nanopdf_set_render_backend(backendId) !== 1) return false;
+  renderBackend = backendId;
+  return true;
+}
+
 // ---- Rotation ----
 
 function rotateClockwise() {
@@ -4529,10 +4540,8 @@ async function loadPDF(arrayBuffer, name) {
       fitMode = savedView.fitMode;
     }
     // Restore the backend if the saved one is available.
-    if (savedView.backend === BACKEND_LIGHTVG && renderBackends.lightvg) {
-      renderBackend = BACKEND_LIGHTVG;
-    } else if (savedView.backend === BACKEND_THORVG && renderBackends.thorvg) {
-      renderBackend = BACKEND_THORVG;
+    if (savedView.backend === BACKEND_LIGHTVG || savedView.backend === BACKEND_THORVG) {
+      setRenderBackendIfAvailable(savedView.backend);
     }
     // Restore the last viewed page for this specific file.
     if (savedView.pages && Number.isInteger(savedView.pages[name])) {
