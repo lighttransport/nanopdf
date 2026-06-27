@@ -159,6 +159,9 @@ struct T1Interp {
   int   seac_origin_x{0}, seac_origin_y{0};  // for seac accent
   float other_results[24];
   int other_sp{0};
+  int flex_active{0};
+  ttf_point_t flex_pts[7];
+  int flex_count{0};
 
   // Subrs
   const std::vector<std::vector<uint8_t>>* subrs{nullptr};
@@ -258,11 +261,13 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
 
     case 4: { // vmoveto
       if (!ti->width_set && ti->sp > 1) ti->width_set = 1;
-      t1_close_contour(ti);
       float dy = (ti->sp > 0) ? ti->stack[ti->sp - 1] : 0;
       ti->y += dy;
-      t1_ob_add_point(ti, ti->x, ti->y, 1);
-      ti->started = 1;
+      if (!ti->flex_active) {
+        t1_close_contour(ti);
+        t1_ob_add_point(ti, ti->x, ti->y, 1);
+        ti->started = 1;
+      }
       ti->sp = 0;
       break;
     }
@@ -404,14 +409,40 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         }
         ti->sp = arg_start;
         ti->other_sp = 0;
-        if (os_num == 3) {
+        if (os_num == 1) {
+          ti->flex_active = 1;
+          ti->flex_count = 1;
+          ti->flex_pts[0].x = ti->x;
+          ti->flex_pts[0].y = ti->y;
+          ti->flex_pts[0].on_curve = 1;
+        } else if (os_num == 2) {
+          if (ti->flex_active && ti->flex_count < 7) {
+            ti->flex_pts[ti->flex_count].x = ti->x;
+            ti->flex_pts[ti->flex_count].y = ti->y;
+            ti->flex_pts[ti->flex_count].on_curve =
+                (ti->flex_count == 3 || ti->flex_count == 6) ? 1 : 2;
+            ti->flex_count++;
+          }
+        } else if (os_num == 3) {
           for (int i = 0; i < n_args && ti->other_sp < 24; ++i) {
             ti->other_results[ti->other_sp++] = ti->stack[arg_start + i];
           }
         } else if (os_num == 0) {
+          if (ti->flex_active && ti->flex_count >= 7) {
+            if (!ti->started) {
+              t1_ob_add_point(ti, ti->flex_pts[0].x, ti->flex_pts[0].y, 1);
+              ti->started = 1;
+            }
+            for (int i = 1; i < 7; ++i) {
+              t1_ob_add_point(ti, ti->flex_pts[i].x, ti->flex_pts[i].y,
+                              ti->flex_pts[i].on_curve);
+            }
+          }
+          ti->flex_active = 0;
+          ti->flex_count = 0;
           // Flex end returns the current point for "pop pop setcurrentpoint".
-          if (ti->other_sp < 24) ti->other_results[ti->other_sp++] = ti->x;
           if (ti->other_sp < 24) ti->other_results[ti->other_sp++] = ti->y;
+          if (ti->other_sp < 24) ti->other_results[ti->other_sp++] = ti->x;
         }
         break;
       }
@@ -429,6 +460,15 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
           ti->y = ti->stack[ti->sp - 1];
         }
         ti->sp = 0;
+        break;
+
+      case 12: // div
+        if (ti->sp >= 2) {
+          float denom = ti->stack[ti->sp - 1];
+          float numer = ti->stack[ti->sp - 2];
+          ti->sp -= 2;
+          ti->stack[ti->sp++] = (denom != 0.0f) ? numer / denom : 0.0f;
+        }
         break;
 
       default:
@@ -455,24 +495,28 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
 
     case 21: { // rmoveto
       if (!ti->width_set && ti->sp > 2) ti->width_set = 1;
-      t1_close_contour(ti);
       float dx = (ti->sp >= 2) ? ti->stack[ti->sp - 2] : 0.0f;
       float dy = (ti->sp >= 1) ? ti->stack[ti->sp - 1] : 0.0f;
       ti->x += dx;
       ti->y += dy;
-      t1_ob_add_point(ti, ti->x, ti->y, 1);
-      ti->started = 1;
+      if (!ti->flex_active) {
+        t1_close_contour(ti);
+        t1_ob_add_point(ti, ti->x, ti->y, 1);
+        ti->started = 1;
+      }
       ti->sp = 0;
       break;
     }
 
     case 22: { // hmoveto
       if (!ti->width_set && ti->sp > 1) ti->width_set = 1;
-      t1_close_contour(ti);
       float dx = (ti->sp >= 1) ? ti->stack[ti->sp - 1] : 0.0f;
       ti->x += dx;
-      t1_ob_add_point(ti, ti->x, ti->y, 1);
-      ti->started = 1;
+      if (!ti->flex_active) {
+        t1_close_contour(ti);
+        t1_ob_add_point(ti, ti->x, ti->y, 1);
+        ti->started = 1;
+      }
       ti->sp = 0;
       break;
     }
