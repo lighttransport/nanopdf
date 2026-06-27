@@ -157,6 +157,8 @@ struct T1Interp {
   int   width_set{0};     // width consumed?
   int   num_hints{0};
   int   seac_origin_x{0}, seac_origin_y{0};  // for seac accent
+  float other_results[24];
+  int other_sp{0};
 
   // Subrs
   const std::vector<std::vector<uint8_t>>* subrs{nullptr};
@@ -382,19 +384,42 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
 
       case 5: { // callothersubr
         // OtherSubrs: predefined subroutines (flex, hint replacement).
-        // Stack: ... n OtherSubr# pop
-        // We just pop the arguments and produce no output.
-        if (ti->sp < 1) break;
-        // Last element is the subr number
+        // Stack: arg0 ... argN n_args other_subr_number callothersubr.
+        // Some fonts use OtherSubr 3 as a hint-replacement trampoline:
+        //   <subr-index> 1 3 callothersubr pop callsubr
+        // The following pop must restore <subr-index>; clearing the stack here
+        // drops whole outline subroutines from embedded Type1 text fonts.
+        if (ti->sp < 2) {
+          ti->sp = 0;
+          break;
+        }
         int os_num = static_cast<int>(ti->stack[ti->sp - 1]);
-        int n_args = ti->sp - 1;
-        (void)os_num; (void)n_args;
-        ti->sp = 0;
+        int n_args = static_cast<int>(ti->stack[ti->sp - 2]);
+        if (n_args < 0) n_args = 0;
+        int arg_start = ti->sp - 2 - n_args;
+        if (arg_start < 0) {
+          ti->sp = 0;
+          ti->other_sp = 0;
+          break;
+        }
+        ti->sp = arg_start;
+        ti->other_sp = 0;
+        if (os_num == 3) {
+          for (int i = 0; i < n_args && ti->other_sp < 24; ++i) {
+            ti->other_results[ti->other_sp++] = ti->stack[arg_start + i];
+          }
+        } else if (os_num == 0) {
+          // Flex end returns the current point for "pop pop setcurrentpoint".
+          if (ti->other_sp < 24) ti->other_results[ti->other_sp++] = ti->x;
+          if (ti->other_sp < 24) ti->other_results[ti->other_sp++] = ti->y;
+        }
         break;
       }
 
       case 6: // pop
-        // Pops a value from OtherSubr's result stack (we don't use them)
+        if (ti->other_sp > 0 && ti->sp < 24) {
+          ti->stack[ti->sp++] = ti->other_results[--ti->other_sp];
+        }
         break;
 
       case 7: // setcurrentpoint
