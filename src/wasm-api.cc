@@ -2617,6 +2617,10 @@ int nanopdf_register_embedded_fonts() {
       cat = nanopdf::FontCategory::kMono;
     } else if (strncmp(name, "Tinos", 5) == 0) {
       cat = nanopdf::FontCategory::kSerif;
+    } else if (strncmp(name, "STIXTwoMath", 10) == 0) {
+      cat = nanopdf::FontCategory::kSymbol;
+    } else if (strncmp(name, "NotoSansSymbols", 15) == 0) {
+      cat = nanopdf::FontCategory::kSymbol;
     } else if (strncmp(name, "NotoSans", 8) == 0) {
       cat = nanopdf::FontCategory::kSymbol;
     } else {

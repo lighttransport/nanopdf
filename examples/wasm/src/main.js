@@ -36,7 +36,7 @@ let hasRendering = false;
 let renderBackend = 1; // 0 = LightVG, 1 = ThorVG
 let renderBackends = { lightvg: false, thorvg: false };
 let pendingPageScrollPlacement = null;
-let wheelPageTurnLocked = false;
+let scrollSnapLocked = false;
 let fileName = '';
 let fileSize = 0;
 let currentPdfBytes = null;
@@ -229,6 +229,10 @@ const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const canvas = document.getElementById('pdf-canvas');
 const textOverlay = document.getElementById('text-overlay');
 const canvasWrapper = document.getElementById('canvas-wrapper');
+const prevPageWrapper = document.getElementById('prev-page-wrapper');
+const prevPageCanvas = document.getElementById('prev-page-canvas');
+const nextPageWrapper = document.getElementById('next-page-wrapper');
+const nextPageCanvas = document.getElementById('next-page-canvas');
 const pageDisplay = document.getElementById('page-display');
 const statusText = document.getElementById('status-text');
 const statusRight = document.getElementById('status-right');
@@ -2348,24 +2352,37 @@ function goToPage(pageIndex) {
   saveViewState();
 }
 
+function canvasScrollSnapThreshold() {
+  const viewHeight = canvasScroll.clientHeight || 1;
+  const visibleDocHeight = pageDisplayHeight > 0 ? pageDisplayHeight : viewHeight;
+  return Math.max(0, Math.round(Math.min(viewHeight, visibleDocHeight) * 0.5));
+}
+
 function canvasScrollSlack() {
-  return Math.max(0, Math.round(canvasScroll.clientHeight * 0.5));
+  return canvasScrollSnapThreshold();
 }
 
 function updateCanvasScrollSlack() {
   canvasScroll.style.setProperty('--canvas-scroll-slack', `${canvasScrollSlack()}px`);
 }
 
+function scrollTopForElementTop(el) {
+  const scrollRect = canvasScroll.getBoundingClientRect();
+  const elRect = el.getBoundingClientRect();
+  return canvasScroll.scrollTop + (elRect.top - scrollRect.top);
+}
+
 function placeCanvasScroll(mode) {
   if (!mode) return;
   requestAnimationFrame(() => {
     updateCanvasScrollSlack();
-    const slack = canvasScrollSlack();
+    const threshold = canvasScrollSlack();
+    const currentTop = scrollTopForElementTop(canvasWrapper);
     const maxTop = Math.max(0, canvasScroll.scrollHeight - canvasScroll.clientHeight);
     const maxLeft = Math.max(0, canvasScroll.scrollWidth - canvasScroll.clientWidth);
     const top = mode === 'bottom'
-      ? Math.max(0, maxTop - slack)
-      : Math.min(slack, maxTop);
+      ? Math.max(0, Math.min(currentTop - threshold, maxTop))
+      : Math.min(currentTop + threshold, maxTop);
     canvasScroll.scrollTo({
       top,
       left: Math.min(canvasScroll.scrollLeft, maxLeft),
@@ -2512,6 +2529,8 @@ function rotateClockwise() {
 function applyRotation() {
   canvas.style.transform = rotation === 0 ? '' : `rotate(${rotation}deg)`;
   textOverlay.style.transform = canvas.style.transform;
+  if (prevPageCanvas) prevPageCanvas.style.transform = canvas.style.transform;
+  if (nextPageCanvas) nextPageCanvas.style.transform = canvas.style.transform;
 
   // Adjust wrapper dimensions for 90/270 so scrolling works correctly
   if (rotation === 90 || rotation === 270) {
@@ -2550,6 +2569,85 @@ function computeBaseScale(pageWidth, pageHeight) {
     const scaleH = availHeight / pageHeight;
     return Math.min(scaleW, scaleH);
   }
+}
+
+function computePageRenderLayout(pageIndex, options = {}) {
+  const preview = options.preview === true;
+  const pageWidth = Module._nanopdf_get_page_width(pageIndex);
+  const pageHeight = Module._nanopdf_get_page_height(pageIndex);
+  const baseScale = computeBaseScale(pageWidth, pageHeight);
+  const renderScale = preview ? 0.5 : 1.0;
+  const effectiveScale = baseScale * zoomLevel * renderScale;
+  const cssWidth = Math.floor(pageWidth * effectiveScale);
+  const cssHeight = Math.floor(pageHeight * effectiveScale);
+  const dpr = window.devicePixelRatio || 1;
+  const maxDim = preview ? 1536 : 4096;
+  const renderSize = computeRenderSize(pageWidth, pageHeight, effectiveScale * dpr, maxDim);
+  return { pageWidth, pageHeight, cssWidth, cssHeight, ...renderSize };
+}
+
+function renderViewerPageToCanvas(pageIndex, targetCanvas, options = {}) {
+  if (!Module || pageIndex < 0 || pageIndex >= totalPages || !targetCanvas) {
+    return null;
+  }
+
+  const layout = computePageRenderLayout(pageIndex, options);
+  const dpi = 72 * (layout.width / layout.pageWidth);
+  const result = renderPageIntoImageData(Module, pageIndex, layout.width, layout.height, dpi);
+  if (!result.ok || !result.imageData) {
+    return { ok: false, error: result.error || 'unknown' };
+  }
+
+  const { data, w: renderWidth, h: renderHeight } = result.imageData;
+  targetCanvas.width = renderWidth;
+  targetCanvas.height = renderHeight;
+  targetCanvas.style.width = `${layout.cssWidth}px`;
+  targetCanvas.style.height = `${layout.cssHeight}px`;
+  const ctx = targetCanvas.getContext('2d');
+  const imageData = ctx.createImageData(renderWidth, renderHeight);
+  imageData.data.set(data);
+  ctx.putImageData(imageData, 0, 0);
+  return { ok: true, ...layout };
+}
+
+function setPreviewVisible(wrapper, visible) {
+  if (!wrapper) return;
+  wrapper.style.display = visible ? 'inline-flex' : 'none';
+  if (!visible) {
+    const canvas = wrapper.querySelector('canvas');
+    if (canvas) {
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+  }
+}
+
+function renderAdjacentPagePreviews() {
+  if (!hasRendering || !Module || totalPages <= 0) {
+    setPreviewVisible(prevPageWrapper, false);
+    setPreviewVisible(nextPageWrapper, false);
+    return;
+  }
+
+  const prevPage = currentPage - 1;
+  if (prevPage >= 0) {
+    const result = renderViewerPageToCanvas(prevPage, prevPageCanvas, { preview: true });
+    setPreviewVisible(prevPageWrapper, !!result && result.ok);
+  } else {
+    setPreviewVisible(prevPageWrapper, false);
+  }
+
+  const nextPage = currentPage + 1;
+  if (nextPage < totalPages) {
+    const result = renderViewerPageToCanvas(nextPage, nextPageCanvas, { preview: true });
+    setPreviewVisible(nextPageWrapper, !!result && result.ok);
+  } else {
+    setPreviewVisible(nextPageWrapper, false);
+  }
+
+  const transform = rotation === 0 ? '' : `rotate(${rotation}deg)`;
+  if (prevPageCanvas) prevPageCanvas.style.transform = transform;
+  if (nextPageCanvas) nextPageCanvas.style.transform = transform;
 }
 
 function getPageScale() {
@@ -3876,44 +3974,16 @@ function renderCurrentPage() {
   // Don't render main page while thumbnails are being rendered
   if (isThumbnailRendering) return;
 
-  const pageWidth = Module._nanopdf_get_page_width(currentPage);
-  const pageHeight = Module._nanopdf_get_page_height(currentPage);
-
-  const baseScale = computeBaseScale(pageWidth, pageHeight);
-  const effectiveScale = baseScale * zoomLevel;
-  // CSS-pixel layout size of the page.
-  const cssWidth = Math.floor(pageWidth * effectiveScale);
-  const cssHeight = Math.floor(pageHeight * effectiveScale);
-
-  // Render at device resolution so text stays crisp on HiDPI/Retina displays.
-  // The canvas bitmap is cssSize * devicePixelRatio; CSS keeps it at the layout size.
-  const dpr = window.devicePixelRatio || 1;
-  // Cap maximum render dimensions (device px) to avoid WASM memory issues.
-  const maxDim = 4096;
-  const { width, height } = computeRenderSize(pageWidth, pageHeight, effectiveScale * dpr, maxDim);
-
-  canvas.width = width;
-  canvas.height = height;
-  canvas.style.width = `${cssWidth}px`;
-  canvas.style.height = `${cssHeight}px`;
-  pageDisplayWidth = cssWidth;
-  pageDisplayHeight = cssHeight;
-
-  const dpi = 72 * (width / pageWidth);
-
-  const result = renderPageIntoImageData(Module, currentPage, width, height, dpi);
-  if (!result.ok || !result.imageData) {
+  const result = renderViewerPageToCanvas(currentPage, canvas);
+  if (!result || !result.ok) {
     setStatus('Render error: ' + (result.error || 'unknown'), true);
     return;
   }
 
-  const { data, w: renderWidth, h: renderHeight } = result.imageData;
+  const { pageWidth, pageHeight, cssWidth, cssHeight } = result;
+  pageDisplayWidth = cssWidth;
+  pageDisplayHeight = cssHeight;
   mainRenderCounter++;
-
-  const ctx = canvas.getContext('2d');
-  const imageData = ctx.createImageData(renderWidth, renderHeight);
-  imageData.data.set(data);
-  ctx.putImageData(imageData, 0, 0);
 
   emptyState.style.display = 'none';
   canvas.style.display = 'block';
@@ -3925,6 +3995,7 @@ function renderCurrentPage() {
   renderTextOverlay();
   renderAnnotations();
   renderFormFields();
+  renderAdjacentPagePreviews();
 
   const zoomPct = Math.round(zoomLevel * 100);
   if (shouldRenderPageStatus(Date.now(), operationStatusHoldUntil)) {
@@ -5667,41 +5738,31 @@ fitModeBtn.addEventListener('click', toggleFitMode);
 // Rotate button
 rotateBtn.addEventListener('click', rotateClockwise);
 
-function normalizeWheelDeltaY(e) {
-  if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) return e.deltaY * 40;
-  if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) return e.deltaY * canvasScroll.clientHeight;
-  return e.deltaY;
-}
-
-function onWheelPageTurn(deltaY) {
-  if (!Module || totalPages <= 0 || Math.abs(deltaY) < 1) return false;
-  if (wheelPageTurnLocked) return true;
-
+function snapPageFromScroll() {
+  if (!Module || totalPages <= 0 || !hasRendering || scrollSnapLocked) return;
   updateCanvasScrollSlack();
-  const slack = canvasScrollSlack();
-  const maxTop = Math.max(0, canvasScroll.scrollHeight - canvasScroll.clientHeight);
-  const pageTop = Math.min(slack, maxTop);
-  const pageBottom = Math.max(0, maxTop - slack);
-  const atTop = canvasScroll.scrollTop <= pageTop + 2;
-  const atBottom = canvasScroll.scrollTop >= pageBottom - 2;
+  const threshold = canvasScrollSlack();
+  const currentTop = scrollTopForElementTop(canvasWrapper);
+  const scrollTop = canvasScroll.scrollTop;
+  const band = 2;  // prevents accidental flip exactly at a threshold
 
-  if (deltaY < 0 && atTop && currentPage > 0) {
-    wheelPageTurnLocked = true;
+  if (currentPage > 0 && scrollTop <= Math.max(0, currentTop - threshold - band)) {
+    scrollSnapLocked = true;
     goToPageWithScroll(currentPage - 1, 'bottom');
-    setTimeout(() => { wheelPageTurnLocked = false; }, 180);
-    return true;
+    setTimeout(() => { scrollSnapLocked = false; }, 220);
+    return;
   }
-  if (deltaY > 0 && atBottom && currentPage < totalPages - 1) {
-    wheelPageTurnLocked = true;
+
+  const nextSnapTop = currentTop + threshold;
+  if (currentPage < totalPages - 1 && scrollTop >= nextSnapTop + band) {
+    scrollSnapLocked = true;
     goToPageWithScroll(currentPage + 1, 'top');
-    setTimeout(() => { wheelPageTurnLocked = false; }, 180);
-    return true;
+    setTimeout(() => { scrollSnapLocked = false; }, 220);
   }
-  return false;
 }
 
-// Ctrl+scroll wheel zoom; plain wheel scrolls the current page and advances to
-// the next/previous page once the scroll container reaches an edge.
+// Ctrl+scroll wheel zoom. Plain wheel scrolling stays native so adjacent page
+// previews are visible; a scroll listener snaps pagination at the 50% mark.
 canvasScroll.addEventListener('wheel', (e) => {
   if (e.ctrlKey || e.metaKey) {
     e.preventDefault();
@@ -5712,11 +5773,9 @@ canvasScroll.addEventListener('wheel', (e) => {
     }
     return;
   }
-
-  if (onWheelPageTurn(normalizeWheelDeltaY(e))) {
-    e.preventDefault();
-  }
 }, { passive: false });
+
+canvasScroll.addEventListener('scroll', snapPageFromScroll, { passive: true });
 
 // Pan the page by dragging with the middle mouse (wheel) button.
 let isPanning = false;
@@ -6235,9 +6294,17 @@ async function init() {
     hasRendering = Module._nanopdf_has_rendering() === 1;
     syncRenderBackendFromModule();
 
-    // Load external fonts if embedded fonts are not available
+    // Load/register embedded fonts when compiled into the module.
     const embeddedFontsAvailable = Module._nanopdf_fonts_available() === 1;
-    if (!embeddedFontsAvailable) {
+    if (embeddedFontsAvailable) {
+      try {
+        showLoading('Registering embedded fonts...');
+        const count = Module._nanopdf_register_embedded_fonts();
+        console.log(`Registered ${count} embedded fonts with FontProvider`);
+      } catch (e) {
+        console.log('Embedded fonts not available:', e.message);
+      }
+    } else {
       try {
         showLoading('Loading fonts...');
         const stdCount = await loadStandardFonts(Module, FONTS_BASE, (ratio, name) => {
