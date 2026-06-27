@@ -2338,9 +2338,25 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
 
       if (font->has_type1) {
         std::string glyph_name;
+        uint32_t mapped_unicode = 0;
+        bool has_mapped_unicode = false;
+        if (current_font_) {
+          if (try_map_tounicode(char_code, current_font_, &mapped_unicode)) {
+            has_mapped_unicode = true;
+            for (const std::string& mapped_name :
+                 type1_glyph_name_candidates_for_unicode(mapped_unicode)) {
+              if (!mapped_name.empty() &&
+                  font->type1.char_strings.find(mapped_name) != font->type1.char_strings.end()) {
+                glyph_name = mapped_name;
+                break;
+              }
+            }
+          }
+        }
         if (current_font_) {
           auto diff_it = current_font_->encoding_differences.find(char_code);
-          if (diff_it != current_font_->encoding_differences.end()) {
+          if (glyph_name.empty() &&
+              diff_it != current_font_->encoding_differences.end()) {
             glyph_name = diff_it->second;
           }
         }
@@ -2360,8 +2376,8 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
         if ((glyph_name.empty() || glyph_name == ".notdef" ||
              font->type1.char_strings.find(glyph_name) == font->type1.char_strings.end()) &&
             current_font_) {
-          uint32_t mapped_unicode = 0;
           if (try_map_tounicode(char_code, current_font_, &mapped_unicode)) {
+            has_mapped_unicode = true;
             for (const std::string& mapped_name :
                  type1_glyph_name_candidates_for_unicode(mapped_unicode)) {
               if (!mapped_name.empty() &&
@@ -2377,11 +2393,20 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
           if (!draw_type1_glyph_by_name(font, glyph_name, cursor_x, cursor_y,
                                         size, r, g, b, a)) {
             uint32_t codepoint = glyph_name_to_unicode(glyph_name);
+            if (codepoint == 0 && has_mapped_unicode) {
+              codepoint = normalize_render_codepoint(mapped_unicode);
+            }
             if (codepoint != 0 &&
                 !try_draw_glyph_fallback(static_cast<int>(codepoint),
                                          cursor_x, cursor_y, size, r, g, b, a)) {
               draw_missing_glyph_placeholder(cursor_x, cursor_y, size, r, g, b, a);
             }
+          }
+        } else if (has_mapped_unicode) {
+          uint32_t codepoint = normalize_render_codepoint(mapped_unicode);
+          if (codepoint != 0 && codepoint <= 0x10FFFFu) {
+            try_draw_glyph_fallback(static_cast<int>(codepoint), cursor_x, cursor_y,
+                                    size, r, g, b, a);
           }
         }
 
@@ -2580,6 +2605,17 @@ static bool load_font_file(const std::string& path, std::vector<uint8_t>& data) 
     return false;
   }
   return true;
+}
+
+static bool looks_like_type1_font_program(const std::vector<uint8_t>& data) {
+  if (data.size() >= 2 && data[0] == 0x80 && data[1] == 0x01) {
+    return true;  // PFB ASCII segment marker.
+  }
+  const size_t n = std::min<size_t>(data.size(), 256);
+  std::string_view head(reinterpret_cast<const char*>(data.data()), n);
+  return head.find("%!PS-AdobeFont-") != std::string_view::npos ||
+         head.find("%!FontType1-") != std::string_view::npos ||
+         head.find("/FontType 1") != std::string_view::npos;
 }
 
 // Try to derive a styled (Bold / Italic / BoldItalic) variant path from a
@@ -3207,10 +3243,9 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     return load_fallback_font_with_hint(font_name, font);
   }
 
-  if (desc->font_file_type == FontFileType::FontFile) {
-    if (!should_use_embedded_type1_for_lightvg(font)) {
-      return load_fallback_font_with_hint(font_name, font);
-    }
+  if ((desc->font_file_type == FontFileType::FontFile ||
+       looks_like_type1_font_program(decoded.data)) &&
+      should_use_embedded_type1_for_lightvg(font)) {
     Type1Parser parser;
     FontCache cache;
     if (!parser.Parse(decoded.data.data(), decoded.data.size(), cache.type1, true)) {
