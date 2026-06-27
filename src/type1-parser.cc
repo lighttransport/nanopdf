@@ -24,6 +24,7 @@ namespace {
 // Standard Type 1 eexec key.
 static const uint16_t kEexecKey = 55665;
 static const uint16_t kCharStringKey = 4330;
+static constexpr int kCharStringStackLimit = 48;
 
 // Decrypt (or encrypt — same operation) len bytes in-place using the
 // Adobe Type 1 standard cipher (keyed XOR with feedback).
@@ -150,7 +151,7 @@ struct T1Interp {
   int* ends{nullptr};
   int num_contours{0}, cap_contours{0};
 
-  float stack[24];
+  float stack[kCharStringStackLimit];
   int   sp{0};
   float x{0}, y{0};
   int   started{0};       // first moveto issued?
@@ -237,7 +238,7 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         cs += 4;
         val = static_cast<float>(fixed) / 65536.0f;
       }
-      if (ti->sp < 24) ti->stack[ti->sp++] = val;
+      if (ti->sp < kCharStringStackLimit) ti->stack[ti->sp++] = val;
       continue;
     }
 
@@ -245,7 +246,7 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
       if (cs + 1 >= end) return -1;
       int16_t v = static_cast<int16_t>((cs[0] << 8) | cs[1]);
       cs += 2;
-      if (ti->sp < 24) ti->stack[ti->sp++] = static_cast<float>(v);
+      if (ti->sp < kCharStringStackLimit) ti->stack[ti->sp++] = static_cast<float>(v);
       continue;
     }
 
@@ -448,7 +449,7 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
       }
 
       case 6: // pop
-        if (ti->other_sp > 0 && ti->sp < 24) {
+        if (ti->other_sp > 0 && ti->sp < kCharStringStackLimit) {
           ti->stack[ti->sp++] = ti->other_results[--ti->other_sp];
         }
         break;
