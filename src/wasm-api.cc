@@ -7,6 +7,7 @@
 #ifdef __EMSCRIPTEN__
 
 #include <emscripten.h>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -53,6 +54,10 @@
 static nanopdf::Pdf* g_pdf = nullptr;
 static std::vector<uint8_t> g_pdf_data;
 static std::string g_last_error;
+// Set true when the most recent render was cancelled by its time budget rather
+// than failing. Lets the JS viewer tell "scrolled away / too slow" apart from a
+// real error and keep its current bitmap instead of clearing it.
+static bool g_last_render_interrupted = false;
 
 // Rendering buffer
 static std::vector<uint8_t> g_render_buffer;
@@ -292,8 +297,10 @@ static bool render_page_with_selected_backend(const nanopdf::Pdf& pdf,
                                               const nanopdf::Page& page,
                                               int page_index,
                                               int width, int height,
-                                              float dpi) {
+                                              float dpi,
+                                              int budget_ms = 0) {
   release_render_buffer_storage();
+  g_last_render_interrupted = false;
 
   const bool can_reuse_backend = (&pdf == g_pdf);
   const uint32_t render_width = static_cast<uint32_t>(width);
@@ -361,7 +368,29 @@ static bool render_page_with_selected_backend(const nanopdf::Pdf& pdf,
   nanopdf::RenderOptions options;
   options.dpi = render_dpi;
 
+  // Time-budgeted rendering: bound the (synchronous) render to budget_ms so a
+  // fast scroll doesn't block the main thread on one heavy page. The progress
+  // callback fires every 5% of objects and aborts once the budget is spent;
+  // the page reports `interrupted` and is left for a later, unbudgeted render.
+  if (budget_ms > 0) {
+    options.progress_percent_step = 5;
+    options.progress_object_threshold = 1;
+    const auto start = std::chrono::steady_clock::now();
+    options.progress_callback =
+        [start, budget_ms](const nanopdf::RenderProgressInfo&) -> bool {
+          const auto elapsed =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+          return elapsed < budget_ms;  // false -> abort the render
+        };
+  }
+
   auto result = backend->render_page(pdf, page, options);
+  if (result.interrupted) {
+    g_last_render_interrupted = true;
+    return false;  // not an error; caller keeps its current bitmap
+  }
   if (!result.success) {
     g_last_error = result.error;
     return false;
@@ -452,6 +481,37 @@ int nanopdf_render_page(int page_index, int width, int height, float dpi) {
 
   const auto& page = g_pdf->catalog.pages[page_index];
   return render_page_with_selected_backend(*g_pdf, page, page_index, width, height, dpi) ? 1 : 0;
+}
+
+// Like nanopdf_render_page, but aborts the render once it has spent more than
+// `budget_ms` milliseconds (the render checks the budget every 5% of objects).
+// Returns: 1 = completed, 2 = interrupted by the budget (render buffer is not
+// updated; the viewer should keep its current bitmap and re-render later
+// without a budget), 0 = error. budget_ms <= 0 means "no budget".
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_render_page_budget(int page_index, int width, int height, float dpi,
+                               int budget_ms) {
+  if (!g_pdf || page_index < 0 ||
+      page_index >= static_cast<int>(g_pdf->catalog.pages.size())) {
+    g_last_error = "Invalid page index or no PDF loaded";
+    return 0;
+  }
+  if (width <= 0 || height <= 0) {
+    g_last_error = "Invalid dimensions";
+    return 0;
+  }
+  const auto& page = g_pdf->catalog.pages[page_index];
+  if (render_page_with_selected_backend(*g_pdf, page, page_index, width, height,
+                                        dpi, budget_ms)) {
+    return 1;
+  }
+  return g_last_render_interrupted ? 2 : 0;
+}
+
+// True (1) if the most recent render was cut short by its time budget.
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_last_render_interrupted() {
+  return g_last_render_interrupted ? 1 : 0;
 }
 
 // Render a page as the document existed at a given incremental-update

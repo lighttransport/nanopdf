@@ -497,6 +497,10 @@ private:
   const Page* current_page_{nullptr};
   RenderProgressConfig progress_config_;
   RenderProgressState progress_;
+  // Set when a progress callback returns false (cancellation). Polled by
+  // parse_pdf_content to abort the page early; reported as
+  // RenderResult::interrupted. Reset at the start of each render_page.
+  bool render_interrupted_{false};
   bool result_pixels_enabled_{true};
   bool clear_canvas_on_draw_{true};
   bool direct_bgra_output_enabled_{false};

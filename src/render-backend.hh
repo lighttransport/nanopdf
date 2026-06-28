@@ -20,6 +20,10 @@ namespace nanopdf {
 // pixels is RGBA8888, row-major, top-down.
 struct RenderResult {
   bool success{false};
+  // True when a progress callback requested cancellation (returned false)
+  // before the page finished. success is false in that case and pixels hold
+  // whatever was rasterized so far (typically discarded by the caller).
+  bool interrupted{false};
   std::string error;
   std::vector<uint8_t> pixels;
   uint32_t width{0};

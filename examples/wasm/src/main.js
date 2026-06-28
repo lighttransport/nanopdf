@@ -2667,8 +2667,13 @@ function renderViewerPageToCanvas(pageIndex, targetCanvas, options = {}) {
 
   const layout = computePageRenderLayout(pageIndex, options);
   const dpi = 72 * (layout.width / layout.pageWidth);
-  const result = renderPageIntoCanvas(Module, pageIndex, layout.width, layout.height, dpi, targetCanvas);
+  // options.budgetMs (>0): cap this render's wall-clock so a fast scroll doesn't
+  // block on one heavy page. On a budget interruption keep the existing bitmap;
+  // the idle scheduleFullResolutionRender re-renders the page without a budget.
+  const budgetMs = Number.isFinite(options.budgetMs) && options.budgetMs > 0 ? options.budgetMs : 0;
+  const result = renderPageIntoCanvas(Module, pageIndex, layout.width, layout.height, dpi, targetCanvas, budgetMs);
   if (!result.ok) {
+    if (result.interrupted) return { ok: false, interrupted: true };
     return { ok: false, error: result.error || 'unknown' };
   }
 
@@ -2789,12 +2794,14 @@ function renderAdjacentPreviewSlot(slot, pageIndex, targetCanvas, wrapper, key, 
     return;
   }
 
-  const result = renderViewerPageToCanvas(pageIndex, targetCanvas, { preview: true });
+  const result = renderViewerPageToCanvas(pageIndex, targetCanvas, { preview: true, budgetMs: ADJACENT_PREVIEW_BUDGET_MS });
   if (jobId !== adjacentPreviewJobId) return;
   if (result && result.ok) {
     adjacentPreviewRenderKeys[slot] = key;
     setPreviewVisible(wrapper, true);
   } else {
+    // Includes budget interruption: leave the slot unkeyed so it re-renders on
+    // the next settle; keep the previous preview hidden rather than erroring.
     adjacentPreviewRenderKeys[slot] = '';
     setPreviewVisible(wrapper, false);
   }
@@ -4146,6 +4153,12 @@ function resetAnnotations() {
   renderedFormFieldsKey = '';
 }
 
+// Wall-clock budgets (ms) for the low-res renders that run on the scroll
+// critical path. A heavy page is interrupted past its budget and finished by
+// the idle full-resolution pass, so fast scrolling never blocks on one page.
+const COLD_PREVIEW_BUDGET_MS = 80;
+const ADJACENT_PREVIEW_BUDGET_MS = 60;
+
 function renderCurrentPage(options = {}) {
   if (!Module || totalPages <= 0) return;
   if (!hasRendering) {
@@ -4170,9 +4183,19 @@ function renderCurrentPage(options = {}) {
       ? canvasScroll.scrollTop
       : null;
   const renderOptions = useColdPreview
-    ? { preview: true, maxDim: 960 }
+    ? { preview: true, maxDim: 960, budgetMs: COLD_PREVIEW_BUDGET_MS }
     : {};
   const result = renderViewerPageToCanvas(currentPage, canvas, renderOptions);
+  if (result && result.interrupted) {
+    // Heavy page hit its budget during a fast scroll: keep whatever is on the
+    // canvas and finish the page off the critical path (the idle full-res pass
+    // re-renders it unbudgeted once we settle here), so scrolling stays smooth.
+    if (shouldRenderPageStatus(Date.now(), operationStatusHoldUntil)) {
+      setStatus(`Page ${currentPage + 1} / ${totalPages} | rendering…`);
+    }
+    scheduleFullResolutionRender(fullKey, currentPage);
+    return;
+  }
   if (!result || !result.ok) {
     setStatus('Render error: ' + (result.error || 'unknown'), true);
     return;

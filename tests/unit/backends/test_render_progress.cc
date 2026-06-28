@@ -10,6 +10,10 @@
 #include "thorvg-backend.hh"
 #endif
 
+#if defined(NANOPDF_USE_LIGHTVG)
+#include "lightvg-backend.hh"
+#endif
+
 namespace {
 
 nanopdf::Value make_stream_value(const std::string& content) {
@@ -108,9 +112,10 @@ TEST_CASE_IN_SUITE("backends", "ThorVG progress callback reports 1 percent steps
   std::vector<uint32_t> reported_percents;
   std::vector<size_t> processed_objects;
   backend.set_progress_callback(
-      [&](const nanopdf::RenderProgressInfo& progress) {
+      [&](const nanopdf::RenderProgressInfo& progress) -> bool {
         reported_percents.push_back(progress.percent);
         processed_objects.push_back(progress.processed_objects);
+        return true;
       });
 
   auto result = backend.render_page(pdf, page);
@@ -142,7 +147,7 @@ TEST_CASE_IN_SUITE("backends", "ThorVG progress callback respects threshold") {
 
   size_t callback_count = 0;
   backend.set_progress_callback(
-      [&](const nanopdf::RenderProgressInfo&) { callback_count++; });
+      [&](const nanopdf::RenderProgressInfo&) { callback_count++; return true; });
 
   auto result = backend.render_page(pdf, page);
   REQUIRE(result.success);
@@ -165,7 +170,7 @@ TEST_CASE_IN_SUITE("backends",
 
   size_t callback_count = 0;
   backend.set_progress_callback(
-      [&](const nanopdf::RenderProgressInfo&) { callback_count++; }, 0, 1);
+      [&](const nanopdf::RenderProgressInfo&) { callback_count++; return true; }, 0, 1);
 
   auto result = backend.render_page(pdf, page);
   REQUIRE(result.success);
@@ -188,13 +193,14 @@ TEST_CASE_IN_SUITE("backends",
 
   size_t backend_callback_count = 0;
   backend.set_progress_callback(
-      [&](const nanopdf::RenderProgressInfo&) { backend_callback_count++; },
+      [&](const nanopdf::RenderProgressInfo&) { backend_callback_count++; return true; },
       1, 1);
 
   nanopdf::ThorVGRenderOptions options;
   std::vector<uint32_t> reported_percents;
-  options.progress_callback = [&](const nanopdf::RenderProgressInfo& progress) {
+  options.progress_callback = [&](const nanopdf::RenderProgressInfo& progress) -> bool {
     reported_percents.push_back(progress.percent);
+    return true;
   };
   options.progress_object_threshold = 1;
   options.progress_percent_step = 10;
@@ -243,5 +249,61 @@ TEST_CASE_IN_SUITE("backends",
     }
   }
   CHECK(!found_placeholder_purple);
+#endif
+}
+
+TEST_CASE_IN_SUITE("backends", "LightVG progress callback can interrupt a render") {
+#if !defined(NANOPDF_USE_LIGHTVG)
+  SKIP_IF(true, "LightVG backend is not enabled");
+#else
+  nanopdf::Pdf pdf;
+  auto page = make_rect_page(200);  // 200 fill objects -> plenty of progress
+
+  nanopdf::LightVGBackend backend;
+  REQUIRE(backend.initialize(64, 64));
+
+  uint32_t last_percent = 0;
+  // Cancel once we pass the halfway mark.
+  backend.set_progress_callback(
+      [&](const nanopdf::RenderProgressInfo& p) -> bool {
+        last_percent = p.percent;
+        return p.percent < 50;
+      },
+      /*object_threshold=*/1, /*percent_step=*/1);
+
+  auto result = backend.render_page(pdf, page);
+  CHECK(result.interrupted);
+  CHECK(!result.success);
+  CHECK(last_percent >= 50);    // we ran at least to the cancel point
+  CHECK(last_percent < 100);    // but did NOT finish the page
+
+  backend.clear_progress_callback();
+#endif
+}
+
+TEST_CASE_IN_SUITE("backends", "LightVG render completes when callback never cancels") {
+#if !defined(NANOPDF_USE_LIGHTVG)
+  SKIP_IF(true, "LightVG backend is not enabled");
+#else
+  nanopdf::Pdf pdf;
+  auto page = make_rect_page(200);
+
+  nanopdf::LightVGBackend backend;
+  REQUIRE(backend.initialize(64, 64));
+
+  uint32_t last_percent = 0;
+  backend.set_progress_callback(
+      [&](const nanopdf::RenderProgressInfo& p) -> bool {
+        last_percent = p.percent;
+        return true;
+      },
+      /*object_threshold=*/1, /*percent_step=*/1);
+
+  auto result = backend.render_page(pdf, page);
+  CHECK(result.success);
+  CHECK(!result.interrupted);
+  CHECK_EQ(last_percent, uint32_t(100));
+
+  backend.clear_progress_callback();
 #endif
 }

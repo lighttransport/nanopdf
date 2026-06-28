@@ -78,7 +78,14 @@ struct RenderProgressInfo {
   uint32_t percent{0};
 };
 
-using RenderProgressCallback = std::function<void(const RenderProgressInfo&)>;
+// Per-page render progress callback. Invoked at each progress step (see
+// RenderOptions::progress_percent_step, e.g. 5 for every 5%). Return true to
+// continue rendering, or false to interrupt it — the backend aborts the current
+// page as soon as it can and reports RenderResult::interrupted. Used by the
+// WASM viewer to cancel a render the user has scrolled away from, or to bound a
+// render to a time budget.
+using RenderProgressCallback =
+    std::function<bool(const RenderProgressInfo&)>;
 
 bool parse_from_memory(const uint8_t* addr, const size_t size);
 

@@ -8048,7 +8048,9 @@ void LightVGBackend::begin_progress(const RenderProgressCallback& callback,
   progress_.total_objects = total_objects;
   progress_.percent_step = std::max<uint32_t>(1, percent_step);
   progress_.enabled = true;
-  progress_.callback(RenderProgressInfo{0, progress_.total_objects, 0});
+  if (!progress_.callback(RenderProgressInfo{0, progress_.total_objects, 0})) {
+    render_interrupted_ = true;
+  }
 }
 
 void LightVGBackend::advance_progress(size_t processed_objects) {
@@ -8067,10 +8069,15 @@ void LightVGBackend::advance_progress(size_t processed_objects) {
   for (uint32_t percent = progress_.last_percent + progress_.percent_step;
        percent <= current_percent && percent <= 100;
        percent += progress_.percent_step) {
-    progress_.callback(
+    const bool keep_going = progress_.callback(
         RenderProgressInfo{progress_.processed_objects, progress_.total_objects,
                            percent});
     progress_.last_percent = percent;
+    if (!keep_going) {
+      render_interrupted_ = true;
+      progress_.enabled = false;  // stop firing further callbacks this page
+      break;
+    }
   }
 }
 
@@ -8229,6 +8236,7 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   lookup_font_owned_.clear();
   current_soft_mask_.reset();
   soft_mask_group_cache_.clear();
+  render_interrupted_ = false;
 
   // Get page dimensions
   float page_width = 612.0f;
@@ -8369,6 +8377,17 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
     parse_pdf_content(merged);
   }
 
+  // Cancelled via progress callback: clean up and report (see 2-arg overload).
+  if (render_interrupted_) {
+    end_scene();
+    finish_progress();
+    current_pdf_ = nullptr;
+    current_page_ = nullptr;
+    result.interrupted = true;
+    result.success = false;
+    return result;
+  }
+
   // Render page annotations (appearance streams + form-widget defaults).
   render_annotations(pdf, page, page_width, page_height, scale);
 
@@ -8432,6 +8451,7 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   lookup_font_owned_.clear();
   current_soft_mask_.reset();
   soft_mask_group_cache_.clear();
+  render_interrupted_ = false;
 
   if (!initialized_) {
     result.error = "Backend not initialized";
@@ -8539,6 +8559,17 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
       merged.push_back('\n');
     }
     parse_pdf_content(merged);
+  }
+
+  // A progress callback asked to cancel: stop now. Flush the (mostly empty)
+  // partial scene to clean up, skip annotations and the pixel copy, and report
+  // the interruption so the caller can discard this page.
+  if (render_interrupted_) {
+    end_scene();
+    finish_progress();
+    result.interrupted = true;
+    result.success = false;
+    return result;
   }
 
   // Render page annotations (appearance streams + form-widget defaults).
@@ -8777,6 +8808,11 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
   npdf_content_scanner_init(&scanner, content_data.data(), content_data.size());
   npdf_content_token c_token;
   while (npdf_content_next_token(&scanner, &c_token)) {
+    // Abort early if a progress callback requested cancellation. advance_progress
+    // (called from the operator handlers below) sets this when the callback
+    // returns false; we stop at the next operator boundary so the partially
+    // built scene is simply discarded by the caller.
+    if (render_interrupted_) break;
     size_t pos = scanner.pos;
     std::string_view token(c_token.ptr, c_token.len);
 

@@ -80,7 +80,11 @@ export function readWasmString(Module, ptr) {
 // "render -> copy HEAPU8 -> ImageData" sequence used by viewer render paths.
 // Returns { ok, imageData, w, h, error }. On failure imageData is null and
 // error carries the C-side message (or thrown message).
-export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
+// `budgetMs` (optional, >0): bound the render's wall-clock; if it runs longer
+// it is interrupted and the result has { interrupted: true } so the caller can
+// keep its current bitmap and re-render later without a budget. Requires the
+// _nanopdf_render_page_budget export (falls back to a normal render otherwise).
+export function renderPageIntoImageData(Module, pageIdx, width, height, dpi, budgetMs = 0) {
   const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
     ? () => performance.now()
     : () => Date.now();
@@ -90,10 +94,18 @@ export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
   let ok = 0;
   try {
     const renderStart = now();
-    ok = Module._nanopdf_render_page(pageIdx, width, height, dpi);
+    if (budgetMs > 0 && Module._nanopdf_render_page_budget) {
+      ok = Module._nanopdf_render_page_budget(pageIdx, width, height, dpi, budgetMs);
+    } else {
+      ok = Module._nanopdf_render_page(pageIdx, width, height, dpi);
+    }
     renderMs = now() - renderStart;
   } catch (e) {
     return { ok: false, imageData: null, w: 0, h: 0, error: e?.message || String(e), renderMs, copyMs, totalMs: now() - totalStart };
+  }
+  if (ok === 2) {
+    // Budget exceeded — not an error; caller keeps its current bitmap.
+    return { ok: false, interrupted: true, imageData: null, w: 0, h: 0, error: '', renderMs, copyMs, totalMs: now() - totalStart };
   }
   if (ok !== 1) {
     const error = Module._nanopdf_get_last_error
@@ -126,7 +138,7 @@ export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
 // Render directly into a canvas without first detaching a full copy of the
 // WASM pixel buffer. The caller must not retain the returned pixel data; it is
 // released immediately after putImageData().
-export function renderPageIntoCanvas(Module, pageIdx, width, height, dpi, canvas) {
+export function renderPageIntoCanvas(Module, pageIdx, width, height, dpi, canvas, budgetMs = 0) {
   const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
     ? () => performance.now()
     : () => Date.now();
@@ -136,10 +148,17 @@ export function renderPageIntoCanvas(Module, pageIdx, width, height, dpi, canvas
   let ok = 0;
   try {
     const renderStart = now();
-    ok = Module._nanopdf_render_page(pageIdx, width, height, dpi);
+    if (budgetMs > 0 && Module._nanopdf_render_page_budget) {
+      ok = Module._nanopdf_render_page_budget(pageIdx, width, height, dpi, budgetMs);
+    } else {
+      ok = Module._nanopdf_render_page(pageIdx, width, height, dpi);
+    }
     renderMs = now() - renderStart;
   } catch (e) {
     return { ok: false, w: 0, h: 0, error: e?.message || String(e), renderMs, paintMs, totalMs: now() - totalStart };
+  }
+  if (ok === 2) {
+    return { ok: false, interrupted: true, w: 0, h: 0, error: '', renderMs, paintMs, totalMs: now() - totalStart };
   }
   if (ok !== 1) {
     const error = Module._nanopdf_get_last_error
