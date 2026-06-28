@@ -1161,8 +1161,14 @@ bool Type1Parser::ParseCharStrings(const char* data, size_t size,
     // Handle state: expecting RD after 'count' (and optional subr index)
     if (state == kWantRD && pending_count >= 0) {
       if (token == "RD" || token == "-|") {
-        // Read pending_count bytes of raw (already-decrypted) data
-        while (dp < dec_end && is_ps_space(*dp)) dp++;
+        // The RD / -| operator is followed by exactly ONE blank (space)
+        // character and then the binary payload (Adobe Type 1 Font Format,
+        // section 6.2). Skip exactly that single delimiter: skipping a run of
+        // whitespace would also consume a binary byte whose value happens to be
+        // a whitespace code (0x20, 0x0A, ...), shifting the read by one byte and
+        // corrupting the position-dependent charstring decryption for that
+        // subr/glyph (observed: subr 3530 -> broken 'E' in LinLibertine).
+        if (dp < dec_end && is_ps_space(*dp)) dp++;
         int count = pending_count;
         if (dp + count <= dec_end) {
           if (in_charstrings && !pending_name.empty()) {

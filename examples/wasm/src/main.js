@@ -37,6 +37,8 @@ let hasRendering = false;
 let renderBackend = 1; // 0 = LightVG, 1 = ThorVG
 let renderBackends = { lightvg: false, thorvg: false };
 let pendingPageScrollPlacement = null;
+let pendingSeamlessOffset = null;
+let lastPromoteTime = 0;
 let scrollSnapLocked = false;
 let lastCanvasScrollTop = 0;
 let renderDocumentVersion = 0;
@@ -4158,6 +4160,15 @@ function renderCurrentPage(options = {}) {
   const fullKey = mainRenderKey(currentPage);
   if (options.expectedKey && options.expectedKey !== fullKey) return;
   const useColdPreview = options.forceFull !== true && !fullRenderKeys.has(fullKey);
+  // The low-res -> full-res upgrade (forceFull) re-renders the same page in
+  // place; it must not move the viewport. Capture the scroll position so a
+  // canvas resize during the upgrade can't snap us back to the page top. Skip
+  // this when a deliberate (re)placement is pending.
+  const preserveScrollTop =
+    (options.forceFull === true && pendingSeamlessOffset === null &&
+     pendingPageScrollPlacement === null)
+      ? canvasScroll.scrollTop
+      : null;
   const renderOptions = useColdPreview
     ? { preview: true, maxDim: 960 }
     : {};
@@ -4200,7 +4211,39 @@ function renderCurrentPage(options = {}) {
 
   if (activeSidebarTab === 'info') renderInfoTab();
 
-  if (pendingPageScrollPlacement) {
+  if (preserveScrollTop !== null) {
+    // Hold the viewport still across the full-resolution upgrade.
+    if (canvasScroll.scrollTop !== preserveScrollTop) {
+      canvasScroll.scrollTop = preserveScrollTop;
+    }
+    lastCanvasScrollTop = canvasScroll.scrollTop;
+    requestAnimationFrame(() => {
+      if (canvasScroll.scrollTop !== preserveScrollTop) {
+        canvasScroll.scrollTop = preserveScrollTop;
+        lastCanvasScrollTop = preserveScrollTop;
+      }
+    });
+  } else if (pendingSeamlessOffset !== null) {
+    // Seamless wheel paging: position the just-promoted page at the same
+    // viewport offset its preview occupied, so the content does not jump.
+    const offset = pendingSeamlessOffset;
+    pendingSeamlessOffset = null;
+    // Two frames: the first lets the adjacent-page previews toggle visibility
+    // (which changes the layout at the first/last page); the second measures the
+    // settled position so the promoted page lands exactly where its preview was.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const docTop = scrollTopForElementTop(canvasWrapper);
+      const maxTop = Math.max(0, canvasScroll.scrollHeight - canvasScroll.clientHeight);
+      canvasScroll.scrollTop = Math.max(0, Math.min(docTop - offset, maxTop));
+      // Re-anchor the scroll baseline so the next scroll delta is measured from
+      // the settled position, then release the lock and start a short cooldown.
+      // Without this the lock could expire mid-render and a stale delta would
+      // fire a spurious opposite-direction promote, cascading back to page 1.
+      lastCanvasScrollTop = canvasScroll.scrollTop;
+      lastPromoteTime = Date.now();
+      scrollSnapLocked = false;
+    }));
+  } else if (pendingPageScrollPlacement) {
     const placement = pendingPageScrollPlacement;
     pendingPageScrollPlacement = null;
     placeCanvasScroll(placement);
@@ -5982,33 +6025,66 @@ fitModeBtn.addEventListener('click', toggleFitMode);
 // Rotate button
 rotateBtn.addEventListener('click', rotateClockwise);
 
+// Advance/retreat the current page by `dir` (+1/-1) without moving the content
+// under the viewport. The adjacent-page preview that is about to become the main
+// page is already on screen; we record its current viewport offset, promote it,
+// and after the re-render restore the scroll so that same page sits at the same
+// offset. Measuring the real positions (rather than assuming a fixed stride)
+// keeps it seamless across the first/last page, where the prev/next preview
+// appears or disappears and changes the layout. The net effect is wheel
+// scrolling that flows continuously from page to page with no snap/jump.
+function seamlessAdvancePage(dir) {
+  if (dir > 0 && currentPage >= totalPages - 1) return;
+  if (dir < 0 && currentPage <= 0) return;
+  const incoming = dir > 0 ? nextPageWrapper : prevPageWrapper;
+  if (!incoming) return;
+  const scrollRect = canvasScroll.getBoundingClientRect();
+  // Viewport offset of the page that is about to become the main page.
+  const incomingOffset = incoming.getBoundingClientRect().top - scrollRect.top;
+  scrollSnapLocked = true;
+  pendingSeamlessOffset = incomingOffset;
+  currentPage += dir;
+  selectedAnnotId = null;
+  hoveredAnnotId = null;
+  annotDraft = null;
+  hideMarkupPopover();
+  updatePageDisplay();
+  renderCurrentPage();
+  clearSearch();
+  updateThumbnailHighlight();
+  updateBookmarkButton();
+  saveViewState();
+  // The lock is released only once the scroll has been re-anchored (in the
+  // pendingSeamlessOffset handler below); this safety timeout just guarantees we
+  // never get stuck locked if the render path bails before that point.
+  setTimeout(() => { scrollSnapLocked = false; }, 1200);
+}
+
 function snapPageFromScroll() {
   if (!Module || totalPages <= 0 || !hasRendering || scrollSnapLocked) return;
-  updateCanvasScrollSlack();
-  const threshold = canvasScrollPageJumpThreshold();
-  const pageTop = scrollTopForElementTop(canvasWrapper);
-  const pageHeight = canvasWrapper.offsetHeight || pageDisplayHeight || canvasScroll.clientHeight || 1;
-  const pageBottom = pageTop + pageHeight;
-  const scrollTop = canvasScroll.scrollTop;
-  const scrollBottom = scrollTop + (canvasScroll.clientHeight || 1);
-  const delta = scrollTop - lastCanvasScrollTop;
-  lastCanvasScrollTop = scrollTop;
-  const band = 2;  // prevents accidental flip exactly at a threshold
-  if (Math.abs(delta) <= band) return;
-
-  if (delta < 0 && currentPage > 0 &&
-      scrollTop <= Math.max(0, pageTop + threshold - band)) {
-    scrollSnapLocked = true;
-    goToPageWithScroll(currentPage - 1, 'bottom');
-    setTimeout(() => { scrollSnapLocked = false; }, 220);
+  // Cooldown after a promotion: lets momentum settle before another page turn,
+  // preventing a chain of promotes (which could otherwise run all the way to the
+  // first/last page) during a single fast wheel gesture.
+  if (Date.now() - lastPromoteTime < 250) {
+    lastCanvasScrollTop = canvasScroll.scrollTop;
     return;
   }
+  const pageTop = scrollTopForElementTop(canvasWrapper);
+  const pageHeight =
+    canvasWrapper.offsetHeight || pageDisplayHeight || canvasScroll.clientHeight || 1;
+  const pageBottom = pageTop + pageHeight;
+  const viewTop = canvasScroll.scrollTop;
+  const viewCenter = viewTop + (canvasScroll.clientHeight || 1) * 0.5;
+  const delta = viewTop - lastCanvasScrollTop;
+  lastCanvasScrollTop = viewTop;
+  if (Math.abs(delta) <= 2) return;  // ignore sub-pixel jitter
 
-  if (delta > 0 && currentPage < totalPages - 1 &&
-      scrollBottom >= pageBottom - threshold + band) {
-    scrollSnapLocked = true;
-    goToPageWithScroll(currentPage + 1, 'top');
-    setTimeout(() => { scrollSnapLocked = false; }, 220);
+  // Hand off to the next/previous page once the current page's far edge crosses
+  // the viewport centre, compensating the scroll so nothing visibly jumps.
+  if (delta > 0 && currentPage < totalPages - 1 && pageBottom <= viewCenter) {
+    seamlessAdvancePage(+1);
+  } else if (delta < 0 && currentPage > 0 && pageTop >= viewCenter) {
+    seamlessAdvancePage(-1);
   }
 }
 
