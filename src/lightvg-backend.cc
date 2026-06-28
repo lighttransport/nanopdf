@@ -4010,7 +4010,11 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
         if (resolved.success) smask_val = resolved.value;
       }
       if (smask_val.type == Value::STREAM) {
-        smask_img = parse_image_xobject(*current_pdf_, smask_val, sm_obj, sm_gen);
+        ImageParseOptions smask_options;
+        smask_options.keep_raw_data = false;
+        smask_options.cache_decoded_stream = false;
+        smask_img = parse_image_xobject(*current_pdf_, smask_val, sm_obj, sm_gen,
+                                        smask_options);
         has_smask = !smask_img.data.empty() && smask_img.width > 0 &&
                     smask_img.height > 0;
         smask_supported = has_smask &&
@@ -4376,7 +4380,11 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
       if (resolved.success) smask_val = resolved.value;
     }
     if (smask_val.type == Value::STREAM) {
-      ImageXObject smask_img = parse_image_xobject(*current_pdf_, smask_val, sm_obj, sm_gen);
+      ImageParseOptions smask_options;
+      smask_options.keep_raw_data = false;
+      smask_options.cache_decoded_stream = false;
+      ImageXObject smask_img = parse_image_xobject(
+          *current_pdf_, smask_val, sm_obj, sm_gen, smask_options);
       if (!smask_img.data.empty() && smask_img.width > 0 && smask_img.height > 0) {
         int sw = smask_img.width;
         int sh = smask_img.height;

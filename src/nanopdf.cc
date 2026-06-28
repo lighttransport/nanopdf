@@ -48,6 +48,15 @@ namespace nanopdf {
 namespace {
 #include "adobe_glyph_list.inc"
 
+static constexpr size_t kMaxCachedObjectStreamBytes = 256 * 1024;
+
+bool should_cache_resolved_object(const Value& value) {
+  if (value.type != Value::STREAM) {
+    return true;
+  }
+  return value.stream.data.size() <= kMaxCachedObjectStreamBytes;
+}
+
 bool is_system_little_endian() {
   const uint16_t value = 0x0102;
   const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
@@ -3554,8 +3563,11 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     }
   }
 
-  // Start with raw stream data
-  std::vector<uint8_t> current_data = stream_obj.stream.data;
+  // Start with a borrowed view of raw stream data. Materialize current_data
+  // only when decryption or a filter produces a new byte buffer.
+  std::vector<uint8_t> current_data;
+  const uint8_t* current_ptr = stream_obj.stream.data.data();
+  size_t current_size = stream_obj.stream.data.size();
 
   // Check if filter chain includes a Crypt filter (handles encryption via /Name)
   bool has_crypt_filter = false;
@@ -3606,14 +3618,17 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
     if (!skip_decrypt) {
       NANOPDF_LOG_TRACE("decode_stream", "Decrypting obj %u %u, before: %zu bytes",
-                        obj_num, gen_num, current_data.size());
-      if (current_data.size() >= 8) {
+                        obj_num, gen_num, current_size);
+      if (current_size >= 8) {
         NANOPDF_LOG_TRACE("decode_stream", "Pre-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
-                          current_data[0], current_data[1], current_data[2], current_data[3],
-                          current_data[4], current_data[5], current_data[6], current_data[7]);
+                          current_ptr[0], current_ptr[1], current_ptr[2], current_ptr[3],
+                          current_ptr[4], current_ptr[5], current_ptr[6], current_ptr[7]);
       }
       std::string effective_filter = has_crypt_filter ? crypt_filter_name : "";
-      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num, effective_filter);
+      current_data = pdf.security.decrypt_stream(stream_obj.stream.data, obj_num,
+                                                gen_num, effective_filter);
+      current_ptr = current_data.data();
+      current_size = current_data.size();
       NANOPDF_LOG_TRACE("decode_stream", "After decrypt: %zu bytes", current_data.size());
       if (current_data.size() >= 8) {
         NANOPDF_LOG_TRACE("decode_stream", "Post-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
@@ -3627,7 +3642,11 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   auto filter_it = stream_obj.stream.dict.find("Filter");
   if (filter_it == stream_obj.stream.dict.end()) {
     // No filter, return (possibly decrypted) data
-    result.data = std::move(current_data);
+    if (current_data.empty() && !stream_obj.stream.data.empty()) {
+      result.data = stream_obj.stream.data;
+    } else {
+      result.data = std::move(current_data);
+    }
     result.success = true;
     return result;
   }
@@ -3729,8 +3748,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     const filters::DecodeParams &params = params_list[i];
 
     DecodedStream step_result =
-        apply_single_filter(filter_name, current_data.data(),
-                            current_data.size(), params);
+        apply_single_filter(filter_name, current_ptr, current_size, params);
 
     if (!step_result.success) {
       if (filter_names.size() > 1) {
@@ -3745,6 +3763,8 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     }
 
     current_data = std::move(step_result.data);
+    current_ptr = current_data.data();
+    current_size = current_data.size();
   }
 
   result.data = std::move(current_data);
@@ -3818,8 +3838,11 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     }
   }
 
-  // Start with raw stream data
-  std::vector<uint8_t> current_data = stream_obj.stream.data;
+  // Start with a borrowed view of raw stream data. Materialize current_data
+  // only when decryption or a filter produces a new byte buffer.
+  std::vector<uint8_t> current_data;
+  const uint8_t* current_ptr = stream_obj.stream.data.data();
+  size_t current_size = stream_obj.stream.data.size();
 
   // Check if filter chain includes a Crypt filter (handles encryption via /Name)
   bool has_crypt_filter = false;
@@ -3870,14 +3893,17 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
 
     if (!skip_decrypt) {
       NANOPDF_LOG_TRACE("decode_stream", "Decrypting obj %u %u, before: %zu bytes",
-                        obj_num, gen_num, current_data.size());
-      if (current_data.size() >= 8) {
+                        obj_num, gen_num, current_size);
+      if (current_size >= 8) {
         NANOPDF_LOG_TRACE("decode_stream", "Pre-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
-                          current_data[0], current_data[1], current_data[2], current_data[3],
-                          current_data[4], current_data[5], current_data[6], current_data[7]);
+                          current_ptr[0], current_ptr[1], current_ptr[2], current_ptr[3],
+                          current_ptr[4], current_ptr[5], current_ptr[6], current_ptr[7]);
       }
       std::string effective_filter = has_crypt_filter ? crypt_filter_name : "";
-      current_data = pdf.security.decrypt_stream(current_data, obj_num, gen_num, effective_filter);
+      current_data = pdf.security.decrypt_stream(stream_obj.stream.data, obj_num,
+                                                gen_num, effective_filter);
+      current_ptr = current_data.data();
+      current_size = current_data.size();
       NANOPDF_LOG_TRACE("decode_stream", "After decrypt: %zu bytes", current_data.size());
       if (current_data.size() >= 8) {
         NANOPDF_LOG_TRACE("decode_stream", "Post-decrypt: %02x %02x %02x %02x %02x %02x %02x %02x",
@@ -3891,7 +3917,11 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
   auto filter_it = stream_obj.stream.dict.find("Filter");
   if (filter_it == stream_obj.stream.dict.end()) {
     // No filter, return (possibly decrypted) data
-    result.data = std::move(current_data);
+    if (current_data.empty() && !stream_obj.stream.data.empty()) {
+      result.data = stream_obj.stream.data;
+    } else {
+      result.data = std::move(current_data);
+    }
     result.success = true;
     return result;
   }
@@ -4015,8 +4045,7 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     const filters::DecodeParams &params = params_list[i];
 
     DecodedStream step_result =
-        apply_single_filter(filter_name, current_data.data(),
-                            current_data.size(), params);
+        apply_single_filter(filter_name, current_ptr, current_size, params);
 
     if (!step_result.success) {
       if (filter_names.size() > 1) {
@@ -4031,6 +4060,8 @@ DecodedStream decode_stream(const Pdf &pdf, const Value &stream_obj,
     }
 
     current_data = std::move(step_result.data);
+    current_ptr = current_data.data();
+    current_size = current_data.size();
   }
 
   result.data = std::move(current_data);
@@ -5582,8 +5613,10 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
       // load_object_from_stream may recursively call load_object, so no lock held here
       if (load_object_from_stream(obj_num, gen_num, stream_obj_num,
                                   stream_index, &from_stream)) {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        object_cache[key] = from_stream;
+        if (should_cache_resolved_object(from_stream)) {
+          std::lock_guard<std::mutex> lock(cache_mutex);
+          object_cache[key] = from_stream;
+        }
         result.success = true;
         result.value = std::move(from_stream);
         return result;
@@ -5650,7 +5683,7 @@ ResolvedObject Pdf::load_object(uint32_t obj_num, uint16_t gen_num) const {
   }
 
   result.success = true;
-  {
+  if (should_cache_resolved_object(result.value)) {
     std::lock_guard<std::mutex> lock(cache_mutex);
     object_cache[key] = result.value;
   }
