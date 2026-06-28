@@ -3834,6 +3834,35 @@ static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
                                    const std::vector<double>& inputs,
                                    std::vector<double>& outputs);
 
+struct BilinearSample {
+  int i0{0};
+  int i1{0};
+  float w0{1.0f};
+  float w1{0.0f};
+};
+
+static std::vector<BilinearSample> make_bilinear_samples(int src, int dst) {
+  std::vector<BilinearSample> samples;
+  if (src <= 0 || dst <= 0) return samples;
+  samples.resize(static_cast<size_t>(dst));
+  for (int i = 0; i < dst; ++i) {
+    float src_i = (static_cast<float>(i) + 0.5f) * src / dst - 0.5f;
+    int i0 = static_cast<int>(std::floor(src_i));
+    float f = src_i - i0;
+    if (i0 < 0) {
+      i0 = 0;
+      f = 0.0f;
+    }
+    samples[static_cast<size_t>(i)] = {i0, std::min(i0 + 1, src - 1),
+                                       1.0f - f, f};
+  }
+  return samples;
+}
+
+static uint32_t clamp_to_byte(float v) {
+  return static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, v + 0.5f)));
+}
+
 static void downsample_argb_bilinear(std::vector<uint32_t>& pixels,
                                      int src_w, int src_h,
                                      int dst_w, int dst_h) {
@@ -3844,43 +3873,31 @@ static void downsample_argb_bilinear(std::vector<uint32_t>& pixels,
 
   std::vector<uint32_t> out(static_cast<size_t>(dst_w) *
                             static_cast<size_t>(dst_h));
+  auto x_samples = make_bilinear_samples(src_w, dst_w);
+  auto y_samples = make_bilinear_samples(src_h, dst_h);
   for (int y = 0; y < dst_h; ++y) {
-    float src_y = (static_cast<float>(y) + 0.5f) * src_h / dst_h - 0.5f;
-    int y0 = static_cast<int>(std::floor(src_y));
-    float fy = src_y - y0;
-    if (y0 < 0) {
-      y0 = 0;
-      fy = 0.0f;
-    }
-    int y1 = std::min(y0 + 1, src_h - 1);
+    const auto& sy = y_samples[static_cast<size_t>(y)];
     const uint32_t* row0 =
-        pixels.data() + static_cast<size_t>(y0) * src_w;
+        pixels.data() + static_cast<size_t>(sy.i0) * src_w;
     const uint32_t* row1 =
-        pixels.data() + static_cast<size_t>(y1) * src_w;
+        pixels.data() + static_cast<size_t>(sy.i1) * src_w;
     uint32_t* dst_row = out.data() + static_cast<size_t>(y) * dst_w;
     for (int x = 0; x < dst_w; ++x) {
-      float src_x = (static_cast<float>(x) + 0.5f) * src_w / dst_w - 0.5f;
-      int x0 = static_cast<int>(std::floor(src_x));
-      float fx = src_x - x0;
-      if (x0 < 0) {
-        x0 = 0;
-        fx = 0.0f;
-      }
-      int x1 = std::min(x0 + 1, src_w - 1);
-      uint32_t p00 = row0[x0];
-      uint32_t p10 = row0[x1];
-      uint32_t p01 = row1[x0];
-      uint32_t p11 = row1[x1];
-      float w00 = (1.0f - fx) * (1.0f - fy);
-      float w10 = fx * (1.0f - fy);
-      float w01 = (1.0f - fx) * fy;
-      float w11 = fx * fy;
+      const auto& sx = x_samples[static_cast<size_t>(x)];
+      uint32_t p00 = row0[sx.i0];
+      uint32_t p10 = row0[sx.i1];
+      uint32_t p01 = row1[sx.i0];
+      uint32_t p11 = row1[sx.i1];
+      float w00 = sx.w0 * sy.w0;
+      float w10 = sx.w1 * sy.w0;
+      float w01 = sx.w0 * sy.w1;
+      float w11 = sx.w1 * sy.w1;
       auto sample = [&](int shift) -> uint32_t {
         float v = static_cast<float>((p00 >> shift) & 0xffu) * w00 +
                   static_cast<float>((p10 >> shift) & 0xffu) * w10 +
                   static_cast<float>((p01 >> shift) & 0xffu) * w01 +
                   static_cast<float>((p11 >> shift) & 0xffu) * w11;
-        return static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, v + 0.5f)));
+        return clamp_to_byte(v);
       };
       uint32_t a = sample(24);
       uint32_t r = sample(16);
@@ -3917,6 +3934,21 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     return false;
   }
 
+  float draw_w_px = std::abs(width) * state_.scale;
+  float draw_h_px = std::abs(height) * state_.scale;
+  if (image_ctm) {
+    draw_w_px = std::hypot(image_ctm->a, image_ctm->b) * state_.scale;
+    draw_h_px = std::hypot(image_ctm->c, image_ctm->d) * state_.scale;
+  }
+  int prescale_w = static_cast<int>(std::ceil(draw_w_px * 2.0f));
+  int prescale_h = static_cast<int>(std::ceil(draw_h_px * 2.0f));
+  prescale_w = std::max(1, std::min(prescale_w, img_width));
+  prescale_h = std::max(1, std::min(prescale_h, img_height));
+  bool should_prescale =
+      !image.image_mask &&
+      prescale_w * 2 <= img_width &&
+      prescale_h * 2 <= img_height;
+
   // Fast path: cached ARGB from render cache.
   if (image.color_space.type == ColorSpaceType::CacheARGB) {
     // data layout: argb_data as uint32_t packed into uint8_t vector
@@ -3924,8 +3956,6 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     memcpy(argb_data.data(), image.data.data(), argb_data.size() * sizeof(uint32_t));
     from_argb_cache = true;
   } else {
-    argb_data.resize(img_width * img_height);
-
   // Determine number of components based on color space
   int num_components = 3;  // Default RGB
   ColorSpaceType cs_type = image.color_space.type;
@@ -3940,6 +3970,116 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     num_components = image.color_space.num_components;
     if (num_components == 0) num_components = 3;  // Default
   }
+
+  bool converted_direct = false;
+  bool handled_image_soft_mask = false;
+  if (should_prescale && num_components == 3 && image.bits_per_component == 8 &&
+      image.data.size() >= static_cast<size_t>(img_width) *
+                               static_cast<size_t>(img_height) * 3) {
+    ImageXObject smask_img;
+    bool has_smask = false;
+    bool smask_supported = true;
+    if (current_pdf_ && image.soft_mask.type != Value::UNDEFINED &&
+        image.soft_mask.type != Value::NULL_OBJ) {
+      Value smask_val = image.soft_mask;
+      uint32_t sm_obj = smask_val.ref_object_number;
+      uint16_t sm_gen = smask_val.ref_generation_number;
+      if (smask_val.type == Value::REFERENCE) {
+        auto resolved = resolve_reference(*current_pdf_, sm_obj, sm_gen);
+        if (resolved.success) smask_val = resolved.value;
+      }
+      if (smask_val.type == Value::STREAM) {
+        smask_img = parse_image_xobject(*current_pdf_, smask_val, sm_obj, sm_gen);
+        has_smask = !smask_img.data.empty() && smask_img.width > 0 &&
+                    smask_img.height > 0;
+        smask_supported = has_smask &&
+            (smask_img.bits_per_component == 8 ||
+             smask_img.bits_per_component == 1);
+      }
+    }
+
+    if (smask_supported) {
+      argb_data.resize(static_cast<size_t>(prescale_w) *
+                       static_cast<size_t>(prescale_h));
+      auto rgb_x_samples = make_bilinear_samples(img_width, prescale_w);
+      auto rgb_y_samples = make_bilinear_samples(img_height, prescale_h);
+      std::vector<BilinearSample> mask_x_samples;
+      std::vector<BilinearSample> mask_y_samples;
+      if (has_smask && smask_img.bits_per_component == 8) {
+        mask_x_samples = make_bilinear_samples(smask_img.width, prescale_w);
+        mask_y_samples = make_bilinear_samples(smask_img.height, prescale_h);
+      }
+      for (int y = 0; y < prescale_h; ++y) {
+        const auto& sy = rgb_y_samples[static_cast<size_t>(y)];
+        const uint8_t* row0 =
+            image.data.data() + static_cast<size_t>(sy.i0) * img_width * 3;
+        const uint8_t* row1 =
+            image.data.data() + static_cast<size_t>(sy.i1) * img_width * 3;
+        uint32_t* dst_row = argb_data.data() + static_cast<size_t>(y) * prescale_w;
+        for (int x = 0; x < prescale_w; ++x) {
+          const auto& sx = rgb_x_samples[static_cast<size_t>(x)];
+          const uint8_t* p00 = row0 + sx.i0 * 3;
+          const uint8_t* p10 = row0 + sx.i1 * 3;
+          const uint8_t* p01 = row1 + sx.i0 * 3;
+          const uint8_t* p11 = row1 + sx.i1 * 3;
+          float w00 = sx.w0 * sy.w0;
+          float w10 = sx.w1 * sy.w0;
+          float w01 = sx.w0 * sy.w1;
+          float w11 = sx.w1 * sy.w1;
+          uint32_t r = clamp_to_byte(p00[0] * w00 + p10[0] * w10 +
+                                     p01[0] * w01 + p11[0] * w11);
+          uint32_t g = clamp_to_byte(p00[1] * w00 + p10[1] * w10 +
+                                     p01[1] * w01 + p11[1] * w11);
+          uint32_t b = clamp_to_byte(p00[2] * w00 + p10[2] * w10 +
+                                     p01[2] * w01 + p11[2] * w11);
+          uint32_t a = 255;
+          if (has_smask) {
+            int sw = smask_img.width;
+            int sh = smask_img.height;
+            if (smask_img.bits_per_component == 8) {
+              const auto& msx = mask_x_samples[static_cast<size_t>(x)];
+              const auto& msy = mask_y_samples[static_cast<size_t>(y)];
+              auto alpha_at = [&](int sx, int sy) -> float {
+                size_t si = static_cast<size_t>(sy) * sw + sx;
+                return si < smask_img.data.size()
+                    ? static_cast<float>(smask_img.data[si])
+                    : 255.0f;
+              };
+              float aw00 = msx.w0 * msy.w0;
+              float aw10 = msx.w1 * msy.w0;
+              float aw01 = msx.w0 * msy.w1;
+              float aw11 = msx.w1 * msy.w1;
+              a = clamp_to_byte(alpha_at(msx.i0, msy.i0) * aw00 +
+                                alpha_at(msx.i1, msy.i0) * aw10 +
+                                alpha_at(msx.i0, msy.i1) * aw01 +
+                                alpha_at(msx.i1, msy.i1) * aw11);
+            } else {
+              int mask_sx = std::min(sw - 1, std::max(0, (sx.i0 * sw) / img_width));
+              int mask_sy = std::min(sh - 1, std::max(0, (sy.i0 * sh) / img_height));
+              int stride = (sw + 7) / 8;
+              size_t bi = static_cast<size_t>(mask_sy) * stride + (mask_sx / 8);
+              if (bi < smask_img.data.size()) {
+                a = ((smask_img.data[bi] >> (7 - (mask_sx % 8))) & 1u) ? 255u : 0u;
+              }
+            }
+            r = (r * a + 127) / 255;
+            g = (g * a + 127) / 255;
+            b = (b * a + 127) / 255;
+          }
+          dst_row[x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+      }
+      img_width = prescale_w;
+      img_height = prescale_h;
+      pixels_are_premultiplied = has_smask;
+      handled_image_soft_mask = has_smask;
+      converted_direct = true;
+      retain_converted_argb = false;
+    }
+  }
+
+  if (!converted_direct) {
+    argb_data.resize(static_cast<size_t>(img_width) * img_height);
 
   // Handle image mask (1-bit data)
   if (image.image_mask) {
@@ -4199,11 +4339,13 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
       }
     }
   }
+  }
 
   // Apply image's own Soft Mask (SMask) as per-pixel alpha.
   // SMask is a grayscale image; each sample becomes alpha for the corresponding
   // base-image pixel. When dimensions differ, nearest-neighbor sample.
-  if (current_pdf_ && image.soft_mask.type != Value::UNDEFINED &&
+  if (!handled_image_soft_mask &&
+      current_pdf_ && image.soft_mask.type != Value::UNDEFINED &&
       image.soft_mask.type != Value::NULL_OBJ) {
     Value smask_val = image.soft_mask;
     uint32_t sm_obj = smask_val.ref_object_number;
@@ -4268,20 +4410,12 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   }  // else (non-cached ARGB path)
 
   if (!argb_data.empty() && !image.image_mask) {
-    float draw_w_px = std::abs(width) * state_.scale;
-    float draw_h_px = std::abs(height) * state_.scale;
-    if (image_ctm) {
-      draw_w_px = std::hypot(image_ctm->a, image_ctm->b) * state_.scale;
-      draw_h_px = std::hypot(image_ctm->c, image_ctm->d) * state_.scale;
-    }
     // Keep extra samples for downscale filtering quality, but do not keep
     // full-resolution image buffers alive when the page only uses a small
     // on-canvas footprint. This is important for papers with many 1080px
     // figure thumbnails drawn at tens of PDF points.
-    int target_w = static_cast<int>(std::ceil(draw_w_px * 2.0f));
-    int target_h = static_cast<int>(std::ceil(draw_h_px * 2.0f));
-    target_w = std::max(1, std::min(target_w, img_width));
-    target_h = std::max(1, std::min(target_h, img_height));
+    int target_w = std::max(1, std::min(prescale_w, img_width));
+    int target_h = std::max(1, std::min(prescale_h, img_height));
     if (target_w * 2 <= img_width && target_h * 2 <= img_height) {
       downsample_argb_bilinear(argb_data, img_width, img_height,
                                target_w, target_h);
