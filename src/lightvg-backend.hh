@@ -146,6 +146,12 @@ private:
     float dash_phase{0.0f};           // d - dash phase (offset)
     float fill_opacity{1.0f};    // ca - fill alpha (0-1)
     float stroke_opacity{1.0f};  // CA - stroke alpha (0-1)
+    // Accumulated constant alpha of enclosing transparency-group Form
+    // XObjects. The group's ca at `Do` time is folded in here (and the
+    // gs ca/CA reset to 1 inside the group) so the whole group fades
+    // uniformly even when inner content resets its own ca/CA. Applied as a
+    // shape-level opacity in push_with_clip. See fig-2 of dcsdd.pdf.
+    float group_opacity{1.0f};
     int blend_mode{0};           // BM - blend mode (0=Normal)
 
     // Extended graphics state parameters

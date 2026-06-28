@@ -3915,6 +3915,13 @@ bool LightVGBackend::push_with_clip(lvg::Shape* shape) {
   // Apply soft mask opacity
   apply_soft_mask_opacity(shape);
 
+  // Apply accumulated transparency-group constant alpha (uniform fade of an
+  // enclosing /Group Form XObject invoked with ca<1).
+  if (state_.group_opacity < 1.0f) {
+    shape->opacity(static_cast<uint8_t>(
+        std::max(0.0f, std::min(1.0f, state_.group_opacity)) * 255.0f + 0.5f));
+  }
+
   // If there's a clipping path, apply it
   if (state_.has_clip && !state_.clip_commands.empty()) {
     // Create a clipper shape from the clipping path
@@ -9642,6 +9649,20 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                   auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                   if (decoded.success && !decoded.data.empty()) {
                     GraphicsState saved_state = state_;
+                    // Transparency group: fold the group's constant alpha (the
+                    // fill ca active at `Do`) into the accumulated
+                    // group_opacity and reset the gs ca/CA to 1 inside the
+                    // group. Without this, the group renders inline and the
+                    // ca<1 is lost as soon as inner content sets its own gs —
+                    // fig-2 of dcsdd.pdf draws faded "ghost" panels as /Group
+                    // forms invoked at ca=0.1..0.2.
+                    bool is_group = xobj_value.stream.dict.find("Group") !=
+                                    xobj_value.stream.dict.end();
+                    if (is_group && state_.fill_opacity < 1.0f) {
+                      state_.group_opacity *= state_.fill_opacity;
+                      state_.fill_opacity = 1.0f;
+                      state_.stroke_opacity = 1.0f;
+                    }
                     auto resources_it = xobj_value.stream.dict.find("Resources");
                     bool has_form_resources = false;
                     if (resources_it != xobj_value.stream.dict.end()) {
