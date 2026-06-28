@@ -4633,6 +4633,44 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
 
 // Helper function to extract color stops from a PDF function
 // Returns color stops for gradient fills. Uses cache when available.
+// Convert a PDF function output array to RGB bytes. Handles 1-component
+// DeviceGray, 3-component RGB, and 4-component CMYK. Returns false if the array
+// is empty/unsupported (caller keeps its default). DeviceGray support matters
+// for luminosity soft masks, whose grayscale gradient would otherwise be
+// dropped and render fully opaque (e.g. fig-14's edge feathers).
+static bool color_array_to_rgb(const Value& v, uint8_t& r, uint8_t& g,
+                               uint8_t& b) {
+  if (v.type != Value::ARRAY) return false;
+  const auto& a = v.array;
+  auto num = [&](size_t i) -> float {
+    return (i < a.size() && a[i].type == Value::NUMBER)
+               ? static_cast<float>(a[i].number)
+               : 0.0f;
+  };
+  auto clampb = [](float f) -> uint8_t {
+    return static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, f * 255.0f)));
+  };
+  if (a.size() == 1) {
+    uint8_t y = clampb(num(0));
+    r = g = b = y;
+    return true;
+  }
+  if (a.size() >= 4) {  // CMYK
+    float c = num(0), m = num(1), yv = num(2), k = num(3);
+    r = clampb((1.0f - c) * (1.0f - k));
+    g = clampb((1.0f - m) * (1.0f - k));
+    b = clampb((1.0f - yv) * (1.0f - k));
+    return true;
+  }
+  if (a.size() >= 3) {
+    r = clampb(num(0));
+    g = clampb(num(1));
+    b = clampb(num(2));
+    return true;
+  }
+  return false;
+}
+
 static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
     const Pdf& pdf, const Value& function,
     std::unordered_map<uint32_t, LightVGColorStopCacheEntry>* cache = nullptr) {
@@ -4688,28 +4726,14 @@ static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
     lvg::Fill::ColorStop stop0 = {0.0f, 0, 0, 0, 255};
     lvg::Fill::ColorStop stop1 = {1.0f, 255, 255, 255, 255};
 
-    if (c0_it != function.dict.end() && c0_it->second.type == Value::ARRAY &&
-        c0_it->second.array.size() >= 3) {
-      float r = c0_it->second.array[0].type == Value::NUMBER ?
-                static_cast<float>(c0_it->second.array[0].number) : 0.0f;
-      float g = c0_it->second.array[1].type == Value::NUMBER ?
-                static_cast<float>(c0_it->second.array[1].number) : 0.0f;
-      float b = c0_it->second.array[2].type == Value::NUMBER ?
-                static_cast<float>(c0_it->second.array[2].number) : 0.0f;
-      stop0 = {0.0f, static_cast<uint8_t>(r * 255),
-               static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255), 255};
+    if (c0_it != fn.dict.end()) {
+      uint8_t r, g, b;
+      if (color_array_to_rgb(c0_it->second, r, g, b)) stop0 = {0.0f, r, g, b, 255};
     }
 
-    if (c1_it != function.dict.end() && c1_it->second.type == Value::ARRAY &&
-        c1_it->second.array.size() >= 3) {
-      float r = c1_it->second.array[0].type == Value::NUMBER ?
-                static_cast<float>(c1_it->second.array[0].number) : 1.0f;
-      float g = c1_it->second.array[1].type == Value::NUMBER ?
-                static_cast<float>(c1_it->second.array[1].number) : 1.0f;
-      float b = c1_it->second.array[2].type == Value::NUMBER ?
-                static_cast<float>(c1_it->second.array[2].number) : 1.0f;
-      stop1 = {1.0f, static_cast<uint8_t>(r * 255),
-               static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255), 255};
+    if (c1_it != fn.dict.end()) {
+      uint8_t r, g, b;
+      if (color_array_to_rgb(c1_it->second, r, g, b)) stop1 = {1.0f, r, g, b, 255};
     }
 
     stops.push_back(stop0);
@@ -4759,16 +4783,10 @@ static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
 
       if (sub_func.type == Value::DICTIONARY) {
         auto sub_c0_it = sub_func.dict.find("C0");
-        if (sub_c0_it != sub_func.dict.end() && sub_c0_it->second.type == Value::ARRAY &&
-            sub_c0_it->second.array.size() >= 3) {
-          float r = sub_c0_it->second.array[0].type == Value::NUMBER ?
-                    static_cast<float>(sub_c0_it->second.array[0].number) : 0.0f;
-          float g = sub_c0_it->second.array[1].type == Value::NUMBER ?
-                    static_cast<float>(sub_c0_it->second.array[1].number) : 0.0f;
-          float b = sub_c0_it->second.array[2].type == Value::NUMBER ?
-                    static_cast<float>(sub_c0_it->second.array[2].number) : 0.0f;
-          stops.push_back({boundaries[i], static_cast<uint8_t>(r * 255),
-                           static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255), 255});
+        uint8_t r, g, b;
+        if (sub_c0_it != sub_func.dict.end() &&
+            color_array_to_rgb(sub_c0_it->second, r, g, b)) {
+          stops.push_back({boundaries[i], r, g, b, 255});
         }
       }
     }
@@ -4786,16 +4804,10 @@ static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
 
       if (last_func.type == Value::DICTIONARY) {
         auto c1_it = last_func.dict.find("C1");
-        if (c1_it != last_func.dict.end() && c1_it->second.type == Value::ARRAY &&
-            c1_it->second.array.size() >= 3) {
-          float r = c1_it->second.array[0].type == Value::NUMBER ?
-                    static_cast<float>(c1_it->second.array[0].number) : 1.0f;
-          float g = c1_it->second.array[1].type == Value::NUMBER ?
-                    static_cast<float>(c1_it->second.array[1].number) : 1.0f;
-          float b = c1_it->second.array[2].type == Value::NUMBER ?
-                    static_cast<float>(c1_it->second.array[2].number) : 1.0f;
-          stops.push_back({1.0f, static_cast<uint8_t>(r * 255),
-                           static_cast<uint8_t>(g * 255), static_cast<uint8_t>(b * 255), 255});
+        uint8_t r, g, b;
+        if (c1_it != last_func.dict.end() &&
+            color_array_to_rgb(c1_it->second, r, g, b)) {
+          stops.push_back({1.0f, r, g, b, 255});
         }
       }
     }
@@ -9691,6 +9703,15 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   }
 
 
+  {
+    float x0=std::min(bbox[0],bbox[2]), y0=std::min(bbox[1],bbox[3]);
+    float x1=std::max(bbox[0],bbox[2]), y1=std::max(bbox[1],bbox[3]);
+    if (state_.page_width>0.0f && state_.page_height>0.0f) {
+      x0=std::max(x0,0.0f); y0=std::max(y0,0.0f);
+      x1=std::min(x1,state_.page_width); y1=std::min(y1,state_.page_height);
+    }
+    if (x1>x0 && y1>y0) { bbox[0]=x0; bbox[1]=y0; bbox[2]=x1; bbox[3]=y1; }
+  }
   uint32_t mask_width = static_cast<uint32_t>(std::abs(bbox[2] - bbox[0]) * state_.scale);
   uint32_t mask_height = static_cast<uint32_t>(std::abs(bbox[3] - bbox[1]) * state_.scale);
 
@@ -9724,8 +9745,8 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   std::vector<uint32_t> mask_buffer(mask_width * mask_height, 0);
 
   // Initialize mask buffer based on mask type
-  if (mask_type == 2) {  // Luminosity - start with white (ARGB = 0xFFFFFFFF)
-    std::fill(mask_buffer.begin(), mask_buffer.end(), 0xFFFFFFFF);
+  if (mask_type == 2) {  // Luminosity backdrop = /BC (default black)
+    std::fill(mask_buffer.begin(), mask_buffer.end(), 0xFF000000u);
   }
   // For alpha mask (type 1), buffer is already zeroed (transparent)
 
@@ -9773,11 +9794,33 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   width_ = mask_width;
   height_ = mask_height;
 
-  // Reset graphics state for mask rendering
-  state_ = GraphicsState();
-  state_.page_width = std::abs(bbox[2] - bbox[0]);
-  state_.page_height = std::abs(bbox[3] - bbox[1]);
-  state_.scale = static_cast<float>(mask_width) / state_.page_width;
+  GraphicsState mask_state;
+  mask_state.transform = state_.transform;
+  mask_state.page_width = state_.page_width>0.0f ? state_.page_width : std::abs(bbox[2]-bbox[0]);
+  mask_state.page_height = state_.page_height>0.0f ? state_.page_height : std::abs(bbox[3]-bbox[1]);
+  mask_state.scale = (mask_state.page_width>0.0f) ? static_cast<float>(mask_width)/mask_state.page_width : state_.scale;
+  state_ = mask_state;
+
+  // Make the mask group's own /Resources active while rendering it. Without
+  // this, resource lookups (e.g. the `sh /Sh0` that draws the mask's gradient)
+  // fall through to the parent form's resources and resolve to the wrong object
+  // — fig-14's luminosity masks then drew the white feather shading instead of
+  // their grayscale gradient, so every mask came out fully opaque and no fade
+  // was applied.
+  bool pushed_mask_resources = false;
+  auto mask_res_it = xobject_value.stream.dict.find("Resources");
+  if (mask_res_it != xobject_value.stream.dict.end()) {
+    Value mask_res = mask_res_it->second;
+    if (mask_res.type == Value::REFERENCE) {
+      auto resolved = resolve_reference(*current_pdf_, mask_res.ref_object_number,
+                                        mask_res.ref_generation_number);
+      if (resolved.success) mask_res = resolved.value;
+    }
+    if (mask_res.type == Value::DICTIONARY) {
+      form_resources_stack_.push_back(mask_res.dict);
+      pushed_mask_resources = true;
+    }
+  }
 
   // Parse and render the XObject content to the mask canvas
   bool progress_enabled = progress_.enabled;
@@ -9787,6 +9830,7 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   parse_pdf_content(decoded.data);
   rendering_soft_mask_group_ = saved_rendering_soft_mask_group;
   progress_.enabled = progress_enabled;
+  if (pushed_mask_resources) form_resources_stack_.pop_back();
 
   // Finalize rendering
   if (mask_canvas->add(mask_scene) == lvg::Result::Success) {

@@ -887,6 +887,8 @@ static void draw_with_soft_mask(lvg_canvas_t* canvas,
   }
   int w = x1 - x0;
   int h = y1 - y0;
+  const int surf_w = surf->width>0 ? surf->width : (int)mask.w;
+  const int surf_h = surf->height>0 ? surf->height : (int)mask.h;
   std::vector<uint32_t> snapshot(static_cast<size_t>(w) * h);
   for (int y = 0; y < h; ++y) {
     const uint32_t* src_row = surf->pixels + (y0 + y) * surf->stride + x0;
@@ -898,15 +900,17 @@ static void draw_with_soft_mask(lvg_canvas_t* canvas,
 
   for (int y = 0; y < h; ++y) {
     int my = y0 + y;
-    if (my < 0 || static_cast<uint32_t>(my) >= mask.h) continue;
+    int msy = (int)((int64_t)my * mask.h / surf_h);
+    if (msy < 0 || static_cast<uint32_t>(msy) >= mask.h) continue;
     const uint8_t* mask_row = mask.data.data() +
-                              static_cast<size_t>(my) * mask.w;
+                              static_cast<size_t>(msy) * mask.w;
     uint32_t* dst_row = surf->pixels + (y0 + y) * surf->stride + x0;
     const uint32_t* snap_row = snapshot.data() + static_cast<size_t>(y) * w;
     for (int x = 0; x < w; ++x) {
       int mx = x0 + x;
-      if (mx < 0 || static_cast<uint32_t>(mx) >= mask.w) continue;
-      uint8_t a = mask_row[mx];
+      int msx = (int)((int64_t)mx * mask.w / surf_w);
+      if (msx < 0 || static_cast<uint32_t>(msx) >= mask.w) continue;
+      uint8_t a = mask_row[msx];
       if (a == 255) continue;
       uint32_t before = snap_row[x];
       if (a == 0) { dst_row[x] = before; continue; }
