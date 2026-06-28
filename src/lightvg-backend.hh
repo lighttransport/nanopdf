@@ -551,6 +551,14 @@ private:
   // in draw_glyph_bitmap_by_index when the render cache misses.
   std::vector<uint32_t> glyph_argb_buf_;
 
+  // Per-page parallel image pre-decode cache: objnum<<16|gen -> decoded
+  // ImageXObject (native-resolution pixels). Populated by predecode_page_images
+  // before the sequential content parse, consumed (moved out) by the image `Do`
+  // handler so the expensive JPEG/stream decode runs concurrently across the
+  // page's distinct images instead of serially during the draw.
+  std::unordered_map<uint64_t, ImageXObject> predecoded_images_;
+  void predecode_page_images(const Pdf& pdf, const Page& page);
+
   // Separation tint function LUT cache (256-entry precomputed ARGB LUT).
   struct TintLutKey {
     uint32_t func_obj_num;

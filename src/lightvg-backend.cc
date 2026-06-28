@@ -10,8 +10,50 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string_view>
+#include <unordered_set>
+
+// Multi-threading is available natively and under Emscripten only when built
+// with pthreads. Without it, the parallel image pre-decode falls back to the
+// lazy per-`Do` decode (still correct, just not parallel).
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+#define NANOPDF_LIGHTVG_HAS_THREADS 1
+#include <atomic>
+#include <thread>
+#else
+#define NANOPDF_LIGHTVG_HAS_THREADS 0
+#endif
+
+namespace {
+// Run `body(y0, y1)` over disjoint row ranges of [0, n), in parallel when the
+// total work is large enough to amortise thread spawn. Falls back to a single
+// call (sequential) for small work or when threads are unavailable.
+inline void parallel_for_rows(int n, long long total_work,
+                              const std::function<void(int, int)>& body) {
+#if NANOPDF_LIGHTVG_HAS_THREADS
+  unsigned hw = std::thread::hardware_concurrency();
+  // ~256K element-ops is roughly where parallelism starts to pay off here.
+  if (n >= 4 && hw > 1 && total_work >= 256ll * 1024) {
+    unsigned nt = std::min<unsigned>(hw, static_cast<unsigned>(n));
+    int chunk = (n + static_cast<int>(nt) - 1) / static_cast<int>(nt);
+    std::vector<std::thread> pool;
+    pool.reserve(nt);
+    for (unsigned t = 0; t < nt; ++t) {
+      int y0 = static_cast<int>(t) * chunk;
+      int y1 = std::min(n, y0 + chunk);
+      if (y0 >= y1) break;
+      pool.emplace_back([&body, y0, y1]() { body(y0, y1); });
+    }
+    for (auto& th : pool) th.join();
+    return;
+  }
+#endif
+  (void)total_work;
+  body(0, n);
+}
+}  // namespace
 
 #include "nanopdf-log.hh"
 #include "color-transform.hh"
@@ -4113,7 +4155,12 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
       // a destination pixel covers. A 2-tap bilinear sample skips most texels
       // when shrinking by more than 2x, which aliases and looks blurry; the
       // box filter preserves the figure detail the reference renderers show.
-      for (int y = 0; y < prescale_h; ++y) {
+      // Rows are independent (each writes its own dst row); parallelise the
+      // box-filter accumulation across cores for large images.
+      parallel_for_rows(prescale_h,
+                        static_cast<long long>(img_width) * img_height,
+                        [&](int y_begin, int y_end) {
+      for (int y = y_begin; y < y_end; ++y) {
         int ys0 = static_cast<int>(static_cast<int64_t>(y) * img_height / prescale_h);
         int ys1 = static_cast<int>(static_cast<int64_t>(y + 1) * img_height / prescale_h);
         if (ys1 <= ys0) ys1 = ys0 + 1;
@@ -4169,6 +4216,7 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
           dst_row[x] = (a << 24) | (r << 16) | (g << 8) | b;
         }
       }
+      });
       img_width = prescale_w;
       img_height = prescale_h;
       pixels_are_premultiplied = has_smask;
@@ -8021,6 +8069,125 @@ void LightVGBackend::clear_progress_callback() {
   progress_config_ = RenderProgressConfig();
 }
 
+// Decode the page's distinct image XObjects concurrently into
+// predecoded_images_ so the sequential content parse skips the per-`Do`
+// JPEG/stream decode (the dominant cost on image-heavy pages at high
+// resolution). Decoding is read-only on `pdf` (resolve_reference / decode_stream
+// take pdf.cache_mutex only for cache access; the heavy DCT/inflate runs
+// lock-free), so distinct images decode in parallel safely. Output is identical
+// to the lazy path — the same parse_image_xobject with the same options.
+void LightVGBackend::predecode_page_images(const Pdf& pdf, const Page& page) {
+  predecoded_images_.clear();
+#if NANOPDF_LIGHTVG_HAS_THREADS
+  // Collect distinct Image XObject (objnum,gen) reachable from page resources,
+  // recursing through Form XObjects. Over-collection (an image in an unused
+  // form) only wastes a decode; it never changes output.
+  std::vector<std::pair<uint32_t, uint16_t>> refs;
+  std::unordered_set<uint64_t> seen;
+  std::unordered_set<uint64_t> visited_forms;
+  // Cap a single pre-decoded image's native size; larger images fall back to
+  // the lazy path so peak memory stays bounded.
+  const int64_t kMaxPredecodePixels = 32ll * 1024 * 1024;
+
+  std::function<void(const Dictionary&, int)> collect =
+      [&](const Dictionary& resources, int depth) {
+        if (depth > 8) return;
+        auto xo_it = resources.find("XObject");
+        if (xo_it == resources.end()) return;
+        Value xo = xo_it->second;
+        if (xo.type == Value::REFERENCE) {
+          auto r = resolve_reference(pdf, xo.ref_object_number,
+                                     xo.ref_generation_number);
+          if (!r.success) return;
+          xo = std::move(r.value);
+        }
+        if (xo.type != Value::DICTIONARY) return;
+        for (const auto& kv : xo.dict) {
+          uint32_t on = 0;
+          uint16_t gn = 0;
+          Value sv = kv.second;
+          if (sv.type == Value::REFERENCE) {
+            on = sv.ref_object_number;
+            gn = sv.ref_generation_number;
+            auto r = resolve_reference(pdf, on, gn);
+            if (!r.success) continue;
+            sv = std::move(r.value);
+          }
+          if (sv.type != Value::STREAM) continue;
+          auto sub_it = sv.stream.dict.find("Subtype");
+          if (sub_it == sv.stream.dict.end() ||
+              sub_it->second.type != Value::NAME)
+            continue;
+          const std::string& sub = sub_it->second.name;
+          uint64_t key = (static_cast<uint64_t>(on) << 16) | gn;
+          if (sub == "Image") {
+            if (on == 0 || !seen.insert(key).second) continue;
+            int64_t w = 0, h = 0;
+            auto wi = sv.stream.dict.find("Width");
+            auto hi = sv.stream.dict.find("Height");
+            if (wi != sv.stream.dict.end() && wi->second.type == Value::NUMBER)
+              w = static_cast<int64_t>(wi->second.number);
+            if (hi != sv.stream.dict.end() && hi->second.type == Value::NUMBER)
+              h = static_cast<int64_t>(hi->second.number);
+            if (w > 0 && h > 0 && w * h <= kMaxPredecodePixels)
+              refs.emplace_back(on, gn);
+          } else if (sub == "Form") {
+            if (on != 0 && !visited_forms.insert(key).second) continue;
+            auto res_it = sv.stream.dict.find("Resources");
+            if (res_it == sv.stream.dict.end()) continue;
+            Value fres = res_it->second;
+            if (fres.type == Value::REFERENCE) {
+              auto r = resolve_reference(pdf, fres.ref_object_number,
+                                        fres.ref_generation_number);
+              if (!r.success) continue;
+              fres = std::move(r.value);
+            }
+            if (fres.type == Value::DICTIONARY) collect(fres.dict, depth + 1);
+          }
+        }
+      };
+  collect(page.resources, 0);
+
+  // Below 2 images the thread overhead outweighs the benefit; let the lazy
+  // path handle it.
+  if (refs.size() < 2) return;
+
+  std::vector<ImageXObject> results(refs.size());
+  std::atomic<size_t> next{0};
+  unsigned hw = std::thread::hardware_concurrency();
+  unsigned nthreads = std::min<unsigned>(hw ? hw : 4,
+                                         static_cast<unsigned>(refs.size()));
+  auto worker = [&]() {
+    size_t i;
+    while ((i = next.fetch_add(1)) < refs.size()) {
+      ImageParseOptions opt;
+      opt.keep_raw_data = false;
+      opt.cache_decoded_stream = false;
+      auto r = resolve_reference(pdf, refs[i].first, refs[i].second);
+      if (!r.success || r.value.type != Value::STREAM) continue;
+      results[i] = parse_image_xobject(pdf, r.value, refs[i].first,
+                                       refs[i].second, opt);
+    }
+  };
+  std::vector<std::thread> pool;
+  pool.reserve(nthreads);
+  for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+  for (auto& th : pool) th.join();
+
+  predecoded_images_.reserve(refs.size());
+  for (size_t i = 0; i < refs.size(); ++i) {
+    if (results[i].width > 0 && results[i].height > 0 &&
+        !results[i].data.empty()) {
+      uint64_t key = (static_cast<uint64_t>(refs[i].first) << 16) | refs[i].second;
+      predecoded_images_.emplace(key, std::move(results[i]));
+    }
+  }
+#else
+  (void)pdf;
+  (void)page;
+#endif
+}
+
 LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page,
                                                const LightVGRenderOptions& options) {
   LightVGRenderResult result;
@@ -8080,6 +8247,10 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   current_pdf_ = &pdf;
   current_page_ = &page;
   page.ensure_fonts_loaded(pdf);
+
+  // Decode the page's images in parallel up-front so the sequential content
+  // parse below skips their JPEG/stream decode.
+  predecode_page_images(pdf, page);
 
   // Preserve glyph bitmap cache across pages — same font/size/glyph
   // produces identical bitmaps, and the FIFO eviction keeps memory bounded.
@@ -8260,6 +8431,10 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
 
   // Ensure page fonts are loaded
   page.ensure_fonts_loaded(pdf);
+
+  // Decode the page's images in parallel up-front so the sequential content
+  // parse below skips their JPEG/stream decode.
+  predecode_page_images(pdf, page);
 
   // Preserve glyph bitmap cache across pages — same font/size/glyph
   // produces identical bitmaps, and the FIFO eviction keeps memory bounded.
@@ -9615,12 +9790,24 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                                state_.fill_r, state_.fill_g, state_.fill_b,
                                &state_.transform);
                   } else {
-                    ImageParseOptions parse_options;
-                    parse_options.keep_raw_data = false;
-                    parse_options.cache_decoded_stream = false;
-                    ImageXObject image = parse_image_xobject(*current_pdf_, xobj_value,
-                                                             xobj_num, xobj_gen,
-                                                             parse_options);
+                    // Use the parallel pre-decoded image if available, else
+                    // decode lazily here. Both produce the identical
+                    // ImageXObject (same parse_image_xobject + options).
+                    ImageXObject image;
+                    uint64_t pkey =
+                        (static_cast<uint64_t>(xobj_num) << 16) | xobj_gen;
+                    auto pit = predecoded_images_.find(pkey);
+                    if (xobj_num != 0 && pit != predecoded_images_.end()) {
+                      image = std::move(pit->second);
+                      predecoded_images_.erase(pit);
+                    } else {
+                      ImageParseOptions parse_options;
+                      parse_options.keep_raw_data = false;
+                      parse_options.cache_decoded_stream = false;
+                      image = parse_image_xobject(*current_pdf_, xobj_value,
+                                                  xobj_num, xobj_gen,
+                                                  parse_options);
+                    }
                     img_w = image.width;
                     img_h = image.height;
                     const size_t converted_bytes =
