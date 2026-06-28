@@ -3834,6 +3834,64 @@ static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
                                    const std::vector<double>& inputs,
                                    std::vector<double>& outputs);
 
+static void downsample_argb_bilinear(std::vector<uint32_t>& pixels,
+                                     int src_w, int src_h,
+                                     int dst_w, int dst_h) {
+  if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
+      (src_w == dst_w && src_h == dst_h)) {
+    return;
+  }
+
+  std::vector<uint32_t> out(static_cast<size_t>(dst_w) *
+                            static_cast<size_t>(dst_h));
+  for (int y = 0; y < dst_h; ++y) {
+    float src_y = (static_cast<float>(y) + 0.5f) * src_h / dst_h - 0.5f;
+    int y0 = static_cast<int>(std::floor(src_y));
+    float fy = src_y - y0;
+    if (y0 < 0) {
+      y0 = 0;
+      fy = 0.0f;
+    }
+    int y1 = std::min(y0 + 1, src_h - 1);
+    const uint32_t* row0 =
+        pixels.data() + static_cast<size_t>(y0) * src_w;
+    const uint32_t* row1 =
+        pixels.data() + static_cast<size_t>(y1) * src_w;
+    uint32_t* dst_row = out.data() + static_cast<size_t>(y) * dst_w;
+    for (int x = 0; x < dst_w; ++x) {
+      float src_x = (static_cast<float>(x) + 0.5f) * src_w / dst_w - 0.5f;
+      int x0 = static_cast<int>(std::floor(src_x));
+      float fx = src_x - x0;
+      if (x0 < 0) {
+        x0 = 0;
+        fx = 0.0f;
+      }
+      int x1 = std::min(x0 + 1, src_w - 1);
+      uint32_t p00 = row0[x0];
+      uint32_t p10 = row0[x1];
+      uint32_t p01 = row1[x0];
+      uint32_t p11 = row1[x1];
+      float w00 = (1.0f - fx) * (1.0f - fy);
+      float w10 = fx * (1.0f - fy);
+      float w01 = (1.0f - fx) * fy;
+      float w11 = fx * fy;
+      auto sample = [&](int shift) -> uint32_t {
+        float v = static_cast<float>((p00 >> shift) & 0xffu) * w00 +
+                  static_cast<float>((p10 >> shift) & 0xffu) * w10 +
+                  static_cast<float>((p01 >> shift) & 0xffu) * w01 +
+                  static_cast<float>((p11 >> shift) & 0xffu) * w11;
+        return static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, v + 0.5f)));
+      };
+      uint32_t a = sample(24);
+      uint32_t r = sample(16);
+      uint32_t g = sample(8);
+      uint32_t b = sample(0);
+      dst_row[x] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+  }
+  pixels = std::move(out);
+}
+
 bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, float width, float height,
                                uint8_t fill_r, uint8_t fill_g, uint8_t fill_b,
                                const GraphicsState::Matrix* image_ctm,
@@ -4208,6 +4266,32 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     }
   }
   }  // else (non-cached ARGB path)
+
+  if (!argb_data.empty() && !image.image_mask) {
+    float draw_w_px = std::abs(width) * state_.scale;
+    float draw_h_px = std::abs(height) * state_.scale;
+    if (image_ctm) {
+      draw_w_px = std::hypot(image_ctm->a, image_ctm->b) * state_.scale;
+      draw_h_px = std::hypot(image_ctm->c, image_ctm->d) * state_.scale;
+    }
+    // Keep extra samples for downscale filtering quality, but do not keep
+    // full-resolution image buffers alive when the page only uses a small
+    // on-canvas footprint. This is important for papers with many 1080px
+    // figure thumbnails drawn at tens of PDF points.
+    int target_w = static_cast<int>(std::ceil(draw_w_px * 2.0f));
+    int target_h = static_cast<int>(std::ceil(draw_h_px * 2.0f));
+    target_w = std::max(1, std::min(target_w, img_width));
+    target_h = std::max(1, std::min(target_h, img_height));
+    if (target_w * 2 <= img_width && target_h * 2 <= img_height) {
+      downsample_argb_bilinear(argb_data, img_width, img_height,
+                               target_w, target_h);
+      img_width = target_w;
+      img_height = target_h;
+      // A per-object cache key cannot distinguish different draw sizes.
+      retain_converted_argb = false;
+      from_argb_cache = false;
+    }
+  }
 
   // Create LightVG Picture from raw data.
   auto picture = lvg::Picture::gen();
