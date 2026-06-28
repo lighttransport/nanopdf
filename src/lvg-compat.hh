@@ -179,6 +179,14 @@ class Paint {
 
   virtual void draw_on(lvg_canvas_t* canvas) = 0;
 
+  // True if this paint (or, for a Scene, any descendant) carries a soft mask.
+  // Soft-masked paints mutate transient state during draw_on (the mask
+  // snapshot/restore), so a scene containing any is drawn single-threaded;
+  // mask-free scenes can be rasterized in parallel tiles. Default: scalar paints.
+  virtual bool has_soft_mask_recursive() const {
+    return static_cast<bool>(soft_mask_);
+  }
+
  protected:
   BlendMethod blend_mode_{BlendMethod::Normal};
   uint8_t     opacity_{255};
@@ -426,6 +434,13 @@ class Scene : public Paint {
   Kind kind() const override { return kScene; }
   void draw_on(lvg_canvas_t* canvas) override;
 
+  bool has_soft_mask_recursive() const override {
+    if (soft_mask_) return true;
+    for (const Paint* p : paints_)
+      if (p->has_soft_mask_recursive()) return true;
+    return false;
+  }
+
   // Reset state without destroying.
   void clear();
 
@@ -456,6 +471,12 @@ class SwCanvas {
   Result sync();
   void setOutputSwizzle(bool enabled) { output_swizzle_enabled_ = enabled; }
 
+  // Allow parallel tiled rasterization in draw() (default off). Enabled by the
+  // backend only on the persistent main page canvas; transient offscreen
+  // canvases (soft-mask groups, function shadings) stay single-threaded so
+  // their gradient fills don't pick up tile band-boundary rounding.
+  void setAllowTiling(bool enabled) { allow_tiling_ = enabled; }
+
   // Returns the wrapped surface (for direct pixel access).
   lvg_surface_t* surface() { return &surface_; }
   ColorSpace colorspace() const { return cs_; }
@@ -469,6 +490,7 @@ class SwCanvas {
   bool          have_canvas_{false};
   ColorSpace    cs_{ColorSpace::ABGR8888};
   bool          output_swizzle_enabled_{true};
+  bool          allow_tiling_{false};
 };
 
 // ---------------------------------------------------------------------------

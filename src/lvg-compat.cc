@@ -10,6 +10,16 @@
 #include <cstring>
 #include <limits>
 
+// Parallel tile rasterization is available natively and under Emscripten only
+// with pthreads; otherwise SwCanvas::draw runs single-threaded.
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+#define NANOPDF_LVG_HAS_THREADS 1
+#include <thread>
+#include <vector>
+#else
+#define NANOPDF_LVG_HAS_THREADS 0
+#endif
+
 namespace lvg {
 
 namespace {
@@ -2210,7 +2220,57 @@ Result SwCanvas::draw(bool clear_first) {
     // Transparent black; the caller (backend) fills its own background.
     lvg_canvas_clear(&canvas_, 0u);
   }
-  for (Paint* p : paints_) p->draw_on(&canvas_);
+
+  bool drawn_tiled = false;
+#if NANOPDF_LVG_HAS_THREADS
+  // Tile the scene rasterization across horizontal bands when it is safe and
+  // worthwhile. Each band gets its own lvg_canvas_t (cheap, no allocation)
+  // over the same surface but a disjoint row range, so threads never touch the
+  // same pixels. Soft-masked paints mutate transient state during draw_on, so
+  // we only tile mask-free scenes; the result is pixel-identical because each
+  // output row is produced by exactly one thread running the full paint list
+  // in order, clipped to that row range.
+  unsigned hw = std::thread::hardware_concurrency();
+  int H = surface_.height;
+  bool any_soft_mask = false;
+  if (allow_tiling_) {
+    for (const Paint* p : paints_)
+      if (p->has_soft_mask_recursive()) { any_soft_mask = true; break; }
+  }
+  // Require enough rows and work (≥4 bands of ≥64 rows) to amortise threads.
+  if (allow_tiling_ && !any_soft_mask && hw > 1 && H >= 256 &&
+      !paints_.empty()) {
+    lvg_rect_t base_clip = lvg_canvas_get_clip(&canvas_);
+    int by0 = std::max(0, base_clip.y);
+    int by1 = std::min(H, base_clip.y + base_clip.height);
+    int rows = by1 - by0;
+    if (rows >= 256) {
+      unsigned nt = std::min<unsigned>(hw, static_cast<unsigned>(rows / 64));
+      if (nt >= 2) {
+        int band = (rows + static_cast<int>(nt) - 1) / static_cast<int>(nt);
+        std::vector<std::thread> pool;
+        pool.reserve(nt);
+        for (unsigned t = 0; t < nt; ++t) {
+          int y0 = by0 + static_cast<int>(t) * band;
+          int y1 = std::min(by1, y0 + band);
+          if (y0 >= y1) break;
+          pool.emplace_back([this, &base_clip, y0, y1]() {
+            lvg_canvas_t local;
+            lvg_canvas_init(&local, &surface_);
+            lvg_rect_t bc{base_clip.x, y0, base_clip.width, y1 - y0};
+            lvg_canvas_set_clip(&local, &bc);
+            for (Paint* p : paints_) p->draw_on(&local);
+          });
+        }
+        for (auto& th : pool) th.join();
+        drawn_tiled = true;
+      }
+    }
+  }
+#endif
+  if (!drawn_tiled) {
+    for (Paint* p : paints_) p->draw_on(&canvas_);
+  }
 
   // After draw, swizzle the surface in-place if the requested colorspace
   // expects ABGR byte order (R,G,B,A in memory) — lvg_canvas writes ARGB

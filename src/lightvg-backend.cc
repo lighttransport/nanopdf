@@ -1758,6 +1758,10 @@ bool LightVGBackend::initialize(uint32_t width, uint32_t height) {
   if (!canvas_) {
     return false;
   }
+  // Allow parallel tiled rasterization on the main page canvas. Transient
+  // offscreen canvases (mask groups, function shadings) are left untiled so
+  // their gradient fills stay band-boundary-exact.
+  canvas_->setAllowTiling(true);
 
   // Set target buffer (v1.0+ API uses lvg::ColorSpace enum)
   if (canvas_->target(reinterpret_cast<uint32_t*>(buffer_.data()),
