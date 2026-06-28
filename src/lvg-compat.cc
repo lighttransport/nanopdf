@@ -1112,8 +1112,27 @@ void Shape::draw_on(lvg_canvas_t* canvas) {
     int y0 = static_cast<int>(std::floor(by));
     int x1 = static_cast<int>(std::ceil(bx + bw));
     int y1 = static_cast<int>(std::ceil(by + bh));
-    draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
-                        [this](lvg_canvas_t* c) { draw_on(c); });
+    // Intersect with the clip path's bounding box. The shape's own geometry can
+    // be a full-page rect (e.g. an `sh` shading fill) while clipped to a tiny
+    // region; outside the clipper the inner draw paints nothing (after==before)
+    // so the per-pixel lerp is an identity there. Restricting the snapshot to the
+    // clipper footprint avoids snapshotting/compositing the whole page per masked
+    // shape (the dominant cost on soft-mask-heavy pages) with no change to output.
+    if (clipper_) {
+      float cx, cy, cw, ch;
+      if (!detect_axis_aligned_rect(clipper_->cmds_, clipper_->pts_, cx, cy, cw,
+                                    ch)) {
+        clipper_->compute_bbox(&cx, &cy, &cw, &ch);
+      }
+      x0 = std::max(x0, static_cast<int>(std::floor(cx)));
+      y0 = std::max(y0, static_cast<int>(std::floor(cy)));
+      x1 = std::min(x1, static_cast<int>(std::ceil(cx + cw)));
+      y1 = std::min(y1, static_cast<int>(std::ceil(cy + ch)));
+    }
+    if (x1 > x0 && y1 > y0) {
+      draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
+                          [this](lvg_canvas_t* c) { draw_on(c); });
+    }
     soft_mask_ = mask;
     return;
   }
@@ -1652,8 +1671,24 @@ void Picture::draw_on(lvg_canvas_t* canvas) {
     int y0 = static_cast<int>(std::floor(by));
     int x1 = static_cast<int>(std::ceil(bx + bw));
     int y1 = static_cast<int>(std::ceil(by + bh));
-    draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
-                        [this](lvg_canvas_t* c) { draw_on(c); });
+    // Restrict the snapshot to the clip footprint (see Shape::draw_on) — outside
+    // the clipper the draw is a no-op, so this preserves output while avoiding a
+    // full-page snapshot/composite per masked picture.
+    if (clipper_) {
+      float cx, cy, cw, ch;
+      if (!detect_axis_aligned_rect(clipper_->cmds_, clipper_->pts_, cx, cy, cw,
+                                    ch)) {
+        clipper_->compute_bbox(&cx, &cy, &cw, &ch);
+      }
+      x0 = std::max(x0, static_cast<int>(std::floor(cx)));
+      y0 = std::max(y0, static_cast<int>(std::floor(cy)));
+      x1 = std::min(x1, static_cast<int>(std::ceil(cx + cw)));
+      y1 = std::min(y1, static_cast<int>(std::ceil(cy + ch)));
+    }
+    if (x1 > x0 && y1 > y0) {
+      draw_with_soft_mask(canvas, *mask, x0, y0, x1, y1,
+                          [this](lvg_canvas_t* c) { draw_on(c); });
+    }
     soft_mask_ = mask;
     return;
   }
