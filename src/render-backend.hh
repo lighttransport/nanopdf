@@ -37,6 +37,11 @@ struct RenderOptions {
   // PNG compression level 0-9.
   int png_compression{1};
 
+  // Use the fast fpnge encoder for PNG output instead of miniz deflate.
+  // ~5-10x faster encode but produces larger files (fixed-Huffman, speed-first).
+  // Falls back to miniz when fpnge is unavailable for the target build/CPU.
+  bool fast_png{false};
+
   // DPI scaling factor (72 = 1x, 144 = 2x, ...).
   float dpi{72.0f};
 

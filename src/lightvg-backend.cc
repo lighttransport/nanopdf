@@ -63,6 +63,9 @@ inline void parallel_for_rows(int n, long long total_work,
 #include "font-unicode-map.hh"
 #include "shared-font-cache.hh"
 #include "render-cache.hh"
+#ifdef NANOPDF_USE_FPNGE
+#include "third_party/fpnge/fpnge_dispatch.hh"
+#endif
 #include "pdf-function.hh"
 #include "pdf-content-scan.h"
 #include "string-parse.hh"
@@ -7820,6 +7823,36 @@ static bool write_png_rgba_stream(const std::string& filename, int width,
   return write_png_chunk(out, "IEND", nullptr, 0);
 }
 
+// Encode a contiguous RGBA buffer to a PNG file. Uses the fast fpnge encoder
+// when options.fast_png is set and fpnge is available for this build/CPU
+// (~5-10x faster than miniz deflate, larger files); otherwise the streaming
+// miniz path. Falls back to miniz if fpnge encoding fails.
+static bool write_png_rgba(const std::string& filename, const uint8_t* pixels,
+                           int width, int height, int stride,
+                           const RenderOptions& options) {
+#ifdef NANOPDF_USE_FPNGE
+  if (options.fast_png && nanopdf::fpnge_available()) {
+    std::vector<uint8_t> out;
+    if (nanopdf::fpnge_encode_png(pixels, width, height, /*channels=*/4, stride,
+                                  options.png_compression, out) &&
+        !out.empty()) {
+      std::ofstream f(filename, std::ios::binary);
+      if (!f) return false;
+      f.write(reinterpret_cast<const char*>(out.data()),
+              static_cast<std::streamsize>(out.size()));
+      return static_cast<bool>(f);
+    }
+    // fpnge failed — fall through to miniz.
+  }
+#endif
+  return write_png_rgba_stream(
+      filename, width, height, options.png_compression,
+      [&](int y, uint8_t* row) {
+        std::memcpy(row, pixels + static_cast<size_t>(y) * stride,
+                    static_cast<size_t>(stride));
+      });
+}
+
 static bool save_rgba_pixels_to_file(const std::string& filename,
                                      const uint8_t* pixels,
                                      int width,
@@ -7831,14 +7864,8 @@ static bool save_rgba_pixels_to_file(const std::string& filename,
   int stride = width * 4;
   switch (options.format) {
     case RenderOptions::Format::PNG: {
-      ret = write_png_rgba_stream(
-                filename, width, height, options.png_compression,
-                [&](int y, uint8_t* row) {
-                  std::memcpy(row, pixels + static_cast<size_t>(y) * stride,
-                              static_cast<size_t>(stride));
-                })
-                ? 1
-                : 0;
+      ret = write_png_rgba(filename, pixels, width, height, stride, options) ? 1
+                                                                             : 0;
       break;
     }
     case RenderOptions::Format::JPEG: {

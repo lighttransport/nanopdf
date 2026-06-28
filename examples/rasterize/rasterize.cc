@@ -64,6 +64,7 @@ struct RasterizeOptions {
   nanopdf::RenderOptions::Format output_format = nanopdf::RenderOptions::Format::PNG;
   int jpeg_quality = 90;
   int png_compression = 1;
+  bool fast_png = false;
   bool list_backends = false;
   bool render_all_pages = false;
   bool verbose = false;
@@ -89,6 +90,7 @@ void print_usage(const char* program_name) {
   std::cout << "  --format <name>    Output format: png, jpg, bmp, or tga (default: png)\n";
   std::cout << "  --jpeg-quality <n> JPEG quality 1-100 (default: 90)\n";
   std::cout << "  --png-compression <n> PNG compression level 0-9 (default: 1)\n";
+  std::cout << "  --fast-png         Fast fpnge PNG encoder (~5-10x faster, larger files)\n";
   std::cout << "  --all              Render all pages (creates multiple PNG files)\n";
   std::cout << "  --verbose          Verbose output\n";
   std::cout << "  --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace\n";
@@ -222,6 +224,8 @@ bool parse_arguments(int argc, char* argv[], RasterizeOptions& options) {
         std::cerr << "Error: PNG compression level must be 0-9\n";
         return false;
       }
+    } else if (arg == "--fast-png") {
+      options.fast_png = true;
     } else if (arg == "--all") {
       options.render_all_pages = true;
     } else if (arg == "--verbose") {
@@ -619,6 +623,7 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     save_options.format = options.output_format;
     save_options.jpeg_quality = options.jpeg_quality;
     save_options.png_compression = options.png_compression;
+    save_options.fast_png = options.fast_png;
     bool saved = false;
     if (total_rotation == 0) {
       saved = backend->save_to_file(output_file, save_options);
