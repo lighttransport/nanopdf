@@ -2138,6 +2138,22 @@ Result SwCanvas::add(Paint* p) {
   return Result::Success;
 }
 
+Result SwCanvas::remove(Paint* p) {
+  if (!p) {
+    for (Paint* paint : paints_) delete paint;
+    paints_.clear();
+    return Result::Success;
+  }
+
+  auto it = std::find(paints_.begin(), paints_.end(), p);
+  if (it == paints_.end()) {
+    return Result::InvalidArguments;
+  }
+  delete *it;
+  paints_.erase(it);
+  return Result::Success;
+}
+
 Result SwCanvas::draw(bool clear_first) {
   if (!have_canvas_) return Result::InsufficientCondition;
   if (clear_first) {

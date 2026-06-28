@@ -451,6 +451,7 @@ class SwCanvas {
                 uint32_t height, ColorSpace cs);
 
   Result add(Paint* p);
+  Result remove(Paint* p = nullptr);
   Result draw(bool clear);
   Result sync();
   void setOutputSwizzle(bool enabled) { output_swizzle_enabled_ = enabled; }

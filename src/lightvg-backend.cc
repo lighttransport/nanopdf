@@ -43,7 +43,8 @@ extern "C" int stbi_write_png_compression_level;
 
 namespace nanopdf {
 
-static constexpr size_t kMaxCachedArgbImageBytes = 16 * 1024 * 1024;
+static constexpr size_t kMaxCachedArgbImageBytes = 1 * 1024 * 1024;
+static constexpr uint64_t kMaxSoftMaskGroupPixels = 2ull * 1024ull * 1024ull;
 
 // Glyph anti-aliasing gamma table: pow(i/255, 1.4) for i in [0,255].
 // Tabulates the transcendental used on every glyph coverage sample; callers
@@ -1686,6 +1687,10 @@ LightVGBackend::~LightVGBackend() {
 }
 
 bool LightVGBackend::initialize(uint32_t width, uint32_t height) {
+  if (initialized_ && canvas_ && width_ == width && height_ == height) {
+    return true;
+  }
+
   width_ = width;
   height_ = height;
 
@@ -1693,7 +1698,9 @@ bool LightVGBackend::initialize(uint32_t width, uint32_t height) {
   buffer_.resize(width * height);
 
   // Create software canvas (v1.0+ API returns raw pointer)
-  canvas_ = lvg::SwCanvas::gen();
+  if (!canvas_) {
+    canvas_ = lvg::SwCanvas::gen();
+  }
   if (!canvas_) {
     return false;
   }
@@ -1748,6 +1755,9 @@ bool LightVGBackend::end_scene() {
 
   // Sync drawing
   if (canvas_->sync() != lvg::Result::Success) {
+    return false;
+  }
+  if (canvas_->remove() != lvg::Result::Success) {
     return false;
   }
 
@@ -7543,6 +7553,7 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   lookup_resolved_owned_.clear();
   lookup_font_owned_.clear();
   current_soft_mask_.reset();
+  soft_mask_group_cache_.clear();
 
   // Get page dimensions
   float page_width = 612.0f;
@@ -7596,6 +7607,10 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   // Preserve glyph bitmap cache across pages — same font/size/glyph
   // produces identical bitmaps, and the FIFO eviction keeps memory bounded.
 
+  const bool has_explicit_progress = static_cast<bool>(options.progress_callback);
+  const bool has_progress_callback =
+      has_explicit_progress || static_cast<bool>(progress_config_.callback);
+
   std::vector<std::vector<uint8_t>> decoded_contents;
   decoded_contents.reserve(page.contents.size());
   size_t total_render_objects = 0;
@@ -7624,16 +7639,17 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
       continue;
     }
 
-    total_render_objects += count_render_objects(decoded_result.data);
-    total_render_objects += scan_do_extra_weight(
-        std::string_view(
-            reinterpret_cast<const char*>(decoded_result.data.data()),
-            decoded_result.data.size()),
-        pdf, page.resources);
+    if (has_progress_callback) {
+      total_render_objects += count_render_objects(decoded_result.data);
+      total_render_objects += scan_do_extra_weight(
+          std::string_view(
+              reinterpret_cast<const char*>(decoded_result.data.data()),
+              decoded_result.data.size()),
+          pdf, page.resources);
+    }
     decoded_contents.push_back(std::move(decoded_result.data));
   }
 
-  const bool has_explicit_progress = static_cast<bool>(options.progress_callback);
   begin_progress(has_explicit_progress ? options.progress_callback
                                        : progress_config_.callback,
                  total_render_objects,
@@ -7770,6 +7786,7 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   lookup_resolved_owned_.clear();
   lookup_font_owned_.clear();
   current_soft_mask_.reset();
+  soft_mask_group_cache_.clear();
 
   if (!initialized_) {
     result.error = "Backend not initialized";
@@ -7804,9 +7821,11 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
   // Preserve glyph bitmap cache across pages — same font/size/glyph
   // produces identical bitmaps, and the FIFO eviction keeps memory bounded.
 
+  const bool has_progress_callback = static_cast<bool>(progress_config_.callback);
+
   std::vector<std::vector<uint8_t>> decoded_contents;
   decoded_contents.reserve(page.contents.size());
-  size_t total_render_objects = page.annotations.size();
+  size_t total_render_objects = has_progress_callback ? page.annotations.size() : 0;
 
   for (const auto& content_obj : page.contents) {
     Value resolved_obj = content_obj;
@@ -7833,12 +7852,14 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
       continue;
     }
 
-    total_render_objects += count_render_objects(decoded_result.data);
-    total_render_objects += scan_do_extra_weight(
-        std::string_view(
-            reinterpret_cast<const char*>(decoded_result.data.data()),
-            decoded_result.data.size()),
-        pdf, page.resources);
+    if (has_progress_callback) {
+      total_render_objects += count_render_objects(decoded_result.data);
+      total_render_objects += scan_do_extra_weight(
+          std::string_view(
+              reinterpret_cast<const char*>(decoded_result.data.data()),
+              decoded_result.data.size()),
+          pdf, page.resources);
+    }
     decoded_contents.push_back(std::move(decoded_result.data));
   }
 
@@ -9244,9 +9265,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                     image.height = static_cast<int>(img_cached.height);
                     img_w = image.width;
                     img_h = image.height;
-                    image.data.resize(img_cached.data.size());
-                    memcpy(image.data.data(), img_cached.data.data(),
-                           img_cached.data.size());
+                    image.data = std::move(img_cached.data);
                     // Mark as cached so draw_image skips conversion.
                     image.color_space.type = ColorSpaceType::CacheARGB;
                     draw_image(image, state_.transform.e, state_.transform.f,
@@ -9383,6 +9402,20 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
 bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask_type) {
   if (!current_pdf_) return false;
 
+  std::string cache_key;
+  if (group_xobject.type == Value::REFERENCE) {
+    cache_key = "smg:" + std::to_string(mask_type) + ":" +
+                std::to_string(group_xobject.ref_object_number) + ":" +
+                std::to_string(group_xobject.ref_generation_number);
+    auto cache_it = soft_mask_group_cache_.find(cache_key);
+    if (cache_it != soft_mask_group_cache_.end()) {
+      state_.soft_mask_width = cache_it->second.width;
+      state_.soft_mask_height = cache_it->second.height;
+      state_.soft_mask_data = cache_it->second.data;
+      return true;
+    }
+  }
+
   // Get the XObject stream
   Value xobject_value = group_xobject;
   if (xobject_value.type == Value::REFERENCE) {
@@ -9425,7 +9458,9 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   uint64_t max_mask_pixels =
       static_cast<uint64_t>(std::max<uint32_t>(1, width_)) *
       static_cast<uint64_t>(std::max<uint32_t>(1, height_));
-  max_mask_pixels = std::max<uint64_t>(max_mask_pixels, 1024u * 1024u);
+  max_mask_pixels = std::min<uint64_t>(
+      std::max<uint64_t>(max_mask_pixels, 1024u * 1024u),
+      kMaxSoftMaskGroupPixels);
   if (mask_pixels > max_mask_pixels) {
     double downscale =
         std::sqrt(static_cast<double>(max_mask_pixels) /
@@ -9560,6 +9595,14 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   state_.soft_mask_data = std::move(soft_mask_data);
   state_.soft_mask_width = soft_mask_width;
   state_.soft_mask_height = soft_mask_height;
+
+  if (!cache_key.empty()) {
+    SoftMaskGroupCacheEntry entry;
+    entry.width = state_.soft_mask_width;
+    entry.height = state_.soft_mask_height;
+    entry.data = state_.soft_mask_data;
+    soft_mask_group_cache_[cache_key] = std::move(entry);
+  }
 
   return true;
 }

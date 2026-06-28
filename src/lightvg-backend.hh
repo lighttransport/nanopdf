@@ -515,6 +515,13 @@ private:
   // Cleared via cache-key mismatch when the underlying soft_mask_data changes.
   std::shared_ptr<const lvg::SoftMaskData> current_soft_mask_;
 
+  struct SoftMaskGroupCacheEntry {
+    std::vector<uint8_t> data;
+    uint32_t width{0};
+    uint32_t height{0};
+  };
+  std::unordered_map<std::string, SoftMaskGroupCacheEntry> soft_mask_group_cache_;
+
   // After draw_image() completes, holds the ARGB pixel buffer so the caller
   // can store it in the render cache. Only filled when the image came from a
   // named XObject (obj_num != 0). Cleared once consumed.
