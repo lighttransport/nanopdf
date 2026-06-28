@@ -17,13 +17,12 @@
 
 #pragma once
 
-#include <cerrno>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <string_view>
+
+#include "pdf-content-scan.h"
 
 namespace nanopdf {
 
@@ -121,43 +120,12 @@ inline bool parse_uint64(std::string_view sv, uint64_t *ret) {
 // Consumes the entire input (no trailing garbage). Does not throw.
 inline bool parse_double(std::string_view sv, double *ret) {
   if (!ret || sv.empty()) return false;
-  // strtod needs a NUL-terminated string. Most PDF numeric tokens are short;
-  // keep those on the stack to avoid per-coordinate heap traffic.
-  char stack_buf[64];
-  const char* p = nullptr;
-  std::string heap_buf;
-  if (sv.size() < sizeof(stack_buf)) {
-    std::memcpy(stack_buf, sv.data(), sv.size());
-    stack_buf[sv.size()] = '\0';
-    p = stack_buf;
-  } else {
-    heap_buf.assign(sv);
-    p = heap_buf.c_str();
-  }
-  errno = 0;
-  char *endptr = nullptr;
-  double v = std::strtod(p, &endptr);
-  if (errno == ERANGE) return false;
-  if (endptr == p) return false;  // no characters consumed
-  // Allow trailing whitespace only.
-  while (endptr && *endptr) {
-    char c = *endptr;
-    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') return false;
-    ++endptr;
-  }
-  *ret = v;
-  return true;
+  return npdf_parse_double_span(sv.data(), sv.size(), ret) != 0;
 }
 
 inline bool parse_float(std::string_view sv, float *ret) {
-  if (!ret) return false;
-  double d = 0.0;
-  if (!parse_double(sv, &d)) return false;
-  // Clamp / reject ranges outside float.
-  if (d > static_cast<double>(std::numeric_limits<float>::max())) return false;
-  if (d < -static_cast<double>(std::numeric_limits<float>::max())) return false;
-  *ret = static_cast<float>(d);
-  return true;
+  if (!ret || sv.empty()) return false;
+  return npdf_parse_float_span(sv.data(), sv.size(), ret) != 0;
 }
 
 // Parse an unsigned integer in an arbitrary base in [2, 36]. No prefix.

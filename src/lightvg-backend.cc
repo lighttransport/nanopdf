@@ -22,6 +22,7 @@
 #include "shared-font-cache.hh"
 #include "render-cache.hh"
 #include "pdf-function.hh"
+#include "pdf-content-scan.h"
 #include "string-parse.hh"
 #ifndef MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
@@ -122,6 +123,11 @@ static std::vector<std::string> type1_glyph_name_candidates_for_unicode(uint32_t
     case 0x007C: names = {"bar", "vert", "uni007C", "bar1", "barex"}; break;
     case 0x00B7: names = {"periodcentered"}; break;
     case 0x03A9: names = {"Omega", "uni03A9"}; break;
+    case 0xFB00: names = {"ff"}; break;
+    case 0xFB01: names = {"fi"}; break;
+    case 0xFB02: names = {"fl"}; break;
+    case 0xFB03: names = {"ffi"}; break;
+    case 0xFB04: names = {"ffl"}; break;
     case 0x2190: names = {"arrowleft"}; break;
     case 0x2192: names = {"arrowright"}; break;
     case 0x2207: names = {"nabla"}; break;
@@ -2233,6 +2239,7 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
       return drew_any;
     };
 
+    uint16_t prev_simple_gid = 0;
     for (size_t i = 0; i < text.length(); ) {
       uint32_t char_code;
       size_t bytes_consumed = 1;
@@ -2409,23 +2416,15 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
         std::string glyph_name;
         uint32_t mapped_unicode = 0;
         bool has_mapped_unicode = false;
-        if (current_font_) {
-          if (try_map_tounicode(char_code, current_font_, &mapped_unicode)) {
-            has_mapped_unicode = true;
-            for (const std::string& mapped_name :
-                 type1_glyph_name_candidates_for_unicode(mapped_unicode)) {
-              if (!mapped_name.empty() &&
-                  font->type1.char_strings.find(mapped_name) != font->type1.char_strings.end()) {
-                glyph_name = mapped_name;
-                break;
-              }
-            }
-          }
-        }
+        // For a simple Type1 font the char-code -> glyph-name mapping comes from
+        // the PDF /Encoding /Differences and the font's built-in encoding; those
+        // are authoritative and must take precedence over ToUnicode. ToUnicode is
+        // lossy for rendering (e.g. it maps the "f_f" ligature code to plain "f"),
+        // so it is only consulted below as a fallback when the encoding yields no
+        // glyph present in the embedded program.
         if (current_font_) {
           auto diff_it = current_font_->encoding_differences.find(char_code);
-          if (glyph_name.empty() &&
-              diff_it != current_font_->encoding_differences.end()) {
+          if (diff_it != current_font_->encoding_differences.end()) {
             glyph_name = diff_it->second;
           }
         }
@@ -2608,8 +2607,21 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
           sequence_x += (step * hscale) * cos_tm;
           sequence_y -= (step * hscale) * sin_tm;
         }
+        prev_simple_gid = 0;
       } else {
+        if (font->has_ttf_parse && prev_simple_gid != 0 && gid != 0) {
+          int kern_units = ttf_kern_lookup(&font->ttf, prev_simple_gid, gid);
+          if (kern_units != 0) {
+            float em_scale = (font->ttf.units_per_em > 0)
+                ? (size / static_cast<float>(font->ttf.units_per_em))
+                : scale;
+            float kern = kern_units * em_scale;
+            cursor_x += (kern * hscale) * cos_tm;
+            cursor_y -= (kern * hscale) * sin_tm;
+          }
+        }
         draw_glyph(static_cast<int>(codepoint), cursor_x, cursor_y, size, r, g, b, a);
+        prev_simple_gid = gid;
       }
 
       // Advance cursor in text direction
@@ -2813,7 +2825,9 @@ static int get_lightvg_font_category(const std::string& font_name) {
   // Check for serif fonts
   if (lower_name.find("times") != std::string::npos ||
       lower_name.find("linlibertine") != std::string::npos ||
+      lower_name.find("linbiolinum") != std::string::npos ||
       lower_name.find("libertine") != std::string::npos ||
+      lower_name.find("biolinum") != std::string::npos ||
       lower_name.find("serif") != std::string::npos ||
       lower_name.find("roman") != std::string::npos ||
       lower_name.find("garamond") != std::string::npos ||
@@ -2823,9 +2837,7 @@ static int get_lightvg_font_category(const std::string& font_name) {
     return 2;  // Serif
   }
 
-  if (lower_name.find("linbiolinum") != std::string::npos ||
-      lower_name.find("biolinum") != std::string::npos ||
-      lower_name.find("helvetica") != std::string::npos ||
+  if (lower_name.find("helvetica") != std::string::npos ||
       lower_name.find("arial") != std::string::npos ||
       lower_name.find("sans") != std::string::npos) {
     return 0;  // Sans-serif
@@ -2879,6 +2891,12 @@ static std::pair<int, bool> parse_font_weight_style(const std::string& name) {
   bool italic = false;
 
   if (lower.find("bold") != std::string::npos) weight = 700;
+  else if (family_name.find("linlibertineb") != std::string::npos ||
+           family_name.find("linlibertinez") != std::string::npos ||
+           family_name.find("linbiolinumb") != std::string::npos ||
+           family_name.find("linbiolinumz") != std::string::npos) {
+    weight = 700;
+  }
   else if (lower.find("black") != std::string::npos ||
            lower.find("heavy") != std::string::npos) weight = 900;
   else if (lower.find("light") != std::string::npos) weight = 300;
@@ -2942,6 +2960,28 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   // Determine font category for better substitution
   int category = get_lightvg_font_category(hint_name);
 
+  // The name-based guess defaults to sans-serif (0) when the base font name is
+  // empty or unrecognized, which mis-substitutes serif/monospace fonts. The
+  // FontDescriptor /Flags are an authoritative signal, so use them to correct the
+  // unreliable sans default. Only nudge the sans/serif/mono axis; never override
+  // symbol (3) or CJK (4), and never downgrade an explicit name match.
+  const FontDescriptor* fdesc = font ? font->descriptor : nullptr;
+  if (!fdesc) {
+    const Type0Font* t0 = as_type0_font(font);
+    if (t0 && t0->descendant_font && t0->descendant_font->descriptor) {
+      fdesc = t0->descendant_font->descriptor;
+    }
+  }
+  if (fdesc && fdesc->flags != 0 && category != 3 && category != 4) {
+    const bool fixed_pitch = (fdesc->flags & 0x1) != 0;  // FixedPitch
+    const bool serif = (fdesc->flags & 0x2) != 0;        // Serif
+    if (fixed_pitch && category != 1) {
+      category = 1;  // Monospace
+    } else if (serif && category == 0) {
+      category = 2;  // promote unreliable sans default to serif
+    }
+  }
+
   // Override category to CJK if font structure indicates CJK
   if (is_cjk_font(font)) {
     category = 4;  // CJK
@@ -2950,6 +2990,8 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   // Font paths organized by category
   // Category 0: Sans-serif, 1: Monospace, 2: Serif, 3: Symbol, 4: CJK
   static const char* sans_fonts[] = {
+    "fonts/arimo/Arimo-Regular.ttf",
+    "../fonts/arimo/Arimo-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
@@ -2963,6 +3005,8 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   };
 
   static const char* mono_fonts[] = {
+    "fonts/cousine/Cousine-Regular.ttf",
+    "../fonts/cousine/Cousine-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
@@ -2973,6 +3017,8 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   };
 
   static const char* serif_fonts[] = {
+    "fonts/tinos/Tinos-Regular.ttf",
+    "../fonts/tinos/Tinos-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
@@ -3233,8 +3279,6 @@ bool LightVGBackend::load_fallback_font_with_hint(const std::string& font_name, 
   return false;
 }
 
-static bool should_use_embedded_type1_for_lightvg(const BaseFont* font);
-
 bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, const BaseFont* font) {
   if (font_cache_.count(font_name)) {
     return font_cache_[font_name].initialized;
@@ -3320,9 +3364,14 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     return load_fallback_font_with_hint(font_name, font);
   }
 
-  if ((desc->font_file_type == FontFileType::FontFile ||
-       looks_like_type1_font_program(decoded.data)) &&
-      should_use_embedded_type1_for_lightvg(font)) {
+  // Render any embedded Type1 (/FontFile) program directly from its outlines.
+  // The reference renderers (browser/poppler) do the same; substituting a system
+  // font here yields wrong glyphs (the embedded program is the only authoritative
+  // source of the actual shapes) and mismatched metrics. The per-glyph fallback
+  // in draw_text() still covers missing glyphs, and the block below falls back to
+  // substitution if the Type1 program fails to parse or has no CharStrings.
+  if (desc->font_file_type == FontFileType::FontFile ||
+      looks_like_type1_font_program(decoded.data)) {
     Type1Parser parser;
     FontCache cache;
     if (!parser.Parse(decoded.data.data(), decoded.data.size(), cache.type1, true)) {
@@ -3513,22 +3562,6 @@ std::string LightVGBackend::font_cache_key(const BaseFont* font) const {
   // the same base name maps to the same substitute — a safe shared identity.
   if (!font->base_font.empty()) return "F" + font->base_font;
   return std::string();
-}
-
-static bool should_use_embedded_type1_for_lightvg(const BaseFont* font) {
-  if (!font) return false;
-  std::string name = font->base_font;
-  size_t subset = name.find('+');
-  if (subset != std::string::npos) name = name.substr(subset + 1);
-  std::string lower;
-  for (char c : name) {
-    lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  return lower.find("math") != std::string::npos ||
-         lower.find("txmia") != std::string::npos ||
-         lower.find("txsys") != std::string::npos ||
-         lower.find("txsym") != std::string::npos ||
-         lower.find("txex") != std::string::npos;
 }
 
 uint16_t LightVGBackend::glyph_advance_units(FontCache* font, uint16_t gid) {
@@ -3758,8 +3791,14 @@ float LightVGBackend::calculate_text_advance_draw_model(const std::string& text,
   }
 
   float advance = 0.0f;
+  uint16_t prev_simple_gid = 0;
   for (size_t i = 0; i < text.length(); i++) {
     uint32_t char_code = static_cast<unsigned char>(text[i]);
+    uint32_t codepoint = map_char_to_unicode(char_code, current_font_);
+    uint16_t gid = 0;
+    if (font->has_ttf_parse) {
+      gid = ttf_cmap_lookup(&font->ttf, codepoint);
+    }
     float adv = -1.0f;
     if (current_font_ && !current_font_->widths.empty()) {
       int first_char = current_font_->first_char;
@@ -3773,10 +3812,8 @@ float LightVGBackend::calculate_text_advance_draw_model(const std::string& text,
       }
     }
     if (adv < 0.0f) {
-      uint32_t codepoint = map_char_to_unicode(char_code, current_font_);
       int adv_units = 0;
       if (font->has_ttf_parse) {
-        uint16_t gid = ttf_cmap_lookup(&font->ttf, codepoint);
         adv_units = glyph_advance_units(font, gid);
       } else {
         int lsb = 0;
@@ -3793,6 +3830,7 @@ float LightVGBackend::calculate_text_advance_draw_model(const std::string& text,
       adv += state_.word_spacing;
     }
     advance += adv;
+    prev_simple_gid = gid;
   }
   return advance;
 }
@@ -3911,35 +3949,6 @@ static bool evaluate_pdf_function(const Pdf& pdf, const Value& function,
                                    const std::vector<double>& inputs,
                                    std::vector<double>& outputs);
 
-struct BilinearSample {
-  int i0{0};
-  int i1{0};
-  float w0{1.0f};
-  float w1{0.0f};
-};
-
-static std::vector<BilinearSample> make_bilinear_samples(int src, int dst) {
-  std::vector<BilinearSample> samples;
-  if (src <= 0 || dst <= 0) return samples;
-  samples.resize(static_cast<size_t>(dst));
-  for (int i = 0; i < dst; ++i) {
-    float src_i = (static_cast<float>(i) + 0.5f) * src / dst - 0.5f;
-    int i0 = static_cast<int>(std::floor(src_i));
-    float f = src_i - i0;
-    if (i0 < 0) {
-      i0 = 0;
-      f = 0.0f;
-    }
-    samples[static_cast<size_t>(i)] = {i0, std::min(i0 + 1, src - 1),
-                                       1.0f - f, f};
-  }
-  return samples;
-}
-
-static uint32_t clamp_to_byte(float v) {
-  return static_cast<uint32_t>(std::min(255.0f, std::max(0.0f, v + 0.5f)));
-}
-
 static void downsample_argb_bilinear(std::vector<uint32_t>& pixels,
                                      int src_w, int src_h,
                                      int dst_w, int dst_h) {
@@ -3948,38 +3957,35 @@ static void downsample_argb_bilinear(std::vector<uint32_t>& pixels,
     return;
   }
 
+  // Area-average (box filter): average every source texel covered by each
+  // destination pixel. Higher quality than a 2-tap bilinear sample when
+  // minifying by more than 2x (which aliases and looks blurry).
   std::vector<uint32_t> out(static_cast<size_t>(dst_w) *
                             static_cast<size_t>(dst_h));
-  auto x_samples = make_bilinear_samples(src_w, dst_w);
-  auto y_samples = make_bilinear_samples(src_h, dst_h);
   for (int y = 0; y < dst_h; ++y) {
-    const auto& sy = y_samples[static_cast<size_t>(y)];
-    const uint32_t* row0 =
-        pixels.data() + static_cast<size_t>(sy.i0) * src_w;
-    const uint32_t* row1 =
-        pixels.data() + static_cast<size_t>(sy.i1) * src_w;
+    int ys0 = static_cast<int>(static_cast<int64_t>(y) * src_h / dst_h);
+    int ys1 = static_cast<int>(static_cast<int64_t>(y + 1) * src_h / dst_h);
+    if (ys1 <= ys0) ys1 = ys0 + 1;
+    if (ys1 > src_h) ys1 = src_h;
     uint32_t* dst_row = out.data() + static_cast<size_t>(y) * dst_w;
     for (int x = 0; x < dst_w; ++x) {
-      const auto& sx = x_samples[static_cast<size_t>(x)];
-      uint32_t p00 = row0[sx.i0];
-      uint32_t p10 = row0[sx.i1];
-      uint32_t p01 = row1[sx.i0];
-      uint32_t p11 = row1[sx.i1];
-      float w00 = sx.w0 * sy.w0;
-      float w10 = sx.w1 * sy.w0;
-      float w01 = sx.w0 * sy.w1;
-      float w11 = sx.w1 * sy.w1;
-      auto sample = [&](int shift) -> uint32_t {
-        float v = static_cast<float>((p00 >> shift) & 0xffu) * w00 +
-                  static_cast<float>((p10 >> shift) & 0xffu) * w10 +
-                  static_cast<float>((p01 >> shift) & 0xffu) * w01 +
-                  static_cast<float>((p11 >> shift) & 0xffu) * w11;
-        return clamp_to_byte(v);
-      };
-      uint32_t a = sample(24);
-      uint32_t r = sample(16);
-      uint32_t g = sample(8);
-      uint32_t b = sample(0);
+      int xs0 = static_cast<int>(static_cast<int64_t>(x) * src_w / dst_w);
+      int xs1 = static_cast<int>(static_cast<int64_t>(x + 1) * src_w / dst_w);
+      if (xs1 <= xs0) xs1 = xs0 + 1;
+      if (xs1 > src_w) xs1 = src_w;
+      uint32_t as = 0, rs = 0, gs = 0, bs = 0, cnt = 0;
+      for (int yy = ys0; yy < ys1; ++yy) {
+        const uint32_t* row = pixels.data() + static_cast<size_t>(yy) * src_w;
+        for (int xx = xs0; xx < xs1; ++xx) {
+          uint32_t p = row[xx];
+          as += (p >> 24) & 0xffu;
+          rs += (p >> 16) & 0xffu;
+          gs += (p >> 8) & 0xffu;
+          bs += p & 0xffu;
+          ++cnt;
+        }
+      }
+      uint32_t a = as / cnt, r = rs / cnt, g = gs / cnt, b = bs / cnt;
       dst_row[x] = (a << 24) | (r << 16) | (g << 8) | b;
     }
   }
@@ -4082,65 +4088,61 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     if (smask_supported) {
       argb_data.resize(static_cast<size_t>(prescale_w) *
                        static_cast<size_t>(prescale_h));
-      auto rgb_x_samples = make_bilinear_samples(img_width, prescale_w);
-      auto rgb_y_samples = make_bilinear_samples(img_height, prescale_h);
-      std::vector<BilinearSample> mask_x_samples;
-      std::vector<BilinearSample> mask_y_samples;
-      if (has_smask && smask_img.bits_per_component == 8) {
-        mask_x_samples = make_bilinear_samples(smask_img.width, prescale_w);
-        mask_y_samples = make_bilinear_samples(smask_img.height, prescale_h);
-      }
+      const bool sm8 = has_smask && smask_img.bits_per_component == 8;
+      const int sw = has_smask ? smask_img.width : 0;
+      const int sh = has_smask ? smask_img.height : 0;
+      const int mask_stride = (has_smask && !sm8) ? (sw + 7) / 8 : 0;
+      // Area-average (box filter) minification: average every source texel that
+      // a destination pixel covers. A 2-tap bilinear sample skips most texels
+      // when shrinking by more than 2x, which aliases and looks blurry; the
+      // box filter preserves the figure detail the reference renderers show.
       for (int y = 0; y < prescale_h; ++y) {
-        const auto& sy = rgb_y_samples[static_cast<size_t>(y)];
-        const uint8_t* row0 =
-            image.data.data() + static_cast<size_t>(sy.i0) * img_width * 3;
-        const uint8_t* row1 =
-            image.data.data() + static_cast<size_t>(sy.i1) * img_width * 3;
+        int ys0 = static_cast<int>(static_cast<int64_t>(y) * img_height / prescale_h);
+        int ys1 = static_cast<int>(static_cast<int64_t>(y + 1) * img_height / prescale_h);
+        if (ys1 <= ys0) ys1 = ys0 + 1;
+        if (ys1 > img_height) ys1 = img_height;
         uint32_t* dst_row = argb_data.data() + static_cast<size_t>(y) * prescale_w;
         for (int x = 0; x < prescale_w; ++x) {
-          const auto& sx = rgb_x_samples[static_cast<size_t>(x)];
-          const uint8_t* p00 = row0 + sx.i0 * 3;
-          const uint8_t* p10 = row0 + sx.i1 * 3;
-          const uint8_t* p01 = row1 + sx.i0 * 3;
-          const uint8_t* p11 = row1 + sx.i1 * 3;
-          float w00 = sx.w0 * sy.w0;
-          float w10 = sx.w1 * sy.w0;
-          float w01 = sx.w0 * sy.w1;
-          float w11 = sx.w1 * sy.w1;
-          uint32_t r = clamp_to_byte(p00[0] * w00 + p10[0] * w10 +
-                                     p01[0] * w01 + p11[0] * w11);
-          uint32_t g = clamp_to_byte(p00[1] * w00 + p10[1] * w10 +
-                                     p01[1] * w01 + p11[1] * w11);
-          uint32_t b = clamp_to_byte(p00[2] * w00 + p10[2] * w10 +
-                                     p01[2] * w01 + p11[2] * w11);
+          int xs0 = static_cast<int>(static_cast<int64_t>(x) * img_width / prescale_w);
+          int xs1 = static_cast<int>(static_cast<int64_t>(x + 1) * img_width / prescale_w);
+          if (xs1 <= xs0) xs1 = xs0 + 1;
+          if (xs1 > img_width) xs1 = img_width;
+          uint32_t rs = 0, gs = 0, bs = 0, cnt = 0;
+          for (int yy = ys0; yy < ys1; ++yy) {
+            const uint8_t* row =
+                image.data.data() + static_cast<size_t>(yy) * img_width * 3;
+            for (int xx = xs0; xx < xs1; ++xx) {
+              const uint8_t* p = row + static_cast<size_t>(xx) * 3;
+              rs += p[0]; gs += p[1]; bs += p[2]; ++cnt;
+            }
+          }
+          uint32_t r = rs / cnt, g = gs / cnt, b = bs / cnt;
           uint32_t a = 255;
           if (has_smask) {
-            int sw = smask_img.width;
-            int sh = smask_img.height;
-            if (smask_img.bits_per_component == 8) {
-              const auto& msx = mask_x_samples[static_cast<size_t>(x)];
-              const auto& msy = mask_y_samples[static_cast<size_t>(y)];
-              auto alpha_at = [&](int sx, int sy) -> float {
-                size_t si = static_cast<size_t>(sy) * sw + sx;
-                return si < smask_img.data.size()
-                    ? static_cast<float>(smask_img.data[si])
-                    : 255.0f;
-              };
-              float aw00 = msx.w0 * msy.w0;
-              float aw10 = msx.w1 * msy.w0;
-              float aw01 = msx.w0 * msy.w1;
-              float aw11 = msx.w1 * msy.w1;
-              a = clamp_to_byte(alpha_at(msx.i0, msy.i0) * aw00 +
-                                alpha_at(msx.i1, msy.i0) * aw10 +
-                                alpha_at(msx.i0, msy.i1) * aw01 +
-                                alpha_at(msx.i1, msy.i1) * aw11);
+            if (sm8) {
+              int mys0 = static_cast<int>(static_cast<int64_t>(y) * sh / prescale_h);
+              int mys1 = static_cast<int>(static_cast<int64_t>(y + 1) * sh / prescale_h);
+              if (mys1 <= mys0) mys1 = mys0 + 1;
+              if (mys1 > sh) mys1 = sh;
+              int mxs0 = static_cast<int>(static_cast<int64_t>(x) * sw / prescale_w);
+              int mxs1 = static_cast<int>(static_cast<int64_t>(x + 1) * sw / prescale_w);
+              if (mxs1 <= mxs0) mxs1 = mxs0 + 1;
+              if (mxs1 > sw) mxs1 = sw;
+              uint32_t as = 0, acnt = 0;
+              for (int yy = mys0; yy < mys1; ++yy) {
+                const uint8_t* mr =
+                    smask_img.data.data() + static_cast<size_t>(yy) * sw;
+                for (int xx = mxs0; xx < mxs1; ++xx) { as += mr[xx]; ++acnt; }
+              }
+              a = acnt ? (as / acnt) : 255;
             } else {
-              int mask_sx = std::min(sw - 1, std::max(0, (sx.i0 * sw) / img_width));
-              int mask_sy = std::min(sh - 1, std::max(0, (sy.i0 * sh) / img_height));
-              int stride = (sw + 7) / 8;
-              size_t bi = static_cast<size_t>(mask_sy) * stride + (mask_sx / 8);
+              int mcx = static_cast<int>(static_cast<int64_t>((xs0 + xs1) / 2) * sw / img_width);
+              int mcy = static_cast<int>(static_cast<int64_t>((ys0 + ys1) / 2) * sh / img_height);
+              mcx = std::min(sw - 1, std::max(0, mcx));
+              mcy = std::min(sh - 1, std::max(0, mcy));
+              size_t bi = static_cast<size_t>(mcy) * mask_stride + (mcx / 8);
               if (bi < smask_img.data.size()) {
-                a = ((smask_img.data[bi] >> (7 - (mask_sx % 8))) & 1u) ? 255u : 0u;
+                a = ((smask_img.data[bi] >> (7 - (mcx % 8))) & 1u) ? 255u : 0u;
               }
             }
             r = (r * a + 127) / 255;
@@ -4645,15 +4647,31 @@ static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
 
   std::vector<lvg::Fill::ColorStop> stops;
 
-  if (function.type != Value::DICTIONARY) {
+  // Resolve an indirect /Function reference. Shadings commonly store /Function
+  // as an indirect object; without resolving it the checks below fall through to
+  // the default black->white gradient, which renders e.g. the white feather and
+  // shadow shadings in fig. 14 as solid dark bands.
+  Value resolved_function;
+  const Value* func_ptr = &function;
+  if (function.type == Value::REFERENCE) {
+    auto r = resolve_reference(pdf, function.ref_object_number,
+                               function.ref_generation_number);
+    if (r.success) {
+      resolved_function = std::move(r.value);
+      func_ptr = &resolved_function;
+    }
+  }
+  const Value& fn = *func_ptr;
+
+  if (fn.type != Value::DICTIONARY) {
     // Default black to white
     stops.push_back({0.0f, 0, 0, 0, 255});
     stops.push_back({1.0f, 255, 255, 255, 255});
     return stops;
   }
 
-  auto func_type_it = function.dict.find("FunctionType");
-  if (func_type_it == function.dict.end() || func_type_it->second.type != Value::NUMBER) {
+  auto func_type_it = fn.dict.find("FunctionType");
+  if (func_type_it == fn.dict.end() || func_type_it->second.type != Value::NUMBER) {
     stops.push_back({0.0f, 0, 0, 0, 255});
     stops.push_back({1.0f, 255, 255, 255, 255});
     return stops;
@@ -4664,8 +4682,8 @@ static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
   if (func_type == 2) {
     // Type 2: Exponential interpolation function
     // C0 = color at t=0, C1 = color at t=1
-    auto c0_it = function.dict.find("C0");
-    auto c1_it = function.dict.find("C1");
+    auto c0_it = fn.dict.find("C0");
+    auto c1_it = fn.dict.find("C1");
 
     lvg::Fill::ColorStop stop0 = {0.0f, 0, 0, 0, 255};
     lvg::Fill::ColorStop stop1 = {1.0f, 255, 255, 255, 255};
@@ -4702,8 +4720,8 @@ static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
     // Functions = array of sub-functions
     // Bounds = array of boundary values between sub-functions
     // Encode = array mapping each subdomain to sub-function domain
-    auto functions_it = function.dict.find("Functions");
-    auto bounds_it = function.dict.find("Bounds");
+    auto functions_it = fn.dict.find("Functions");
+    auto bounds_it = fn.dict.find("Bounds");
 
     if (functions_it == function.dict.end() || functions_it->second.type != Value::ARRAY) {
       stops.push_back({0.0f, 0, 0, 0, 255});
@@ -5189,11 +5207,21 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
       return false;
     }
 
-    // Coords are [x0, y0, x1, y1]
-    float x0 = static_cast<float>(shading->coords[0]) * state_.scale;
-    float y0 = (state_.page_height - static_cast<float>(shading->coords[1])) * state_.scale;
-    float x1 = static_cast<float>(shading->coords[2]) * state_.scale;
-    float y1 = (state_.page_height - static_cast<float>(shading->coords[3])) * state_.scale;
+    // Coords are [x0, y0, x1, y1] in the shading's own space, which the `sh`
+    // operator maps through the current CTM. Apply state_.transform before the
+    // page scale / Y-flip, otherwise the gradient axis lands at the page origin
+    // instead of where the content stream's `cm` placed it (e.g. fig-14 feather
+    // gradients) and the shading misses its clip region entirely.
+    float ax0 = static_cast<float>(shading->coords[0]);
+    float ay0 = static_cast<float>(shading->coords[1]);
+    float ax1 = static_cast<float>(shading->coords[2]);
+    float ay1 = static_cast<float>(shading->coords[3]);
+    state_.transform.transform(ax0, ay0);
+    state_.transform.transform(ax1, ay1);
+    float x0 = ax0 * state_.scale;
+    float y0 = (state_.page_height - ay0) * state_.scale;
+    float x1 = ax1 * state_.scale;
+    float y1 = (state_.page_height - ay1) * state_.scale;
 
     gradient->linear(x0, y0, x1, y1);
 
@@ -5216,13 +5244,24 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
       return false;
     }
 
-    // Coords are [x0, y0, r0, x1, y1, r1]
-    float x0 = static_cast<float>(shading->coords[0]) * state_.scale;
-    float y0 = (state_.page_height - static_cast<float>(shading->coords[1])) * state_.scale;
-    float r0 = static_cast<float>(shading->coords[2]) * state_.scale;
-    float x1 = static_cast<float>(shading->coords[3]) * state_.scale;
-    float y1 = (state_.page_height - static_cast<float>(shading->coords[4])) * state_.scale;
-    float r1 = static_cast<float>(shading->coords[5]) * state_.scale;
+    // Coords are [x0, y0, r0, x1, y1, r1]. Map the circle centres through the
+    // current CTM (see axial note above); scale the radii by the CTM's scale
+    // factor so a `cm`-placed radial shading lands correctly.
+    float cx0 = static_cast<float>(shading->coords[0]);
+    float cy0 = static_cast<float>(shading->coords[1]);
+    float cx1 = static_cast<float>(shading->coords[3]);
+    float cy1 = static_cast<float>(shading->coords[4]);
+    state_.transform.transform(cx0, cy0);
+    state_.transform.transform(cx1, cy1);
+    float ctm_scale = std::sqrt(std::abs(
+        state_.transform.a * state_.transform.d -
+        state_.transform.b * state_.transform.c));
+    float x0 = cx0 * state_.scale;
+    float y0 = (state_.page_height - cy0) * state_.scale;
+    float r0 = static_cast<float>(shading->coords[2]) * ctm_scale * state_.scale;
+    float x1 = cx1 * state_.scale;
+    float y1 = (state_.page_height - cy1) * state_.scale;
+    float r1 = static_cast<float>(shading->coords[5]) * ctm_scale * state_.scale;
 
     // ThorVG radial uses (cx, cy, r, fx, fy, fr) where:
     // - (cx, cy, r) is the outer circle
@@ -5745,178 +5784,36 @@ bool LightVGBackend::draw_shading(const std::string& shading_name) {
   return push_with_clip(shape);
 }
 
-bool LightVGBackend::parse_inline_image(const std::string& content, size_t& pos) {
+bool LightVGBackend::parse_inline_image(std::string_view content, size_t& pos) {
   // Parse inline image dictionary (BI ... ID data EI)
   // pos should be right after "BI"
 
-  std::map<std::string, std::string> dict;
-
-  // Skip whitespace after BI
-  while (pos < content.length() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-    pos++;
-  }
-
-  // Parse dictionary entries until we hit "ID"
-  while (pos < content.length()) {
-    // Skip whitespace
-    while (pos < content.length() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-      pos++;
-    }
-    if (pos >= content.length()) break;
-
-    // Check for ID (marks start of image data)
-    if (content[pos] == 'I' && pos + 1 < content.length() && content[pos + 1] == 'D') {
-      pos += 2;  // Skip "ID"
-      // Skip single whitespace after ID
-      if (pos < content.length() && (content[pos] == ' ' || content[pos] == '\n' || content[pos] == '\r')) {
-        pos++;
-      }
-      break;
-    }
-
-    // Parse key (should start with /)
-    std::string key;
-    if (content[pos] == '/') {
-      pos++;  // Skip /
-      while (pos < content.length() && !std::isspace(static_cast<unsigned char>(content[pos])) &&
-             content[pos] != '/') {
-        key += content[pos++];
-      }
-    } else {
-      // Skip unknown token
-      while (pos < content.length() && !std::isspace(static_cast<unsigned char>(content[pos]))) {
-        pos++;
-      }
-      continue;
-    }
-
-    // Skip whitespace
-    while (pos < content.length() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-      pos++;
-    }
-
-    // Parse value
-    std::string value;
-    if (pos < content.length()) {
-      if (content[pos] == '/') {
-        pos++;  // Skip /
-        while (pos < content.length() && !std::isspace(static_cast<unsigned char>(content[pos])) &&
-               content[pos] != '/') {
-          value += content[pos++];
-        }
-      } else if (content[pos] == '[') {
-        // Array value
-        value += content[pos++];
-        while (pos < content.length() && content[pos] != ']') {
-          value += content[pos++];
-        }
-        if (pos < content.length()) value += content[pos++];
-      } else {
-        // Numeric or other value
-        while (pos < content.length() && !std::isspace(static_cast<unsigned char>(content[pos])) &&
-               content[pos] != '/') {
-          value += content[pos++];
-        }
-      }
-    }
-
-    if (!key.empty()) {
-      dict[key] = value;
-    }
-  }
-
-  // Get image properties using PDF abbreviations
-  int width = 0, height = 0, bpc = 8;
-  std::string cs = "G";  // Default grayscale
-  std::string filter;
-  bool interpolate = false;
-
-  // W or Width
-  auto it = dict.find("W");
-  if (it == dict.end()) it = dict.find("Width");
-  if (it != dict.end()) width = nanopdf::stoi_or(it->second);
-
-  // H or Height
-  it = dict.find("H");
-  if (it == dict.end()) it = dict.find("Height");
-  if (it != dict.end()) height = nanopdf::stoi_or(it->second);
-
-  // BPC or BitsPerComponent
-  it = dict.find("BPC");
-  if (it == dict.end()) it = dict.find("BitsPerComponent");
-  if (it != dict.end()) bpc = nanopdf::stoi_or(it->second);
-
-  // CS or ColorSpace
-  it = dict.find("CS");
-  if (it == dict.end()) it = dict.find("ColorSpace");
-  if (it != dict.end()) cs = it->second;
-
-  // F or Filter
-  it = dict.find("F");
-  if (it == dict.end()) it = dict.find("Filter");
-  if (it != dict.end()) filter = it->second;
-
-  // I or Interpolate
-  it = dict.find("I");
-  if (it == dict.end()) it = dict.find("Interpolate");
-  if (it != dict.end()) {
-    interpolate = (it->second == "true" || it->second == "True" ||
-                   it->second == "1");
-  }
-
-  if (width <= 0 || height <= 0) {
-    // Skip to EI and return
-    while (pos < content.length()) {
-      if (content[pos] == 'E' && pos + 1 < content.length() && content[pos + 1] == 'I') {
-        pos += 2;
-        return false;
-      }
-      pos++;
-    }
+  npdf_inline_image_info info;
+  const int parsed = npdf_parse_inline_image_info(
+      content.data(), content.size(), pos, &info);
+  pos = info.end_pos;
+  if (!parsed) {
     return false;
   }
 
-  // Determine components based on color space
-  int components = 1;
-  if (cs == "RGB" || cs == "DeviceRGB") components = 3;
-  else if (cs == "CMYK" || cs == "DeviceCMYK") components = 4;
-  else if (cs == "G" || cs == "DeviceGray") components = 1;
-
-  // Calculate expected data size
-  int row_bytes = (width * components * bpc + 7) / 8;
-  int expected_size = row_bytes * height;
-
-  // Read raw image data until EI
   std::vector<uint8_t> raw_data;
-  raw_data.reserve(expected_size);
-
-  size_t data_start = pos;
-  while (pos < content.length()) {
-    // Look for EI preceded by whitespace
-    if (pos > data_start &&
-        (content[pos - 1] == ' ' || content[pos - 1] == '\n' || content[pos - 1] == '\r') &&
-        content[pos] == 'E' && pos + 1 < content.length() && content[pos + 1] == 'I') {
-      break;
-    }
-    raw_data.push_back(static_cast<uint8_t>(content[pos]));
-    pos++;
-  }
-
-  // Skip EI
-  if (pos < content.length() && content[pos] == 'E') {
-    pos += 2;  // Skip "EI"
+  raw_data.reserve(info.expected_data_size);
+  if (info.data_end > info.data_start && info.data_end <= content.size()) {
+    const auto* begin = reinterpret_cast<const uint8_t*>(content.data() + info.data_start);
+    const auto* end = reinterpret_cast<const uint8_t*>(content.data() + info.data_end);
+    raw_data.assign(begin, end);
   }
 
   // Decode if filtered
   std::vector<uint8_t> decoded_data;
-  if (filter == "AHx" || filter == "ASCIIHexDecode") {
+  if (info.filter == NPDF_INLINE_IMAGE_FILTER_ASCII_HEX) {
     // ASCII Hex decode
     decoded_data.reserve(raw_data.size() / 2);
     for (size_t i = 0; i + 1 < raw_data.size(); i += 2) {
       char hex[3] = {static_cast<char>(raw_data[i]), static_cast<char>(raw_data[i + 1]), 0};
       decoded_data.push_back(static_cast<uint8_t>(strtol(hex, nullptr, 16)));
     }
-  } else if (filter == "A85" || filter == "ASCII85Decode") {
+  } else if (info.filter == NPDF_INLINE_IMAGE_FILTER_ASCII85) {
     // ASCII85 decode
     decoded_data.reserve(raw_data.size() * 4 / 5);
     uint32_t value = 0;
@@ -5958,14 +5855,15 @@ bool LightVGBackend::parse_inline_image(const std::string& content, size_t& pos)
       if (count > 2) decoded_data.push_back((value >> 16) & 0xFF);
       if (count > 3) decoded_data.push_back((value >> 8) & 0xFF);
     }
-  } else if (filter == "Fl" || filter == "FlateDecode" || filter == "LZW" || filter == "LZWDecode") {
+  } else if (info.filter == NPDF_INLINE_IMAGE_FILTER_FLATE ||
+             info.filter == NPDF_INLINE_IMAGE_FILTER_LZW) {
     // Need to decompress - use nanopdf's decode functions
     if (current_pdf_) {
       // Create a temporary stream value for decoding
       Value stream_val;
       stream_val.type = Value::STREAM;
       stream_val.stream.data = raw_data;
-      if (filter == "Fl" || filter == "FlateDecode") {
+      if (info.filter == NPDF_INLINE_IMAGE_FILTER_FLATE) {
         stream_val.stream.dict["Filter"] = Value();
         stream_val.stream.dict["Filter"].type = Value::NAME;
         stream_val.stream.dict["Filter"].name = "FlateDecode";
@@ -5990,15 +5888,15 @@ bool LightVGBackend::parse_inline_image(const std::string& content, size_t& pos)
 
   // Build ImageXObject
   ImageXObject image;
-  image.width = width;
-  image.height = height;
-  image.bits_per_component = bpc;
+  image.width = info.width;
+  image.height = info.height;
+  image.bits_per_component = info.bits_per_component;
   image.data = decoded_data;
-  image.interpolate = interpolate;
+  image.interpolate = info.interpolate != 0;
 
-  if (cs == "RGB" || cs == "DeviceRGB") {
+  if (info.color_space == NPDF_INLINE_IMAGE_RGB) {
     image.color_space.type = ColorSpaceType::DeviceRGB;
-  } else if (cs == "CMYK" || cs == "DeviceCMYK") {
+  } else if (info.color_space == NPDF_INLINE_IMAGE_CMYK) {
     image.color_space.type = ColorSpaceType::DeviceCMYK;
   } else {
     image.color_space.type = ColorSpaceType::DeviceGray;
@@ -6696,16 +6594,13 @@ fallback:
 
 bool LightVGBackend::draw_missing_glyph_placeholder(float x, float y, float size,
                                                     uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-  auto shape = lvg::Shape::gen();
-  if (!shape) return false;
-  float glyph_width = size * 0.5f;
-  float box_margin = size * 0.05f;
-  shape->appendRect(x + box_margin, y - size + box_margin,
-                    glyph_width - 2 * box_margin, size - 2 * box_margin, 0, 0);
-  shape->fill(0, 0, 0, 0);  // transparent fill
-  shape->strokeFill(r, g, b, static_cast<uint8_t>(a * 0.4f));
-  shape->strokeWidth(size * 0.04f);  // thin stroke relative to font size
-  push_with_clip(shape);
+  (void)x;
+  (void)y;
+  (void)size;
+  (void)r;
+  (void)g;
+  (void)b;
+  (void)a;
   return true;
 }
 
@@ -6787,6 +6682,14 @@ bool LightVGBackend::draw_glyph(int codepoint, float x, float y, float size,
   }
   codepoint = static_cast<int>(
       normalize_render_codepoint(static_cast<uint32_t>(codepoint)));
+
+  if (codepoint == 0 ||
+      (codepoint < 0x20 && codepoint != 0x09 && codepoint != 0x0A && codepoint != 0x0D) ||
+      codepoint == 0x00AD || codepoint == 0x200B || codepoint == 0x200C ||
+      codepoint == 0x200D || codepoint == 0xFEFF ||
+      (codepoint >= 0xFE00 && codepoint <= 0xFE0F)) {
+    return true;
+  }
 
   auto draw_ligature_fallback = [&]() -> bool {
     const char* letters = nullptr;
@@ -8534,8 +8437,8 @@ void LightVGBackend::render_annotations(const Pdf& pdf, const Page& page,
 bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) {
   // Enhanced PDF content parser with more operators support
 
-  std::string content(content_data.begin(), content_data.end());
-  std::string_view content_view(content);
+  std::string_view content_view(
+      reinterpret_cast<const char*>(content_data.data()), content_data.size());
 
   std::vector<std::string_view> operands;
   std::vector<GraphicsState> state_stack;  // For save/restore state
@@ -8564,115 +8467,12 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
     state_.path_points.reserve(estimated_segments);
   }
 
-  size_t pos = 0;
-  while (pos < content.size()) {
-    // Skip whitespace
-    while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t' ||
-           content[pos] == '\r' || content[pos] == '\n')) {
-      pos++;
-    }
-    if (pos >= content.size()) break;
-
-    // Skip comments (% to end of line)
-    if (content[pos] == '%') {
-      while (pos < content.size() && content[pos] != '\r' && content[pos] != '\n') {
-        pos++;
-      }
-      continue;
-    }
-
-    std::string_view token;
-
-    // Skip stray '>' (e.g. leftover from malformed dict), but preserve valid '>' handled below
-    if (content[pos] == '>') {
-      pos++;
-      continue;
-    }
-
-    // Check for dictionary <<...>> or hex string <...>
-    if (content[pos] == '<') {
-      if (pos + 1 < content.size() && content[pos + 1] == '<') {
-        // Dictionary literal — scan with nesting until matching >>
-        size_t start = pos;
-        pos += 2;
-        int depth = 1;
-        while (pos < content.size() && depth > 0) {
-          if (content[pos] == '<' && pos + 1 < content.size() && content[pos + 1] == '<') {
-            depth++;
-            pos += 2;
-          } else if (content[pos] == '>' && pos + 1 < content.size() && content[pos + 1] == '>') {
-            depth--;
-            pos += 2;
-          } else if (content[pos] == '(') {
-            // Skip literal string inside dict
-            int pdepth = 1;
-            pos++;
-            while (pos < content.size() && pdepth > 0) {
-              if (content[pos] == '\\' && pos + 1 < content.size()) { pos += 2; continue; }
-              if (content[pos] == '(') pdepth++;
-              else if (content[pos] == ')') pdepth--;
-              pos++;
-            }
-          } else {
-            pos++;
-          }
-        }
-        token = content_view.substr(start, pos - start);
-      } else {
-        // Hex string <...>
-        size_t end = content.find('>', pos);
-        if (end != std::string::npos) {
-          token = content_view.substr(pos, end - pos + 1);
-          pos = end + 1;
-        } else {
-          pos++;
-          continue;
-        }
-      }
-    }
-    // Check for literal string (...)
-    else if (content[pos] == '(') {
-      int depth = 1;
-      size_t start = pos;
-      pos++;
-      while (pos < content.size() && depth > 0) {
-        // Honor escapes by skipping the char after a backslash. A naive
-        // "previous char != backslash" test mis-handles an escaped backslash
-        // "\\" before a ")" (e.g. the string "(\\)" for a path separator),
-        // treating the ")" as escaped and swallowing the rest of the stream.
-        if (content[pos] == '\\') {
-          pos += 2;
-          continue;
-        }
-        if (content[pos] == '(') {
-          depth++;
-        } else if (content[pos] == ')') {
-          depth--;
-        }
-        pos++;
-      }
-      token = content_view.substr(start, pos - start);
-    }
-    // Check for array [...] - skip for now, just collect the bracket
-    else if (content[pos] == '[') {
-      token = std::string_view("[", 1);
-      pos++;
-    }
-    else if (content[pos] == ']') {
-      token = std::string_view("]", 1);
-      pos++;
-    }
-    // Regular token
-    else {
-      size_t start = pos;
-      while (pos < content.size() && content[pos] != ' ' && content[pos] != '\t' &&
-             content[pos] != '\r' && content[pos] != '\n' && content[pos] != '<' &&
-             content[pos] != '>' && content[pos] != '(' && content[pos] != '[' &&
-             content[pos] != ']') {
-        pos++;
-      }
-      token = content_view.substr(start, pos - start);
-    }
+  npdf_content_scanner scanner;
+  npdf_content_scanner_init(&scanner, content_data.data(), content_data.size());
+  npdf_content_token c_token;
+  while (npdf_content_next_token(&scanner, &c_token)) {
+    size_t pos = scanner.pos;
+    std::string_view token(c_token.ptr, c_token.len);
 
     if (token.empty()) continue;
 
@@ -9652,7 +9452,8 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       }
       // Inline image (BI ... ID data EI)
       else if (tok2('B', 'I')) {
-        parse_inline_image(content, pos);
+        parse_inline_image(content_view, pos);
+        scanner.pos = pos;
         advance_progress();
         operands.clear();
         continue;  // Skip normal operand clearing
@@ -9888,6 +9689,7 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
       }
     }
   }
+
 
   uint32_t mask_width = static_cast<uint32_t>(std::abs(bbox[2] - bbox[0]) * state_.scale);
   uint32_t mask_height = static_cast<uint32_t>(std::abs(bbox[3] - bbox[1]) * state_.scale);

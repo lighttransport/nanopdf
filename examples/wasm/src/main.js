@@ -38,6 +38,7 @@ let renderBackend = 1; // 0 = LightVG, 1 = ThorVG
 let renderBackends = { lightvg: false, thorvg: false };
 let pendingPageScrollPlacement = null;
 let scrollSnapLocked = false;
+let lastCanvasScrollTop = 0;
 let renderDocumentVersion = 0;
 let adjacentPreviewJobId = 0;
 let adjacentPreviewTimer = 0;
@@ -318,6 +319,30 @@ function showLoading(msg) {
 
 function hideLoading() {
   loadingOverlay.classList.add('hidden');
+}
+
+function afterNextPaint() {
+  return new Promise((resolve) => {
+    if (typeof window.requestAnimationFrame !== 'function') {
+      setTimeout(resolve, 0);
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(resolve);
+    });
+  });
+}
+
+function scheduleDocumentIdleWork(callback) {
+  if (typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(callback, { timeout: 250 });
+  } else {
+    setTimeout(callback, 32);
+  }
+}
+
+function isCurrentDocumentVersion(version) {
+  return version === renderDocumentVersion;
 }
 
 function updatePageDisplay() {
@@ -2345,6 +2370,9 @@ function downloadAttachment(index, name) {
 
 function goToPage(pageIndex) {
   if (pageIndex < 0 || pageIndex >= totalPages) return;
+  scrollSnapLocked = true;
+  lastCanvasScrollTop = canvasScroll.scrollTop || 0;
+  setTimeout(() => { scrollSnapLocked = false; }, 220);
   currentPage = pageIndex;
   selectedAnnotId = null;
   hoveredAnnotId = null;
@@ -2366,6 +2394,12 @@ function canvasScrollSnapThreshold() {
 
 function canvasScrollSlack() {
   return canvasScrollSnapThreshold();
+}
+
+function canvasScrollPageJumpThreshold() {
+  const viewHeight = canvasScroll.clientHeight || 1;
+  const visibleDocHeight = pageDisplayHeight > 0 ? pageDisplayHeight : viewHeight;
+  return Math.max(0, Math.round(Math.min(viewHeight, visibleDocHeight) * 0.15));
 }
 
 function updateCanvasScrollSlack() {
@@ -2398,6 +2432,7 @@ function placeCanvasScroll(mode) {
       left: Math.min(canvasScroll.scrollLeft, maxLeft),
       behavior: 'auto',
     });
+    lastCanvasScrollTop = top;
   });
 }
 
@@ -4150,7 +4185,11 @@ function renderCurrentPage(options = {}) {
   renderTextOverlay();
   renderAnnotations();
   renderFormFields();
-  renderAdjacentPagePreviews();
+  if (useColdPreview) {
+    cancelScheduledAdjacentPreviewRender();
+  } else {
+    renderAdjacentPagePreviews();
+  }
 
   const zoomPct = Math.round(zoomLevel * 100);
   if (shouldRenderPageStatus(Date.now(), operationStatusHoldUntil)) {
@@ -4652,6 +4691,60 @@ function promptOpenUrl() {
   if (url) loadPdfFromUrl(url);
 }
 
+async function loadDeferredDocumentMetadata(docVersion, name) {
+  if (!isCurrentDocumentVersion(docVersion)) return;
+
+  clearRecovery().finally(() => {
+    if (!isCurrentDocumentVersion(docVersion)) return;
+    recoveryActiveName = name;
+    scheduleRecoverySave();
+  });
+
+  loadFormFields();
+  if (!isCurrentDocumentVersion(docVersion)) return;
+  renderFormFields();
+  updateSaveAnnotState();
+  updateExportButton();
+
+  loadOutline();
+  if (!isCurrentDocumentVersion(docVersion)) return;
+
+  loadSignatureInfo();
+  if (!isCurrentDocumentVersion(docVersion)) return;
+
+  const signatures = signatureData && Array.isArray(signatureData.signatures)
+    ? signatureData.signatures
+    : [];
+  const history = await loadRevisionHistory(currentPdfBytes, signatures);
+  if (!isCurrentDocumentVersion(docVersion)) return;
+  editHistoryData = history;
+
+  const hasOutline = outlineData && outlineData.outline && outlineData.outline.length > 0;
+  const hasSignatures = signatures.length > 0;
+  let sidebarOpened = false;
+
+  if (hasOutline || hasSignatures) {
+    sidebarOpened = sidebar.classList.contains('hidden');
+    sidebar.classList.remove('hidden');
+    if (hasSignatures && !hasOutline) {
+      activeSidebarTab = 'signatures';
+      document.querySelectorAll('.sidebar-tabs button').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === activeSidebarTab);
+      });
+    }
+  }
+
+  if (!sidebar.classList.contains('hidden')) {
+    updateSidebar();
+  }
+  if (activeSidebarTab === 'info') {
+    renderInfoTab();
+  }
+  if (sidebarOpened && hasRendering) {
+    renderCurrentPage();
+  }
+}
+
 async function loadPDF(arrayBuffer, name) {
   if (!Module) return;
 
@@ -4675,13 +4768,20 @@ async function loadPDF(arrayBuffer, name) {
     currentPdfBytes = new Uint8Array(bytes);
     currentPage = 0;
     renderDocumentVersion++;
+    const docVersion = renderDocumentVersion;
     cancelScheduledAdjacentPreviewRender();
     adjacentPreviewRenderKeys.prev = '';
     adjacentPreviewRenderKeys.next = '';
+    setPreviewVisible(prevPageWrapper, false);
+    setPreviewVisible(nextPageWrapper, false);
     fullRenderJobId++;
     fullRenderKeys.clear();
+    outlineData = null;
     signatureData = null;
     editHistoryData = null;
+    formFieldsByPage = {};
+    clearFormFieldControls();
+    if (sidebarContent) sidebarContent.textContent = '';
 
     // Reset view state, then apply persisted preferences.
     zoomLevel = 1.0;
@@ -4719,12 +4819,6 @@ async function loadPDF(arrayBuffer, name) {
     userBookmarks = [];
     clearUndoHistory();
     currentSelection = null;
-    // Start an auto-recovery stash for this document. Clear any prior
-    // stashes first so we only ever persist the most recent file.
-    clearRecovery().finally(() => {
-      recoveryActiveName = name;
-      scheduleRecoverySave();
-    });
     selectionStartPoint = null;
     selectionDragBox = null;
     searchInput.value = '';
@@ -4755,31 +4849,10 @@ async function loadPDF(arrayBuffer, name) {
 
     // Annotation tooling
     resetAnnotations();
-    loadFormFields();
     setAnnotControlsEnabled(hasRendering);
     updateSaveAnnotState();
 
     updatePageDisplay();
-
-    // Load outline
-    loadOutline();
-    loadSignatureInfo();
-    editHistoryData = await loadRevisionHistory(currentPdfBytes, signatureData?.signatures || []);
-
-    const hasSignatures = signatureData && Array.isArray(signatureData.signatures) &&
-      signatureData.signatures.length > 0;
-
-    // Auto-show sidebar if there are bookmarks or signatures
-    if ((outlineData && outlineData.outline && outlineData.outline.length > 0) || hasSignatures) {
-      sidebar.classList.remove('hidden');
-      if (hasSignatures && (!outlineData || !outlineData.outline || outlineData.outline.length === 0)) {
-        activeSidebarTab = 'signatures';
-        document.querySelectorAll('.sidebar-tabs button').forEach(b => {
-          b.classList.toggle('active', b.dataset.tab === activeSidebarTab);
-        });
-      }
-      updateSidebar();
-    }
 
     // Render first page
     if (hasRendering) {
@@ -4791,9 +4864,17 @@ async function loadPDF(arrayBuffer, name) {
       setStatus(`Loaded ${name}: ${totalPages} page(s) (no rendering backend)`);
     }
 
+    await afterNextPaint();
+    if (!isCurrentDocumentVersion(docVersion)) return;
     hideLoading();
     setStatus(`Loaded ${name}: ${totalPages} page(s), ${formatFileSize(fileSize)}`);
     statusRight.textContent = name;
+    scheduleDocumentIdleWork(() => {
+      loadDeferredDocumentMetadata(docVersion, name).catch((err) => {
+        if (!isCurrentDocumentVersion(docVersion)) return;
+        console.error('Deferred document metadata failed:', err);
+      });
+    });
 
   } catch (err) {
     hideLoading();
@@ -5904,28 +5985,46 @@ rotateBtn.addEventListener('click', rotateClockwise);
 function snapPageFromScroll() {
   if (!Module || totalPages <= 0 || !hasRendering || scrollSnapLocked) return;
   updateCanvasScrollSlack();
-  const threshold = canvasScrollSlack();
-  const currentTop = scrollTopForElementTop(canvasWrapper);
+  const threshold = canvasScrollPageJumpThreshold();
+  const pageTop = scrollTopForElementTop(canvasWrapper);
+  const pageHeight = canvasWrapper.offsetHeight || pageDisplayHeight || canvasScroll.clientHeight || 1;
+  const pageBottom = pageTop + pageHeight;
   const scrollTop = canvasScroll.scrollTop;
+  const scrollBottom = scrollTop + (canvasScroll.clientHeight || 1);
+  const delta = scrollTop - lastCanvasScrollTop;
+  lastCanvasScrollTop = scrollTop;
   const band = 2;  // prevents accidental flip exactly at a threshold
+  if (Math.abs(delta) <= band) return;
 
-  if (currentPage > 0 && scrollTop <= Math.max(0, currentTop - threshold - band)) {
+  if (delta < 0 && currentPage > 0 &&
+      scrollTop <= Math.max(0, pageTop + threshold - band)) {
     scrollSnapLocked = true;
     goToPageWithScroll(currentPage - 1, 'bottom');
     setTimeout(() => { scrollSnapLocked = false; }, 220);
     return;
   }
 
-  const nextSnapTop = currentTop + threshold;
-  if (currentPage < totalPages - 1 && scrollTop >= nextSnapTop + band) {
+  if (delta > 0 && currentPage < totalPages - 1 &&
+      scrollBottom >= pageBottom - threshold + band) {
     scrollSnapLocked = true;
     goToPageWithScroll(currentPage + 1, 'top');
     setTimeout(() => { scrollSnapLocked = false; }, 220);
   }
 }
 
-// Ctrl+scroll wheel zoom. Plain wheel scrolling stays native so adjacent page
-// previews are visible; a scroll listener snaps pagination at the 50% mark.
+function snapPageFromKeyboard(reverse = false) {
+  if (!Module || totalPages <= 0 || !hasRendering) return;
+  if (reverse) {
+    if (currentPage > 0) goToPageWithScroll(currentPage - 1, 'bottom');
+  } else if (currentPage < totalPages - 1) {
+    goToPageWithScroll(currentPage + 1, 'top');
+  }
+}
+
+// Ctrl+scroll wheel zoom. Plain wheel scrolling stays native (so adjacent page
+// previews are visible), but once it reaches a page boundary the scroll handler
+// below snaps to the next/previous page. Snapping is also explicit via
+// Space / Shift+Space.
 canvasScroll.addEventListener('wheel', (e) => {
   if (e.ctrlKey || e.metaKey) {
     e.preventDefault();
@@ -5938,7 +6037,12 @@ canvasScroll.addEventListener('wheel', (e) => {
   }
 }, { passive: false });
 
-canvasScroll.addEventListener('scroll', snapPageFromScroll, { passive: true });
+// Advance to the next/previous page when native wheel/trackpad scrolling crosses
+// a page boundary. Without this, scrolling past the end of a page never turns the
+// page (snapPageFromScroll was defined but never wired to the scroll event).
+canvasScroll.addEventListener('scroll', () => {
+  snapPageFromScroll();
+}, { passive: true });
 
 // Pan the page by dragging with the middle mouse (wheel) button.
 let isPanning = false;
@@ -6051,6 +6155,9 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'ArrowRight') {
     e.preventDefault();
     if (currentPage < totalPages - 1) goToPage(currentPage + 1);
+  } else if (e.key === ' ') {
+    e.preventDefault();
+    snapPageFromKeyboard(e.shiftKey);
   } else if (e.key === 'Home') {
     e.preventDefault();
     if (totalPages > 0) goToPage(0);
@@ -6437,6 +6544,15 @@ function hideRecoveryBanner() {
   if (el) el.classList.add('hidden');
 }
 
+async function loadExternalStandardFontsForWasm() {
+  showLoading('Loading fonts...');
+  const stdCount = await loadStandardFonts(Module, FONTS_BASE, (ratio, name) => {
+    loadingText.textContent = `Loading font: ${name} (${Math.round(ratio * 100)}%)`;
+  });
+  console.log(`Loaded ${stdCount} standard fonts from external files`);
+  return stdCount;
+}
+
 // ---- Initialize ----
 
 async function init() {
@@ -6459,38 +6575,42 @@ async function init() {
 
     // Load/register embedded fonts when compiled into the module.
     const embeddedFontsAvailable = Module._nanopdf_fonts_available() === 1;
+    let standardFontsReady = false;
     if (embeddedFontsAvailable) {
       try {
         showLoading('Registering embedded fonts...');
+        if (typeof Module._nanopdf_register_embedded_fonts !== 'function') {
+          throw new Error('Module._nanopdf_register_embedded_fonts is not a function');
+        }
         const count = Module._nanopdf_register_embedded_fonts();
+        standardFontsReady = count > 0;
         console.log(`Registered ${count} embedded fonts with FontProvider`);
       } catch (e) {
         console.log('Embedded fonts not available:', e.message);
       }
-    } else {
+    }
+    if (!standardFontsReady) {
       try {
-        showLoading('Loading fonts...');
-        const stdCount = await loadStandardFonts(Module, FONTS_BASE, (ratio, name) => {
-          loadingText.textContent = `Loading font: ${name} (${Math.round(ratio * 100)}%)`;
-        });
-        console.log(`Loaded ${stdCount} standard fonts from external files`);
-
-        // Load CJK fonts in the background (they're large, ~10MB). These are
-        // not self-hosted — they stream from the jsDelivr CDN (@embedpdf/fonts-jp)
-        // so the deployed site stays small. See loadCDNCJKFonts in font-loader.js.
-        loadCDNCJKFonts(Module, (ratio, name) => {
-          console.log(`CJK font: ${name} (${Math.round(ratio * 100)}%)`);
-        }).then(cjkCount => {
-          if (cjkCount > 0) {
-            console.log(`Loaded ${cjkCount} CJK fonts from CDN`);
-          }
-        }).catch(e => {
-          console.log('CJK fonts not available:', e.message);
-        });
+        await loadExternalStandardFontsForWasm();
       } catch (e) {
         console.log('External fonts not available:', e.message);
       }
     }
+
+    // CJK fonts are loaded in the background so PDFs with bold/emoji-like glyphs
+    // can re-render with the right face once ready.
+    loadCDNCJKFonts(Module, (ratio, name) => {
+      console.log(`CJK font: ${name} (${Math.round(ratio * 100)}%)`);
+    }).then(count => {
+      if (count > 0 && totalPages > 0 && hasRendering) {
+        console.log(`Loaded ${count} CJK fonts from CDN`);
+        renderCurrentPage();
+      }
+      return count;
+    }).catch(e => {
+      console.log('CJK fonts not available:', e.message);
+      return 0;
+    });
 
     hideLoading();
 

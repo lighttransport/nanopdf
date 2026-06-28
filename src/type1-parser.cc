@@ -229,14 +229,17 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         if (cs >= end) return -1;
         val = static_cast<float>(
             -(static_cast<int>(b0) - 251) * 256 - *cs++ - 108);
-      } else {  // b0 == 255: 32-bit fixed-point 16.16
+      } else {  // b0 == 255: Type1 32-bit two's-complement integer.
+        // NOTE: Type1 charstrings encode this as a plain 32-bit integer, unlike
+        // Type2/CFF where 255 is a 16.16 fixed-point value. Dividing by 65536
+        // here would turn large operands (e.g. subr indices like 3566) into ~0.
         if (cs + 3 >= end) return -1;
-        int32_t fixed = (static_cast<uint32_t>(cs[0]) << 24) |
-                        (static_cast<uint32_t>(cs[1]) << 16) |
-                        (static_cast<uint32_t>(cs[2]) << 8) |
-                        static_cast<uint32_t>(cs[3]);
+        int32_t v = static_cast<int32_t>((static_cast<uint32_t>(cs[0]) << 24) |
+                                         (static_cast<uint32_t>(cs[1]) << 16) |
+                                         (static_cast<uint32_t>(cs[2]) << 8) |
+                                         static_cast<uint32_t>(cs[3]));
         cs += 4;
-        val = static_cast<float>(fixed) / 65536.0f;
+        val = static_cast<float>(v);
       }
       if (ti->sp < kCharStringStackLimit) ti->stack[ti->sp++] = val;
       continue;
@@ -360,7 +363,7 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         ti->sp = 0;
         break;
 
-      case 3: { // seac (standard encoding accent composite)
+      case 6: { // seac (standard encoding accent composite)
         // Stack: asb adh ady bchar achar
         if (ti->sp < 5) break;
         int achar = static_cast<int>(ti->stack[ti->sp - 1]);
@@ -375,7 +378,7 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         break;
       }
 
-      case 4: { // sbw: sidebearing x/y and width x/y
+      case 7: { // sbw: sidebearing x/y and width x/y
         if (ti->sp >= 4) {
           // Stack: sbx sby wx wy, possibly after hint values. The last four
           // operands carry the metrics; TeX extensible symbols use sby for
@@ -388,7 +391,7 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         break;
       }
 
-      case 5: { // callothersubr
+      case 16: { // callothersubr
         // OtherSubrs: predefined subroutines (flex, hint replacement).
         // Stack: arg0 ... argN n_args other_subr_number callothersubr.
         // Some fonts use OtherSubr 3 as a hint-replacement trampoline:
@@ -448,13 +451,13 @@ static int t1_run_charstring(T1Interp* ti, const uint8_t* cs, uint32_t len,
         break;
       }
 
-      case 6: // pop
+      case 17: // pop
         if (ti->other_sp > 0 && ti->sp < kCharStringStackLimit) {
           ti->stack[ti->sp++] = ti->other_results[--ti->other_sp];
         }
         break;
 
-      case 7: // setcurrentpoint
+      case 33: // setcurrentpoint
         // Stack: x y
         if (ti->sp >= 2) {
           ti->x = ti->stack[ti->sp - 2];

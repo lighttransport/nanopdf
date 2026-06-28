@@ -17,6 +17,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -91,6 +92,8 @@ float g_ui_scale = 1.0f;
 constexpr float kMinZoom = 0.1f;
 constexpr float kMaxZoom = 8.0f;
 constexpr float kZoomStep = 1.2f;
+constexpr float kPreviewScale = 0.5f;
+constexpr int kPreviewRenderDelayMs = 48;
 
 // Dark UI chrome, matching the wasm viewer.
 constexpr lvg_color_t kBgColor = LVG_COLOR_RGB(0x1E, 0x20, 0x24);
@@ -209,6 +212,23 @@ struct Viewer {
   int page_px = 0, page_py = 0;
   float page_scale = 1.0f;
 
+  // Two-stage page rendering: first show a lower-resolution preview, then a
+  // delayed full-resolution pass for smoother page jumps.
+  int render_epoch = 0;            // increments on page/zoom/rotation changes
+  int rendered_epoch = -1;         // last epoch for which page image was rendered
+  bool rendered_full = false;       // true if current image is full-resolution
+  int pending_full_epoch = -1;     // epoch needing full-resolution render
+  uint64_t pending_full_at_ms = 0; // when the full-resolution render is due
+  int prefetched_epoch = -1;       // last epoch where adjacent previews were prefetched
+
+  // Toolbar pagination control hit boxes.
+  int page_prev_btn_x = 0, page_prev_btn_y = 0;
+  int page_prev_btn_w = 0, page_prev_btn_h = 0;
+  int page_num_btn_x = 0, page_num_btn_y = 0;
+  int page_num_btn_w = 0, page_num_btn_h = 0;
+  int page_next_btn_x = 0, page_next_btn_y = 0;
+  int page_next_btn_w = 0, page_next_btn_h = 0;
+
   int screenshot_seq = 0;  // counter for auto-named screenshot files
   std::string toast;       // transient message (e.g. "Saved screenshot");
                            // shown in the toolbar until the next input
@@ -219,6 +239,34 @@ struct Viewer {
 
   char status[256] = {0};
 };
+
+uint64_t now_ms() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void schedule_page_render(Viewer& v) {
+  ++v.render_epoch;
+  v.rendered_epoch = -1;
+  v.rendered_full = false;
+  v.pending_full_epoch = v.render_epoch;
+  v.pending_full_at_ms = now_ms() + kPreviewRenderDelayMs;
+  v.prefetched_epoch = -1;
+}
+
+void prefetch_adjacent_previews(Viewer& v, float preview_scale) {
+  if (!v.doc.loaded() || v.prefetched_epoch == v.render_epoch) return;
+  int n = v.doc.page_count();
+  if (n <= 1) {
+    v.prefetched_epoch = v.render_epoch;
+    return;
+  }
+  preview_scale = std::max(kMinZoom, preview_scale);
+  if (v.page > 0) v.doc.render(v.page - 1, preview_scale);
+  if (v.page + 1 < n) v.doc.render(v.page + 1, preview_scale);
+  v.prefetched_epoch = v.render_epoch;
+}
 
 // Truncate @s with an ellipsis so it fits within @maxw pixels.
 std::string fit_text(lui_font_t* f, const std::string& s, int maxw) {
@@ -846,10 +894,64 @@ void draw(Viewer& v, lvg_surface_t* surf) {
   const int content_w = std::max(0, W - content_x - right_w);
   const int content_y = kToolbarH;
   const int content_h = std::max(0, H - kToolbarH);
+  const uint64_t now = now_ms();
 
   if (v.doc.loaded()) {
-    if (v.fit_width) v.zoom = fit_width_zoom(v, content_w);
-    const pdfview::RenderedPage* rp = v.doc.render(v.page, v.zoom);
+    if (v.fit_width) {
+      const float fitted = fit_width_zoom(v, content_w);
+      if (std::fabs(fitted - v.zoom) > 0.001f) {
+        v.zoom = fitted;
+        if (v.rendered_epoch == v.render_epoch) schedule_page_render(v);
+      }
+    }
+
+    float preview_scale = std::max(kMinZoom, v.zoom * kPreviewScale);
+    const pdfview::RenderedPage* rp = nullptr;
+
+    if (v.rendered_epoch != v.render_epoch) {
+      // Fresh state change: draw a low-res preview first.
+      rp = v.doc.render(v.page, preview_scale);
+      if (rp && rp->valid()) {
+        v.rendered_epoch = v.render_epoch;
+        v.rendered_full = false;
+        v.pending_full_epoch = (std::fabs(preview_scale - v.zoom) < 0.0005f)
+                                  ? -1
+                                  : v.render_epoch;
+        v.pending_full_at_ms = (v.pending_full_epoch == v.render_epoch)
+                                   ? now + kPreviewRenderDelayMs
+                                   : 0;
+      }
+    } else if (v.pending_full_epoch == v.render_epoch &&
+               v.pending_full_at_ms <= now && !v.rendered_full) {
+      // Deferred full render for better perceived responsiveness.
+      const pdfview::RenderedPage* full = v.doc.render(v.page, v.zoom);
+      if (full && full->valid()) {
+        rp = full;
+        v.rendered_full = true;
+        v.pending_full_epoch = -1;
+        v.pending_full_at_ms = 0;
+      }
+    }
+
+    if (!rp || !rp->valid()) {
+      // If we just rendered full but it failed, keep the current preview.
+      float fallback = v.rendered_full ? v.zoom : preview_scale;
+      rp = v.doc.render(v.page, fallback);
+    }
+
+    if (rp && rp->valid()) {
+      prefetch_adjacent_previews(v, preview_scale);
+      if (v.rendered_epoch != v.render_epoch) {
+        v.rendered_epoch = v.render_epoch;
+        v.rendered_full = (rp->scale >= v.zoom - 1e-4f);
+      }
+      // If we have stale pending state but this was a render miss, retry full on
+      // a later frame to avoid permanent starvation.
+      if (!v.rendered_full && v.pending_full_epoch == v.render_epoch) {
+        v.pending_full_at_ms = now + kPreviewRenderDelayMs;
+      }
+    }
+
     // Revision view: render the Before snapshot + diff when a revision is picked.
     bool rev_view = (v.right_panel == 2 && v.rev_selected >= 0);
     if (rev_view) ensure_rev_render(v, rp);
@@ -997,6 +1099,91 @@ void draw(Viewer& v, lvg_surface_t* surf) {
                            v.font, kTextColor);
     }
   }
+
+  // In-toolbar pagination controls (prev / page / next).
+  if (v.font && v.doc.loaded()) {
+    const int lh = lui_font_line_height(v.font);
+    const int btn_h = std::max(ui_px(22), kToolbarH - ui_px(12));
+    const int btn_y = (kToolbarH - btn_h) / 2;
+    const int btn_w = std::max(ui_px(30), ui_px(34));
+    const int gap = ui_px(6);
+    char page_text[64];
+    std::snprintf(page_text, sizeof(page_text), "%d / %d", v.page + 1,
+                  v.doc.page_count());
+    const int text_w =
+        lui_font_measure_text(v.font, page_text, (int)std::strlen(page_text));
+    const int num_w = std::max(ui_px(84), text_w + ui_px(16));
+    const int total_w = btn_w * 2 + num_w + gap * 2;
+    const int x0 = std::max(ui_px(12), W - total_w - ui_px(12));
+
+    v.page_prev_btn_x = x0;
+    v.page_prev_btn_y = btn_y;
+    v.page_prev_btn_w = btn_w;
+    v.page_prev_btn_h = btn_h;
+    v.page_num_btn_x = x0 + btn_w + gap;
+    v.page_num_btn_y = btn_y;
+    v.page_num_btn_w = num_w;
+    v.page_num_btn_h = btn_h;
+    v.page_next_btn_x = x0 + btn_w + gap + num_w + gap;
+    v.page_next_btn_y = btn_y;
+    v.page_next_btn_w = btn_w;
+    v.page_next_btn_h = btn_h;
+
+    const int mx = v.mouse_x;
+    const int my = v.mouse_y;
+    const bool prev_hover =
+        (mx >= v.page_prev_btn_x &&
+         mx < v.page_prev_btn_x + v.page_prev_btn_w &&
+         my >= v.page_prev_btn_y && my < v.page_prev_btn_y + v.page_prev_btn_h);
+    const bool num_hover =
+        (mx >= v.page_num_btn_x && mx < v.page_num_btn_x + v.page_num_btn_w &&
+         my >= v.page_num_btn_y && my < v.page_num_btn_y + v.page_num_btn_h);
+    const bool next_hover =
+        (mx >= v.page_next_btn_x &&
+         mx < v.page_next_btn_x + v.page_next_btn_w &&
+         my >= v.page_next_btn_y && my < v.page_next_btn_y + v.page_next_btn_h);
+
+    const bool can_prev = v.page > 0;
+    const bool can_next = v.page + 1 < v.doc.page_count();
+
+    const lvg_color_t prev_fill =
+        can_prev ? (prev_hover ? kSidebarSel : kToolbarLine) :
+                   LVG_COLOR_RGB(0x28, 0x2A, 0x30);
+    const lvg_color_t next_fill =
+        can_next ? (next_hover ? kSidebarSel : kToolbarLine) :
+                   LVG_COLOR_RGB(0x28, 0x2A, 0x30);
+    const lvg_color_t num_fill = num_hover ? kTabInactive : kToolbarLine;
+
+    lvg_canvas_fill_rect(&c, v.page_prev_btn_x, v.page_prev_btn_y,
+                         v.page_prev_btn_w, v.page_prev_btn_h, prev_fill);
+    lvg_canvas_fill_rect(&c, v.page_num_btn_x, v.page_num_btn_y,
+                         v.page_num_btn_w, v.page_num_btn_h, num_fill);
+    lvg_canvas_fill_rect(&c, v.page_next_btn_x, v.page_next_btn_y,
+                         v.page_next_btn_w, v.page_next_btn_h, next_fill);
+
+    const int label_y = v.page_prev_btn_y + (btn_h - lh) / 2;
+    const int prev_label_x =
+        v.page_prev_btn_x + std::max(0, (btn_w - lui_font_measure_text(v.font, "<", 1)) / 2);
+    const int next_label_x =
+        v.page_next_btn_x + std::max(0, (btn_w - lui_font_measure_text(v.font, ">", 1)) / 2);
+    const int page_label_x = v.page_num_btn_x + std::max(0, (num_w - text_w) / 2);
+
+    lui_canvas_draw_text(&c, prev_label_x, label_y, "<", 1, v.font,
+                         can_prev ? kTextColor : kTextDim);
+    lui_canvas_draw_text(&c, page_label_x, label_y, page_text,
+                         (int)std::strlen(page_text), v.font,
+                         num_hover ? kTextColor : kTextDim);
+    lui_canvas_draw_text(&c, next_label_x, label_y, ">", 1, v.font,
+                         can_next ? kTextColor : kTextDim);
+  } else {
+    v.page_prev_btn_x = v.page_prev_btn_y = 0;
+    v.page_prev_btn_w = v.page_prev_btn_h = 0;
+    v.page_num_btn_x = v.page_num_btn_y = 0;
+    v.page_num_btn_w = v.page_num_btn_h = 0;
+    v.page_next_btn_x = v.page_next_btn_y = 0;
+    v.page_next_btn_w = v.page_next_btn_h = 0;
+  }
+
   if (v.show_help && v.font) {
     static const char* kHelp[] = {
         "Keyboard shortcuts",
@@ -1053,9 +1240,17 @@ void draw(Viewer& v, lvg_surface_t* surf) {
 void go_to_page(Viewer& v, int page) {
   int n = v.doc.page_count();
   if (n <= 0) return;
-  v.page = clampi(page, 0, n - 1);
+  int new_page = clampi(page, 0, n - 1);
+  if (new_page == v.page) {
+    v.scroll_y = 0;
+    v.scroll_x = 0;
+    schedule_page_render(v);
+    return;
+  }
+  v.page = new_page;
   v.scroll_y = 0;
   v.scroll_x = 0;
+  schedule_page_render(v);
 }
 
 int utf8_char_count(const std::string& s) {
@@ -1267,6 +1462,7 @@ bool load_document(Viewer& v, lui_window_t* win, const char* path) {
   v.sidebar_scroll = 0;
   v.thumb_scroll = 0;
   v.sidebar_mode = v.doc.outline().empty() ? 1 : 0;  // Pages if no bookmarks
+  schedule_page_render(v);
   if (win) lui_window_set_title(win, v.title.c_str());
   std::printf("pdfview: loaded %s (%d pages)\n", path, v.doc.page_count());
   return true;
@@ -1394,6 +1590,7 @@ void tool_set_zoom(const char* a, int al, void* u, char** out, int* olen) {
     v.zoom = clampf((float)(lui_json_number(z) / 100.0 * (96.0 / 72.0)), kMinZoom,
                     kMaxZoom);
   }
+  schedule_page_render(v);
   lui_json_free(j);
   *m->dirty = true;
   *out = mcp_text("zoom set");
@@ -2168,6 +2365,13 @@ int main(int argc, char** argv) {
       dirty = false;
     }
 
+    uint64_t now = now_ms();
+    if (viewer.pending_full_epoch == viewer.render_epoch &&
+        viewer.pending_full_at_ms > 0 && viewer.pending_full_at_ms <= now) {
+      dirty = true;
+    }
+    if (dirty) continue;
+
     lui_event_t event;
 #if PDFVIEW_HAVE_MCP
     if (mcp) {
@@ -2180,9 +2384,18 @@ int main(int argc, char** argv) {
       }
     } else
 #endif
-        if (!lui_window_wait_event(win, &event)) {
-      break;
+    if (!lui_window_poll_event(win, &event)) {
+      now = now_ms();
+      if (viewer.pending_full_epoch == viewer.render_epoch &&
+          viewer.pending_full_at_ms > now) {
+        const uint64_t delay = viewer.pending_full_at_ms - now;
+        usleep((useconds_t)(std::min<uint64_t>(delay, 8ULL) * 1000));
+        continue;
+      }
+      if (!lui_window_wait_event(win, &event)) break;
     }
+
+    if (!running) break;
     do {
       int W = 0, H = 0;
       lui_window_get_physical_size(win, &W, &H);
@@ -2393,21 +2606,26 @@ int main(int argc, char** argv) {
           } else if (ch == '+' || ch == '=') {
             viewer.fit_width = false;
             viewer.zoom = clampf(viewer.zoom * kZoomStep, kMinZoom, kMaxZoom);
+            schedule_page_render(viewer);
             dirty = true;
           } else if (ch == '-' || ch == '_') {
             viewer.fit_width = false;
             viewer.zoom = clampf(viewer.zoom / kZoomStep, kMinZoom, kMaxZoom);
+            schedule_page_render(viewer);
             dirty = true;
           } else if (ch == '0') {
             viewer.fit_width = true;
+            schedule_page_render(viewer);
             dirty = true;
           } else if (ch == '1') {
             viewer.fit_width = false;
             viewer.zoom = 96.0f / 72.0f;  // ~100% at 96 DPI
+            schedule_page_render(viewer);
             dirty = true;
           } else if (ch == 'f' || ch == 'F') {
             viewer.fit_width = false;
             viewer.zoom = fit_page_zoom(viewer, content_w, content_h);
+            schedule_page_render(viewer);
             dirty = true;
           } else if (ch == 'j') {
             go_to_page(viewer, viewer.page + 1);
@@ -2466,9 +2684,11 @@ int main(int argc, char** argv) {
             dirty = true;
           } else if (ch == ']') {
             viewer.rotation = (viewer.rotation + 90) % 360;  // rotate CW
+            schedule_page_render(viewer);
             dirty = true;
           } else if (ch == '[') {
             viewer.rotation = (viewer.rotation + 270) % 360;  // rotate CCW
+            schedule_page_render(viewer);
             dirty = true;
           } else if (ch == 'h' || ch == 'H' || ch == 'u' || ch == 'U' ||
                      ch == 'x' || ch == 'X') {
@@ -2535,6 +2755,33 @@ int main(int argc, char** argv) {
           int my = (int)event.data.mouse_button.y;
           viewer.mouse_x = mx;
           viewer.mouse_y = my;
+          if (viewer.doc.loaded() && my <= kToolbarH) {
+            if (mx >= viewer.page_prev_btn_x &&
+                mx < viewer.page_prev_btn_x + viewer.page_prev_btn_w &&
+                my >= viewer.page_prev_btn_y &&
+                my < viewer.page_prev_btn_y + viewer.page_prev_btn_h) {
+              go_to_page(viewer, viewer.page - 1);
+              dirty = true;
+              break;
+            }
+            if (mx >= viewer.page_next_btn_x &&
+                mx < viewer.page_next_btn_x + viewer.page_next_btn_w &&
+                my >= viewer.page_next_btn_y &&
+                my < viewer.page_next_btn_y + viewer.page_next_btn_h) {
+              go_to_page(viewer, viewer.page + 1);
+              dirty = true;
+              break;
+            }
+            if (mx >= viewer.page_num_btn_x &&
+                mx < viewer.page_num_btn_x + viewer.page_num_btn_w &&
+                my >= viewer.page_num_btn_y &&
+                my < viewer.page_num_btn_y + viewer.page_num_btn_h) {
+              viewer.goto_active = true;
+              viewer.goto_buf.clear();
+              dirty = true;
+              break;
+            }
+          }
           const int panel_y = sidebar_panel_y();
           if (content_x > 0 && mx < content_x) {  // sidebar
             if (my >= kToolbarH && my < panel_y) {

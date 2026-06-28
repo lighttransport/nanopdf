@@ -11,6 +11,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <map>
 #include <unordered_map>
 
@@ -412,7 +413,7 @@ private:
   void apply_soft_mask_opacity(lvg::Paint* paint);
 
   // Parse and render inline image (BI/ID/EI operators)
-  bool parse_inline_image(const std::string& content, size_t& pos);
+  bool parse_inline_image(std::string_view content, size_t& pos);
 
   // Render a transparency group XObject to create a soft mask
   bool render_soft_mask_group(const Value& group_xobject, int mask_type);

@@ -41,6 +41,9 @@ find_package(Sanitizers) # Address sanitizer (-DSANITIZE_ADDRESS=ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
 # Build nanopdf (and the examples/tests that pick up these flags) without C++
 # exceptions and RTTI. The library replaces every std::stoi / std::stod call
@@ -169,6 +172,7 @@ set(NANOPDF_SOURCES
   src/form-manipulation.cc
   src/document-structure.cc
   src/pdf-writer.cc
+  src/pdf-content-scan.c
   src/third_party/stb_image_impl.cc
   src/third_party/stb_image_write_impl.cc
   src/third_party/stb_truetype_impl.cc
