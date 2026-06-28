@@ -4701,6 +4701,77 @@ static std::vector<lvg::Fill::ColorStop> extract_color_stops_from_function(
   }
   const Value& fn = *func_ptr;
 
+  // Primary path: densely sample the function across its [0,1] domain. This
+  // honours the sub-function exponents (N), the stitching /Encode arrays, and
+  // sampled (type-0) functions — none of which the boundary-only extraction
+  // below reproduces. fig-14's edge feathers use type-3 stitches whose ramp
+  // lives inside an Encode'd sub-function, so reading only each sub-function's
+  // C0 collapsed the ramp to a hard step (vertical feathers became a hard cut
+  // instead of a soft fade). Sampling recovers the true ramp shape.
+  {
+    const int kSamples = 48;
+    std::vector<lvg::Fill::ColorStop> sampled;
+    sampled.reserve(kSamples + 1);
+    std::vector<double> inputs(1), outputs;
+    bool ok = true;
+    for (int i = 0; i <= kSamples && ok; ++i) {
+      float t = static_cast<float>(i) / kSamples;
+      inputs[0] = t;
+      outputs.clear();
+      if (!evaluate_pdf_function(pdf, fn, inputs, outputs) ||
+          outputs.empty()) {
+        ok = false;
+        break;
+      }
+      uint8_t r = 0, g = 0, b = 0;
+      auto cl = [](double f) -> uint8_t {
+        return static_cast<uint8_t>(
+            std::min(255.0, std::max(0.0, f * 255.0)));
+      };
+      if (outputs.size() == 1) {
+        r = g = b = cl(outputs[0]);
+      } else if (outputs.size() == 3) {
+        r = cl(outputs[0]); g = cl(outputs[1]); b = cl(outputs[2]);
+      } else if (outputs.size() >= 4) {
+        double c = outputs[0], m = outputs[1], yv = outputs[2], k = outputs[3];
+        r = cl((1.0 - c) * (1.0 - k));
+        g = cl((1.0 - m) * (1.0 - k));
+        b = cl((1.0 - yv) * (1.0 - k));
+      } else {
+        ok = false;
+        break;
+      }
+      sampled.push_back({t, r, g, b, 255});
+    }
+    if (ok && sampled.size() >= 2) {
+      // Drop interior stops that lie on a straight color ramp between their
+      // neighbours, so a smooth gradient keeps just a handful of stops while a
+      // sharp knee retains its detail.
+      std::vector<lvg::Fill::ColorStop> reduced;
+      reduced.push_back(sampled.front());
+      for (size_t i = 1; i + 1 < sampled.size(); ++i) {
+        const auto& p = reduced.back();
+        const auto& cur = sampled[i];
+        const auto& nxt = sampled[i + 1];
+        float span = nxt.offset - p.offset;
+        float frac = span > 1e-6f ? (cur.offset - p.offset) / span : 0.0f;
+        auto interp = [&](uint8_t a, uint8_t bb) {
+          return static_cast<int>(a + (bb - a) * frac + 0.5f);
+        };
+        int er = std::abs(interp(p.r, nxt.r) - cur.r);
+        int eg = std::abs(interp(p.g, nxt.g) - cur.g);
+        int eb = std::abs(interp(p.b, nxt.b) - cur.b);
+        if (er > 3 || eg > 3 || eb > 3) reduced.push_back(cur);
+      }
+      reduced.push_back(sampled.back());
+      stops = std::move(reduced);
+      if (cache && function.type == Value::REFERENCE) {
+        (*cache)[function.ref_object_number].stops = stops;
+      }
+      return stops;
+    }
+  }
+
   if (fn.type != Value::DICTIONARY) {
     // Default black to white
     stops.push_back({0.0f, 0, 0, 0, 255});
