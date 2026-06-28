@@ -81,27 +81,36 @@ export function readWasmString(Module, ptr) {
 // Returns { ok, imageData, w, h, error }. On failure imageData is null and
 // error carries the C-side message (or thrown message).
 export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
+  const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? () => performance.now()
+    : () => Date.now();
+  const totalStart = now();
+  let renderMs = 0;
+  let copyMs = 0;
   let ok = 0;
   try {
+    const renderStart = now();
     ok = Module._nanopdf_render_page(pageIdx, width, height, dpi);
+    renderMs = now() - renderStart;
   } catch (e) {
-    return { ok: false, imageData: null, w: 0, h: 0, error: e?.message || String(e) };
+    return { ok: false, imageData: null, w: 0, h: 0, error: e?.message || String(e), renderMs, copyMs, totalMs: now() - totalStart };
   }
   if (ok !== 1) {
     const error = Module._nanopdf_get_last_error
       ? Module.UTF8ToString(Module._nanopdf_get_last_error())
       : '';
-    return { ok: false, imageData: null, w: 0, h: 0, error };
+    return { ok: false, imageData: null, w: 0, h: 0, error, renderMs, copyMs, totalMs: now() - totalStart };
   }
   const ptr = Module._nanopdf_get_render_buffer();
   const size = Module._nanopdf_get_render_buffer_size();
   const w = Module._nanopdf_get_render_width();
   const h = Module._nanopdf_get_render_height();
   if (!ptr || size <= 0) {
-    return { ok: false, imageData: null, w, h, error: 'empty render buffer' };
+    return { ok: false, imageData: null, w, h, error: 'empty render buffer', renderMs, copyMs, totalMs: now() - totalStart };
   }
   // Detach from the WASM heap so subsequent renders can't clobber us. Build
   // ImageData here so callers don't allocate another full-page pixel buffer.
+  const copyStart = now();
   const data = new Uint8ClampedArray(size);
   data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size));
   if (Module._nanopdf_release_render_buffer) {
@@ -110,7 +119,8 @@ export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
   const imageData = typeof ImageData === 'function'
     ? new ImageData(data, w, h)
     : { data, width: w, height: h, w, h };
-  return { ok: true, imageData, w, h, error: '' };
+  copyMs = now() - copyStart;
+  return { ok: true, imageData, w, h, error: '', renderMs, copyMs, totalMs: now() - totalStart };
 }
 
 // Validate a WASM operation's ok flag and throw with the C-side error

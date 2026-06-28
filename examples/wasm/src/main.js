@@ -2632,7 +2632,13 @@ function renderViewerPageToCanvas(pageIndex, targetCanvas, options = {}) {
   targetCanvas.style.height = `${layout.cssHeight}px`;
   const ctx = targetCanvas.getContext('2d');
   ctx.putImageData(result.imageData, 0, 0);
-  return { ok: true, ...layout };
+  return {
+    ok: true,
+    ...layout,
+    renderMs: result.renderMs,
+    copyMs: result.copyMs,
+    totalMs: result.totalMs,
+  };
 }
 
 function cancelScheduledAdjacentPreviewRender() {
@@ -4105,7 +4111,8 @@ function renderCurrentPage() {
 
   const zoomPct = Math.round(zoomLevel * 100);
   if (shouldRenderPageStatus(Date.now(), operationStatusHoldUntil)) {
-    setStatus(`Page ${currentPage + 1} / ${totalPages} | ${backendLabel(renderBackend)} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}`);
+    const rasterMs = Number.isFinite(result.renderMs) ? ` | raster ${result.renderMs.toFixed(1)} ms` : '';
+    setStatus(`Page ${currentPage + 1} / ${totalPages} | ${backendLabel(renderBackend)} | ${pageWidth.toFixed(0)} x ${pageHeight.toFixed(0)} pts | ${zoomPct}%${rotation !== 0 ? ' | ' + rotation + '°' : ''}${rasterMs}`);
   }
   statusRight.textContent = fileName;
 

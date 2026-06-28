@@ -173,6 +173,9 @@ test('renderPageIntoImageData copies the WASM render buffer into a detached Imag
   assert.equal(result.h, h);
   assert.equal(result.imageData.data.length, size);
   assert.equal(result.imageData.data[0], 0xFF);
+  assert.equal(typeof result.renderMs, 'number');
+  assert.equal(typeof result.copyMs, 'number');
+  assert.equal(typeof result.totalMs, 'number');
   assert.equal(calls.render, 1);
   assert.equal(calls.release, 1);
 });
