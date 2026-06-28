@@ -107,6 +107,14 @@ class RenderBackend {
   virtual bool save_to_png(const std::string& filename) = 0;
   virtual bool save_to_file(const std::string& filename,
                             const RenderOptions& options = RenderOptions()) = 0;
+  virtual bool save_to_file_rotated(const std::string& filename,
+                                    const RenderOptions& options,
+                                    int rotation_degrees) {
+    (void)filename;
+    (void)options;
+    (void)rotation_degrees;
+    return false;
+  }
 
   // Identifies which concrete backend this instance is.
   virtual BackendKind kind() const = 0;

@@ -7609,15 +7609,106 @@ bool LightVGBackend::save_to_png(const std::string& filename) {
   return save_to_file(filename, options);
 }
 
+static bool save_rgba_pixels_to_file(const std::string& filename,
+                                     const uint8_t* pixels,
+                                     int width,
+                                     int height,
+                                     const RenderOptions& options) {
+  if (!pixels || width <= 0 || height <= 0) return false;
+
+  int ret = 0;
+  int stride = width * 4;
+  switch (options.format) {
+    case RenderOptions::Format::PNG: {
+#ifdef NANOPDF_USE_FPNGE
+      if (nanopdf::fpnge_available()) {
+        std::vector<uint8_t> png_bytes;
+        if (nanopdf::fpnge_encode_png(pixels, width, height, /*channels=*/4,
+                                      stride, options.png_compression,
+                                      png_bytes)) {
+          std::ofstream out(filename, std::ios::binary);
+          if (out.write(reinterpret_cast<const char*>(png_bytes.data()),
+                        static_cast<std::streamsize>(png_bytes.size()))) {
+            ret = 1;
+            break;
+          }
+        }
+      }
+#endif
+      stbi_write_png_compression_level = options.png_compression;
+      ret = stbi_write_png(filename.c_str(), width, height, 4,
+                           pixels, stride);
+      break;
+    }
+    case RenderOptions::Format::JPEG: {
+      std::vector<uint8_t> rgb_pixels(static_cast<size_t>(width) * height * 3);
+      for (int i = 0; i < width * height; i++) {
+        rgb_pixels[i * 3 + 0] = pixels[i * 4 + 0];
+        rgb_pixels[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb_pixels[i * 3 + 2] = pixels[i * 4 + 2];
+      }
+      ret = stbi_write_jpg(filename.c_str(), width, height, 3,
+                           rgb_pixels.data(), options.jpeg_quality);
+      break;
+    }
+    case RenderOptions::Format::BMP:
+      ret = stbi_write_bmp(filename.c_str(), width, height, 4, pixels);
+      break;
+    case RenderOptions::Format::TGA:
+      ret = stbi_write_tga(filename.c_str(), width, height, 4, pixels);
+      break;
+  }
+  return ret != 0;
+}
+
+static std::vector<uint8_t> rotate_rgba_pixels_copy(const uint8_t* src,
+                                                    int src_w,
+                                                    int src_h,
+                                                    int rotation,
+                                                    int* out_w,
+                                                    int* out_h) {
+  if (!src || src_w <= 0 || src_h <= 0 || !out_w || !out_h) return {};
+  rotation %= 360;
+  if (rotation < 0) rotation += 360;
+  if (rotation != 90 && rotation != 180 && rotation != 270) return {};
+
+  const int dst_w = (rotation == 90 || rotation == 270) ? src_h : src_w;
+  const int dst_h = (rotation == 90 || rotation == 270) ? src_w : src_h;
+  std::vector<uint8_t> dst(static_cast<size_t>(dst_w) * dst_h * 4);
+  for (int dy = 0; dy < dst_h; ++dy) {
+    for (int dx = 0; dx < dst_w; ++dx) {
+      int sx = dx;
+      int sy = dy;
+      if (rotation == 90) {
+        sx = dy;
+        sy = dst_w - 1 - dx;
+      } else if (rotation == 180) {
+        sx = src_w - 1 - dx;
+        sy = src_h - 1 - dy;
+      } else {
+        sx = src_w - 1 - dy;
+        sy = dx;
+      }
+      const uint8_t* sp = src + (static_cast<size_t>(sy) * src_w + sx) * 4;
+      uint8_t* dp = dst.data() + (static_cast<size_t>(dy) * dst_w + dx) * 4;
+      dp[0] = sp[0];
+      dp[1] = sp[1];
+      dp[2] = sp[2];
+      dp[3] = sp[3];
+    }
+  }
+  *out_w = dst_w;
+  *out_h = dst_h;
+  return dst;
+}
+
 bool LightVGBackend::save_to_file(const std::string& filename, const LightVGRenderOptions& options) {
   if (!initialized_) {
     return false;
   }
 
-  int ret = 0;
   int width = static_cast<int>(width_);
   int height = static_cast<int>(height_);
-  int stride = width * 4;
   const uint8_t* pixels = nullptr;
   std::vector<uint8_t> converted_pixels;
 
@@ -7640,54 +7731,39 @@ bool LightVGBackend::save_to_file(const std::string& filename, const LightVGRend
   pixels = converted_pixels.data();
 #endif
 
-  switch (options.format) {
-    case LightVGRenderOptions::Format::PNG: {
-#ifdef NANOPDF_USE_FPNGE
-      // Fast path: fpnge (AVX2/SSE4.1) encodes RGBA8888 several times faster
-      // than stb's deflate. On little-endian the ABGR8888 buffer is already
-      // R,G,B,A byte order, matching fpnge's RGB channel order. Falls back to
-      // stb+miniz when no SIMD path is available or encoding fails.
-      if (nanopdf::fpnge_available()) {
-        std::vector<uint8_t> png_bytes;
-        if (nanopdf::fpnge_encode_png(pixels, width, height, /*channels=*/4,
-                                      stride, options.png_compression,
-                                      png_bytes)) {
-          std::ofstream out(filename, std::ios::binary);
-          if (out.write(reinterpret_cast<const char*>(png_bytes.data()),
-                        static_cast<std::streamsize>(png_bytes.size()))) {
-            ret = 1;
-            break;
-          }
-        }
-      }
-#endif
-      stbi_write_png_compression_level = options.png_compression;
-      ret = stbi_write_png(filename.c_str(), width, height, 4,
-                           pixels, stride);
-      break;
-    }
-    case LightVGRenderOptions::Format::JPEG: {
-      std::vector<uint8_t> rgb_pixels(width * height * 3);
-      for (int i = 0; i < width * height; i++) {
-        rgb_pixels[i * 3 + 0] = pixels[i * 4 + 0];
-        rgb_pixels[i * 3 + 1] = pixels[i * 4 + 1];
-        rgb_pixels[i * 3 + 2] = pixels[i * 4 + 2];
-      }
-      ret = stbi_write_jpg(filename.c_str(), width, height, 3,
-                           rgb_pixels.data(), options.jpeg_quality);
-      break;
-    }
-    case LightVGRenderOptions::Format::BMP:
-      ret = stbi_write_bmp(filename.c_str(), width, height, 4,
-                           pixels);
-      break;
-    case LightVGRenderOptions::Format::TGA:
-      ret = stbi_write_tga(filename.c_str(), width, height, 4,
-                           pixels);
-      break;
-  }
+  return save_rgba_pixels_to_file(filename, pixels, width, height, options);
+}
 
-  return ret != 0;
+bool LightVGBackend::save_to_file_rotated(const std::string& filename,
+                                          const LightVGRenderOptions& options,
+                                          int rotation_degrees) {
+  if (!initialized_) return false;
+
+  int rotation = rotation_degrees % 360;
+  if (rotation < 0) rotation += 360;
+  if (rotation == 0) return save_to_file(filename, options);
+  if (rotation != 90 && rotation != 180 && rotation != 270) return false;
+
+  const int src_w = static_cast<int>(width_);
+  const int src_h = static_cast<int>(height_);
+
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(buffer_.data());
+#else
+  auto result = get_buffer();
+  if (!result.success || result.pixels.empty()) return false;
+  const uint8_t* src = result.pixels.data();
+#endif
+
+  int dst_w = 0;
+  int dst_h = 0;
+  std::vector<uint8_t> rotated =
+      rotate_rgba_pixels_copy(src, src_w, src_h, rotation, &dst_w, &dst_h);
+  if (rotated.empty()) return false;
+
+  return save_rgba_pixels_to_file(filename, rotated.data(), dst_w, dst_h,
+                                  options);
 }
 
 size_t LightVGBackend::count_render_objects(
@@ -7931,68 +8007,34 @@ LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page
     return result;
   }
 
-  result = get_buffer();
-
   // Apply page rotation if specified
   int rotation = static_cast<int>(page.rotate) % 360;
   if (rotation < 0) rotation += 360;
-  if (rotation != 0 && result.success && !result.pixels.empty()) {
-    uint32_t src_w = result.width;
-    uint32_t src_h = result.height;
-    const auto& src = result.pixels;
-
-    if (rotation == 90) {
-      // 90° CW: new(x,y) = old(y, src_w-1-x), new size = src_h × src_w
-      uint32_t dst_w = src_h, dst_h = src_w;
-      std::vector<uint8_t> dst(dst_w * dst_h * 4);
-      for (uint32_t dy = 0; dy < dst_h; dy++) {
-        for (uint32_t dx = 0; dx < dst_w; dx++) {
-          uint32_t sx = dy;               // old x = new y
-          uint32_t sy = dst_w - 1 - dx;   // old y = dst_w - 1 - new x
-          size_t si = (sy * src_w + sx) * 4;
-          size_t di = (dy * dst_w + dx) * 4;
-          dst[di] = src[si]; dst[di+1] = src[si+1];
-          dst[di+2] = src[si+2]; dst[di+3] = src[si+3];
-        }
-      }
-      result.pixels = std::move(dst);
-      result.width = dst_w;
-      result.height = dst_h;
-    } else if (rotation == 180) {
-      // 180°: new(x,y) = old(src_w-1-x, src_h-1-y), same size
-      std::vector<uint8_t> dst(src_w * src_h * 4);
-      for (uint32_t dy = 0; dy < src_h; dy++) {
-        for (uint32_t dx = 0; dx < src_w; dx++) {
-          uint32_t sx = src_w - 1 - dx;
-          uint32_t sy = src_h - 1 - dy;
-          size_t si = (sy * src_w + sx) * 4;
-          size_t di = (dy * src_w + dx) * 4;
-          dst[di] = src[si]; dst[di+1] = src[si+1];
-          dst[di+2] = src[si+2]; dst[di+3] = src[si+3];
-        }
-      }
-      result.pixels = std::move(dst);
-    } else if (rotation == 270) {
-      // 270° CW: new(x,y) = old(src_w-1-y, x), new size = src_h × src_w
-      uint32_t dst_w = src_h, dst_h = src_w;
-      std::vector<uint8_t> dst(dst_w * dst_h * 4);
-      for (uint32_t dy = 0; dy < dst_h; dy++) {
-        for (uint32_t dx = 0; dx < dst_w; dx++) {
-          uint32_t sx = src_w - 1 - dy;   // old x = src_w - 1 - new y
-          uint32_t sy = dx;                // old y = new x
-          size_t si = (sy * src_w + sx) * 4;
-          size_t di = (dy * dst_w + dx) * 4;
-          dst[di] = src[si]; dst[di+1] = src[si+1];
-          dst[di+2] = src[si+2]; dst[di+3] = src[si+3];
-        }
-      }
-      result.pixels = std::move(dst);
-      result.width = dst_w;
-      result.height = dst_h;
+  if (rotation == 90 || rotation == 180 || rotation == 270) {
+    int dst_w = 0;
+    int dst_h = 0;
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    result.pixels = rotate_rgba_pixels_copy(
+        reinterpret_cast<const uint8_t*>(buffer_.data()),
+        static_cast<int>(width_), static_cast<int>(height_), rotation,
+        &dst_w, &dst_h);
+#else
+    auto unrotated = get_buffer();
+    if (unrotated.success && !unrotated.pixels.empty()) {
+      result.pixels = rotate_rgba_pixels_copy(
+          unrotated.pixels.data(), static_cast<int>(unrotated.width),
+          static_cast<int>(unrotated.height), rotation, &dst_w, &dst_h);
     }
+#endif
+    result.success = !result.pixels.empty();
+    result.width = static_cast<uint32_t>(dst_w);
+    result.height = static_cast<uint32_t>(dst_h);
+    if (!result.success) result.error = "Failed to rotate render buffer";
+    return result;
   }
 
-  return result;
+  return get_buffer();
 }
 
 LightVGRenderResult LightVGBackend::render_page(const Pdf& pdf, const Page& page) {

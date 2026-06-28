@@ -595,10 +595,14 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
               << "'...\n";
   }
 
+  int total_rotation = (page_rotation + options.rotation) % 360;
+  if (total_rotation < 0) total_rotation += 360;
   const bool direct_backend_save =
-      (page_rotation == 0 && options.rotation == 0 && !options.grayscale);
+      !options.grayscale &&
+      (total_rotation == 0 || backend->kind() == nanopdf::BackendKind::LightVG);
   const bool direct_tga_save =
       direct_backend_save &&
+      total_rotation == 0 &&
       options.output_format == nanopdf::RenderOptions::Format::TGA;
   backend->set_render_result_pixels_enabled(!direct_backend_save);
   backend->set_direct_bgra_output_enabled(direct_tga_save);
@@ -607,6 +611,29 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
   if (!result.success) {
     backend->set_direct_bgra_output_enabled(false);
     std::cerr << "Error: Failed to render page " << page_num << ": " << result.error << "\n";
+    return false;
+  }
+
+  if (direct_backend_save) {
+    nanopdf::RenderOptions save_options;
+    save_options.format = options.output_format;
+    save_options.jpeg_quality = options.jpeg_quality;
+    save_options.png_compression = options.png_compression;
+    bool saved = false;
+    if (total_rotation == 0) {
+      saved = backend->save_to_file(output_file, save_options);
+    } else {
+      saved = backend->save_to_file_rotated(output_file, save_options,
+                                            total_rotation);
+    }
+    backend->set_direct_bgra_output_enabled(false);
+    if (saved) {
+      if (options.verbose) {
+        std::cout << "  Saved to: " << output_file << "\n";
+      }
+      return true;
+    }
+    std::cerr << "Error: Failed to save output file: " << output_file << "\n";
     return false;
   }
 
@@ -661,23 +688,7 @@ bool render_page(const nanopdf::Pdf& pdf, const nanopdf::Page& page, int page_nu
     }
   }
 
-  nanopdf::RenderOptions save_options;
-  save_options.format = options.output_format;
-  save_options.jpeg_quality = options.jpeg_quality;
-  save_options.png_compression = options.png_compression;
-
-  // No post-processing needed, save directly through the selected backend.
-  if (backend->save_to_file(output_file, save_options)) {
-    backend->set_direct_bgra_output_enabled(false);
-    if (options.verbose) {
-      std::cout << "  Saved to: " << output_file << "\n";
-    }
-    return true;
-  } else {
-    backend->set_direct_bgra_output_enabled(false);
-    std::cerr << "Error: Failed to save output file: " << output_file << "\n";
-    return false;
-  }
+  return false;
 }
 
 int main(int argc, char* argv[]) {

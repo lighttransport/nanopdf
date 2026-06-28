@@ -102,6 +102,9 @@ public:
   // Save to file with options
   bool save_to_file(const std::string& filename,
                     const LightVGRenderOptions& options = LightVGRenderOptions()) override;
+  bool save_to_file_rotated(const std::string& filename,
+                            const LightVGRenderOptions& options,
+                            int rotation_degrees) override;
 
   // Render page with options (handles DPI scaling)
   LightVGRenderResult render_page(const Pdf& pdf, const Page& page,
