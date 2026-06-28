@@ -77,7 +77,7 @@ export function readWasmString(Module, ptr) {
 }
 
 // Read a render page into a fresh ImageData. Centralizes the
-// "render -> copy HEAPU8 -> createImageData" sequence used by 5 sites.
+// "render -> copy HEAPU8 -> ImageData" sequence used by viewer render paths.
 // Returns { ok, imageData, w, h, error }. On failure imageData is null and
 // error carries the C-side message (or thrown message).
 export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
@@ -100,13 +100,17 @@ export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
   if (!ptr || size <= 0) {
     return { ok: false, imageData: null, w, h, error: 'empty render buffer' };
   }
-  // Detach from the WASM heap so subsequent renders can't clobber us.
+  // Detach from the WASM heap so subsequent renders can't clobber us. Build
+  // ImageData here so callers don't allocate another full-page pixel buffer.
   const data = new Uint8ClampedArray(size);
   data.set(new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size));
   if (Module._nanopdf_release_render_buffer) {
     Module._nanopdf_release_render_buffer();
   }
-  return { ok: true, imageData: { data, w, h }, w, h, error: '' };
+  const imageData = typeof ImageData === 'function'
+    ? new ImageData(data, w, h)
+    : { data, width: w, height: h, w, h };
+  return { ok: true, imageData, w, h, error: '' };
 }
 
 // Validate a WASM operation's ok flag and throw with the C-side error

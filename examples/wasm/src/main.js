@@ -1651,12 +1651,11 @@ function renderPageToCanvas(pageIdx, canvas, maxW) {
   const h = Math.max(1, Math.round(ph * scale));
   const result = renderPageIntoImageData(Module, pageIdx, w, h, 72 * (w / pw));
   if (!result.ok || !result.imageData) return false;
-  const { data, w: rw, h: rh } = result.imageData;
+  const rw = result.w;
+  const rh = result.h;
   canvas.width = rw; canvas.height = rh;
   const ctx = canvas.getContext('2d');
-  const img = ctx.createImageData(rw, rh);
-  img.data.set(data);
-  ctx.putImageData(img, 0, 0);
+  ctx.putImageData(result.imageData, 0, 0);
   return true;
 }
 
@@ -2094,15 +2093,14 @@ function processThumbnailQueue() {
 
     const result = renderPageIntoImageData(Module, pageIdx, width, height, dpi);
     if (result.ok && result.imageData) {
-      const { data, w: renderWidth, h: renderHeight } = result.imageData;
+      const renderWidth = result.w;
+      const renderHeight = result.h;
       // Draw at display size by scaling
       canvasEl.width = renderWidth;
       canvasEl.height = renderHeight;
       const ctx = canvasEl.getContext('2d');
-      const imageData = ctx.createImageData(renderWidth, renderHeight);
-      imageData.data.set(data);
-      ctx.putImageData(imageData, 0, 0);
-      thumbnailCache[pageIdx] = imageData;
+      ctx.putImageData(result.imageData, 0, 0);
+      thumbnailCache[pageIdx] = result.imageData;
     }
   } catch (e) {
     console.warn('Thumbnail render failed for page', pageIdx, e);
@@ -2582,6 +2580,14 @@ function computeBaseScale(pageWidth, pageHeight) {
   }
 }
 
+function maxViewerRenderDimension(preview = false) {
+  if (preview) return 1536;
+  const deviceMemory = Number(navigator.deviceMemory || 0);
+  if (deviceMemory > 0 && deviceMemory <= 2) return 2560;
+  if (deviceMemory > 0 && deviceMemory <= 4) return 3072;
+  return 4096;
+}
+
 function computePageRenderLayout(pageIndex, options = {}) {
   const preview = options.preview === true;
   const pageWidth = Module._nanopdf_get_page_width(pageIndex);
@@ -2592,7 +2598,7 @@ function computePageRenderLayout(pageIndex, options = {}) {
   const cssWidth = Math.floor(pageWidth * effectiveScale);
   const cssHeight = Math.floor(pageHeight * effectiveScale);
   const dpr = window.devicePixelRatio || 1;
-  const maxDim = preview ? 1536 : 4096;
+  const maxDim = maxViewerRenderDimension(preview);
   const renderSize = computeRenderSize(pageWidth, pageHeight, effectiveScale * dpr, maxDim);
   return { pageWidth, pageHeight, cssWidth, cssHeight, ...renderSize };
 }
@@ -2609,15 +2615,14 @@ function renderViewerPageToCanvas(pageIndex, targetCanvas, options = {}) {
     return { ok: false, error: result.error || 'unknown' };
   }
 
-  const { data, w: renderWidth, h: renderHeight } = result.imageData;
+  const renderWidth = result.w;
+  const renderHeight = result.h;
   targetCanvas.width = renderWidth;
   targetCanvas.height = renderHeight;
   targetCanvas.style.width = `${layout.cssWidth}px`;
   targetCanvas.style.height = `${layout.cssHeight}px`;
   const ctx = targetCanvas.getContext('2d');
-  const imageData = ctx.createImageData(renderWidth, renderHeight);
-  imageData.data.set(data);
-  ctx.putImageData(imageData, 0, 0);
+  ctx.putImageData(result.imageData, 0, 0);
   return { ok: true, ...layout };
 }
 
@@ -5473,13 +5478,12 @@ function flattenOnePageToImagePdf(pageIdx, imgCache) {
   const dpi = 72 * (width / pw);
   const result = renderPageIntoImageData(Module, pageIdx, width, height, dpi);
   if (!result.ok || !result.imageData) return null;
-  const { data, w: rw, h: rh } = result.imageData;
+  const rw = result.w;
+  const rh = result.h;
   const cvs = document.createElement('canvas');
   cvs.width = rw; cvs.height = rh;
   const ctx = cvs.getContext('2d');
-  const imageData = ctx.createImageData(rw, rh);
-  imageData.data.set(data);
-  ctx.putImageData(imageData, 0, 0);
+  ctx.putImageData(result.imageData, 0, 0);
   flattenAnnotationsToCanvas(ctx, pageIdx, rw / pw, ph, imgCache);  // burns redaction
   return buildPdf([{ jpegBytes: canvasToJpegBytes(cvs), imgWidth: rw, imgHeight: rh, pageWidth: pw, pageHeight: ph }]);
 }
