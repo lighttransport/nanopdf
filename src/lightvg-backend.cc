@@ -8535,8 +8535,9 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
   // Enhanced PDF content parser with more operators support
 
   std::string content(content_data.begin(), content_data.end());
+  std::string_view content_view(content);
 
-  std::vector<std::string> operands;
+  std::vector<std::string_view> operands;
   std::vector<GraphicsState> state_stack;  // For save/restore state
   std::vector<std::pair<std::string, const BaseFont*>> font_state_stack;
   auto effective_stroke_width_px = [&]() -> float {
@@ -8580,7 +8581,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       continue;
     }
 
-    std::string token;
+    std::string_view token;
 
     // Skip stray '>' (e.g. leftover from malformed dict), but preserve valid '>' handled below
     if (content[pos] == '>') {
@@ -8616,12 +8617,12 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             pos++;
           }
         }
-        token = content.substr(start, pos - start);
+        token = content_view.substr(start, pos - start);
       } else {
         // Hex string <...>
         size_t end = content.find('>', pos);
         if (end != std::string::npos) {
-          token = content.substr(pos, end - pos + 1);
+          token = content_view.substr(pos, end - pos + 1);
           pos = end + 1;
         } else {
           pos++;
@@ -8650,15 +8651,15 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
         pos++;
       }
-      token = content.substr(start, pos - start);
+      token = content_view.substr(start, pos - start);
     }
     // Check for array [...] - skip for now, just collect the bracket
     else if (content[pos] == '[') {
-      token = "[";
+      token = std::string_view("[", 1);
       pos++;
     }
     else if (content[pos] == ']') {
-      token = "]";
+      token = std::string_view("]", 1);
       pos++;
     }
     // Regular token
@@ -8670,7 +8671,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
              content[pos] != ']') {
         pos++;
       }
-      token = content.substr(start, pos - start);
+      token = content_view.substr(start, pos - start);
     }
 
     if (token.empty()) continue;
@@ -9131,7 +9132,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       // Color space operators
       else if (tok2('c', 's')) {  // Set non-stroking color space
         if (operands.size() >= 1) {
-          std::string cs_name = operands[0];
+          std::string cs_name(operands[0]);
           if (!cs_name.empty() && cs_name[0] == '/') {
             cs_name = cs_name.substr(1);
           }
@@ -9141,7 +9142,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       } else if (tok2('C', 'S')) {  // Set stroking color space
         if (operands.size() >= 1) {
-          std::string cs_name = operands[0];
+          std::string cs_name(operands[0]);
           if (!cs_name.empty() && cs_name[0] == '/') {
             cs_name = cs_name.substr(1);
           }
@@ -9153,10 +9154,10 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         // Check if last operand is a pattern name (starts with /)
         bool is_pattern = false;
         if (!operands.empty()) {
-          const std::string& last = operands.back();
+          std::string_view last = operands.back();
           if (!last.empty() && last[0] == '/') {
             // This is a pattern name
-            std::string pattern_name = last.substr(1);
+            std::string pattern_name(last.substr(1));
             state_.fill_pattern = pattern_name;
             is_pattern = true;
             NANOPDF_LOG_TRACE("LightVG", "scn: set fill pattern to '%s'", pattern_name.c_str());
@@ -9180,10 +9181,10 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         // Check if last operand is a pattern name (starts with /)
         bool is_pattern = false;
         if (!operands.empty()) {
-          const std::string& last = operands.back();
+          std::string_view last = operands.back();
           if (!last.empty() && last[0] == '/') {
             // This is a pattern name
-            std::string pattern_name = last.substr(1);
+            std::string pattern_name(last.substr(1));
             state_.stroke_pattern = pattern_name;
             is_pattern = true;
             NANOPDF_LOG_TRACE("LightVG", "SCN: set stroke pattern to '%s'", pattern_name.c_str());
@@ -9242,7 +9243,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
         }
       } else if (tok2('r', 'i')) {  // Set rendering intent
         if (!operands.empty()) {
-          state_.rendering_intent = operands[0];
+          state_.rendering_intent = std::string(operands[0]);
         }
       } else if (tok1('i')) {  // Set flatness tolerance
         if (!operands.empty()) {
@@ -9267,7 +9268,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       }
       // Graphics state dictionary (gs operator)
       else if (tok2('g', 's')) {
-        if (!operands.empty()) apply_extgstate(operands[0]);
+        if (!operands.empty()) apply_extgstate(std::string(operands[0]));
       }
       // Transformation matrix operators
       else if (tok2('c', 'm')) {  // Concatenate matrix
@@ -9380,7 +9381,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       } else if (tok2('T', 'f')) {  // Set font and size
         if (operands.size() >= 2) {
           // operands[0] is font name (with leading /), operands[1] is size
-          std::string font_name = operands[0];
+          std::string font_name(operands[0]);
           if (!font_name.empty() && font_name[0] == '/') {
             font_name = font_name.substr(1);  // Remove leading /
           }
@@ -9438,7 +9439,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       } else if (tok2('T', 'j')) {  // Show text
         if (operands.size() >= 1 && state_.in_text_block) {
           // Remove parentheses or angle brackets from text string
-          std::string text = operands[0];
+          std::string text(operands[0]);
           bool was_literal = !text.empty() && text[0] == '(' && text.back() == ')';
           if (was_literal) {
             text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
@@ -9509,7 +9510,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
           for (const auto& item : operands) {
             if (!item.empty() && (item[0] == '(' || item[0] == '<')) {
               // Text string element
-              std::string text = item;
+              std::string text(item);
               bool was_literal = (text[0] == '(' && text.back() == ')');
               if (was_literal) {
                 text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
@@ -9597,7 +9598,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
             state_.char_spacing = nanopdf::stof_or(operands[1]);
           }
 
-          std::string text = operands[text_idx];
+          std::string text(operands[text_idx]);
           if (!text.empty() && text[0] == '(' && text.back() == ')') {
             text = decode_pdf_literal_string(text.substr(1, text.length() - 2));
           } else if (!text.empty() && text[0] == '<' && text.back() == '>') {
@@ -9660,7 +9661,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       else if (tok2('D', 'o')) {  // Paint XObject
         if (operands.size() >= 1 && current_pdf_ && current_page_) {
           bool rendered_xobject = false;
-          std::string xobj_name = operands[0];
+          std::string xobj_name(operands[0]);
           // Remove leading '/' if present
           if (!xobj_name.empty() && xobj_name[0] == '/') {
             xobj_name = xobj_name.substr(1);
@@ -9819,7 +9820,7 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       // Shading operator (sh) - paint a shading pattern
       else if (tok2('s', 'h')) {
         if (operands.size() >= 1) {
-          std::string shading_name = operands[0];
+          std::string shading_name(operands[0]);
           // Remove leading '/' if present
           if (!shading_name.empty() && shading_name[0] == '/') {
             shading_name = shading_name.substr(1);

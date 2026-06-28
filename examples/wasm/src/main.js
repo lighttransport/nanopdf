@@ -43,6 +43,8 @@ let adjacentPreviewJobId = 0;
 let adjacentPreviewTimer = 0;
 let adjacentPreviewTimerKind = '';
 const adjacentPreviewRenderKeys = { prev: '', next: '' };
+let fullRenderJobId = 0;
+const fullRenderKeys = new Set();
 let fileName = '';
 let fileSize = 0;
 let currentPdfBytes = null;
@@ -2614,7 +2616,9 @@ function computePageRenderLayout(pageIndex, options = {}) {
   const cssWidth = Math.floor(pageWidth * cssScale);
   const cssHeight = Math.floor(pageHeight * cssScale);
   const dpr = window.devicePixelRatio || 1;
-  const maxDim = maxViewerRenderDimension(preview);
+  const maxDim = Number.isFinite(options.maxDim) && options.maxDim > 0
+    ? options.maxDim
+    : maxViewerRenderDimension(preview);
   const renderSize = computeRenderSize(pageWidth, pageHeight, cssScale * renderScale * dpr, maxDim);
   return { pageWidth, pageHeight, cssWidth, cssHeight, ...renderSize };
 }
@@ -2644,6 +2648,31 @@ function renderViewerPageToCanvas(pageIndex, targetCanvas, options = {}) {
     paintMs: result.paintMs,
     totalMs: result.totalMs,
   };
+}
+
+function mainRenderKey(pageIndex) {
+  const sidebarState = sidebar.classList.contains('hidden') ? 'hidden' : 'open';
+  const dpr = window.devicePixelRatio || 1;
+  return [
+    renderDocumentVersion,
+    pageIndex,
+    renderBackend,
+    fitMode,
+    Math.round(zoomLevel * 1000),
+    Math.round(dpr * 100),
+    window.innerWidth,
+    window.innerHeight,
+    sidebarState,
+  ].join(':');
+}
+
+function scheduleFullResolutionRender(key, pageIndex) {
+  const jobId = ++fullRenderJobId;
+  setTimeout(() => {
+    if (jobId !== fullRenderJobId) return;
+    if (pageIndex !== currentPage || key !== mainRenderKey(currentPage)) return;
+    renderCurrentPage({ forceFull: true, expectedKey: key });
+  }, 32);
 }
 
 function cancelScheduledAdjacentPreviewRender() {
@@ -4080,7 +4109,7 @@ function resetAnnotations() {
   renderedFormFieldsKey = '';
 }
 
-function renderCurrentPage() {
+function renderCurrentPage(options = {}) {
   if (!Module || totalPages <= 0) return;
   if (!hasRendering) {
     setStatus(`Page ${currentPage + 1} / ${totalPages} (rendering not available)`);
@@ -4091,10 +4120,19 @@ function renderCurrentPage() {
   // Don't render main page while thumbnails are being rendered
   if (isThumbnailRendering) return;
 
-  const result = renderViewerPageToCanvas(currentPage, canvas);
+  const fullKey = mainRenderKey(currentPage);
+  if (options.expectedKey && options.expectedKey !== fullKey) return;
+  const useColdPreview = options.forceFull !== true && !fullRenderKeys.has(fullKey);
+  const renderOptions = useColdPreview
+    ? { preview: true, maxDim: 960 }
+    : {};
+  const result = renderViewerPageToCanvas(currentPage, canvas, renderOptions);
   if (!result || !result.ok) {
     setStatus('Render error: ' + (result.error || 'unknown'), true);
     return;
+  }
+  if (!useColdPreview) {
+    fullRenderKeys.add(fullKey);
   }
 
   const { pageWidth, pageHeight, cssWidth, cssHeight } = result;
@@ -4127,6 +4165,10 @@ function renderCurrentPage() {
     const placement = pendingPageScrollPlacement;
     pendingPageScrollPlacement = null;
     placeCanvasScroll(placement);
+  }
+
+  if (useColdPreview) {
+    scheduleFullResolutionRender(fullKey, currentPage);
   }
 }
 
@@ -4636,6 +4678,8 @@ async function loadPDF(arrayBuffer, name) {
     cancelScheduledAdjacentPreviewRender();
     adjacentPreviewRenderKeys.prev = '';
     adjacentPreviewRenderKeys.next = '';
+    fullRenderJobId++;
+    fullRenderKeys.clear();
     signatureData = null;
     editHistoryData = null;
 

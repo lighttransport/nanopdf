@@ -121,11 +121,21 @@ inline bool parse_uint64(std::string_view sv, uint64_t *ret) {
 // Consumes the entire input (no trailing garbage). Does not throw.
 inline bool parse_double(std::string_view sv, double *ret) {
   if (!ret || sv.empty()) return false;
-  // strtod needs a NUL-terminated string; materialize a local copy.
-  std::string buf(sv);
+  // strtod needs a NUL-terminated string. Most PDF numeric tokens are short;
+  // keep those on the stack to avoid per-coordinate heap traffic.
+  char stack_buf[64];
+  const char* p = nullptr;
+  std::string heap_buf;
+  if (sv.size() < sizeof(stack_buf)) {
+    std::memcpy(stack_buf, sv.data(), sv.size());
+    stack_buf[sv.size()] = '\0';
+    p = stack_buf;
+  } else {
+    heap_buf.assign(sv);
+    p = heap_buf.c_str();
+  }
   errno = 0;
   char *endptr = nullptr;
-  const char *p = buf.c_str();
   double v = std::strtod(p, &endptr);
   if (errno == ERANGE) return false;
   if (endptr == p) return false;  // no characters consumed
