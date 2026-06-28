@@ -17,6 +17,7 @@ import {
   highlightContext,
   outlineBranchMatches,
   readWasmString,
+  renderPageIntoCanvas,
   renderPageIntoImageData,
   resolvePdfDeepLink,
   shouldRenderPageStatus,
@@ -203,6 +204,46 @@ test('renderPageIntoImageData returns an empty-buffer error if the bridge return
   const result = renderPageIntoImageData(Module, 0, 1, 1, 72);
   assert.equal(result.ok, false);
   assert.equal(result.error, 'empty render buffer');
+});
+
+test('renderPageIntoCanvas paints from the WASM buffer and releases it', () => {
+  const w = 2, h = 2;
+  const size = w * h * 4;
+  const heap = new ArrayBuffer(0x10000);
+  new Uint8Array(heap, 0x1000, size).fill(0x7F);
+  const calls = { render: 0, release: 0, paint: 0 };
+  const Module = {
+    _nanopdf_render_page: () => { calls.render++; return 1; },
+    _nanopdf_get_render_buffer: () => 0x1000,
+    _nanopdf_get_render_buffer_size: () => size,
+    _nanopdf_get_render_width: () => w,
+    _nanopdf_get_render_height: () => h,
+    _nanopdf_release_render_buffer: () => { calls.release++; },
+    HEAPU8: { buffer: heap },
+  };
+  let painted = null;
+  const canvas = {
+    width: 0,
+    height: 0,
+    getContext: () => ({
+      putImageData: (imageData, x, y) => {
+        calls.paint++;
+        painted = { imageData, x, y };
+      },
+    }),
+  };
+
+  const result = renderPageIntoCanvas(Module, 0, w, h, 72, canvas);
+  assert.equal(result.ok, true);
+  assert.equal(canvas.width, w);
+  assert.equal(canvas.height, h);
+  assert.equal(painted.x, 0);
+  assert.equal(painted.y, 0);
+  assert.equal(painted.imageData.data.buffer, heap);
+  assert.equal(painted.imageData.data[0], 0x7F);
+  assert.equal(calls.render, 1);
+  assert.equal(calls.paint, 1);
+  assert.equal(calls.release, 1);
 });
 
 test('assertOkOrThrow passes through success and throws on failure', () => {

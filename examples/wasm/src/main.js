@@ -18,6 +18,7 @@ import {
   highlightContext,
   outlineBranchMatches,
   readWasmString,
+  renderPageIntoCanvas,
   renderPageIntoImageData,
   resolvePdfDeepLink,
   shouldRenderPageStatus,
@@ -2578,9 +2579,15 @@ function computeBaseScale(pageWidth, pageHeight) {
   const sidebarWidth = sidebar.classList.contains('hidden') ? 0 : 260;
   const availWidth = window.innerWidth - sidebarWidth - 80; // 80 for padding/scrollbar
   const availHeight = window.innerHeight - 120; // toolbar + statusbar + padding
+  const deviceMemory = Number(navigator.deviceMemory || 0);
+  const fitWidthLimit = deviceMemory > 0 && deviceMemory <= 2
+    ? 1200
+    : deviceMemory > 0 && deviceMemory <= 4
+      ? 1800
+      : 3000;
 
   if (fitMode === 'width') {
-    return Math.min(availWidth, 800) / pageWidth;
+    return Math.min(availWidth, fitWidthLimit) / pageWidth;
   } else {
     // Fit page: entire page visible
     const scaleW = availWidth / pageWidth;
@@ -2619,24 +2626,22 @@ function renderViewerPageToCanvas(pageIndex, targetCanvas, options = {}) {
 
   const layout = computePageRenderLayout(pageIndex, options);
   const dpi = 72 * (layout.width / layout.pageWidth);
-  const result = renderPageIntoImageData(Module, pageIndex, layout.width, layout.height, dpi);
-  if (!result.ok || !result.imageData) {
+  const result = renderPageIntoCanvas(Module, pageIndex, layout.width, layout.height, dpi, targetCanvas);
+  if (!result.ok) {
     return { ok: false, error: result.error || 'unknown' };
   }
 
   const renderWidth = result.w;
   const renderHeight = result.h;
-  targetCanvas.width = renderWidth;
-  targetCanvas.height = renderHeight;
   targetCanvas.style.width = `${layout.cssWidth}px`;
   targetCanvas.style.height = `${layout.cssHeight}px`;
-  const ctx = targetCanvas.getContext('2d');
-  ctx.putImageData(result.imageData, 0, 0);
   return {
     ok: true,
     ...layout,
+    width: renderWidth,
+    height: renderHeight,
     renderMs: result.renderMs,
-    copyMs: result.copyMs,
+    paintMs: result.paintMs,
     totalMs: result.totalMs,
   };
 }

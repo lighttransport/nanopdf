@@ -123,6 +123,58 @@ export function renderPageIntoImageData(Module, pageIdx, width, height, dpi) {
   return { ok: true, imageData, w, h, error: '', renderMs, copyMs, totalMs: now() - totalStart };
 }
 
+// Render directly into a canvas without first detaching a full copy of the
+// WASM pixel buffer. The caller must not retain the returned pixel data; it is
+// released immediately after putImageData().
+export function renderPageIntoCanvas(Module, pageIdx, width, height, dpi, canvas) {
+  const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? () => performance.now()
+    : () => Date.now();
+  const totalStart = now();
+  let renderMs = 0;
+  let paintMs = 0;
+  let ok = 0;
+  try {
+    const renderStart = now();
+    ok = Module._nanopdf_render_page(pageIdx, width, height, dpi);
+    renderMs = now() - renderStart;
+  } catch (e) {
+    return { ok: false, w: 0, h: 0, error: e?.message || String(e), renderMs, paintMs, totalMs: now() - totalStart };
+  }
+  if (ok !== 1) {
+    const error = Module._nanopdf_get_last_error
+      ? Module.UTF8ToString(Module._nanopdf_get_last_error())
+      : '';
+    return { ok: false, w: 0, h: 0, error, renderMs, paintMs, totalMs: now() - totalStart };
+  }
+
+  const ptr = Module._nanopdf_get_render_buffer();
+  const size = Module._nanopdf_get_render_buffer_size();
+  const w = Module._nanopdf_get_render_width();
+  const h = Module._nanopdf_get_render_height();
+  if (!ptr || size <= 0) {
+    return { ok: false, w, h, error: 'empty render buffer', renderMs, paintMs, totalMs: now() - totalStart };
+  }
+
+  try {
+    const paintStart = now();
+    canvas.width = w;
+    canvas.height = h;
+    const pixels = new Uint8ClampedArray(Module.HEAPU8.buffer, ptr, size);
+    const imageData = typeof ImageData === 'function'
+      ? new ImageData(pixels, w, h)
+      : { data: pixels, width: w, height: h, w, h };
+    canvas.getContext('2d').putImageData(imageData, 0, 0);
+    paintMs = now() - paintStart;
+  } finally {
+    if (Module._nanopdf_release_render_buffer) {
+      Module._nanopdf_release_render_buffer();
+    }
+  }
+
+  return { ok: true, w, h, error: '', renderMs, paintMs, totalMs: now() - totalStart };
+}
+
 // Validate a WASM operation's ok flag and throw with the C-side error
 // message. Use before reading any *_get_buffer / *_get_size pair, since those
 // output pointers are documented as valid only on success.
