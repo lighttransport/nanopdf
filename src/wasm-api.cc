@@ -13,6 +13,7 @@
 #include <string>
 #include <map>
 #include <cmath>
+#include <memory>
 
 #include "nanopdf.hh"
 #include "pdf-writer.hh"
@@ -64,6 +65,25 @@ static nanopdf::BackendKind g_render_backend =
     nanopdf::BackendKind::LightVG;
 #endif
 ;
+static std::unique_ptr<nanopdf::RenderBackend> g_cached_render_backend;
+static nanopdf::BackendKind g_cached_render_backend_kind = g_render_backend;
+static uint32_t g_cached_render_width = 0;
+static uint32_t g_cached_render_height = 0;
+static const nanopdf::Pdf* g_cached_render_pdf = nullptr;
+
+struct CachedRenderPage {
+  const nanopdf::Pdf* pdf{nullptr};
+  int page_index{-1};
+  nanopdf::BackendKind backend{g_render_backend};
+  uint32_t width{0};
+  uint32_t height{0};
+  uint32_t output_width{0};
+  uint32_t output_height{0};
+  float dpi{0.0f};
+  std::vector<uint8_t> pixels;
+};
+static CachedRenderPage g_cached_render_page;
+static constexpr size_t kMaxCachedRenderPageBytes = 96ull * 1024ull * 1024ull;
 
 // Text buffer
 static std::string g_text_buffer;
@@ -80,6 +100,18 @@ static void release_render_buffer_storage() {
   std::vector<uint8_t>().swap(g_render_buffer);
   g_render_width = 0;
   g_render_height = 0;
+}
+
+static void reset_cached_render_backend() {
+  g_cached_render_backend.reset();
+  g_cached_render_width = 0;
+  g_cached_render_height = 0;
+  g_cached_render_pdf = nullptr;
+  g_cached_render_backend_kind = g_render_backend;
+}
+
+static void reset_cached_render_page() {
+  g_cached_render_page = CachedRenderPage{};
 }
 
 // ============================================================
@@ -150,6 +182,8 @@ void nanopdf_shutdown() {
   }
   g_pdf_data.clear();
   release_render_buffer_storage();
+  reset_cached_render_backend();
+  reset_cached_render_page();
 
   // Clean up writer
   if (g_writer) {
@@ -188,6 +222,8 @@ int nanopdf_load_pdf(const uint8_t* data, size_t size) {
     delete g_pdf;
     g_pdf = nullptr;
   }
+  reset_cached_render_backend();
+  reset_cached_render_page();
 
   g_pdf_data.assign(data, data + size);
 
@@ -254,26 +290,76 @@ int nanopdf_has_rendering() {
 
 static bool render_page_with_selected_backend(const nanopdf::Pdf& pdf,
                                               const nanopdf::Page& page,
+                                              int page_index,
                                               int width, int height,
                                               float dpi) {
   release_render_buffer_storage();
 
-  auto backend = nanopdf::make_backend(g_render_backend);
-  if (!backend) {
-    g_last_error = std::string("Rendering backend not available: ") +
-                   nanopdf::backend_kind_name(g_render_backend);
-    return false;
+  const bool can_reuse_backend = (&pdf == g_pdf);
+  const uint32_t render_width = static_cast<uint32_t>(width);
+  const uint32_t render_height = static_cast<uint32_t>(height);
+  const float render_dpi = dpi > 0 ? dpi : 72.0f;
+
+  if (can_reuse_backend &&
+      g_cached_render_page.pdf == &pdf &&
+      g_cached_render_page.page_index == page_index &&
+      g_cached_render_page.backend == g_render_backend &&
+      g_cached_render_page.width == render_width &&
+      g_cached_render_page.height == render_height &&
+      std::fabs(g_cached_render_page.dpi - render_dpi) < 0.001f &&
+      !g_cached_render_page.pixels.empty()) {
+    g_render_buffer = g_cached_render_page.pixels;
+    g_render_width = g_cached_render_page.output_width;
+    g_render_height = g_cached_render_page.output_height;
+    return true;
   }
 
-  if (!backend->initialize(static_cast<uint32_t>(width),
-                           static_cast<uint32_t>(height))) {
-    g_last_error = std::string("Failed to initialize ") +
-                   nanopdf::backend_kind_name(g_render_backend) + " backend";
-    return false;
+  std::unique_ptr<nanopdf::RenderBackend> local_backend;
+  nanopdf::RenderBackend* backend = nullptr;
+  if (can_reuse_backend) {
+    const bool cache_matches =
+        g_cached_render_backend &&
+        g_cached_render_backend_kind == g_render_backend &&
+        g_cached_render_width == render_width &&
+        g_cached_render_height == render_height &&
+        g_cached_render_pdf == &pdf;
+    if (!cache_matches) {
+      reset_cached_render_backend();
+      g_cached_render_backend = nanopdf::make_backend(g_render_backend);
+      if (!g_cached_render_backend) {
+        g_last_error = std::string("Rendering backend not available: ") +
+                       nanopdf::backend_kind_name(g_render_backend);
+        return false;
+      }
+      if (!g_cached_render_backend->initialize(render_width, render_height)) {
+        g_last_error = std::string("Failed to initialize ") +
+                       nanopdf::backend_kind_name(g_render_backend) + " backend";
+        reset_cached_render_backend();
+        return false;
+      }
+      g_cached_render_backend_kind = g_render_backend;
+      g_cached_render_width = render_width;
+      g_cached_render_height = render_height;
+      g_cached_render_pdf = &pdf;
+    }
+    backend = g_cached_render_backend.get();
+  } else {
+    local_backend = nanopdf::make_backend(g_render_backend);
+    if (!local_backend) {
+      g_last_error = std::string("Rendering backend not available: ") +
+                     nanopdf::backend_kind_name(g_render_backend);
+      return false;
+    }
+    if (!local_backend->initialize(render_width, render_height)) {
+      g_last_error = std::string("Failed to initialize ") +
+                     nanopdf::backend_kind_name(g_render_backend) + " backend";
+      return false;
+    }
+    backend = local_backend.get();
   }
 
   nanopdf::RenderOptions options;
-  options.dpi = dpi > 0 ? dpi : 72.0f;
+  options.dpi = render_dpi;
 
   auto result = backend->render_page(pdf, page, options);
   if (!result.success) {
@@ -284,6 +370,19 @@ static bool render_page_with_selected_backend(const nanopdf::Pdf& pdf,
   g_render_buffer = std::move(result.pixels);
   g_render_width = result.width;
   g_render_height = result.height;
+  if (can_reuse_backend && g_render_buffer.size() <= kMaxCachedRenderPageBytes) {
+    g_cached_render_page.pdf = &pdf;
+    g_cached_render_page.page_index = page_index;
+    g_cached_render_page.backend = g_render_backend;
+    g_cached_render_page.width = render_width;
+    g_cached_render_page.height = render_height;
+    g_cached_render_page.output_width = g_render_width;
+    g_cached_render_page.output_height = g_render_height;
+    g_cached_render_page.dpi = render_dpi;
+    g_cached_render_page.pixels = g_render_buffer;
+  } else if (can_reuse_backend) {
+    reset_cached_render_page();
+  }
   return true;
 }
 
@@ -330,7 +429,11 @@ int nanopdf_set_render_backend(int backend_id) {
                    nanopdf::backend_kind_name(kind);
     return 0;
   }
-  g_render_backend = kind;
+  if (g_render_backend != kind) {
+    g_render_backend = kind;
+    reset_cached_render_backend();
+    reset_cached_render_page();
+  }
   return 1;
 }
 
@@ -348,7 +451,7 @@ int nanopdf_render_page(int page_index, int width, int height, float dpi) {
   }
 
   const auto& page = g_pdf->catalog.pages[page_index];
-  return render_page_with_selected_backend(*g_pdf, page, width, height, dpi) ? 1 : 0;
+  return render_page_with_selected_backend(*g_pdf, page, page_index, width, height, dpi) ? 1 : 0;
 }
 
 // Render a page as the document existed at a given incremental-update
@@ -387,7 +490,7 @@ int nanopdf_render_revision_page(unsigned int byte_len, int page_index,
   }
 
   const auto& page = rev_pdf.catalog.pages[page_index];
-  return render_page_with_selected_backend(rev_pdf, page, width, height, dpi)
+  return render_page_with_selected_backend(rev_pdf, page, page_index, width, height, dpi)
              ? 1
              : 0;
 }
@@ -942,7 +1045,7 @@ int nanopdf_doc_render_page(int doc_id, int page_index, int width, int height, f
   }
 
   const auto& page = it->second.pdf->catalog.pages[page_index];
-  return render_page_with_selected_backend(*it->second.pdf, page, width, height, dpi) ? 1 : 0;
+  return render_page_with_selected_backend(*it->second.pdf, page, page_index, width, height, dpi) ? 1 : 0;
 }
 
 // ============================================================

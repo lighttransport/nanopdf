@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "color-transform.hh"
+#include "type1-parser.hh"
 
 namespace nanopdf {
 
@@ -25,6 +26,8 @@ struct SharedFontEntry {
   bool is_embedded{false};
   bool has_ttf_parse{false};
   std::vector<uint16_t> cid_to_gid;
+  bool has_type1{false};
+  Type1FontData type1;
 };
 
 class SharedFontCache {

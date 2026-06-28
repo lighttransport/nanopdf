@@ -262,6 +262,11 @@ private:
     // Sentinel -1 = not yet computed. Dedupes repeated ttf_hmtx_advance walks
     // across the measure and draw passes for hot glyphs.
     std::vector<int16_t> advance_cache;
+
+    // Type1 fonts address glyphs by name. Intern names to small ids so they
+    // can share the integer-keyed outline cache used by sfnt glyphs.
+    std::unordered_map<std::string, int> type1_glyph_ids;
+    int next_type1_glyph_id{1};
   };
 
   // Glyph outline cache key: font_id + glyph_id.

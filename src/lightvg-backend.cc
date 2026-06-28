@@ -1955,9 +1955,47 @@ bool LightVGBackend::draw_type1_glyph_by_name(FontCache* font,
     return false;
   }
 
+  if (font->font_id == 0) {
+    font->font_id = next_font_id_++;
+  }
+  auto id_it = font->type1_glyph_ids.find(glyph_name);
+  if (id_it == font->type1_glyph_ids.end()) {
+    id_it = font->type1_glyph_ids
+                .emplace(glyph_name, font->next_type1_glyph_id++)
+                .first;
+  }
+
   ttf_outline_t outline{};
-  if (t1_glyph_outline(font->type1, glyph_name, &outline) != 0) {
-    return false;
+  GlyphOutlineKey cache_key{font->font_id, id_it->second};
+  auto cache_it = glyph_outline_cache_.find(cache_key);
+  bool outline_from_cache = (cache_it != glyph_outline_cache_.end());
+
+  if (outline_from_cache) {
+    const auto& cached = cache_it->second;
+    outline.points = const_cast<ttf_point_t*>(cached.points.data());
+    outline.contour_ends = const_cast<int*>(cached.contour_ends.data());
+    outline.num_points = static_cast<int>(cached.points.size());
+    outline.num_contours = static_cast<int>(cached.contour_ends.size());
+    outline.x_min = cached.x_min;
+    outline.y_min = cached.y_min;
+    outline.x_max = cached.x_max;
+    outline.y_max = cached.y_max;
+  } else {
+    if (t1_glyph_outline(font->type1, glyph_name, &outline) != 0) {
+      return false;
+    }
+    GlyphOutlineEntry entry;
+    entry.points.assign(outline.points, outline.points + outline.num_points);
+    entry.contour_ends.assign(outline.contour_ends,
+                              outline.contour_ends + outline.num_contours);
+    entry.x_min = outline.x_min;
+    entry.y_min = outline.y_min;
+    entry.x_max = outline.x_max;
+    entry.y_max = outline.y_max;
+    if (glyph_outline_cache_.size() >= kMaxGlyphOutlineCacheEntries) {
+      glyph_outline_cache_.erase(glyph_outline_cache_.begin());
+    }
+    glyph_outline_cache_[cache_key] = std::move(entry);
   }
 
   double units_per_em_d = 1000.0;
@@ -1976,7 +2014,7 @@ bool LightVGBackend::draw_type1_glyph_by_name(FontCache* font,
 
   auto shape = lvg::Shape::gen();
   if (!shape) {
-    ttf_outline_free(&outline);
+    if (!outline_from_cache) ttf_outline_free(&outline);
     return false;
   }
 
@@ -2020,7 +2058,7 @@ bool LightVGBackend::draw_type1_glyph_by_name(FontCache* font,
   if (add_to_clip) state_.text_clip_active = true;
   decompose_ttf_outline_to_path(outline, scale, x, y, cos_theta, sin_theta,
                                 emit_move, emit_line, emit_cubic, emit_close);
-  ttf_outline_free(&outline);
+  if (!outline_from_cache) ttf_outline_free(&outline);
 
   if (render_mode == 7 || invisible) return true;
 
@@ -3211,6 +3249,14 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
       cache.font_data = std::move(shared.font_data);
       cache.is_embedded = shared.is_embedded;
       cache.cid_to_gid = std::move(shared.cid_to_gid);
+      cache.has_type1 = shared.has_type1;
+      cache.type1 = std::move(shared.type1);
+
+      if (cache.has_type1) {
+        cache.initialized = true;
+        font_cache_[font_name] = std::move(cache);
+        return true;
+      }
 
       int font_offset = stbtt_GetFontOffsetForIndex(cache.font_data.data(), 0);
       bool stbtt_ok = font_offset >= 0 &&
@@ -3297,6 +3343,14 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     cache.has_type1 = true;
     NANOPDF_LOG_INFO("LightVG", "Loaded embedded Type1 font '%s' (%zu glyphs)",
                      font_name.c_str(), cache.type1.char_strings.size());
+    SharedFontCache::instance().store(&pdf, font_name, {
+      cache.font_data,  // copy
+      true,             // is_embedded
+      false,            // has_ttf_parse
+      {},               // cid_to_gid
+      true,             // has_type1
+      cache.type1       // copy parsed Type1 program
+    });
     font_cache_[font_name] = std::move(cache);
     return true;
   }
@@ -3404,7 +3458,9 @@ bool LightVGBackend::load_font(const Pdf& pdf, const std::string& font_name, con
     cache.font_data,  // copy
     true,             // is_embedded
     cache.has_ttf_parse,
-    cache.cid_to_gid  // copy
+    cache.cid_to_gid, // copy
+    false,            // has_type1
+    {}                // type1
   });
 
   font_cache_[font_name] = std::move(cache);
