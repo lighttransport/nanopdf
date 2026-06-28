@@ -2378,9 +2378,13 @@ function placeCanvasScroll(mode) {
     const currentTop = scrollTopForElementTop(canvasWrapper);
     const maxTop = Math.max(0, canvasScroll.scrollHeight - canvasScroll.clientHeight);
     const maxLeft = Math.max(0, canvasScroll.scrollWidth - canvasScroll.clientWidth);
-    const top = mode === 'bottom'
-      ? Math.max(0, Math.min(currentTop - threshold, maxTop))
-      : Math.min(currentTop + threshold, maxTop);
+    let top = currentTop;
+    if (mode === 'top') {
+      top = currentTop - threshold;
+    } else if (mode === 'bottom') {
+      top = currentTop + threshold;
+    }
+    top = Math.max(0, Math.min(top, maxTop));
     canvasScroll.scrollTo({
       top,
       left: Math.min(canvasScroll.scrollLeft, maxLeft),
@@ -2593,13 +2597,13 @@ function computePageRenderLayout(pageIndex, options = {}) {
   const pageWidth = Module._nanopdf_get_page_width(pageIndex);
   const pageHeight = Module._nanopdf_get_page_height(pageIndex);
   const baseScale = computeBaseScale(pageWidth, pageHeight);
+  const cssScale = baseScale * zoomLevel;
   const renderScale = preview ? 0.5 : 1.0;
-  const effectiveScale = baseScale * zoomLevel * renderScale;
-  const cssWidth = Math.floor(pageWidth * effectiveScale);
-  const cssHeight = Math.floor(pageHeight * effectiveScale);
+  const cssWidth = Math.floor(pageWidth * cssScale);
+  const cssHeight = Math.floor(pageHeight * cssScale);
   const dpr = window.devicePixelRatio || 1;
   const maxDim = maxViewerRenderDimension(preview);
-  const renderSize = computeRenderSize(pageWidth, pageHeight, effectiveScale * dpr, maxDim);
+  const renderSize = computeRenderSize(pageWidth, pageHeight, cssScale * renderScale * dpr, maxDim);
   return { pageWidth, pageHeight, cssWidth, cssHeight, ...renderSize };
 }
 
@@ -4633,7 +4637,7 @@ async function loadPDF(arrayBuffer, name) {
 
     // Render first page
     if (hasRendering) {
-      pendingPageScrollPlacement = 'top';
+      pendingPageScrollPlacement = 'start';
       renderCurrentPage();
     } else {
       emptyState.style.display = 'none';

@@ -715,13 +715,11 @@ body {
   justify-content: center;
   margin: 24px 0;
   pointer-events: none;
-  max-height: 45vh;
 }
 .page-preview-canvas {
   box-shadow: 0 2px 8px rgba(0,0,0,0.12);
   background: #fff;
   transition: transform 0.3s ease;
-  max-width: min(90vw, 960px);
   width: auto;
   height: auto;
 }
