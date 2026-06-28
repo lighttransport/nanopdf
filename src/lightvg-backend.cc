@@ -2436,9 +2436,19 @@ bool LightVGBackend::draw_text(float x, float y, const std::string& text, float 
           for (char& c : base_lower) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
           }
+          // txex/txexs (tx-fonts math extension) delimiter fallback: the larger
+          // "Big" variants are only swapped for the smaller "big" variants when
+          // the font does NOT actually contain the requested glyph. The font
+          // usually does have parenleftBig etc.; downgrading unconditionally
+          // rendered the big equation delimiters (e.g. eq. 4/5 of dcsdd.pdf) too
+          // short.
           if (base_lower.find("txex") != std::string::npos) {
-            if (glyph_name == "parenleftBig") glyph_name = "parenleftbig";
-            else if (glyph_name == "parenrightBig") glyph_name = "parenrightbig";
+            if (glyph_name == "parenleftBig" &&
+                !font->type1.char_strings.count("parenleftBig"))
+              glyph_name = "parenleftbig";
+            else if (glyph_name == "parenrightBig" &&
+                     !font->type1.char_strings.count("parenrightBig"))
+              glyph_name = "parenrightbig";
           }
         }
         if ((glyph_name.empty() || glyph_name == ".notdef" ||
