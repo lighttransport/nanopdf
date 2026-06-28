@@ -37,6 +37,11 @@ let renderBackend = 1; // 0 = LightVG, 1 = ThorVG
 let renderBackends = { lightvg: false, thorvg: false };
 let pendingPageScrollPlacement = null;
 let scrollSnapLocked = false;
+let renderDocumentVersion = 0;
+let adjacentPreviewJobId = 0;
+let adjacentPreviewTimer = 0;
+let adjacentPreviewTimerKind = '';
+const adjacentPreviewRenderKeys = { prev: '', next: '' };
 let fileName = '';
 let fileSize = 0;
 let currentPdfBytes = null;
@@ -2630,6 +2635,44 @@ function renderViewerPageToCanvas(pageIndex, targetCanvas, options = {}) {
   return { ok: true, ...layout };
 }
 
+function cancelScheduledAdjacentPreviewRender() {
+  adjacentPreviewJobId++;
+  if (!adjacentPreviewTimer) return;
+  if (adjacentPreviewTimerKind === 'idle' && typeof window.cancelIdleCallback === 'function') {
+    window.cancelIdleCallback(adjacentPreviewTimer);
+  } else {
+    clearTimeout(adjacentPreviewTimer);
+  }
+  adjacentPreviewTimer = 0;
+  adjacentPreviewTimerKind = '';
+}
+
+function schedulePreviewWork(callback) {
+  if (typeof window.requestIdleCallback === 'function') {
+    adjacentPreviewTimerKind = 'idle';
+    adjacentPreviewTimer = window.requestIdleCallback(callback, { timeout: 120 });
+  } else {
+    adjacentPreviewTimerKind = 'timeout';
+    adjacentPreviewTimer = setTimeout(callback, 16);
+  }
+}
+
+function adjacentPreviewKey(pageIndex) {
+  const sidebarState = sidebar.classList.contains('hidden') ? 'hidden' : 'open';
+  const dpr = window.devicePixelRatio || 1;
+  return [
+    renderDocumentVersion,
+    pageIndex,
+    renderBackend,
+    fitMode,
+    Math.round(zoomLevel * 1000),
+    Math.round(dpr * 100),
+    window.innerWidth,
+    window.innerHeight,
+    sidebarState,
+  ].join(':');
+}
+
 function setPreviewVisible(wrapper, visible) {
   if (!wrapper) return;
   wrapper.style.display = visible ? 'inline-flex' : 'none';
@@ -2642,32 +2685,75 @@ function setPreviewVisible(wrapper, visible) {
   }
 }
 
+function prepareAdjacentPreviewSlot(slot, pageIndex, targetCanvas, wrapper) {
+  if (!targetCanvas || !wrapper || pageIndex < 0 || pageIndex >= totalPages) {
+    adjacentPreviewRenderKeys[slot] = '';
+    setPreviewVisible(wrapper, false);
+    return null;
+  }
+
+  const key = adjacentPreviewKey(pageIndex);
+  const layout = computePageRenderLayout(pageIndex, { preview: true });
+  targetCanvas.style.width = `${layout.cssWidth}px`;
+  targetCanvas.style.height = `${layout.cssHeight}px`;
+  setPreviewVisible(wrapper, true);
+
+  if (adjacentPreviewRenderKeys[slot] !== key) {
+    targetCanvas.width = 1;
+    targetCanvas.height = 1;
+    adjacentPreviewRenderKeys[slot] = '';
+  }
+  return key;
+}
+
+function renderAdjacentPreviewSlot(slot, pageIndex, targetCanvas, wrapper, key, jobId) {
+  if (jobId !== adjacentPreviewJobId || !key) return;
+  if (adjacentPreviewRenderKeys[slot] === key && targetCanvas.width > 1 && targetCanvas.height > 1) {
+    return;
+  }
+
+  const result = renderViewerPageToCanvas(pageIndex, targetCanvas, { preview: true });
+  if (jobId !== adjacentPreviewJobId) return;
+  if (result && result.ok) {
+    adjacentPreviewRenderKeys[slot] = key;
+    setPreviewVisible(wrapper, true);
+  } else {
+    adjacentPreviewRenderKeys[slot] = '';
+    setPreviewVisible(wrapper, false);
+  }
+}
+
 function renderAdjacentPagePreviews() {
+  cancelScheduledAdjacentPreviewRender();
+
   if (!hasRendering || !Module || totalPages <= 0) {
+    adjacentPreviewRenderKeys.prev = '';
+    adjacentPreviewRenderKeys.next = '';
     setPreviewVisible(prevPageWrapper, false);
     setPreviewVisible(nextPageWrapper, false);
     return;
   }
 
   const prevPage = currentPage - 1;
-  if (prevPage >= 0) {
-    const result = renderViewerPageToCanvas(prevPage, prevPageCanvas, { preview: true });
-    setPreviewVisible(prevPageWrapper, !!result && result.ok);
-  } else {
-    setPreviewVisible(prevPageWrapper, false);
-  }
-
   const nextPage = currentPage + 1;
-  if (nextPage < totalPages) {
-    const result = renderViewerPageToCanvas(nextPage, nextPageCanvas, { preview: true });
-    setPreviewVisible(nextPageWrapper, !!result && result.ok);
-  } else {
-    setPreviewVisible(nextPageWrapper, false);
-  }
+  const prevKey = prepareAdjacentPreviewSlot('prev', prevPage, prevPageCanvas, prevPageWrapper);
+  const nextKey = prepareAdjacentPreviewSlot('next', nextPage, nextPageCanvas, nextPageWrapper);
 
   const transform = rotation === 0 ? '' : `rotate(${rotation}deg)`;
   if (prevPageCanvas) prevPageCanvas.style.transform = transform;
   if (nextPageCanvas) nextPageCanvas.style.transform = transform;
+
+  const jobId = adjacentPreviewJobId;
+  schedulePreviewWork(() => {
+    adjacentPreviewTimer = 0;
+    adjacentPreviewTimerKind = '';
+    renderAdjacentPreviewSlot('prev', prevPage, prevPageCanvas, prevPageWrapper, prevKey, jobId);
+    schedulePreviewWork(() => {
+      adjacentPreviewTimer = 0;
+      adjacentPreviewTimerKind = '';
+      renderAdjacentPreviewSlot('next', nextPage, nextPageCanvas, nextPageWrapper, nextKey, jobId);
+    });
+  });
 }
 
 function getPageScale() {
@@ -4534,6 +4620,10 @@ async function loadPDF(arrayBuffer, name) {
     fileSize = bytes.length;
     currentPdfBytes = new Uint8Array(bytes);
     currentPage = 0;
+    renderDocumentVersion++;
+    cancelScheduledAdjacentPreviewRender();
+    adjacentPreviewRenderKeys.prev = '';
+    adjacentPreviewRenderKeys.next = '';
     signatureData = null;
     editHistoryData = null;
 
