@@ -28,7 +28,7 @@ class RenderCache {
  public:
   static RenderCache& instance();
 
-  // Maximum cache size in bytes (default 128 MB).
+  // Maximum cache size in bytes (default 32 MB).
   void set_max_size(size_t bytes);
 
   // Current max size.
@@ -77,7 +77,7 @@ class RenderCache {
 
   LruList lru_;
   LruMap map_;
-  size_t max_size_{128 * 1024 * 1024};  // 128 MB default
+  size_t max_size_{32 * 1024 * 1024};  // 32 MB default
   size_t used_{0};
   mutable std::mutex mutex_;
 

@@ -35,7 +35,7 @@ struct RenderOptions {
   int jpeg_quality{90};
 
   // PNG compression level 0-9.
-  int png_compression{6};
+  int png_compression{1};
 
   // DPI scaling factor (72 = 1x, 144 = 2x, ...).
   float dpi{72.0f};

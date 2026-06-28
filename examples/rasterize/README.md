@@ -40,7 +40,7 @@ Options:
 - `-g, --grayscale`: Convert output to grayscale
 - `--format <name>`: `png`, `jpg`, `bmp`, or `tga`; default `png`
 - `--jpeg-quality <n>`: JPEG quality `1-100`, default `90`
-- `--png-compression <n>`: PNG compression `0-9`, default `6`
+- `--png-compression <n>`: PNG compression `0-9`, default `1`
 - `--verbose`: Print page details and render progress for dense pages
 - `--log-level <n>`: `0=none`, `1=error`, `2=warn`, `3=info`, `4=debug`, `5=trace`
 

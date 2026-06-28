@@ -21,7 +21,7 @@
 //   -g, --grayscale    Convert output to grayscale
 //   --format <name>    Output format: png, jpg, bmp, or tga
 //   --jpeg-quality <n> JPEG quality 1-100 (default: 90)
-//   --png-compression <n> PNG compression level 0-9 (default: 6)
+//   --png-compression <n> PNG compression level 0-9 (default: 1)
 //   --all              Render all pages (creates multiple PNG files)
 //   --verbose          Verbose output
 //   --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace
@@ -63,7 +63,7 @@ struct RasterizeOptions {
   bool grayscale = false;
   nanopdf::RenderOptions::Format output_format = nanopdf::RenderOptions::Format::PNG;
   int jpeg_quality = 90;
-  int png_compression = 6;
+  int png_compression = 1;
   bool list_backends = false;
   bool render_all_pages = false;
   bool verbose = false;
@@ -88,7 +88,7 @@ void print_usage(const char* program_name) {
   std::cout << "  -g, --grayscale    Convert output to grayscale\n";
   std::cout << "  --format <name>    Output format: png, jpg, bmp, or tga (default: png)\n";
   std::cout << "  --jpeg-quality <n> JPEG quality 1-100 (default: 90)\n";
-  std::cout << "  --png-compression <n> PNG compression level 0-9 (default: 6)\n";
+  std::cout << "  --png-compression <n> PNG compression level 0-9 (default: 1)\n";
   std::cout << "  --all              Render all pages (creates multiple PNG files)\n";
   std::cout << "  --verbose          Verbose output\n";
   std::cout << "  --log-level <n>    Log level: 0=none, 1=error, 2=warn, 3=info, 4=debug, 5=trace\n";

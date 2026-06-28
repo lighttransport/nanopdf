@@ -1583,12 +1583,23 @@ Result Picture::load_argb_owned(std::vector<uint32_t>&& pixels, uint32_t w,
   }
   width_ = w;
   height_ = h;
-  if (!premultiplied) {
-    opaque_ = pixels_are_opaque(pixels.data(), pixels.size());
-    pixels_ = std::move(pixels);
-    return Result::Success;
+  if (premultiplied) {
+    for (uint32_t& p : pixels) {
+      uint8_t a = static_cast<uint8_t>((p >> 24) & 0xff);
+      if (a > 0 && a < 255) {
+        uint32_t r = (p >> 16) & 0xff;
+        uint32_t g = (p >> 8) & 0xff;
+        uint32_t b = p & 0xff;
+        r = static_cast<uint8_t>(std::min<uint32_t>(255, (r * 255) / a));
+        g = static_cast<uint8_t>(std::min<uint32_t>(255, (g * 255) / a));
+        b = static_cast<uint8_t>(std::min<uint32_t>(255, (b * 255) / a));
+        p = (static_cast<uint32_t>(a) << 24) | (r << 16) | (g << 8) | b;
+      }
+    }
   }
-  return load(pixels.data(), w, h, ColorSpace::ARGB8888, true);
+  opaque_ = pixels_are_opaque(pixels.data(), pixels.size());
+  pixels_ = std::move(pixels);
+  return Result::Success;
 }
 
 Result Picture::transform(const Matrix& m) {

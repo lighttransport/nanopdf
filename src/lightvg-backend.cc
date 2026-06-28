@@ -21,11 +21,12 @@
 #include "font-unicode-map.hh"
 #include "shared-font-cache.hh"
 #include "render-cache.hh"
-#ifdef NANOPDF_USE_FPNGE
-#include "fpnge/fpnge_dispatch.hh"
-#endif
 #include "pdf-function.hh"
 #include "string-parse.hh"
+#ifndef MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#endif
+#include "miniz.h"
 
 #ifdef NANOPDF_EMBED_FONTS
 #include "embedded-fonts.hh"
@@ -44,7 +45,9 @@ extern "C" int stbi_write_png_compression_level;
 namespace nanopdf {
 
 static constexpr size_t kMaxCachedArgbImageBytes = 1 * 1024 * 1024;
+static constexpr size_t kIncrementalImageFlushBytes = 16 * 1024 * 1024;
 static constexpr uint64_t kMaxSoftMaskGroupPixels = 2ull * 1024ull * 1024ull;
+static constexpr float kImagePrescaleOversample = 2.0f;
 
 // Glyph anti-aliasing gamma table: pow(i/255, 1.4) for i in [0,255].
 // Tabulates the transcendental used on every glyph coverage sample; callers
@@ -1726,26 +1729,30 @@ bool LightVGBackend::begin_scene() {
   if (!scene_) {
     return false;
   }
+  root_scene_ = scene_;
 
   return true;
 }
 
-bool LightVGBackend::end_scene() {
+bool LightVGBackend::flush_scene(bool restart) {
   if (!initialized_ || !scene_) {
     return false;
   }
 
   // Hand the scene over to the canvas; canvas owns it from here.
+  lvg::Scene* submitted_scene = scene_;
   if (canvas_->add(scene_) != lvg::Result::Success) {
     scene_ = nullptr;
+    if (root_scene_ == submitted_scene) root_scene_ = nullptr;
     return false;
   }
   scene_ = nullptr;
+  if (root_scene_ == submitted_scene) root_scene_ = nullptr;
 
   // Draw the canvas. Opaque page backgrounds can pre-fill the target buffer
   // and skip LightVG's transparent clear pass.
   const bool clear_canvas = clear_canvas_on_draw_;
-  clear_canvas_on_draw_ = true;
+  clear_canvas_on_draw_ = false;
   canvas_->setOutputSwizzle(!direct_bgra_output_enabled_);
   if (canvas_->draw(clear_canvas) != lvg::Result::Success) {
     canvas_->setOutputSwizzle(true);
@@ -1761,7 +1768,21 @@ bool LightVGBackend::end_scene() {
     return false;
   }
 
+  if (restart) {
+    scene_ = lvg::Scene::gen();
+    if (!scene_) {
+      return false;
+    }
+    root_scene_ = scene_;
+  }
+
   return true;
+}
+
+bool LightVGBackend::end_scene() {
+  bool ok = flush_scene(false);
+  clear_canvas_on_draw_ = true;
+  return ok;
 }
 
 bool LightVGBackend::draw_rectangle(float x, float y, float width, float height,
@@ -3940,8 +3961,8 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
     draw_w_px = std::hypot(image_ctm->a, image_ctm->b) * state_.scale;
     draw_h_px = std::hypot(image_ctm->c, image_ctm->d) * state_.scale;
   }
-  int prescale_w = static_cast<int>(std::ceil(draw_w_px * 2.0f));
-  int prescale_h = static_cast<int>(std::ceil(draw_h_px * 2.0f));
+  int prescale_w = static_cast<int>(std::ceil(draw_w_px * kImagePrescaleOversample));
+  int prescale_h = static_cast<int>(std::ceil(draw_h_px * kImagePrescaleOversample));
   prescale_w = std::max(1, std::min(prescale_w, img_width));
   prescale_h = std::max(1, std::min(prescale_h, img_height));
   bool should_prescale =
@@ -4434,9 +4455,9 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   }
 
   lvg::Result result = lvg::Result::Unknown;
-  if (!retain_converted_argb && !pixels_are_premultiplied) {
+  if (!retain_converted_argb) {
     result = picture->load_argb_owned(std::move(argb_data), img_width, img_height,
-                                      false);
+                                      pixels_are_premultiplied);
   } else {
     result = picture->load(argb_data.data(), img_width, img_height,
                            lvg::ColorSpace::ARGB8888, pixels_are_premultiplied);
@@ -4529,6 +4550,17 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   apply_soft_mask_opacity(picture);
   auto push_result = scene_->add(picture);
   NANOPDF_LOG_DEBUG("LightVG", "draw_image: pushed to scene, result=%d", static_cast<int>(push_result));
+  if (push_result != lvg::Result::Success) {
+    return false;
+  }
+
+  const size_t picture_bytes =
+      static_cast<size_t>(img_width) * static_cast<size_t>(img_height) *
+      sizeof(uint32_t);
+  if (!rendering_soft_mask_group_ && scene_ == root_scene_ &&
+      picture_bytes >= kIncrementalImageFlushBytes) {
+    return flush_scene(true);
+  }
 
   return true;
 }
@@ -7431,31 +7463,11 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
   int gh = entry->height;
   size_t npixels = static_cast<size_t>(gw) * gh;
 
-  // Try render cache for pre-colored ARGB — skips per-pixel fill on hit.
-  std::string glyph_cache_key;
-  bool glyph_cached = false;
-  glyph_cache_key = "glyph:" + current_font_name_ + ":" +
-                    std::to_string(glyph_index) + ":" +
-                    std::to_string(size_q) + ":" +
-                    (enable_lcd_ ? "1" : "0") + ":" +
-                    std::to_string(r) + ":" +
-                    std::to_string(g) + ":" +
-                    std::to_string(b) + ":" +
-                    std::to_string(a);
-  {
-    RenderCacheEntry gce;
-    if (RenderCache::instance().find(glyph_cache_key, gce) &&
-        gce.width == static_cast<uint32_t>(gw) &&
-        gce.height == static_cast<uint32_t>(gh)) {
-      glyph_argb_buf_.resize(npixels);
-      memcpy(glyph_argb_buf_.data(), gce.data.data(), npixels * sizeof(uint32_t));
-      glyph_cached = true;
-    }
-  }
-  if (!glyph_cached) {
-    // Reuse pre-allocated buffer to avoid per-glyph heap allocation.
-    glyph_argb_buf_.resize(npixels);
-    if (entry->is_lcd) {
+  // Reuse pre-allocated buffer to avoid per-glyph heap allocation. The glyph
+  // coverage bitmap is cached separately; caching the colorized ARGB copy too
+  // costs memory and mutex traffic for little benefit on text-heavy pages.
+  glyph_argb_buf_.resize(npixels);
+  if (entry->is_lcd) {
     // LCD subpixel: per-channel alpha (3 bytes/pixel, gamma-corrected)
     for (int i = 0; i < gw * gh; i++) {
       const uint8_t* pc = &entry->bitmap[i * 3];
@@ -7485,16 +7497,6 @@ bool LightVGBackend::draw_glyph_bitmap_by_index(int glyph_index, float x,
           (static_cast<uint32_t>(r) << 16) |
           (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
     }
-  }
-
-    // Store colored ARGB in render cache for future same-color hits.
-    size_t argb_bytes = glyph_argb_buf_.size() * sizeof(uint32_t);
-    RenderCacheEntry gce_out;
-    gce_out.width = static_cast<uint32_t>(gw);
-    gce_out.height = static_cast<uint32_t>(gh);
-    gce_out.data.resize(argb_bytes);
-    memcpy(gce_out.data.data(), glyph_argb_buf_.data(), argb_bytes);
-    RenderCache::instance().store(glyph_cache_key, std::move(gce_out));
   }
 
   // Create LightVG Picture and position it. Picture copies the input pixels.
@@ -7609,6 +7611,100 @@ bool LightVGBackend::save_to_png(const std::string& filename) {
   return save_to_file(filename, options);
 }
 
+static void write_be32(std::ofstream& out, uint32_t v) {
+  uint8_t b[4] = {
+      static_cast<uint8_t>((v >> 24) & 0xff),
+      static_cast<uint8_t>((v >> 16) & 0xff),
+      static_cast<uint8_t>((v >> 8) & 0xff),
+      static_cast<uint8_t>(v & 0xff)};
+  out.write(reinterpret_cast<const char*>(b), sizeof(b));
+}
+
+static bool write_png_chunk(std::ofstream& out, const char type[4],
+                            const uint8_t* data, size_t size) {
+  if (size > 0xffffffffu) return false;
+  write_be32(out, static_cast<uint32_t>(size));
+  out.write(type, 4);
+  if (size > 0) {
+    out.write(reinterpret_cast<const char*>(data),
+              static_cast<std::streamsize>(size));
+  }
+  mz_ulong crc = mz_crc32(MZ_CRC32_INIT, nullptr, 0);
+  crc = mz_crc32(crc, reinterpret_cast<const unsigned char*>(type), 4);
+  if (size > 0) crc = mz_crc32(crc, data, static_cast<mz_uint>(size));
+  write_be32(out, static_cast<uint32_t>(crc));
+  return static_cast<bool>(out);
+}
+
+template <typename FillRow>
+static bool write_png_rgba_stream(const std::string& filename, int width,
+                                  int height, int compression_level,
+                                  FillRow fill_row) {
+  if (width <= 0 || height <= 0) return false;
+  std::ofstream out(filename, std::ios::binary);
+  if (!out) return false;
+
+  static constexpr uint8_t kPngSig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+  out.write(reinterpret_cast<const char*>(kPngSig), sizeof(kPngSig));
+
+  uint8_t ihdr[13] = {};
+  ihdr[0] = static_cast<uint8_t>((width >> 24) & 0xff);
+  ihdr[1] = static_cast<uint8_t>((width >> 16) & 0xff);
+  ihdr[2] = static_cast<uint8_t>((width >> 8) & 0xff);
+  ihdr[3] = static_cast<uint8_t>(width & 0xff);
+  ihdr[4] = static_cast<uint8_t>((height >> 24) & 0xff);
+  ihdr[5] = static_cast<uint8_t>((height >> 16) & 0xff);
+  ihdr[6] = static_cast<uint8_t>((height >> 8) & 0xff);
+  ihdr[7] = static_cast<uint8_t>(height & 0xff);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // RGBA
+  if (!write_png_chunk(out, "IHDR", ihdr, sizeof(ihdr))) return false;
+
+  int level = std::max(0, std::min(9, compression_level));
+  mz_stream zs{};
+  if (mz_deflateInit(&zs, level) != MZ_OK) return false;
+
+  std::vector<uint8_t> row(static_cast<size_t>(width) * 4 + 1);
+  std::vector<uint8_t> zbuf(64 * 1024);
+  bool ok = true;
+  auto pump = [&](int flush) -> int {
+    do {
+      zs.next_out = zbuf.data();
+      zs.avail_out = static_cast<unsigned int>(zbuf.size());
+      int ret = mz_deflate(&zs, flush);
+      if (ret != MZ_OK && ret != MZ_STREAM_END) {
+        ok = false;
+        return ret;
+      }
+      size_t produced = zbuf.size() - zs.avail_out;
+      if (produced > 0 &&
+          !write_png_chunk(out, "IDAT", zbuf.data(), produced)) {
+        ok = false;
+        return MZ_STREAM_ERROR;
+      }
+      if (ret == MZ_STREAM_END) return ret;
+    } while (zs.avail_out == 0);
+    return MZ_OK;
+  };
+
+  for (int y = 0; ok && y < height; ++y) {
+    row[0] = 0;  // PNG filter type: None
+    fill_row(y, row.data() + 1);
+    zs.next_in = row.data();
+    zs.avail_in = static_cast<unsigned int>(row.size());
+    while (ok && zs.avail_in > 0) {
+      pump(MZ_NO_FLUSH);
+    }
+  }
+  while (ok) {
+    int ret = pump(MZ_FINISH);
+    if (ret == MZ_STREAM_END) break;
+  }
+  mz_deflateEnd(&zs);
+  if (!ok) return false;
+  return write_png_chunk(out, "IEND", nullptr, 0);
+}
+
 static bool save_rgba_pixels_to_file(const std::string& filename,
                                      const uint8_t* pixels,
                                      int width,
@@ -7620,24 +7716,14 @@ static bool save_rgba_pixels_to_file(const std::string& filename,
   int stride = width * 4;
   switch (options.format) {
     case RenderOptions::Format::PNG: {
-#ifdef NANOPDF_USE_FPNGE
-      if (nanopdf::fpnge_available()) {
-        std::vector<uint8_t> png_bytes;
-        if (nanopdf::fpnge_encode_png(pixels, width, height, /*channels=*/4,
-                                      stride, options.png_compression,
-                                      png_bytes)) {
-          std::ofstream out(filename, std::ios::binary);
-          if (out.write(reinterpret_cast<const char*>(png_bytes.data()),
-                        static_cast<std::streamsize>(png_bytes.size()))) {
-            ret = 1;
-            break;
-          }
-        }
-      }
-#endif
-      stbi_write_png_compression_level = options.png_compression;
-      ret = stbi_write_png(filename.c_str(), width, height, 4,
-                           pixels, stride);
+      ret = write_png_rgba_stream(
+                filename, width, height, options.png_compression,
+                [&](int y, uint8_t* row) {
+                  std::memcpy(row, pixels + static_cast<size_t>(y) * stride,
+                              static_cast<size_t>(stride));
+                })
+                ? 1
+                : 0;
       break;
     }
     case RenderOptions::Format::JPEG: {
@@ -7755,6 +7841,36 @@ bool LightVGBackend::save_to_file_rotated(const std::string& filename,
   if (!result.success || result.pixels.empty()) return false;
   const uint8_t* src = result.pixels.data();
 #endif
+
+  if (options.format == RenderOptions::Format::PNG) {
+    const int dst_w = (rotation == 90 || rotation == 270) ? src_h : src_w;
+    const int dst_h = (rotation == 90 || rotation == 270) ? src_w : src_h;
+    return write_png_rgba_stream(
+        filename, dst_w, dst_h, options.png_compression,
+        [&](int dy, uint8_t* row) {
+          for (int dx = 0; dx < dst_w; ++dx) {
+            int sx = dx;
+            int sy = dy;
+            if (rotation == 90) {
+              sx = dy;
+              sy = dst_w - 1 - dx;
+            } else if (rotation == 180) {
+              sx = src_w - 1 - dx;
+              sy = src_h - 1 - dy;
+            } else {
+              sx = src_w - 1 - dy;
+              sy = dx;
+            }
+            const uint8_t* sp =
+                src + (static_cast<size_t>(sy) * src_w + sx) * 4;
+            uint8_t* dp = row + static_cast<size_t>(dx) * 4;
+            dp[0] = sp[0];
+            dp[1] = sp[1];
+            dp[2] = sp[2];
+            dp[3] = sp[3];
+          }
+        });
+  }
 
   int dst_w = 0;
   int dst_h = 0;

@@ -47,6 +47,16 @@ void RenderCache::store(const std::string& key, RenderCacheEntry&& entry) {
 
   std::lock_guard<std::mutex> lock(mutex_);
 
+  if (entry_bytes > max_size_) {
+    auto it = map_.find(key);
+    if (it != map_.end()) {
+      used_ -= it->second->approx_bytes;
+      lru_.erase(it->second);
+      map_.erase(it);
+    }
+    return;
+  }
+
   // If key already exists, remove old entry
   auto it = map_.find(key);
   if (it != map_.end()) {

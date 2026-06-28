@@ -418,6 +418,7 @@ private:
                       uint32_t percent_step);
   void advance_progress(size_t processed_objects = 1);
   void finish_progress();
+  bool flush_scene(bool restart);
   static size_t count_render_objects(const std::vector<uint8_t>& content_data);
 
   struct RenderProgressState {
@@ -437,6 +438,7 @@ private:
 
   lvg::SwCanvas* canvas_{nullptr};
   lvg::Scene* scene_{nullptr};
+  lvg::Scene* root_scene_{nullptr};
   std::vector<uint32_t> buffer_;
   uint32_t width_{0};
   uint32_t height_{0};
