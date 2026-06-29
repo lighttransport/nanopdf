@@ -4703,6 +4703,565 @@ bool LightVGBackend::draw_image(const ImageXObject& image, float x, float y, flo
   return true;
 }
 
+bool LightVGBackend::image_can_prepare_off_thread(const ImageXObject& image) const {
+  if (image.data.empty() || image.width <= 0 || image.height <= 0) return false;
+  if (image.image_mask) return false;
+  if (image.soft_mask.type != Value::UNDEFINED &&
+      image.soft_mask.type != Value::NULL_OBJ && !current_pdf_) {
+    return false;
+  }
+
+  switch (image.color_space.type) {
+    case ColorSpaceType::CacheARGB:
+    case ColorSpaceType::DeviceGray:
+    case ColorSpaceType::CalGray:
+    case ColorSpaceType::DeviceRGB:
+    case ColorSpaceType::CalRGB:
+    case ColorSpaceType::DeviceCMYK:
+      return image.bits_per_component == 8 ||
+             (image.bits_per_component == 1 &&
+              (image.color_space.type == ColorSpaceType::DeviceGray ||
+               image.color_space.type == ColorSpaceType::CalGray));
+    default:
+      return false;
+  }
+}
+
+bool LightVGBackend::prepare_image_pixels(
+    const ImageXObject& image, const GraphicsState& draw_state, float width,
+    float height, const GraphicsState::Matrix* image_ctm, uint8_t fill_r,
+    uint8_t fill_g, uint8_t fill_b, bool retain_converted_argb,
+    PreparedImage& out) const {
+  (void)fill_r;
+  (void)fill_g;
+  (void)fill_b;
+
+  if (!image_can_prepare_off_thread(image)) return false;
+
+  int img_width = image.width;
+  int img_height = image.height;
+  if (img_width <= 0 || img_height <= 0) return false;
+
+  out = PreparedImage{};
+  out.width = img_width;
+  out.height = img_height;
+
+  float draw_w_px = std::abs(width) * draw_state.scale;
+  float draw_h_px = std::abs(height) * draw_state.scale;
+  if (image_ctm) {
+    draw_w_px = std::hypot(image_ctm->a, image_ctm->b) * draw_state.scale;
+    draw_h_px = std::hypot(image_ctm->c, image_ctm->d) * draw_state.scale;
+  }
+  int prescale_w =
+      static_cast<int>(std::ceil(draw_w_px * kImagePrescaleOversample));
+  int prescale_h =
+      static_cast<int>(std::ceil(draw_h_px * kImagePrescaleOversample));
+  prescale_w = std::max(1, std::min(prescale_w, img_width));
+  prescale_h = std::max(1, std::min(prescale_h, img_height));
+
+  bool handled_image_soft_mask = false;
+  if (image.color_space.type == ColorSpaceType::CacheARGB) {
+    out.argb.resize(static_cast<size_t>(img_width) * img_height);
+    memcpy(out.argb.data(), image.data.data(), out.argb.size() * sizeof(uint32_t));
+    out.from_argb_cache = true;
+  } else {
+    int num_components = 3;
+    ColorSpaceType cs_type = image.color_space.type;
+    if (cs_type == ColorSpaceType::DeviceGray ||
+        cs_type == ColorSpaceType::CalGray) {
+      num_components = 1;
+    } else if (cs_type == ColorSpaceType::DeviceCMYK) {
+      num_components = 4;
+    }
+
+    bool converted_direct = false;
+    bool should_prescale =
+        num_components == 3 && image.bits_per_component == 8 &&
+        prescale_w * 2 <= img_width && prescale_h * 2 <= img_height &&
+        image.data.size() >= static_cast<size_t>(img_width) *
+                                 static_cast<size_t>(img_height) * 3;
+    if (should_prescale) {
+      ImageXObject smask_img;
+      bool has_smask = false;
+      bool smask_supported = true;
+      if (current_pdf_ && image.soft_mask.type != Value::UNDEFINED &&
+          image.soft_mask.type != Value::NULL_OBJ) {
+        Value smask_val = image.soft_mask;
+        uint32_t sm_obj = smask_val.ref_object_number;
+        uint16_t sm_gen = smask_val.ref_generation_number;
+        if (smask_val.type == Value::REFERENCE) {
+          auto resolved = resolve_reference(*current_pdf_, sm_obj, sm_gen);
+          if (resolved.success) smask_val = resolved.value;
+        }
+        if (smask_val.type == Value::STREAM) {
+          ImageParseOptions smask_options;
+          smask_options.keep_raw_data = false;
+          smask_options.cache_decoded_stream = false;
+          smask_img = parse_image_xobject(*current_pdf_, smask_val, sm_obj,
+                                          sm_gen, smask_options);
+          has_smask = !smask_img.data.empty() && smask_img.width > 0 &&
+                      smask_img.height > 0;
+          smask_supported = has_smask &&
+              (smask_img.bits_per_component == 8 ||
+               smask_img.bits_per_component == 1);
+        }
+      }
+      if (smask_supported) {
+        out.argb.resize(static_cast<size_t>(prescale_w) *
+                        static_cast<size_t>(prescale_h));
+        const bool sm8 = has_smask && smask_img.bits_per_component == 8;
+        const int sw = has_smask ? smask_img.width : 0;
+        const int sh = has_smask ? smask_img.height : 0;
+        const int mask_stride = (has_smask && !sm8) ? (sw + 7) / 8 : 0;
+        parallel_for_rows(prescale_h,
+                          static_cast<long long>(img_width) * img_height,
+                          [&](int y_begin, int y_end) {
+        for (int y = y_begin; y < y_end; ++y) {
+          int ys0 = static_cast<int>(
+              static_cast<int64_t>(y) * img_height / prescale_h);
+          int ys1 = static_cast<int>(
+              static_cast<int64_t>(y + 1) * img_height / prescale_h);
+          if (ys1 <= ys0) ys1 = ys0 + 1;
+          if (ys1 > img_height) ys1 = img_height;
+          uint32_t* dst_row =
+              out.argb.data() + static_cast<size_t>(y) * prescale_w;
+          for (int x = 0; x < prescale_w; ++x) {
+            int xs0 = static_cast<int>(
+                static_cast<int64_t>(x) * img_width / prescale_w);
+            int xs1 = static_cast<int>(
+                static_cast<int64_t>(x + 1) * img_width / prescale_w);
+            if (xs1 <= xs0) xs1 = xs0 + 1;
+            if (xs1 > img_width) xs1 = img_width;
+            uint32_t rs = 0, gs = 0, bs = 0, cnt = 0;
+            for (int yy = ys0; yy < ys1; ++yy) {
+              const uint8_t* row =
+                  image.data.data() + static_cast<size_t>(yy) * img_width * 3;
+              for (int xx = xs0; xx < xs1; ++xx) {
+                const uint8_t* p = row + static_cast<size_t>(xx) * 3;
+                rs += p[0];
+                gs += p[1];
+                bs += p[2];
+                ++cnt;
+              }
+            }
+            uint32_t r = rs / cnt;
+            uint32_t g = gs / cnt;
+            uint32_t b = bs / cnt;
+            uint32_t a = 255;
+            if (has_smask) {
+              if (sm8) {
+                int mys0 = static_cast<int>(
+                    static_cast<int64_t>(y) * sh / prescale_h);
+                int mys1 = static_cast<int>(
+                    static_cast<int64_t>(y + 1) * sh / prescale_h);
+                if (mys1 <= mys0) mys1 = mys0 + 1;
+                if (mys1 > sh) mys1 = sh;
+                int mxs0 = static_cast<int>(
+                    static_cast<int64_t>(x) * sw / prescale_w);
+                int mxs1 = static_cast<int>(
+                    static_cast<int64_t>(x + 1) * sw / prescale_w);
+                if (mxs1 <= mxs0) mxs1 = mxs0 + 1;
+                if (mxs1 > sw) mxs1 = sw;
+                uint32_t as = 0, acnt = 0;
+                for (int yy = mys0; yy < mys1; ++yy) {
+                  const uint8_t* mr =
+                      smask_img.data.data() + static_cast<size_t>(yy) * sw;
+                  for (int xx = mxs0; xx < mxs1; ++xx) {
+                    as += mr[xx];
+                    ++acnt;
+                  }
+                }
+                a = acnt ? (as / acnt) : 255;
+              } else {
+                int mcx = static_cast<int>(
+                    static_cast<int64_t>((xs0 + xs1) / 2) * sw / img_width);
+                int mcy = static_cast<int>(
+                    static_cast<int64_t>((ys0 + ys1) / 2) * sh / img_height);
+                mcx = std::min(sw - 1, std::max(0, mcx));
+                mcy = std::min(sh - 1, std::max(0, mcy));
+                size_t bi = static_cast<size_t>(mcy) * mask_stride + (mcx / 8);
+                if (bi < smask_img.data.size()) {
+                  a = ((smask_img.data[bi] >> (7 - (mcx % 8))) & 1u) ? 255u
+                                                                      : 0u;
+                }
+              }
+              r = (r * a + 127) / 255;
+              g = (g * a + 127) / 255;
+              b = (b * a + 127) / 255;
+            }
+            dst_row[x] = (a << 24) | (r << 16) | (g << 8) | b;
+          }
+        }
+        });
+        out.width = prescale_w;
+        out.height = prescale_h;
+        out.premultiplied = has_smask;
+        handled_image_soft_mask = has_smask;
+        converted_direct = true;
+        retain_converted_argb = false;
+      }
+    }
+
+    if (!converted_direct) {
+      out.argb.resize(static_cast<size_t>(img_width) * img_height);
+      if (num_components == 1) {
+        if (image.bits_per_component == 1) {
+          int stride = (img_width + 7) / 8;
+          for (int row = 0; row < img_height; row++) {
+            for (int col = 0; col < img_width; col++) {
+              int byte_idx = row * stride + col / 8;
+              int bit_idx = 7 - (col % 8);
+              if (byte_idx < static_cast<int>(image.data.size())) {
+                bool bit_set = (image.data[byte_idx] >> bit_idx) & 1;
+                uint8_t gray = bit_set ? 0xff : 0x00;
+                out.argb[static_cast<size_t>(row) * img_width + col] =
+                    (0xffu << 24) | (gray << 16) | (gray << 8) | gray;
+              }
+            }
+          }
+        } else {
+          int n = std::min(img_width * img_height,
+                           static_cast<int>(image.data.size()));
+          for (int i = 0; i < n; i++) {
+            uint8_t gray = image.data[i];
+            out.argb[i] = (0xffu << 24) | (gray << 16) | (gray << 8) | gray;
+          }
+        }
+      } else if (num_components == 3) {
+        if (image.data.size() < static_cast<size_t>(img_width) *
+                                    static_cast<size_t>(img_height) * 3) {
+          return false;
+        }
+        for (int i = 0; i < img_width * img_height; i++) {
+          const uint8_t* p = image.data.data() + static_cast<size_t>(i) * 3;
+          out.argb[i] =
+              (0xffu << 24) | (static_cast<uint32_t>(p[0]) << 16) |
+              (static_cast<uint32_t>(p[1]) << 8) | p[2];
+        }
+      } else if (num_components == 4) {
+        if (image.data.size() < static_cast<size_t>(img_width) *
+                                    static_cast<size_t>(img_height) * 4) {
+          return false;
+        }
+        for (int i = 0; i < img_width * img_height; i++) {
+          const uint8_t* p = image.data.data() + static_cast<size_t>(i) * 4;
+          uint8_t r, g, b;
+          cmyk_to_rgb(p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f,
+                      p[3] / 255.0f, r, g, b);
+          out.argb[i] = (0xffu << 24) | (static_cast<uint32_t>(r) << 16) |
+                        (static_cast<uint32_t>(g) << 8) | b;
+        }
+      }
+    }
+  }
+
+  if (!handled_image_soft_mask &&
+      current_pdf_ && image.soft_mask.type != Value::UNDEFINED &&
+      image.soft_mask.type != Value::NULL_OBJ) {
+    Value smask_val = image.soft_mask;
+    uint32_t sm_obj = smask_val.ref_object_number;
+    uint16_t sm_gen = smask_val.ref_generation_number;
+    if (smask_val.type == Value::REFERENCE) {
+      auto resolved = resolve_reference(*current_pdf_, sm_obj, sm_gen);
+      if (resolved.success) smask_val = resolved.value;
+    }
+    if (smask_val.type == Value::STREAM) {
+      ImageParseOptions smask_options;
+      smask_options.keep_raw_data = false;
+      smask_options.cache_decoded_stream = false;
+      ImageXObject smask_img =
+          parse_image_xobject(*current_pdf_, smask_val, sm_obj, sm_gen,
+                              smask_options);
+      if (!smask_img.data.empty() && smask_img.width > 0 &&
+          smask_img.height > 0) {
+        int sw = smask_img.width;
+        int sh = smask_img.height;
+        auto premult_pixel = [](uint32_t& argb, uint32_t alpha) {
+          uint32_t r = (argb >> 16) & 0xff;
+          uint32_t g = (argb >> 8) & 0xff;
+          uint32_t b = argb & 0xff;
+          r = (r * alpha + 127) / 255;
+          g = (g * alpha + 127) / 255;
+          b = (b * alpha + 127) / 255;
+          argb = (alpha << 24) | (r << 16) | (g << 8) | b;
+        };
+        if (smask_img.bits_per_component == 8) {
+          out.premultiplied = true;
+          for (int py = 0; py < out.height; ++py) {
+            int sy = (py * sh) / out.height;
+            for (int px = 0; px < out.width; ++px) {
+              int sx = (px * sw) / out.width;
+              size_t si = static_cast<size_t>(sy) * sw + sx;
+              if (si < smask_img.data.size()) {
+                premult_pixel(out.argb[static_cast<size_t>(py) * out.width + px],
+                              smask_img.data[si]);
+              }
+            }
+          }
+        } else if (smask_img.bits_per_component == 1) {
+          out.premultiplied = true;
+          int stride = (sw + 7) / 8;
+          for (int py = 0; py < out.height; ++py) {
+            int sy = (py * sh) / out.height;
+            for (int px = 0; px < out.width; ++px) {
+              int sx = (px * sw) / out.width;
+              size_t bi = static_cast<size_t>(sy) * stride + (sx / 8);
+              if (bi < smask_img.data.size()) {
+                uint8_t bit = (smask_img.data[bi] >> (7 - (sx % 8))) & 1u;
+                premult_pixel(out.argb[static_cast<size_t>(py) * out.width + px],
+                              bit ? 0xffu : 0x00u);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!out.argb.empty()) {
+    int target_w = std::max(1, std::min(prescale_w, out.width));
+    int target_h = std::max(1, std::min(prescale_h, out.height));
+    if (target_w * 2 <= out.width && target_h * 2 <= out.height) {
+      downsample_argb_bilinear(out.argb, out.width, out.height,
+                               target_w, target_h);
+      out.width = target_w;
+      out.height = target_h;
+      retain_converted_argb = false;
+      out.from_argb_cache = false;
+    }
+  }
+
+  if (!retain_converted_argb) {
+    out.from_argb_cache = out.from_argb_cache && image.color_space.type == ColorSpaceType::CacheARGB;
+  }
+  return !out.argb.empty() && out.width > 0 && out.height > 0;
+}
+
+bool LightVGBackend::submit_prepared_image(
+    PreparedImage&& prepared, bool interpolate, const GraphicsState& draw_state,
+    float x, float y, float width, float height,
+    const GraphicsState::Matrix* image_ctm, bool retain_converted_argb) {
+  if (!scene_ || prepared.argb.empty() || prepared.width <= 0 ||
+      prepared.height <= 0) {
+    return false;
+  }
+
+  last_image_argb_.clear();
+
+  auto picture = lvg::Picture::gen();
+  if (!picture) return false;
+
+  lvg::Result result = lvg::Result::Unknown;
+  if (!retain_converted_argb) {
+    result = picture->load_argb_owned(std::move(prepared.argb),
+                                      prepared.width, prepared.height,
+                                      prepared.premultiplied);
+  } else {
+    result = picture->load(prepared.argb.data(), prepared.width, prepared.height,
+                           lvg::ColorSpace::ARGB8888,
+                           prepared.premultiplied);
+  }
+  if (result != lvg::Result::Success) {
+    picture->unref();
+    return false;
+  }
+
+  if (retain_converted_argb && !prepared.from_argb_cache) {
+    last_image_argb_ = std::move(prepared.argb);
+  }
+  picture->interpolate(interpolate);
+
+  lvg::Matrix m;
+  if (image_ctm) {
+    float inv_w = 1.0f / static_cast<float>(prepared.width);
+    float inv_h = 1.0f / static_cast<float>(prepared.height);
+    m.e11 = image_ctm->a * inv_w * draw_state.scale;
+    m.e12 = -image_ctm->c * inv_h * draw_state.scale;
+    m.e13 = (image_ctm->c + image_ctm->e) * draw_state.scale;
+    m.e21 = -image_ctm->b * inv_w * draw_state.scale;
+    m.e22 = image_ctm->d * inv_h * draw_state.scale;
+    m.e23 = (draw_state.page_height - image_ctm->d - image_ctm->f) *
+            draw_state.scale;
+  } else {
+    float scale_x = width / prepared.width;
+    float scale_y = height / prepared.height;
+    float canvas_x = x * draw_state.scale;
+    float canvas_y = (draw_state.page_height - y - height) * draw_state.scale;
+    m.e11 = scale_x * draw_state.scale;
+    m.e12 = 0.0f;
+    m.e13 = canvas_x;
+    m.e21 = 0.0f;
+    m.e22 = scale_y * draw_state.scale;
+    m.e23 = canvas_y;
+  }
+  m.e31 = 0.0f;
+  m.e32 = 0.0f;
+  m.e33 = 1.0f;
+  picture->transform(m);
+
+  if (draw_state.blend_mode != 0) {
+    picture->blend(static_cast<lvg::BlendMethod>(draw_state.blend_mode));
+  }
+  if (draw_state.fill_opacity < 1.0f) {
+    float opacity = std::max(0.0f, std::min(1.0f, draw_state.fill_opacity));
+    picture->opacity(static_cast<uint8_t>(opacity * 255.0f + 0.5f));
+  }
+  if (draw_state.has_clip && !draw_state.clip_commands.empty()) {
+    auto clipper = lvg::Shape::gen();
+    if (clipper) {
+      append_shape_geometry(clipper, draw_state.clip_commands,
+                            draw_state.clip_points);
+      clipper->fillRule(draw_state.clip_even_odd ? lvg::FillRule::EvenOdd
+                                                 : lvg::FillRule::NonZero);
+      if (picture->clip(clipper) != lvg::Result::Success) {
+        clipper->unref();
+      }
+    }
+  }
+
+  GraphicsState saved_state = state_;
+  state_ = draw_state;
+  apply_soft_mask_opacity(picture);
+  state_ = saved_state;
+
+  auto push_result = scene_->add(picture);
+  if (push_result != lvg::Result::Success) return false;
+
+  const size_t picture_bytes =
+      static_cast<size_t>(prepared.width) * static_cast<size_t>(prepared.height) *
+      sizeof(uint32_t);
+  if (!rendering_soft_mask_group_ && scene_ == root_scene_ &&
+      picture_bytes >= kIncrementalImageFlushBytes) {
+    return flush_scene(true);
+  }
+  return true;
+}
+
+void LightVGBackend::defer_or_draw_image(DeferredImageDraw&& draw) {
+  if (!draw.image || !image_can_prepare_off_thread(*draw.image) ||
+      rendering_soft_mask_group_) {
+    flush_deferred_images();
+    if (draw.image) {
+      draw_image(*draw.image, draw.x, draw.y, draw.width, draw.height,
+               draw.fill_r, draw.fill_g, draw.fill_b,
+               draw.has_image_ctm ? &draw.image_ctm : nullptr,
+               draw.retain_converted_argb);
+    }
+    return;
+  }
+  deferred_images_.push_back(std::move(draw));
+}
+
+bool LightVGBackend::flush_deferred_images() {
+  if (deferred_images_.empty()) return true;
+
+  std::vector<DeferredImageDraw> draws;
+  draws.swap(deferred_images_);
+  if (draws.size() == 1) {
+    const auto& d = draws[0];
+    GraphicsState saved_state = state_;
+    state_ = d.state;
+    bool ok = d.image && draw_image(*d.image, d.x, d.y, d.width, d.height,
+                         d.fill_r, d.fill_g, d.fill_b,
+                         d.has_image_ctm ? &d.image_ctm : nullptr,
+                         d.retain_converted_argb);
+    if (ok && d.cache_converted_argb && !last_image_argb_.empty()) {
+      size_t n = static_cast<size_t>(d.original_width) *
+                 static_cast<size_t>(d.original_height);
+      if (last_image_argb_.size() == n) {
+        RenderCacheEntry entry;
+        entry.width = static_cast<uint32_t>(d.original_width);
+        entry.height = static_cast<uint32_t>(d.original_height);
+        entry.data.resize(n * sizeof(uint32_t));
+        memcpy(entry.data.data(), last_image_argb_.data(), n * sizeof(uint32_t));
+        RenderCache::instance().store(d.cache_key, std::move(entry));
+      }
+      last_image_argb_.clear();
+    }
+    state_ = saved_state;
+    return ok;
+  }
+  std::vector<PreparedImage> prepared(draws.size());
+  std::vector<uint8_t> ok(draws.size(), 0);
+
+#if NANOPDF_LIGHTVG_HAS_THREADS
+  if (draws.size() >= 2) {
+    std::atomic<size_t> next{0};
+    unsigned hw = std::thread::hardware_concurrency();
+    unsigned nthreads = std::min<unsigned>(hw ? hw : 4,
+                                           static_cast<unsigned>(draws.size()));
+    std::vector<std::thread> pool;
+    pool.reserve(nthreads);
+    for (unsigned t = 0; t < nthreads; ++t) {
+      pool.emplace_back([&]() {
+        size_t i;
+        while ((i = next.fetch_add(1)) < draws.size()) {
+          const auto& d = draws[i];
+          ok[i] = prepare_image_pixels(
+                      *d.image, d.state, d.width, d.height,
+                      d.has_image_ctm ? &d.image_ctm : nullptr,
+                      d.fill_r, d.fill_g, d.fill_b, d.retain_converted_argb,
+                      prepared[i])
+                      ? 1
+                      : 0;
+        }
+      });
+    }
+    for (auto& th : pool) th.join();
+  } else
+#endif
+  {
+    for (size_t i = 0; i < draws.size(); ++i) {
+      const auto& d = draws[i];
+      ok[i] = prepare_image_pixels(
+                  *d.image, d.state, d.width, d.height,
+                  d.has_image_ctm ? &d.image_ctm : nullptr,
+                  d.fill_r, d.fill_g, d.fill_b, d.retain_converted_argb,
+                  prepared[i])
+                  ? 1
+                  : 0;
+    }
+  }
+
+  bool all_ok = true;
+  for (size_t i = 0; i < draws.size(); ++i) {
+    const auto& d = draws[i];
+    bool submitted = false;
+    if (ok[i]) {
+      submitted = submit_prepared_image(
+          std::move(prepared[i]), d.image->interpolate, d.state, d.x, d.y,
+          d.width, d.height, d.has_image_ctm ? &d.image_ctm : nullptr,
+          d.retain_converted_argb);
+      if (submitted && d.cache_converted_argb && !last_image_argb_.empty()) {
+        size_t n = static_cast<size_t>(d.original_width) *
+                   static_cast<size_t>(d.original_height);
+        if (last_image_argb_.size() == n) {
+          RenderCacheEntry entry;
+          entry.width = static_cast<uint32_t>(d.original_width);
+          entry.height = static_cast<uint32_t>(d.original_height);
+          entry.data.resize(n * sizeof(uint32_t));
+          memcpy(entry.data.data(), last_image_argb_.data(), n * sizeof(uint32_t));
+          RenderCache::instance().store(d.cache_key, std::move(entry));
+        }
+        last_image_argb_.clear();
+      }
+    }
+    if (!submitted) {
+      GraphicsState saved_state = state_;
+      state_ = d.state;
+      if (!d.image ||
+          !draw_image(*d.image, d.x, d.y, d.width, d.height,
+                      d.fill_r, d.fill_g, d.fill_b,
+                      d.has_image_ctm ? &d.image_ctm : nullptr,
+                      d.retain_converted_argb)) {
+        all_ok = false;
+      }
+      state_ = saved_state;
+    }
+  }
+  return all_ok;
+}
+
 // Helper function to extract color stops from a PDF function
 // Returns color stops for gradient fills. Uses cache when available.
 // Convert a PDF function output array to RGB bytes. Handles 1-component
@@ -8217,7 +8776,8 @@ void LightVGBackend::predecode_page_images(const Pdf& pdf, const Page& page) {
     if (results[i].width > 0 && results[i].height > 0 &&
         !results[i].data.empty()) {
       uint64_t key = (static_cast<uint64_t>(refs[i].first) << 16) | refs[i].second;
-      predecoded_images_.emplace(key, std::move(results[i]));
+      predecoded_images_.emplace(
+          key, std::make_shared<ImageXObject>(std::move(results[i])));
     }
   }
 #else
@@ -8773,6 +9333,11 @@ void LightVGBackend::render_annotations(const Pdf& pdf, const Page& page,
 
 bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data) {
   // Enhanced PDF content parser with more operators support
+  ++parse_content_depth_;
+  struct ParseDepthGuard {
+    int& depth;
+    ~ParseDepthGuard() { --depth; }
+  } parse_depth_guard{parse_content_depth_};
 
   std::string_view content_view(
       reinterpret_cast<const char*>(content_data.data()), content_data.size());
@@ -8839,6 +9404,40 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
       auto tok3 = [&](char a, char b, char c) {
         return token_eq3(token, a, b, c);
       };
+      auto deferred_safe_operator = [&]() -> bool {
+        if (tok2('D', 'o')) return true;
+        if (tok1('q') || tok1('Q') || tok2('c', 'm')) return true;
+        if (tok1('m') || tok1('l') || tok1('c') || tok1('v') ||
+            tok1('y') || tok2('r', 'e') || tok1('h') || tok1('n')) {
+          return true;
+        }
+        if (tok1('W') || tok2('W', '*')) return true;
+        if (tok2('c', 's') || tok2('C', 'S') || tok2('r', 'g') ||
+            tok2('R', 'G') || tok1('g') || tok1('G') || tok1('k') ||
+            tok1('K') || tok3('s', 'c', 'n') || tok3('S', 'C', 'N') ||
+            tok2('s', 'c') || tok2('S', 'C')) {
+          return true;
+        }
+        if (tok1('w') || tok1('J') || tok1('j') || tok1('M') ||
+            tok1('d') || tok2('r', 'i') || tok1('i')) {
+          return true;
+        }
+        if (tok2('B', 'T') || tok2('E', 'T') || tok2('T', 'd') ||
+            tok2('T', 'D') || tok2('T', 'm') || tok2('T', '*') ||
+            tok2('T', 'L') || tok2('T', 'c') || tok2('T', 'w') ||
+            tok2('T', 'z') || tok2('T', 's') || tok2('T', 'r') ||
+            tok2('T', 'f')) {
+          return true;
+        }
+        if (tok3('B', 'M', 'C') || tok3('B', 'D', 'C') ||
+            tok3('E', 'M', 'C') || tok2('M', 'P') || tok2('D', 'P')) {
+          return true;
+        }
+        return false;
+      };
+      if (!deferred_safe_operator()) {
+        flush_deferred_images();
+      }
 
       // Path construction operators
       if (tok1('m')) {  // moveTo
@@ -9840,76 +10439,81 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
                                               std::to_string(xobj_gen);
                   RenderCacheEntry img_cached;
                   int img_w = 0, img_h = 0;
+                  std::shared_ptr<const ImageXObject> image;
+                  bool cache_converted_argb = false;
                   if (xobj_num != 0 &&
                       RenderCache::instance().find(img_cache_key, img_cached) &&
                       img_cached.width > 0 && img_cached.height > 0) {
                     // Cache hit: use pre-converted ARGB pixels directly.
-                    ImageXObject image;
-                    image.width = static_cast<int>(img_cached.width);
-                    image.height = static_cast<int>(img_cached.height);
-                    img_w = image.width;
-                    img_h = image.height;
-                    image.data = std::move(img_cached.data);
+                    auto cached_image = std::make_shared<ImageXObject>();
+                    cached_image->width = static_cast<int>(img_cached.width);
+                    cached_image->height = static_cast<int>(img_cached.height);
+                    img_w = cached_image->width;
+                    img_h = cached_image->height;
+                    cached_image->data = std::move(img_cached.data);
                     // Mark as cached so draw_image skips conversion.
-                    image.color_space.type = ColorSpaceType::CacheARGB;
-                    draw_image(image, state_.transform.e, state_.transform.f,
-                               state_.transform.a, state_.transform.d,
-                               state_.fill_r, state_.fill_g, state_.fill_b,
-                               &state_.transform);
+                    cached_image->color_space.type = ColorSpaceType::CacheARGB;
+                    image = std::move(cached_image);
                   } else {
                     // Use the parallel pre-decoded image if available, else
                     // decode lazily here. Both produce the identical
                     // ImageXObject (same parse_image_xobject + options).
-                    ImageXObject image;
                     uint64_t pkey =
                         (static_cast<uint64_t>(xobj_num) << 16) | xobj_gen;
                     auto pit = predecoded_images_.find(pkey);
                     if (xobj_num != 0 && pit != predecoded_images_.end()) {
-                      image = std::move(pit->second);
-                      predecoded_images_.erase(pit);
+                      image = pit->second;
                     } else {
                       ImageParseOptions parse_options;
                       parse_options.keep_raw_data = false;
                       parse_options.cache_decoded_stream = false;
-                      image = parse_image_xobject(*current_pdf_, xobj_value,
-                                                  xobj_num, xobj_gen,
-                                                  parse_options);
+                      auto parsed_image = std::make_shared<ImageXObject>(
+                          parse_image_xobject(*current_pdf_, xobj_value,
+                                              xobj_num, xobj_gen,
+                                              parse_options));
+                      image = parsed_image;
+                      if (xobj_num != 0 && parsed_image->width > 0 &&
+                          parsed_image->height > 0 &&
+                          !parsed_image->data.empty()) {
+                        predecoded_images_.emplace(pkey, parsed_image);
+                      }
                     }
-                    img_w = image.width;
-                    img_h = image.height;
+                    img_w = image ? image->width : 0;
+                    img_h = image ? image->height : 0;
                     const size_t converted_bytes =
                         (img_w > 0 && img_h > 0)
                             ? static_cast<size_t>(img_w) *
                                   static_cast<size_t>(img_h) * sizeof(uint32_t)
                             : 0;
-                    const bool cache_converted_argb =
+                    cache_converted_argb =
                         xobj_num != 0 && converted_bytes > 0 &&
                         converted_bytes <= kMaxCachedArgbImageBytes;
-                    draw_image(image, state_.transform.e, state_.transform.f,
-                               state_.transform.a, state_.transform.d,
-                               state_.fill_r, state_.fill_g, state_.fill_b,
-                               &state_.transform, cache_converted_argb);
-                    // Cache the result ARGB for future use. draw_image stores
-                    // its result in last_image_argb_ when obj_num != 0.
-                    if (cache_converted_argb && !last_image_argb_.empty()) {
-                      size_t n = static_cast<size_t>(img_w) *
-                                 static_cast<size_t>(img_h);
-                      RenderCacheEntry entry;
-                      entry.width = static_cast<uint32_t>(img_w);
-                      entry.height = static_cast<uint32_t>(img_h);
-                      entry.data.resize(n * sizeof(uint32_t));
-                      memcpy(entry.data.data(), last_image_argb_.data(),
-                             n * sizeof(uint32_t));
-                      RenderCache::instance().store(img_cache_key, std::move(entry));
-                      last_image_argb_.clear();
-                    }
                   }
+                  DeferredImageDraw deferred;
+                  deferred.image = std::move(image);
+                  deferred.state = state_;
+                  deferred.image_ctm = state_.transform;
+                  deferred.has_image_ctm = true;
+                  deferred.x = state_.transform.e;
+                  deferred.y = state_.transform.f;
+                  deferred.width = state_.transform.a;
+                  deferred.height = state_.transform.d;
+                  deferred.fill_r = state_.fill_r;
+                  deferred.fill_g = state_.fill_g;
+                  deferred.fill_b = state_.fill_b;
+                  deferred.retain_converted_argb = cache_converted_argb;
+                  deferred.cache_key = img_cache_key;
+                  deferred.cache_converted_argb = cache_converted_argb;
+                  deferred.original_width = img_w;
+                  deferred.original_height = img_h;
+                  defer_or_draw_image(std::move(deferred));
                   rendered_xobject = true;
                   // Advance progress proportional to image work
                   size_t img_weight = std::max<size_t>(1,
                       (static_cast<size_t>(img_w) * img_h) / 10000);
                   advance_progress(img_weight);
                 } else if (subtype_it->second.name == "Form") {
+                  flush_deferred_images();
                   auto decoded = decode_stream(*current_pdf_, xobj_value, xobj_num, xobj_gen);
                   if (decoded.success && !decoded.data.empty()) {
                     GraphicsState saved_state = state_;
@@ -10006,6 +10610,13 @@ bool LightVGBackend::parse_pdf_content(const std::vector<uint8_t>& content_data)
     }
   }
 
+  if (parse_content_depth_ == 1 || rendering_soft_mask_group_) {
+    if (render_interrupted_) {
+      deferred_images_.clear();
+    } else {
+      flush_deferred_images();
+    }
+  }
   return true;
 }
 
@@ -10097,14 +10708,21 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
     return false;
   }
 
-  // Create temporary canvas and scene for rendering the soft mask
-  std::vector<uint32_t> mask_buffer(mask_width * mask_height, 0);
+  // Reuse a scratch canvas buffer across soft-mask groups. dcsdd.pdf has many
+  // similarly-sized luminosity masks; keeping the allocation hot cuts repeated
+  // malloc/page-fault churn while preserving the exact clear color per mask.
+  const size_t mask_pixel_count =
+      static_cast<size_t>(mask_width) * static_cast<size_t>(mask_height);
+  soft_mask_group_argb_buffer_.resize(mask_pixel_count);
 
   // Initialize mask buffer based on mask type
   if (mask_type == 2) {  // Luminosity backdrop = /BC (default black)
-    std::fill(mask_buffer.begin(), mask_buffer.end(), 0xFF000000u);
+    std::fill(soft_mask_group_argb_buffer_.begin(),
+              soft_mask_group_argb_buffer_.end(), 0xFF000000u);
+  } else {
+    std::fill(soft_mask_group_argb_buffer_.begin(),
+              soft_mask_group_argb_buffer_.end(), 0u);
   }
-  // For alpha mask (type 1), buffer is already zeroed (transparent)
 
   lvg::SwCanvas* mask_canvas = lvg::SwCanvas::gen();
   if (!mask_canvas) {
@@ -10115,7 +10733,7 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
     return true;
   }
 
-  if (mask_canvas->target(mask_buffer.data(),
+  if (mask_canvas->target(soft_mask_group_argb_buffer_.data(),
                           mask_width, mask_width, mask_height,
                           lvg::ColorSpace::ABGR8888) != lvg::Result::Success) {
     delete mask_canvas;
@@ -10146,7 +10764,7 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   // Switch to mask canvas
   canvas_ = mask_canvas;
   scene_ = mask_scene;
-  buffer_ = std::move(mask_buffer);
+  buffer_.swap(soft_mask_group_argb_buffer_);
   width_ = mask_width;
   height_ = mask_height;
 
@@ -10226,6 +10844,7 @@ bool LightVGBackend::render_soft_mask_group(const Value& group_xobject, int mask
   // Restore original state
   canvas_ = saved_canvas;
   scene_ = saved_scene;
+  soft_mask_group_argb_buffer_.swap(buffer_);
   buffer_ = std::move(saved_buffer);
   width_ = saved_width;
   height_ = saved_height;

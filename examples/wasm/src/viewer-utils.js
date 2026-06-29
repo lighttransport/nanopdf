@@ -76,6 +76,19 @@ export function readWasmString(Module, ptr) {
   return ptr ? Module.UTF8ToString(ptr) : '';
 }
 
+export function getWasmAccelerationInfo(Module) {
+  const simd = Module?._nanopdf_wasm_simd_enabled
+    ? Module._nanopdf_wasm_simd_enabled() === 1
+    : false;
+  const fastPng = Module?._nanopdf_fpnge_available
+    ? Module._nanopdf_fpnge_available() === 1
+    : false;
+  const fpngeIsa = Module?._nanopdf_fpnge_active_isa
+    ? readWasmString(Module, Module._nanopdf_fpnge_active_isa())
+    : 'none';
+  return { simd, fastPng, fpngeIsa: fpngeIsa || 'none' };
+}
+
 // Read a render page into a fresh ImageData. Centralizes the
 // "render -> copy HEAPU8 -> ImageData" sequence used by viewer render paths.
 // Returns { ok, imageData, w, h, error }. On failure imageData is null and

@@ -48,6 +48,10 @@
 
 #include "font-provider.hh"
 
+#ifdef NANOPDF_USE_FPNGE
+#include "third_party/fpnge/fpnge_dispatch.hh"
+#endif
+
 // ============================================================
 // Global state for PDF reading
 // ============================================================
@@ -177,6 +181,39 @@ int nanopdf_init() {
   tvg::Initializer::init(0);
 #endif
   return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_wasm_simd_enabled() {
+#ifdef __wasm_simd128__
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE
+int nanopdf_fpnge_available() {
+#ifdef NANOPDF_USE_FPNGE
+  return nanopdf::fpnge_available() ? 1 : 0;
+#else
+  return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* nanopdf_fpnge_active_isa() {
+#ifdef NANOPDF_USE_FPNGE
+  switch (nanopdf::fpnge_active_isa()) {
+    case nanopdf::FpngeIsa::AVX2: return "avx2";
+    case nanopdf::FpngeIsa::SSE41: return "sse4.1";
+    case nanopdf::FpngeIsa::SSE2: return "sse2";
+    case nanopdf::FpngeIsa::None:
+    default: return "none";
+  }
+#else
+  return "none";
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE

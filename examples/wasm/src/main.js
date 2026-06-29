@@ -14,6 +14,7 @@ import {
   formatFileSize,
   formatPdfDate,
   formatRecoveryAge,
+  getWasmAccelerationInfo,
   getMdpPermissionLabel,
   highlightContext,
   outlineBranchMatches,
@@ -6721,7 +6722,9 @@ async function init() {
       setStatus(`Ready - ${backendLabel(renderBackend)} backend`);
     }
 
-    console.log('nanopdf WASM loaded. Rendering:', hasRendering);
+    const accel = getWasmAccelerationInfo(Module);
+    console.log('nanopdf WASM loaded. Rendering:', hasRendering,
+                'SIMD:', accel.simd, 'fpnge:', accel.fastPng ? accel.fpngeIsa : 'none');
 
     // Deep-link support: ?pdf=<pdf>, #pdf=<pdf>, or #url=<pdf>.
     // Avoid ?url= because Vite dev treats that as an import URL query.

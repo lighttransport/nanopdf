@@ -13,6 +13,7 @@ import {
   formatFileSize,
   formatPdfDate,
   formatRecoveryAge,
+  getWasmAccelerationInfo,
   getMdpPermissionLabel,
   highlightContext,
   outlineBranchMatches,
@@ -79,6 +80,28 @@ test('formatPdfDate falls back to the raw string for partial-mangled input', () 
   assert.equal(formatPdfDate('D:2024ab'), '2024-01-01 00:00:00');
   // No "D:" prefix at all -> returned as-is
   assert.equal(formatPdfDate('2024-01-02'), '2024-01-02');
+});
+
+test('getWasmAccelerationInfo reports SIMD and fpnge probes when exported', () => {
+  const Module = {
+    _nanopdf_wasm_simd_enabled: () => 1,
+    _nanopdf_fpnge_available: () => 1,
+    _nanopdf_fpnge_active_isa: () => 0x4000,
+    UTF8ToString: (ptr) => ptr === 0x4000 ? 'sse2' : '',
+  };
+  assert.deepEqual(getWasmAccelerationInfo(Module), {
+    simd: true,
+    fastPng: true,
+    fpngeIsa: 'sse2',
+  });
+});
+
+test('getWasmAccelerationInfo handles older modules without probes', () => {
+  assert.deepEqual(getWasmAccelerationInfo({}), {
+    simd: false,
+    fastPng: false,
+    fpngeIsa: 'none',
+  });
 });
 
 test('getMdpPermissionLabel normalizes permission labels', () => {

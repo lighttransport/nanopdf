@@ -402,6 +402,48 @@ private:
                   const GraphicsState::Matrix* image_ctm = nullptr,
                   bool retain_converted_argb = false);
 
+  struct PreparedImage {
+    std::vector<uint32_t> argb;
+    int width{0};
+    int height{0};
+    bool premultiplied{false};
+    bool from_argb_cache{false};
+  };
+
+  bool image_can_prepare_off_thread(const ImageXObject& image) const;
+  bool prepare_image_pixels(const ImageXObject& image, const GraphicsState& state,
+                            float width, float height,
+                            const GraphicsState::Matrix* image_ctm,
+                            uint8_t fill_r, uint8_t fill_g, uint8_t fill_b,
+                            bool retain_converted_argb,
+                            PreparedImage& out) const;
+  bool submit_prepared_image(PreparedImage&& prepared, bool interpolate,
+                             const GraphicsState& draw_state, float x, float y,
+                             float width, float height,
+                             const GraphicsState::Matrix* image_ctm,
+                             bool retain_converted_argb);
+
+  struct DeferredImageDraw {
+    std::shared_ptr<const ImageXObject> image;
+    GraphicsState state;
+    GraphicsState::Matrix image_ctm;
+    bool has_image_ctm{false};
+    float x{0.0f};
+    float y{0.0f};
+    float width{0.0f};
+    float height{0.0f};
+    uint8_t fill_r{0};
+    uint8_t fill_g{0};
+    uint8_t fill_b{0};
+    bool retain_converted_argb{false};
+    std::string cache_key;
+    bool cache_converted_argb{false};
+    int original_width{0};
+    int original_height{0};
+  };
+  void defer_or_draw_image(DeferredImageDraw&& draw);
+  bool flush_deferred_images();
+
   // Draw a shading (gradient)
   bool draw_shading(const std::string& shading_name);
 
@@ -505,6 +547,7 @@ private:
   bool clear_canvas_on_draw_{true};
   bool direct_bgra_output_enabled_{false};
   bool rendering_soft_mask_group_{false};
+  int parse_content_depth_{0};
 
   // Form XObject resource stack for nested Form XObjects
   // Each entry contains resources from a Form XObject
@@ -542,11 +585,13 @@ private:
     uint32_t height{0};
   };
   std::unordered_map<std::string, SoftMaskGroupCacheEntry> soft_mask_group_cache_;
+  std::vector<uint32_t> soft_mask_group_argb_buffer_;
 
   // After draw_image() completes, holds the ARGB pixel buffer so the caller
   // can store it in the render cache. Only filled when the image came from a
   // named XObject (obj_num != 0). Cleared once consumed.
   std::vector<uint32_t> last_image_argb_;
+  std::vector<DeferredImageDraw> deferred_images_;
 
   // Current render option for function-based shadings.
   size_t max_function_shading_pixels_{1024 * 1024};
@@ -560,7 +605,7 @@ private:
   // before the sequential content parse, consumed (moved out) by the image `Do`
   // handler so the expensive JPEG/stream decode runs concurrently across the
   // page's distinct images instead of serially during the draw.
-  std::unordered_map<uint64_t, ImageXObject> predecoded_images_;
+  std::unordered_map<uint64_t, std::shared_ptr<const ImageXObject>> predecoded_images_;
   void predecode_page_images(const Pdf& pdf, const Page& page);
 
   // Separation tint function LUT cache (256-entry precomputed ARGB LUT).
