@@ -6098,16 +6098,21 @@ function snapPageFromScroll() {
     canvasWrapper.offsetHeight || pageDisplayHeight || canvasScroll.clientHeight || 1;
   const pageBottom = pageTop + pageHeight;
   const viewTop = canvasScroll.scrollTop;
-  const viewCenter = viewTop + (canvasScroll.clientHeight || 1) * 0.5;
+  const viewHeight = canvasScroll.clientHeight || 1;
+  const viewBottom = viewTop + viewHeight;
   const delta = viewTop - lastCanvasScrollTop;
   lastCanvasScrollTop = viewTop;
   if (Math.abs(delta) <= 2) return;  // ignore sub-pixel jitter
 
-  // Hand off to the next/previous page once the current page's far edge crosses
-  // the viewport centre, compensating the scroll so nothing visibly jumps.
-  if (delta > 0 && currentPage < totalPages - 1 && pageBottom <= viewCenter) {
+  // Hand off only after the current page is nearly out of view. Promoting at
+  // the viewport centre feels like snapping to a page boundary with mouse-wheel
+  // deltas because a large part of the old page is still visible.
+  const handoffSlop = Math.max(24, Math.min(viewHeight, pageHeight) * 0.08);
+  if (delta > 0 && currentPage < totalPages - 1 &&
+      pageBottom <= viewTop + handoffSlop) {
     seamlessAdvancePage(+1);
-  } else if (delta < 0 && currentPage > 0 && pageTop >= viewCenter) {
+  } else if (delta < 0 && currentPage > 0 &&
+             pageTop >= viewBottom - handoffSlop) {
     seamlessAdvancePage(-1);
   }
 }
